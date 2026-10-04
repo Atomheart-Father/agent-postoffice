@@ -143,5 +143,31 @@ s2=$(grep -l "广播汇总" "$POSTOFFICE_HOME/bob/inbox/"*.md 2>/dev/null)
 grep -q "dave：我回了" $s2 && grep -q "erin：未回执" $s2 \
   && ok "截止后汇总列出已回执与未回执" || bad "截止汇总内容"
 
+# 7. 发信方校验 + 坏广播记录不能搞挂邮递员（审核退回的必修 bug）
+before_bc=$(ls "$POSTOFFICE_HOME/broadcasts/"*.json 2>/dev/null | wc -l | tr -d ' ')
+echo x | "$PO" broadcast bob ghost "坏发信方" "仅告知" >/dev/null 2>&1 && bad "未登记发信方应报错" \
+  || ok "broadcast 校验发信方已登记"
+[ "$(ls "$POSTOFFICE_HOME/broadcasts/"*.json 2>/dev/null | wc -l | tr -d ' ')" = "$before_bc" ] \
+  && ok "校验失败不建广播记录" || bad "校验失败却建了记录"
+python3 - "$POSTOFFICE_HOME" <<'PY'
+import json, sys, time
+from pathlib import Path
+h = Path(sys.argv[1])
+(h / "broadcasts").mkdir(exist_ok=True)
+(h / "broadcasts" / "B20260101-000000_ghost.json").write_text(json.dumps({
+    "id": "B20260101-000000_ghost", "from": "ghost", "subject": "坏记录", "need": "仅告知",
+    "to": ["bob"], "deadline": time.time() - 1, "created": "x", "acks": {}, "summarized": False}))
+PY
+POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
+kill -0 $PM 2>/dev/null && ok "坏广播记录不搞挂邮递员" || bad "邮递员被坏记录搞挂"
+grep -q "广播汇总失败 B20260101-000000_ghost.json" "$POSTOFFICE_HOME/logs/postman.log" \
+  && ok "坏记录写进日志并通知人" || bad "坏记录无日志"
+grep -q '"summarized": "error"' "$POSTOFFICE_HOME/broadcasts/B20260101-000000_ghost.json" \
+  && ok "坏记录标记为已处理（不再重试）" || bad "坏记录未标记"
+kill $PM 2>/dev/null; wait $PM 2>/dev/null
+POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null
+[ "$(grep -c "广播汇总失败 B20260101-000000_ghost.json" "$POSTOFFICE_HOME/logs/postman.log")" -eq 1 ] \
+  && ok "坏记录不重复重试" || bad "坏记录重复重试"
+
 rm -rf "$T"
 echo "通过 ${pass}，失败 ${fail}"; [ $fail -eq 0 ]

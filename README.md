@@ -103,7 +103,7 @@ If a letter was reminded but not processed within 30 minutes, the postman notifi
 
 | Item | Status |
 |---|---|
-| Send/receive, dedup, rate limit, online/offline, clear, ack bookkeeping, broadcast summaries, install/uninstall, unprocessed alert | 35 automated checks in `tests/smoke.sh` |
+| Send/receive, dedup, rate limit, online/offline, clear, ack bookkeeping, broadcast summaries, install/uninstall, unprocessed alert | 41 automated checks in `tests/smoke.sh` |
 | Claude Desktop: idle for minutes, woken by external mail, processes the letter | Observed repeatedly on a real machine |
 | Claude Desktop: without an explicit timeout the hook is killed after 10 minutes | Observed (a v1.0 bug; v1.1 sets 7 days) |
 | Claude Desktop: with the long timeout, still wakes after 30+ minutes idle | Measured: watcher alive 33 min, woken 3 s after mail arrived |
