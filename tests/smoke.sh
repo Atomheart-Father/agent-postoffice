@@ -39,6 +39,7 @@ mkdir -p "$T/.claude"; echo '{"theme":"dark","hooks":{"Stop":[{"hooks":[{"type":
 "$PO" install claude >/dev/null; "$PO" install claude >/dev/null
 n=$(grep -c '" hook' "$T/.claude/settings.json"); other=$(grep -c "echo other" "$T/.claude/settings.json")
 [ "$n" -eq 2 ] && [ "$other" -eq 1 ] && ok "装钩子可重复运行且保留别人的钩子" || bad "装钩子 n=$n other=$other"
+"$PO" doctor 2>/dev/null | grep -q "✅ Claude Code 收信钩子" && ok "体检认出已装的钩子" || bad "体检误报钩子未装"
 "$PO" uninstall claude >/dev/null
 ! grep -q '" hook' "$T/.claude/settings.json" && grep -q "echo other" "$T/.claude/settings.json" && ok "卸钩子只卸自己的" || bad "卸钩子"
 

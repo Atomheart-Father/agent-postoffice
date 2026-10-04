@@ -627,7 +627,17 @@ def cmd_doctor(_a):
 
     say(ROUTES.exists(), f"邮局目录 {HOME}")
     s = Path.home() / ".claude" / "settings.json"
-    hooked = s.exists() and f'"{SELF}" hook' in s.read_text(encoding="utf-8")
+    hooked = False
+    if s.exists():
+        try:
+            cfg = json.loads(s.read_text(encoding="utf-8"))
+            cmds = [h.get("command", "") for ev in ("Stop", "SessionStart")
+                    for g in cfg.get("hooks", {}).get(ev, []) for h in g.get("hooks", [])]
+            hooked = all(any(str(SELF) in c and is_ours(c) for c in
+                             [h.get("command", "") for g in cfg.get("hooks", {}).get(ev, []) for h in g.get("hooks", [])])
+                         for ev in ("Stop", "SessionStart")) and bool(cmds)
+        except ValueError:
+            pass
     routes = boxes(load_routes())
     kinds = {r.get("methods", ["notify"])[0] for r in routes.values()}
     if "claude_hook" in kinds:
