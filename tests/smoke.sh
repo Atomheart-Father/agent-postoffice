@@ -79,7 +79,7 @@ grep -q "\"id\": \"$lid\"" "$POSTOFFICE_HOME/acks.jsonl" && grep -q "\"to\": \"b
 [ ! -e "$POSTOFFICE_HOME/alice/inbox/$lid.md" ] && [ -e "$POSTOFFICE_HOME/alice/done/$lid.md" ] \
   && ok "ack 把信挪到 done" || bad "ack 挪信"
 bob_after=$(ls "$POSTOFFICE_HOME/bob/inbox/"*.md 2>/dev/null | wc -l | tr -d ' ')
-[ "$bob_before" = "$bob_after" ] && ok "ack 不产生给原发信方的新信" || bad "ack 多发了信"
+[ "$bob_after" -eq "$((bob_before+1))" ] && ok "ack 产生一封无需答复的回执通知" || bad "ack 回执通知"
 
 # 2. ack --wake：原发信方 inbox 多一封 copy that
 out=$(echo "正文" | "$PO" send alice bob "需要回执的信2" "回复")

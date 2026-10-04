@@ -16,7 +16,7 @@ coder (OpenCode) ──writes a letter──▶ ~/agent-postoffice/boss/inbox/xx
 - **Delivered once**: each letter triggers one reminder, even across restarts; at most 6 wakes per mailbox per 10 minutes, so agents can't spam each other.
 - **Online / offline**: a session out of quota? `postoffice offline <name>` — letters are kept locally and not sent; `online` delivers the backlog; `clear` archives it instead (nothing is deleted).
 - **Post office only**: agents should talk only through the post office, never call `codex queue` directly — messages that bypass it ignore the offline switch, pile up while the recipient has no quota, and all pop out when it comes back.
-- **Receipts without waking**: `postoffice ack` records a receipt (and files the letter into `done/`) without waking the sender, so "FYI" letters and closing "copy that" replies no longer interrupt. A broadcast becomes one summary: `broadcast` sends each recipient a letter tagged with an ID, they `ack` it, and when everyone has replied (or the deadline passes) the sender gets exactly one summary letter.
+- **Receipts default to no reply**: `postoffice ack` records a receipt (and files the letter into `done/`) with a receipt notification through the existing idle delivery channel, so receipt content is visible without requiring a reply. A broadcast becomes one summary: `broadcast` sends each recipient a letter tagged with an ID, they `ack` it, and when everyone has replied (or the deadline passes) the sender gets exactly one summary letter.
 - **Control panel**: `postoffice panel` opens a local web page with one switch per session to cut or restore its connection, plus the backlog, broadcast progress and recent delivery log.
 - **Fallbacks**: if a session can't be woken (not open), you get one system notification after 20 minutes; if a reminder went out but the letter is still in the inbox after 30 minutes (session stuck, Codex thread not loaded…), you get one too.
 - Pure standard-library Python 3.9+, no dependencies. macOS first (Linux works: notifications via `notify-send`, and you keep the postman running yourself).
@@ -65,12 +65,12 @@ MSG
 
 The recipient wakes up, reads, does the work, replies, and moves the letter into its own `done/`.
 
-**Receipt rule (copy that / ack)**: a letter you must answer before you can continue ("need: reply / review") still gets a proper `send` back. For "FYI" letters and the closing copy that, use `ack` instead: it records the receipt and files the letter into `done/`, without waking the sender. `send` prints the **letter ID** (the file name minus `.md`), which is what `ack` takes. A broadcast (`broadcast`) sends one tagged letter per recipient; they ack the broadcast ID, and the sender gets **one** summary once everyone has replied or the deadline passes.
+**Receipt rule (copy that / ack)**: a letter you must answer before you can continue ("need: reply / review") still gets a proper `send` back. For "FYI" letters and the closing copy that, use `ack` instead: it records the receipt and files the letter into `done/`, with a receipt notification through the existing idle delivery channel. `send` prints the **letter ID** (the file name minus `.md`), which is what `ack` takes. A broadcast (`broadcast`) sends one tagged letter per recipient; they ack the broadcast ID, and the sender gets **one** summary once everyone has replied or the deadline passes.
 
 | Command | What it does |
 |---|---|
 | `postoffice panel` | Open the web control panel (listens on 127.0.0.1 only), including broadcast progress |
-| `postoffice ack boss 20261004-223334_coder_hello "one line"` | Record a receipt: file the letter into `done/`, wake nobody; add `--wake` to also send a `copy that` letter |
+| `postoffice ack boss 20261004-223334_coder_hello "one line"` | Record a receipt: file the letter into `done/`, notify the sender when idle; `--wake` keeps the `copy that` title |
 | `postoffice broadcast all boss "subject" "need"` | Send every other mailbox a tagged letter; `--deadline 30m`; acks are summarized into one letter to you |
 | `postoffice offline codex1` | Recipient out of quota / away: letters are kept, no reminders |
 | `postoffice online codex1` | Back: the backlog is delivered within 10 s |
@@ -141,3 +141,9 @@ In these cases a Claude session can't be woken for a while; letters are never lo
 ## License
 
 MIT
+
+## Receipt handling (v1.3)
+
+Receipt notifications and broadcast summaries default to no reply and no further ack: read and move to `done/`. Only follow up when an omitted part of the original request is needed to continue work. Offline mailboxes retain notifications. Existing hook/plugin/queue limitations still apply.
+
+Run `python3 tests/receipt_test.py` for receipt content, deduplication and loop prevention checks.

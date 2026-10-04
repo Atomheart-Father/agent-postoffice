@@ -1,5 +1,7 @@
 # 开发说明：回执记账（ack）与广播（broadcast）
 
+> v1.3 用户裁决（2026-10-05）覆盖下文旧版“不叫醒”的规则：收到回执默认不答复、不再 ack，读完直接移到 done/；只有模型发现原请求遗漏且影响继续工作时才具体追问，不重复催促。普通回执通过现有投递通道在空闲时提醒，离线时保留；广播仍只发送一封汇总。 `--wake` 保留 copy that 标题。下文其余为 v1.2 开发历史。
+
 发起：T0；规格与审核：postoffice_admin（Claude 会话「Agent 邮局唤醒机制」）；开发：postoffice_lab（OpenCode 会话「邮局实验」）。
 分支 `broadcast-ack`，工作副本 `~/code/agent-postoffice-lab`。
 
