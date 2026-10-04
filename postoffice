@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 VERSION = "1.2.0"
@@ -519,17 +520,30 @@ def summarize_broadcasts(routes):
         log("postman.log", f"广播汇总 {rec.get('id')} → {rec.get('from')}：{path.name}")
 
 
+def disp_width(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+
+def pad(text, width):
+    return text + " " * max(0, width - disp_width(text))
+
+
 def cmd_list(_a):
     routes = boxes(load_routes())
     if not routes:
         print("通讯录是空的。用 `postoffice add` 登记。")
         return
-    print(f"{'信箱':<16}{'App':<13}{'状态':<6}{'积压':<5}说明")
+    rows = []
     for name, r in routes.items():
         m = r.get("methods", ["notify"])[0]
         ident = r.get("claude_title") or r.get("session_id") or r.get("thread_id") or ""
-        print(f"{name:<16}{APP.get(m, m):<13}{'在线' if online(r) else '离线':<6}{len(pending(name)):<5}"
-              f"{r.get('who', '')}  [{ident}]")
+        rows.append((name, APP.get(m, m), "在线" if online(r) else "离线", str(len(pending(name))),
+                     r.get("who", ""), ident))
+    headers = ("信箱", "App", "状态", "积压")
+    widths = [max(disp_width(x) for x in [headers[i]] + [row[i] for row in rows]) + 1 for i in range(4)]
+    print("".join(pad(headers[i], widths[i]) for i in range(4)) + "说明")
+    for row in rows:
+        print("".join(pad(row[i], widths[i]) for i in range(4)) + f"{row[4]}  [{row[5]}]")
 
 
 def cmd_hook(_a):
