@@ -803,7 +803,33 @@ def cmd_panel(a):
                 ok = False
             self._send(200 if ok else 400, json.dumps({"ok": ok}).encode())
 
-    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    except OSError:
+        # an older panel still holding the port: replace it; anything else: explain instead of a traceback
+        r = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], capture_output=True, text=True)
+        old = []
+        for x in r.stdout.split():
+            cmd = subprocess.run(["ps", "-o", "command=", "-p", x], capture_output=True, text=True).stdout
+            if "postoffice" in cmd and " panel" in cmd and int(x) != os.getpid():
+                old.append(int(x))
+        if not old:
+            sys.exit(f"端口 {port} 被别的程序占用了，换一个：postoffice panel --port 8766")
+        for pid in old:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        print(f"已关闭旧面板（pid {', '.join(map(str, old))}），换成新版")
+        for _ in range(20):
+            time.sleep(0.25)
+            try:
+                srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+                break
+            except OSError:
+                continue
+        else:
+            sys.exit(f"旧面板没能关掉，端口 {port} 仍被占用")
     url = f"http://127.0.0.1:{port}/"
     print(f"联络总站面板：{url}（Ctrl+C 关闭）", flush=True)
     if not a.no_open:
