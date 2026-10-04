@@ -282,6 +282,26 @@ def set_status(name, status):
         print(f"{name} 已上线：积压的 {n} 封会在 10 秒内送达（受每 10 分钟 6 次的限流）。")
 
 
+def clear_backlog(name):
+    """Move every letter waiting in <name>/inbox to <name>/archived/<time>/ (kept on disk, never sent)."""
+    files = pending(name)
+    if not files:
+        return None, 0
+    dst = HOME / name / "archived" / time.strftime("%Y%m%d-%H%M%S")
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        f.replace(dst / f.name)
+    log("postman.log", f"清空积压 {name}：{len(files)} 封存档到 {dst}")
+    return dst, len(files)
+
+
+def cmd_clear(a):
+    if a.name not in boxes(load_routes()):
+        sys.exit(f"没有信箱 {a.name}")
+    dst, n = clear_backlog(a.name)
+    print(f"{a.name} 没有积压的信" if not n else f"已把 {n} 封积压信存档到 {dst}（不会再送出；需要时手动挪回 inbox/）")
+
+
 def cmd_send(a):
     routes = load_routes()
     if not (HOME / a.to / "inbox").is_dir():
@@ -764,16 +784,23 @@ def cmd_panel(a):
                 self._send(404, b"{}")
 
         def do_POST(self):
-            if self.path != "/api/status" or not self._local() \
+            if self.path not in ("/api/status", "/api/clear") or not self._local() \
                     or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self._send(403, b'{"ok":false}')
             try:
                 d = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-                ok = apply_status(str(d["name"]), str(d["status"]))
+                name = str(d["name"])
+                if self.path == "/api/clear":
+                    ok = name in boxes(load_routes())
+                    if ok:
+                        _, n = clear_backlog(name)
+                        log("postman.log", f"面板：清空 {name} 积压 {n} 封")
+                else:
+                    ok = apply_status(name, str(d["status"]))
+                    if ok:
+                        log("postman.log", f"面板：{name} 设为{'在线' if d['status'] == 'online' else '离线'}")
             except (ValueError, KeyError):
                 ok = False
-            if ok:
-                log("postman.log", f"面板：{d['name']} 设为{'在线' if d['status'] == 'online' else '离线'}")
             self._send(200 if ok else 400, json.dumps({"ok": ok}).encode())
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
@@ -806,6 +833,9 @@ def main():
     p = sp.add_parser("offline", help="设为离线（照收信，不提醒）")
     p.add_argument("name")
     p.set_defaults(fn=lambda a: set_status(a.name, "offline"))
+    p = sp.add_parser("clear", help="清空积压：把还没送出的信存档到 archived/，不再投递")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_clear)
     p = sp.add_parser("send", help="发信：正文从标准输入或 --file")
     p.add_argument("to")
     p.add_argument("sender")

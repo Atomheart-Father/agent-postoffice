@@ -12,7 +12,8 @@
 - **空等不花钱**：等信的是一个小 shell/Python 循环，不调用模型，不消耗额度。
 - **不打断**：对方正忙，就等它这一轮做完再送；不碰输入框里的草稿。
 - **只送一次**：每封信只提醒一次，重启也不重复；每个信箱 10 分钟最多叫醒 6 次，防止 AI 之间互相刷屏。
-- **能下线**：某个会话没额度了，`postoffice offline <名字>`，信照收但不提醒；`online` 后自动补送。
+- **能下线**：某个会话没额度了，`postoffice offline <名字>`，信存在本地，不发给它；`online` 后自动补送；不想补送就 `clear`（存档不删）。
+- **只走邮局**：各会话之间传话都通过邮局，不要直接 `codex queue`——绕过邮局的消息不受离线开关管，会在对方没额度时堆积，一上线全弹出来。
 - **操作面板**：`postoffice panel` 打开本机网页，每个会话一个开关，一键断开/恢复它的连接，还能看积压的信和最近投递记录。
 - **兜底**：会话没开、送不到，20 分钟后弹一次系统通知给你；提醒送到了但信 30 分钟还躺在 inbox 里（会话卡住、Codex 线程没加载等），也弹一次。
 - 纯标准库 Python 3.9+，无第三方依赖；macOS 优先（Linux 能用，通知用 `notify-send`，邮递员需自己常驻）。
@@ -68,6 +69,7 @@ MSG
 | `postoffice panel` | 打开网页操作面板（只监听本机 127.0.0.1） |
 | `postoffice offline codex1` | 对方没额度/下线：信照收，不提醒 |
 | `postoffice online codex1` | 恢复：积压的信 10 秒内补送 |
+| `postoffice clear codex1` | 清空积压：把还没送出的信存档到 `archived/`，不再发（面板上有同名按钮） |
 | `postoffice remove coder` | 从通讯录移除 |
 | `postoffice postman` | 前台运行邮递员（不想用开机自启时） |
 | `postoffice uninstall claude` / `postman` | 卸载钩子 / 自启 |

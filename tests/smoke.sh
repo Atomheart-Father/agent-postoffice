@@ -59,5 +59,9 @@ mv "$POSTOFFICE_HOME"/carol/inbox/*.md "$POSTOFFICE_HOME/carol/done/"
 POSTOFFICE_POLL=1 POSTOFFICE_CONSUME_ALERT=2 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM
 ! grep -q carol "$POSTOFFICE_HOME/.woken.json" && ok "信挪进 done 即算处理完" || bad "处理完未清账"
 
+"$PO" offline alice >/dev/null; echo "x" | "$PO" send alice bob "积压待清" "仅告知" >/dev/null
+"$PO" clear alice >/dev/null
+[ -z "$(ls "$POSTOFFICE_HOME/alice/inbox/"*.md 2>/dev/null)" ] && ls "$POSTOFFICE_HOME"/alice/archived/*/*积压待清*.md >/dev/null 2>&1 && ok "清空积压：存档不删、不再投递" || bad "清空积压"
+
 rm -rf "$T"
 echo "通过 $pass，失败 $fail"; [ $fail -eq 0 ]
