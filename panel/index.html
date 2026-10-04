@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>联络总站</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --card: #ffffff; --ink: #1d1d1b; --muted: #77756e; --line: #e4e1d8;
+    --on: #2f7d4f; --off: #b04a3a; --chip: #efede6; --accent: #1d1d1b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --card: #1f1f1d; --ink: #ecebe6; --muted: #9a988f; --line: #2e2e2b;
+            --on: #5fbf85; --off: #e07a68; --chip: #2a2a27; --accent: #ecebe6; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 -apple-system, "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: .02em; }
+  .home { color: var(--muted); font-size: 13px; font-family: ui-monospace, Menlo, monospace; }
+  .hint { color: var(--muted); font-size: 13px; margin: 6px 0 20px; }
+  .box { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+         padding: 14px 16px; margin-bottom: 10px; display: grid;
+         grid-template-columns: 1fr auto; gap: 4px 16px; align-items: center; }
+  .box.offline { opacity: .72; }
+  .name { font-weight: 600; font-size: 16px; }
+  .name small { font-weight: 400; color: var(--muted); margin-left: 8px; font-size: 13px; }
+  .meta { color: var(--muted); font-size: 13px; grid-column: 1; overflow-wrap: anywhere; }
+  .chip { display: inline-block; background: var(--chip); border-radius: 999px; padding: 0 8px;
+          font-size: 12px; margin-right: 6px; color: var(--ink); }
+  .pending { grid-column: 1 / -1; margin-top: 6px; font-size: 13px; }
+  .pending div { padding: 3px 0; border-top: 1px dashed var(--line); }
+  .pending b { font-weight: 500; }
+  .toggle { grid-row: 1 / span 2; grid-column: 2; display: flex; align-items: center; gap: 10px;
+            cursor: pointer; user-select: none; border: 0; background: none; color: inherit; font: inherit; padding: 4px; }
+  .track { width: 46px; height: 26px; border-radius: 13px; background: var(--off); position: relative; transition: background .15s; }
+  .track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px;
+                  border-radius: 50%; background: #fff; transition: transform .15s; }
+  .on .track { background: var(--on); }
+  .on .track::after { transform: translateX(20px); }
+  .state { width: 3em; text-align: right; font-size: 14px; }
+  .toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
+  h2 { font-size: 15px; margin: 28px 0 8px; }
+  .log { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px 14px;
+         font: 12.5px/1.6 ui-monospace, Menlo, monospace; max-height: 340px; overflow: auto; }
+  .log div { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .log span { color: var(--muted); }
+  .err { color: var(--off); font-size: 13px; min-height: 1.5em; }
+  @media (max-width: 520px) { .state { display: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>联络总站</h1><span class="home" id="home"></span></header>
+  <p class="hint">关掉开关 = 该会话离线：信照收，但不提醒它；打开后积压的信 10 秒内补送。页面每 5 秒刷新。</p>
+  <div class="err" id="err"></div>
+  <section id="boxes"></section>
+  <h2>最近投递记录</h2>
+  <div class="log" id="log"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function load() {
+  try {
+    const st = await (await fetch("/api/state")).json();
+    $("err").textContent = "";
+    $("home").textContent = st.home;
+    $("boxes").innerHTML = st.boxes.length ? st.boxes.map((b) => `
+      <div class="box ${b.online ? "" : "offline"}">
+        <div class="name">${esc(b.name)}<small>${esc(b.who)}</small></div>
+        <button class="toggle ${b.online ? "on" : ""}" data-name="${esc(b.name)}" data-online="${b.online}"
+                aria-label="${esc(b.name)} ${b.online ? "在线，点击设为离线" : "离线，点击设为在线"}">
+          <span class="state">${b.online ? "在线" : "离线"}</span><span class="track"></span>
+        </button>
+        <div class="meta"><span class="chip">${esc(b.app)}</span>${esc(b.ident)}
+          · 积压 ${b.pending.length} 封</div>
+        ${b.pending.length ? `<div class="pending">${b.pending.map((p) =>
+          `<div><b>${esc(p.subject || p.file)}</b> <span class="meta">来自 ${esc(p.from)}</span></div>`).join("")}</div>` : ""}
+      </div>`).join("") : `<p class="hint">通讯录是空的，用 <code>postoffice add</code> 登记会话。</p>`;
+    $("log").innerHTML = st.log.map((l) => `<div><span>${esc(l.t.slice(5))} ${esc(l.src)}</span> ${esc(l.msg)}</div>`).join("")
+      || `<span>还没有记录</span>`;
+  } catch (e) {
+    $("err").textContent = "连不上面板服务（postoffice panel 是否还开着？）";
+  }
+}
+
+$("boxes").addEventListener("click", async (ev) => {
+  const t = ev.target.closest(".toggle");
+  if (!t) return;
+  const status = t.dataset.online === "true" ? "offline" : "online";
+  const r = await fetch("/api/status", { method: "POST", headers: { "Content-Type": "application/json" },
+                                         body: JSON.stringify({ name: t.dataset.name, status }) });
+  if (!r.ok) $("err").textContent = "修改失败";
+  load();
+});
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
