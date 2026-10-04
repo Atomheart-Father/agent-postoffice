@@ -37,7 +37,7 @@ kill -0 $P 2>/dev/null && bad "上线后没补送" || { grep -q "离线测试" "
 
 mkdir -p "$T/.claude"; echo '{"theme":"dark","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo other"}]}]}}' > "$T/.claude/settings.json"
 "$PO" install claude >/dev/null; "$PO" install claude >/dev/null
-n=$(grep -c '" hook' "$T/.claude/settings.json"); other=$(grep -c "echo other" "$T/.claude/settings.json")
+n=$(grep -c '" hook' "$T/.claude/settings.json"); grep -q '"timeout": 604800' "$T/.claude/settings.json" || n=0; other=$(grep -c "echo other" "$T/.claude/settings.json")
 [ "$n" -eq 2 ] && [ "$other" -eq 1 ] && ok "装钩子可重复运行且保留别人的钩子" || bad "装钩子 n=$n other=$other"
 "$PO" doctor 2>/dev/null | grep -q "✅ Claude Code 收信钩子" && ok "体检认出已装的钩子" || bad "体检误报钩子未装"
 "$PO" uninstall claude >/dev/null
@@ -48,6 +48,16 @@ echo "x" | "$POSTOFFICE_HOME/bin/send.sh" bob alice "兼容旧命令" "仅告知
 grep -q "兼容旧命令" "$POSTOFFICE_HOME/.delivered.json" 2>/dev/null || grep -q "bob" "$POSTOFFICE_HOME/.delivered.json" && ok "邮递员投递通知信箱并记账" || bad "邮递员"
 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM
 [ $(grep -c "notify bob" "$POSTOFFICE_HOME/logs/postman.log") -eq 1 ] && ok "邮递员重启不重投" || bad "邮递员重投"
+
+printf '#!/bin/sh\nexit 0\n' > "$T/fakecodex"; chmod +x "$T/fakecodex"   # 假 codex：queue 永远“受理成功”
+"$PO" add carol --codex thread-1 >/dev/null
+python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r['carol']['codex_cli']=sys.argv[2];json.dump(r,open(p,'w'))" "$POSTOFFICE_HOME/routes.json" "$T/fakecodex"
+echo "x" | "$PO" send carol alice "没人处理的信" "仅告知" >/dev/null
+POSTOFFICE_POLL=1 POSTOFFICE_CONSUME_ALERT=2 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 6; kill $PM
+[ $(grep -c "未处理 carol" "$POSTOFFICE_HOME/logs/postman.log") -eq 1 ] && ok "提醒后久未处理只告诉人一次" || bad "未处理提醒"
+mv "$POSTOFFICE_HOME"/carol/inbox/*.md "$POSTOFFICE_HOME/carol/done/"
+POSTOFFICE_POLL=1 POSTOFFICE_CONSUME_ALERT=2 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM
+! grep -q carol "$POSTOFFICE_HOME/.woken.json" && ok "信挪进 done 即算处理完" || bad "处理完未清账"
 
 rm -rf "$T"
 echo "通过 $pass，失败 $fail"; [ $fail -eq 0 ]

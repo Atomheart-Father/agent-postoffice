@@ -14,7 +14,7 @@
 - **只送一次**：每封信只提醒一次，重启也不重复；每个信箱 10 分钟最多叫醒 6 次，防止 AI 之间互相刷屏。
 - **能下线**：某个会话没额度了，`postoffice offline <名字>`，信照收但不提醒；`online` 后自动补送。
 - **操作面板**：`postoffice panel` 打开本机网页，每个会话一个开关，一键断开/恢复它的连接，还能看积压的信和最近投递记录。
-- **兜底**：会话没开、送不到，20 分钟后弹一次系统通知给你。
+- **兜底**：会话没开、送不到，20 分钟后弹一次系统通知给你；提醒送到了但信 30 分钟还躺在 inbox 里（会话卡住、Codex 线程没加载等），也弹一次。
 - 纯标准库 Python 3.9+，无第三方依赖；macOS 优先（Linux 能用，通知用 `notify-send`，邮递员需自己常驻）。
 
 ## 安装（三步）
@@ -74,12 +74,32 @@ MSG
 
 | 收件方 | 谁来叫醒 | 怎么叫 |
 |---|---|---|
-| Claude Code | Claude Code 自己的钩子 | 每轮结束、会话打开时，钩子在后台起 `postoffice hook`。异步钩子没有超时限制，空等不调用模型；有信就以退出码 2 结束，Claude Code 把提醒交给会话并唤醒它 |
+| Claude Code | Claude Code 自己的钩子 | 每轮结束、会话打开时，钩子在后台起 `postoffice hook`，空等不调用模型；有信就以退出码 2 结束，Claude Code 把提醒交给会话并唤醒它。命令钩子默认 600 秒超时（实测 10 分钟后会被结束），所以安装时显式设 `timeout` 为 7 天 |
 | OpenCode | 全局插件 | 每 10 秒和每次会话空闲时检查；会话空闲才用 OpenCode 自带接口 `session.promptAsync` 发一条提醒。多个 OpenCode 实例同时开着时，靠认领文件保证只送一次 |
 | Codex | 邮递员 | `codex queue --thread <id>` 往线程里排一条提醒 |
 | 人 | 邮递员 | 系统通知 |
 
 数据都在 `~/agent-postoffice/`（可用环境变量 `POSTOFFICE_HOME` 改）：`routes.json` 是唯一配置；每个信箱一个目录（`inbox/`、`done/`、`CONTACT.md`）；日志在 `logs/`。
+
+## 送达的含义
+
+邮局区分两件事：
+
+- **已提醒**：钩子唤醒了 Claude 会话 / 插件给 OpenCode 发了提醒 / `codex queue` 返回成功。这只说明提醒发出去了。
+- **已处理**：收件方把信挪进了自己的 `done/`。
+
+已提醒但 30 分钟仍未处理，邮递员通知你一次。已知情况：Codex 线程没有加载时，`codex queue` 也会返回成功，但线程不会自己恢复，这时就靠这条通知。
+
+## 验证状态（v1.1）
+
+| 项目 | 状态 |
+|---|---|
+| 收发信、去重、限流、在线/离线、安装卸载、未处理提醒 | `tests/smoke.sh` 17 项自动测试 |
+| Claude 桌面版：空闲几分钟后被外部来信叫醒并处理信件 | 真机多次观察到 |
+| Claude 桌面版：不显式设 timeout 时，钩子 10 分钟后被结束 | 真机观察到（v1.0 的缺陷，v1.1 已显式设 7 天） |
+| Claude 桌面版：设了长 timeout 后，空闲 30 分钟以上仍能被叫醒 | 待真机长时间测试 |
+| OpenCode：空闲会话 10 秒内收到提醒 | 真机多次观察到 |
+| Codex：`codex queue` 唤醒已加载的空闲线程 | 待测 |
 
 ## 安全须知
 
@@ -95,4 +115,4 @@ MSG
 
 ## English (short)
 
-A local mailbox for AI coding agents on one machine. Drop a `.md` file in `~/agent-postoffice/<name>/inbox/` (or `postoffice send`), and the recipient session is woken automatically: Claude Code via `Stop`/`SessionStart` hooks with `asyncRewake` (zero model calls while idle), OpenCode via a global plugin using `session.promptAsync` when the session is idle, Codex via `codex queue`. Deliver-once ledgers, rate limiting, online/offline per mailbox, and a 20-minute fallback notification. Run `./install.sh`, restart the apps, then `postoffice add …`. MIT licensed.
+A local mailbox for AI coding agents on one machine. Drop a `.md` file in `~/agent-postoffice/<name>/inbox/` (or `postoffice send`), and the recipient session is woken automatically: Claude Code via `Stop`/`SessionStart` hooks with `asyncRewake` (zero model calls while idle), OpenCode via a global plugin using `session.promptAsync` when the session is idle, Codex via `codex queue`. Deliver-once ledgers, rate limiting, online/offline per mailbox, a 20-minute not-woken alert and a 30-minute reminded-but-unprocessed alert. Note: Claude Code command hooks default to a 600 s timeout, so the installer sets an explicit 7-day `timeout` on the async hook. Run `./install.sh`, restart the apps, then `postoffice add …`. MIT licensed.

@@ -23,16 +23,18 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
 REPO = Path(__file__).resolve().parent
 SELF = Path(__file__).resolve()
 
-POLL = 10               # seconds between inbox checks
+POLL = int(os.environ.get("POSTOFFICE_POLL", 10))   # seconds between inbox checks
 RATE_N, RATE_WIN = 6, 600   # at most 6 wakes per mailbox per 10 minutes
 GRACE = 1200            # postman alerts the human if a hook/plugin mailbox is not woken within 20 min
+CONSUME_ALERT = int(os.environ.get("POSTOFFICE_CONSUME_ALERT", 1800))  # reminded but still in inbox after 30 min → tell the human
+HOOK_TIMEOUT = 7 * 24 * 3600  # explicit timeout for the async Claude hook (seconds)
 
 METHODS = {
     "claude_hook": "Claude Code 收信钩子（Stop/SessionStart 钩子，asyncRewake）",
@@ -397,9 +399,35 @@ def cmd_postman(_a):
     log("postman.log", f"邮递员上岗 v{VERSION}")
     print(f"{now_str()} 邮递员上岗（{HOME}），Ctrl+C 停止", flush=True)
 
-    def mark(key):
+    wokef = HOME / ".woken.json"     # letter → time we saw it reminded (ACCEPTED); leaving inbox = CONSUMED
+    woken = json.loads(wokef.read_text()) if wokef.exists() else {}
+
+    def mark(key, reminded=True):
         delivered.add(key)
         state.write_text(json.dumps(sorted(delivered), ensure_ascii=False))
+        if reminded:
+            woken[key] = {"t": time.time(), "alerted": False}
+            wokef.write_text(json.dumps(woken, ensure_ascii=False))
+
+    def check_consumed(routes):
+        changed = False
+        for key in list(woken):
+            p = Path(key)
+            if not p.exists():                       # moved to done/ (or deleted): consumed
+                del woken[key]
+                changed = True
+                continue
+            w = woken[key]
+            r = routes.get(p.parent.parent.name)
+            if w["alerted"] or not r or not online(r) or time.time() - w["t"] < CONSUME_ALERT:
+                continue
+            notify(f"联络总站：{p.parent.parent.name} 已提醒但 {CONSUME_ALERT // 60} 分钟未处理",
+                   (field(p, "事由") or p.name) + "（会话可能没加载、卡住或在忙长任务）")
+            log("postman.log", f"未处理 {p.parent.parent.name} {p.name}：提醒后 {CONSUME_ALERT // 60} 分钟仍在 inbox，已通知人")
+            w["alerted"] = True
+            changed = True
+        if changed:
+            wokef.write_text(json.dumps(woken, ensure_ascii=False))
 
     while True:
         try:
@@ -418,6 +446,7 @@ def cmd_postman(_a):
                         oc_ok.add(f"{e['box']}::{e['file']}")
                 except (ValueError, KeyError):
                     pass
+        check_consumed(routes)
         for name, r in routes.items():
             if not online(r):
                 continue                      # offline: letters wait, nobody is reminded
@@ -434,6 +463,8 @@ def cmd_postman(_a):
                     elif time.time() - p.stat().st_mtime > GRACE:
                         notify(f"联络总站：{name} 20 分钟未被唤醒", field(p, "事由") or p.name)
                         log("postman.log", f"{method} {name} {p.name} 超 20 分钟未送达，已通知人")
+                        mark(key, reminded=False)
+                        continue
                     else:
                         continue
                     mark(key)
@@ -464,7 +495,7 @@ def cmd_postman(_a):
                 if not ok:
                     notify("联络总站：投递失败", f"{name} {p.name}，请手动转交")
                 rate_mark(name)
-                mark(key)                     # failures are not retried; the human was notified once
+                mark(key, reminded=ok and method == "codex_queue")                     # failures are not retried; the human was notified once
         time.sleep(POLL)
 
 
@@ -488,7 +519,9 @@ def cmd_install_claude(_a):
     s.parent.mkdir(parents=True, exist_ok=True)
     cfg = json.loads(s.read_text(encoding="utf-8")) if s.exists() and s.read_text().strip() else {}
     bk = backup(s)
-    ours = {"type": "command", "command": f'exec "{SELF}" hook', "asyncRewake": True}
+    # Claude Code docs say async hooks are not timed out, but the settings schema documents a 600 s default
+    # for command hooks; set an explicit long timeout so neither reading can kill the watcher after 10 min.
+    ours = {"type": "command", "command": f'exec "{SELF}" hook', "asyncRewake": True, "timeout": HOOK_TIMEOUT}
     hooks = cfg.setdefault("hooks", {})
     for event, extra in (("Stop", {}), ("SessionStart", {"matcher": "startup|resume|clear|compact"})):
         groups = []
@@ -631,11 +664,10 @@ def cmd_doctor(_a):
     if s.exists():
         try:
             cfg = json.loads(s.read_text(encoding="utf-8"))
-            cmds = [h.get("command", "") for ev in ("Stop", "SessionStart")
-                    for g in cfg.get("hooks", {}).get(ev, []) for h in g.get("hooks", [])]
-            hooked = all(any(str(SELF) in c and is_ours(c) for c in
-                             [h.get("command", "") for g in cfg.get("hooks", {}).get(ev, []) for h in g.get("hooks", [])])
-                         for ev in ("Stop", "SessionStart")) and bool(cmds)
+            hooked = all(any(str(SELF) in h.get("command", "") and is_ours(h.get("command", ""))
+                             and h.get("asyncRewake") and h.get("timeout")
+                             for g in cfg.get("hooks", {}).get(ev, []) for h in g.get("hooks", []))
+                         for ev in ("Stop", "SessionStart"))
         except ValueError:
             pass
     routes = boxes(load_routes())
