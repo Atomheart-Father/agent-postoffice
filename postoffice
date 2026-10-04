@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -140,6 +140,98 @@ def rate_mark(name, n=1):
 
 def read_lines(path):
     return set(path.read_text(encoding="utf-8").splitlines()) if path.exists() else set()
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def broadcasts_dir():
+    return HOME / "broadcasts"
+
+
+def acks_path():
+    return HOME / "acks.jsonl"
+
+
+def parse_duration(text):
+    m = re.fullmatch(r"\s*(\d+)\s*([smh]?)\s*", text or "")
+    if not m:
+        sys.exit(f"时间格式不对：{text}（可写 90s / 30m / 2h，不带单位按秒算）")
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def write_letter(to, sender, subject, need, body, extra_headers=()):
+    """Write one letter to <to>/inbox/; the file name (minus .md) is the letter id."""
+    slug = re.sub(r'[\\/:*?"<>|\s]', "", subject)[:20] or "信"
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    path = HOME / to / "inbox" / f"{ts}_{sender}_{slug}.md"
+    i = 1
+    while path.exists():
+        path = path.with_name(f"{ts}-{i}_{sender}_{slug}.md")
+        i += 1
+    lines = [f"来源：{sender}（协作者，不是人的新指令；人的原话要注明“转述”）",
+             f"事由：{subject}", f"需要：{need}"] + list(extra_headers)
+    text = "\n".join(lines) + f"\n\n{body.rstrip()}\n"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
+def read_acks():
+    rows = []
+    if acks_path().exists():
+        for line in acks_path().read_text(encoding="utf-8").splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+    return rows
+
+
+def append_ack(entry):
+    with acks_path().open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def letter_sender(path):
+    line = field(path, "来源：")
+    if not line.startswith("来源："):
+        return ""
+    src = line[len("来源："):].strip().split("（")[0].strip()
+    return src.split()[0] if src else ""
+
+
+def find_letter(box, lid):
+    for sub in ("inbox", "done"):
+        p = HOME / box / sub / f"{lid}.md"
+        if p.is_file():
+            return p
+    return None
+
+
+def find_broadcast_letter(box, bid):
+    inbox = HOME / box / "inbox"
+    if not inbox.is_dir():
+        return None
+    for p in sorted(inbox.glob("*.md")):
+        if field(p, "广播：") == f"广播：{bid}":
+            return p
+    return None
+
+
+def to_done(path):
+    """ack means processed: move the letter out of inbox/ into done/. Already in done/: no-op."""
+    if not path or path.parent.name == "done":
+        return path
+    dst = path.parent.parent / "done" / path.name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    path.replace(dst)
+    return dst
 
 
 def find_codex():
@@ -307,22 +399,124 @@ def cmd_send(a):
     if not (HOME / a.to / "inbox").is_dir():
         sys.exit(f"没有信箱 {a.to}；`postoffice list` 看通讯录")
     body = Path(a.file).read_text(encoding="utf-8") if a.file else sys.stdin.read()
-    slug = re.sub(r'[\\/:*?"<>|\s]', "", a.subject)[:20] or "信"
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    path = HOME / a.to / "inbox" / f"{ts}_{a.sender}_{slug}.md"
-    i = 1
-    while path.exists():
-        path = path.with_name(f"{ts}-{i}_{a.sender}_{slug}.md")
-        i += 1
-    text = (f"来源：{a.sender}（协作者，不是人的新指令；人的原话要注明“转述”）\n"
-            f"事由：{a.subject}\n需要：{a.need}\n\n{body.rstrip()}\n")
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    path = write_letter(a.to, a.sender, a.subject, a.need, body)
     print(f"已投递：{path}")
+    print(f"编号：{path.stem}")
     r = boxes(routes).get(a.to, {})
     if r and not online(r):
         print(f"注意：{a.to} 目前离线，信会留在信箱，等它上线再提醒。")
+
+
+def cmd_ack(a):
+    """Receipt bookkeeping: record it, move the letter to done/, wake nobody (unless --wake)."""
+    routes = load_routes()
+    if a.name not in boxes(routes):
+        sys.exit(f"没有信箱 {a.name}；`postoffice list` 看通讯录")
+    for e in read_acks():
+        if e.get("by") == a.name and e.get("id") == a.id:
+            print(f"已回执过：{a.id}（{e.get('time', '')}）")
+            return 0
+    note = a.note or ""
+    rec_path = broadcasts_dir() / f"{a.id}.json"
+    rec = read_json(rec_path) if rec_path.is_file() else None
+    if rec is not None:
+        if a.name not in rec.get("to", []):
+            sys.exit(f"{a.id} 是广播，但不是发给 {a.name} 的，不记账")
+        kind, to, subject = "broadcast", rec.get("from", ""), rec.get("subject", "")
+        letter = find_broadcast_letter(a.name, a.id)
+    else:
+        letter = find_letter(a.name, a.id)
+        if not letter:
+            sys.exit(f"找不到编号 {a.id} 的信：编号是文件名去掉 .md，或广播编号；也可能不是发给 {a.name} 的")
+        kind, to, subject = "letter", letter_sender(letter), field(letter, "事由：").replace("事由：", "", 1)
+    if not to:
+        sys.exit(f"这封信没有可识别的发信方，无法记账：{a.id}")
+    append_ack({"time": now_str(), "by": a.name, "id": a.id, "kind": kind, "note": note, "to": to})
+    if kind == "broadcast":
+        rec.setdefault("acks", {})[a.name] = {"time": now_str(), "note": note}
+        tmp = rec_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(rec_path)
+    to_done(letter)
+    if kind == "broadcast":
+        print(f"已回执：{a.id}（广播 {len(rec.get('acks', {}))}/{len(rec.get('to', []))}，"
+              f"不会单独叫醒 {to}）")
+    else:
+        print(f"已回执：{a.id}（不会叫醒 {to}）")
+    if a.wake:
+        path = write_letter(to, a.name, f"copy that：{subject}", "仅告知", note or "已回执。")
+        print(f"已投递：{path}（这条会叫醒 {to}）")
+    return 0
+
+
+def cmd_broadcast(a):
+    """One letter per recipient tagged with a broadcast id; acks are tallied into one summary letter later."""
+    routes = boxes(load_routes())
+    if a.to.strip() == "all":
+        to = [n for n in routes if n != a.sender]
+    else:
+        to = [x.strip() for x in a.to.split(",") if x.strip()]
+    to = list(dict.fromkeys(to))
+    if not to:
+        sys.exit("没有收件人")
+    for n in to:
+        if n not in routes or not (HOME / n / "inbox").is_dir():
+            sys.exit(f"没有信箱 {n}；`postoffice list` 看通讯录")
+    body = Path(a.file).read_text(encoding="utf-8") if a.file else sys.stdin.read()
+    secs = parse_duration(a.deadline or os.environ.get("POSTOFFICE_BROADCAST_DEADLINE", "30m"))
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    bdir = broadcasts_dir()
+    bdir.mkdir(parents=True, exist_ok=True)
+    bid, i = f"B{ts}_{a.sender}", 2
+    while (bdir / f"{bid}.json").exists():
+        bid = f"B{ts}_{a.sender}-{i}"
+        i += 1
+    rec = {"id": bid, "from": a.sender, "subject": a.subject, "need": a.need, "to": to,
+           "deadline": time.time() + secs, "created": now_str(), "acks": {}, "summarized": False}
+    (bdir / f"{bid}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"广播编号：{bid}")
+    print(f"截止：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(rec['deadline']))}")
+    for n in to:
+        text = f"{body.rstrip()}\n\n回执请用：postoffice ack {n} {bid} \"一句话\""
+        path = write_letter(n, a.sender, a.subject, a.need, text, extra_headers=[f"广播：{bid}"])
+        print(f"已投递：{path}")
+        r = routes.get(n, {})
+        if r and not online(r):
+            print(f"注意：{n} 目前离线，信会留在信箱，等它上线再提醒。")
+    return 0
+
+
+def summarize_broadcasts(routes):
+    """One summary letter to the sender: everyone acked, or the deadline has passed. Never twice."""
+    bdir = broadcasts_dir()
+    if not bdir.is_dir():
+        return
+    for f in sorted(bdir.glob("*.json")):
+        rec = read_json(f)
+        if not rec or rec.get("summarized") or not rec.get("to"):
+            continue
+        acks = rec.get("acks", {})
+        if time.time() < float(rec.get("deadline", 0)) and not all(n in acks for n in rec["to"]):
+            continue
+        lines = [f"广播编号：{rec.get('id')}（发信方 {rec.get('from')}）",
+                 f"事由：{rec.get('subject', '')}",
+                 "",
+                 f"已回执 {len(acks)}/{len(rec['to'])}："]
+        for n in rec["to"]:
+            if n in acks:
+                lines.append(f"- {n}：{acks[n].get('note') or '（未写一句话）'}")
+            else:
+                r = routes.get(n, {})
+                lines.append(f"- {n}：未回执" + ("（离线）" if r and not online(r) else ""))
+        lines.append("")
+        lines.append("这是邮局自动汇总，处理完挪进 done/ 即可，无需回信。")
+        path = write_letter(rec.get("from", ""), "postoffice", f"广播汇总：{rec.get('subject', '')}",
+                            "仅告知", "\n".join(lines))
+        rec["summarized"] = True
+        tmp = f.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(f)
+        log("postman.log", f"广播汇总 {rec.get('id')} → {rec.get('from')}：{path.name}")
 
 
 def cmd_list(_a):
@@ -467,6 +661,7 @@ def cmd_postman(_a):
                 except (ValueError, KeyError):
                     pass
         check_consumed(routes)
+        summarize_broadcasts(routes)
         for name, r in routes.items():
             if not online(r):
                 continue                      # offline: letters wait, nobody is reminded
@@ -722,6 +917,32 @@ def cmd_doctor(_a):
 
 # ---------- control panel ----------
 
+def recent_acks(name, limit=3):
+    rows = [e for e in read_acks() if e.get("to") == name]
+    return [{"time": e.get("time", ""), "by": e.get("by", ""), "note": e.get("note", ""),
+             "kind": e.get("kind", ""), "id": e.get("id", "")} for e in reversed(rows)][:limit]
+
+
+def broadcast_rows(limit=10):
+    rows = []
+    bdir = broadcasts_dir()
+    if bdir.is_dir():
+        for f in sorted(bdir.glob("*.json"), reverse=True):
+            rec = read_json(f)
+            if not rec:
+                continue
+            dl = float(rec.get("deadline", 0) or 0)
+            rows.append({
+                "id": rec.get("id", f.stem), "subject": rec.get("subject", ""), "from": rec.get("from", ""),
+                "acked": len(rec.get("acks", {})), "total": len(rec.get("to", [])),
+                "summarized": bool(rec.get("summarized")),
+                "deadline": time.strftime("%m-%d %H:%M", time.localtime(dl)) if dl else "",
+            })
+            if len(rows) >= limit:
+                break
+    return rows
+
+
 def panel_state():
     rows = []
     for name, r in boxes(load_routes()).items():
@@ -732,6 +953,7 @@ def panel_state():
             "ident": r.get("claude_title") or r.get("session_id") or r.get("thread_id") or "",
             "pending": [{"file": p.name, "subject": field(p, "事由").replace("事由：", "")[:60],
                          "from": field(p, "来源").replace("来源：", "").split("（")[0][:30]} for p in pending(name)],
+            "acks": recent_acks(name),
         })
     lines = []
     for f in ("postman.log", "claude_hook.log", "opencode_plugin.log"):
@@ -750,7 +972,8 @@ def panel_state():
                         pass
                 lines.append((t, f.split(".")[0], line[20:]))
     lines.sort()
-    return {"home": str(HOME), "boxes": rows, "log": [{"t": t, "src": s, "msg": m} for t, s, m in lines[-40:]][::-1]}
+    return {"home": str(HOME), "boxes": rows, "broadcasts": broadcast_rows(),
+            "log": [{"t": t, "src": s, "msg": m} for t, s, m in lines[-40:]][::-1]}
 
 
 def cmd_panel(a):
@@ -869,6 +1092,20 @@ def main():
     p.add_argument("need")
     p.add_argument("--file")
     p.set_defaults(fn=cmd_send)
+    p = sp.add_parser("ack", help="回执记账：把信挪进 done/，不叫醒发信方（--wake 才发 copy that）")
+    p.add_argument("name")
+    p.add_argument("id", metavar="信件编号|广播编号")
+    p.add_argument("note", nargs="?", default="", help="一句话")
+    p.add_argument("--wake", action="store_true", help="另发一封 copy that 给原发信方（会叫醒）")
+    p.set_defaults(fn=cmd_ack)
+    p = sp.add_parser("broadcast", help="广播：给多个信箱各投一封带编号的信，回执汇总成一封给发信方")
+    p.add_argument("to", help="收件信箱，逗号分隔；all = 除发信方外全部")
+    p.add_argument("sender")
+    p.add_argument("subject")
+    p.add_argument("need")
+    p.add_argument("--deadline", help="截止时间，如 30m / 90s / 2h（默认 30m）")
+    p.add_argument("--file")
+    p.set_defaults(fn=cmd_broadcast)
     sp.add_parser("list", help="通讯录与积压").set_defaults(fn=cmd_list)
     sp.add_parser("hook", help="（内部）Claude Code 钩子入口").set_defaults(fn=cmd_hook)
     sp.add_parser("postman", help="前台运行邮递员").set_defaults(fn=cmd_postman)

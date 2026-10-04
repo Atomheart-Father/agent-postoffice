@@ -16,7 +16,8 @@ coder (OpenCode) ──writes a letter──▶ ~/agent-postoffice/boss/inbox/xx
 - **Delivered once**: each letter triggers one reminder, even across restarts; at most 6 wakes per mailbox per 10 minutes, so agents can't spam each other.
 - **Online / offline**: a session out of quota? `postoffice offline <name>` — letters are kept locally and not sent; `online` delivers the backlog; `clear` archives it instead (nothing is deleted).
 - **Post office only**: agents should talk only through the post office, never call `codex queue` directly — messages that bypass it ignore the offline switch, pile up while the recipient has no quota, and all pop out when it comes back.
-- **Control panel**: `postoffice panel` opens a local web page with one switch per session to cut or restore its connection, plus the backlog and recent delivery log.
+- **Receipts without waking**: `postoffice ack` records a receipt (and files the letter into `done/`) without waking the sender, so "FYI" letters and closing "copy that" replies no longer interrupt. A broadcast becomes one summary: `broadcast` sends each recipient a letter tagged with an ID, they `ack` it, and when everyone has replied (or the deadline passes) the sender gets exactly one summary letter.
+- **Control panel**: `postoffice panel` opens a local web page with one switch per session to cut or restore its connection, plus the backlog, broadcast progress and recent delivery log.
 - **Fallbacks**: if a session can't be woken (not open), you get one system notification after 20 minutes; if a reminder went out but the letter is still in the inbox after 30 minutes (session stuck, Codex thread not loaded…), you get one too.
 - Pure standard-library Python 3.9+, no dependencies. macOS first (Linux works: notifications via `notify-send`, and you keep the postman running yourself).
 
@@ -64,11 +65,13 @@ MSG
 
 The recipient wakes up, reads, does the work, replies, and moves the letter into its own `done/`.
 
-**Receipt rule**: every letter gets at least a "copy that" plus the next step; the original sender answers that receipt with one more "copy that", which closes the exchange. An agent only starts a new turn when it receives a message — no receipt means the sender just sits there.
+**Receipt rule (copy that / ack)**: a letter you must answer before you can continue ("need: reply / review") still gets a proper `send` back. For "FYI" letters and the closing copy that, use `ack` instead: it records the receipt and files the letter into `done/`, without waking the sender. `send` prints the **letter ID** (the file name minus `.md`), which is what `ack` takes. A broadcast (`broadcast`) sends one tagged letter per recipient; they ack the broadcast ID, and the sender gets **one** summary once everyone has replied or the deadline passes.
 
 | Command | What it does |
 |---|---|
-| `postoffice panel` | Open the web control panel (listens on 127.0.0.1 only) |
+| `postoffice panel` | Open the web control panel (listens on 127.0.0.1 only), including broadcast progress |
+| `postoffice ack boss 20261004-223334_coder_hello "one line"` | Record a receipt: file the letter into `done/`, wake nobody; add `--wake` to also send a `copy that` letter |
+| `postoffice broadcast all boss "subject" "need"` | Send every other mailbox a tagged letter; `--deadline 30m`; acks are summarized into one letter to you |
 | `postoffice offline codex1` | Recipient out of quota / away: letters are kept, no reminders |
 | `postoffice online codex1` | Back: the backlog is delivered within 10 s |
 | `postoffice clear codex1` | Clear backlog: archive unsent letters to `archived/`, never send them (same button in the panel) |
@@ -100,7 +103,7 @@ If a letter was reminded but not processed within 30 minutes, the postman notifi
 
 | Item | Status |
 |---|---|
-| Send/receive, dedup, rate limit, online/offline, clear, install/uninstall, unprocessed alert | 18 automated checks in `tests/smoke.sh` |
+| Send/receive, dedup, rate limit, online/offline, clear, ack bookkeeping, broadcast summaries, install/uninstall, unprocessed alert | 35 automated checks in `tests/smoke.sh` |
 | Claude Desktop: idle for minutes, woken by external mail, processes the letter | Observed repeatedly on a real machine |
 | Claude Desktop: without an explicit timeout the hook is killed after 10 minutes | Observed (a v1.0 bug; v1.1 sets 7 days) |
 | Claude Desktop: with the long timeout, still wakes after 30+ minutes idle | Measured: watcher alive 33 min, woken 3 s after mail arrived |
@@ -119,11 +122,6 @@ In these cases a Claude session can't be woken for a while; letters are never lo
 
 ## Future work
 
-- **Broadcast with receipt tally** (not built yet): today, notifying everyone means one letter per recipient and one "copy that" back from each, so the sender is woken again and again and the inbox gets noisy. Plan:
-  - `postoffice broadcast <mailboxes|all> "<subject>" "<need>"` creates a broadcast ID and sends each recipient a letter tagged with it;
-  - recipients reply with `postoffice ack <id> ["one line"]`: recorded only, without waking the sender each time;
-  - once everyone has acked (or at a deadline), the sender gets **one** summary letter: who replied, what they said, who hasn't;
-  - the panel shows each broadcast's progress.
 - **Waking a stopped Claude session**: when a session's background process is gone, hooks can't help. Possible approach: relay through the Claude app's own cross-session messaging via an always-on session (costs one model call per relay).
 - **Delivery stage in the panel**: show "queued / reminded / processed" per letter.
 - **Linux**: install the postman as a systemd user service.
