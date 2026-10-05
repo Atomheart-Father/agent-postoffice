@@ -1245,7 +1245,8 @@ def broadcast_record(bid):
 
 
 ALARM_TEXT = "你设的闹钟到了，请检查刚才安排的任务。"   # the one and only alarm reminder text
-ALARM_LOCK_STALE = int(os.environ.get("POSTOFFICE_ALARM_LOCK_STALE", 60))
+ALARM_LOCK_STALE = int(os.environ.get("POSTOFFICE_ALARM_LOCK_STALE", 60))    # soft
+ALARM_LOCK_HARD = int(os.environ.get("POSTOFFICE_ALARM_LOCK_HARD", 600))   # hard cap
 
 
 def alarms_dir():
@@ -1299,31 +1300,111 @@ def alarm_lock_path(path):
     return path.with_suffix(".json.lock")
 
 
+def reap_lock_path(path):
+    return alarm_lock_path(path).with_suffix(".lock.reap")
+
+
+def _lock_info(p):
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mtime, time.time() - st.st_mtime)
+
+
+def _holder_pid(p):
+    try:
+        return int(p.read_text(encoding="utf-8").split(" ")[0])
+    except (OSError, ValueError):
+        return 0
+
+
+def _pid_alive(pid):
+    # pid 被复用只会让我们多等到硬超时，不会误删 —— 方向上是安全的那一侧
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True     # 没有权限 ≠ 不存在
+    return True
+
+
+def _lock_expired(info, p):
+    _, _, _, age = info
+    if age <= ALARM_LOCK_STALE:
+        return False
+    if age > ALARM_LOCK_HARD:
+        return True
+    return not _pid_alive(_holder_pid(p))
+
+
+def _create_lock(p, body):
+    fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, body.encode())
+    finally:
+        os.close(fd)
+
+
+def try_reap_alarm_lock(path):
+    """Reclaim a lock whose holder is provably gone, without ever deleting a *new* lock.
+
+    Two things have to hold. The reclaim itself runs under a second O_EXCL lock so only one
+    process reclaims at a time, and the delete is guarded by re-stat'ing the lock and comparing
+    (dev, ino, mtime) with the instance we judged stale — if anything changed we do not delete and
+    try again next round instead. mtime alone proves nothing, so between the soft and the hard
+    timeout the holder's pid still has to be gone.
+    """
+    p = alarm_lock_path(path)
+    before = _lock_info(p)
+    if before is None or not _lock_expired(before, p):
+        return False
+    rp = reap_lock_path(path)
+    try:
+        _create_lock(rp, f"{os.getpid()} {int(time.time())}\n")
+    except FileExistsError:
+        ri = _lock_info(rp)
+        if ri is None or not _lock_expired(ri, rp):
+            return False
+        try:
+            rp.unlink()
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return False
+    try:
+        now = _lock_info(p)
+        if now is None or now[:3] != before[:3]:
+            return False
+        p.unlink()
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            rp.unlink()
+        except OSError:
+            pass
+
+
 def take_alarm_lock(path):
     p = alarm_lock_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    for _ in range(2):
+    for _ in range(3):
         try:
-            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            _create_lock(p, f"{os.getpid()} {int(time.time())}\n")
+            return True
         except FileExistsError:
-            try:
-                age = time.time() - p.stat().st_mtime
-            except OSError:
-                continue        # 锁刚被别人释放，再抢一次
-            if age > ALARM_LOCK_STALE:
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
+            if _lock_info(p) is None:
                 continue
-            return False
+            if not try_reap_alarm_lock(path):
+                return False
         except OSError:
             return False
-        try:
-            os.write(fd, f"{os.getpid()} {int(time.time())}\n".encode())
-        finally:
-            os.close(fd)
-        return True
     return False
 
 

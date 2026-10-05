@@ -11,12 +11,39 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import threading
 import subprocess
 import tempfile
 import time
 import unittest
 
 PO = Path(__file__).resolve().parents[1] / 'postoffice'
+_LOCKS = None
+
+
+def _locks():
+    """锁原语直接在本进程里调用（用多线程制造确定的并发），不用起子进程。"""
+    global _LOCKS
+    if _LOCKS is None:
+        import importlib.machinery
+        import importlib.util
+        # 导入时会算出 HOME；指到本次测试自己的临时目录，免得在真实邮局里留下任何东西
+        os.environ['POSTOFFICE_HOME'] = os.environ.get('ALARM_TEST_HOME') or tempfile.mkdtemp(
+            prefix='po-alarm-lock-')
+        loader = importlib.machinery.SourceFileLoader('po_alarm', str(PO))
+        spec = importlib.util.spec_from_loader('po_alarm', loader)
+        _LOCKS = importlib.util.module_from_spec(spec)
+        loader.exec_module(_LOCKS)
+    return _LOCKS
+
+
+def take_lock(path):
+    return _locks().take_alarm_lock(Path(path))
+
+
+def release_lock(path):
+    _locks().release_alarm_lock(Path(path))
+
 FIXED = '你设的闹钟到了，请检查刚才安排的任务。'
 
 for _var in ('CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_HOST_SESSION_ID'):
@@ -41,7 +68,8 @@ class AlarmScheduler(unittest.TestCase):
         self.db = Path(self.tmp.name) / 'opencode.db'
         mkdb(self.db, [('ses_live', '邮局实验', '/tmp'), ('ses_other', '别的会话', '/tmp')])
         self.env = dict(os.environ, POSTOFFICE_HOME=str(self.home), POSTOFFICE_NO_NOTIFY='1',
-                        OPENCODE_DB=str(self.db), POSTOFFICE_POLL='1')
+                        OPENCODE_DB=str(self.db), POSTOFFICE_POLL='1', ALARM_TEST_HOME=str(self.home))
+        os.environ['ALARM_TEST_HOME'] = str(self.home)   # 供 _locks() 导入模块时用同一个临时 HOME
         self.run_po('init')
         self.run_po('add', 'lab', '--notify')
         self.routes = json.loads((self.home / 'routes.json').read_text())
@@ -205,6 +233,105 @@ class AlarmScheduler(unittest.TestCase):
         self.assertFalse(self.lock_path().exists(), '处理完必须释放锁')
         self.run_postman()
         self.assertEqual(len(self.inbox()), 1, '下一轮仍正常工作且不重复')
+
+    # --- 锁回收的并发证据 -----------------------------------------------------
+    # 两个进程可能同时看到同一把陈旧锁：回收本身必须互斥，而且只许删「被验证过的那一把」，
+    # 否则后一个会把前一个刚建的新锁删掉，两边同时持锁。这里用多线程同抢一把锁来复现。
+    def test_only_one_writer_holds_the_lock_when_it_is_fresh(self):
+        self.put_alarm()
+        p = self.alarm_path()
+        winners = []
+        barrier = threading.Barrier(8)
+
+        def grab():
+            barrier.wait()
+            if take_lock(p):
+                winners.append(1)
+
+        ts = [threading.Thread(target=grab) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(30)
+        self.assertEqual(len(winners), 1, f'同一时刻只应有一个持锁者（实际 {len(winners)}）')
+        self.assertTrue(self.lock_path().exists(), '持锁者的锁文件必须还在')
+        self.assertEqual(self.read_alarm()['state'], 'pending', '记录没被动')
+
+    def test_reclaiming_a_stale_lock_never_deletes_a_fresh_one(self):
+        """陈旧锁被回收后会有新锁建起来；后来的进程不得把这个新锁当成陈旧的删掉。"""
+        for _ in range(12):
+            self.put_alarm()
+            p = self.alarm_path()
+            lock = self.lock_path()
+            lock.write_text('999999 已崩掉的进程\n', encoding='utf-8')
+            old = time.time() - 3600                     # 远超硬超时，无条件可回收
+            os.utime(lock, (old, old))
+            winners = []
+            barrier = threading.Barrier(8)
+
+            def grab():
+                barrier.wait()
+                if take_lock(p):
+                    winners.append(1)
+
+            ts = [threading.Thread(target=grab) for _ in range(8)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(30)
+            self.assertEqual(len(winners), 1, f'回收竞争后仍只应有一个持锁者（实际 {len(winners)}）')
+            self.assertTrue(lock.exists(), '持锁者的新锁不得被后来者删掉')
+            release_lock(p)
+        self.run_postman()
+        self.assertEqual(len(self.inbox()), 1, '锁机制生效后闹钟照常只响一次')
+
+    def test_reclaim_only_targets_the_verified_stale_lock_instance(self):
+        """TOCTOU 定向复现：验证旧锁之后、删除之前，锁被别人换成了新的。
+
+        这里用一个受控的 _lock_info 包装把「替换」钉在第一次 stat 之后那一步：
+        我们第一次看到的是那把陈旧锁，紧接着盘上的锁就被换成一把刚建的新锁。
+        正确实现必须发现 (dev, ino, mtime) 对不上而放弃删除；只看 mtime 的旧实现会把新锁删掉。
+        """
+        self.put_alarm()
+        p = self.alarm_path()
+        lock = self.lock_path()
+        lock.write_text('999999 已崩掉的进程\n', encoding='utf-8')
+        old = time.time() - 3600
+        os.utime(lock, (old, old))
+        mod = _locks()
+        real = mod._lock_info
+        swapped = [False]
+
+        def fake(q):
+            st = real(q)
+            if st is None or swapped[0] or Path(q) != lock:
+                return st
+            swapped[0] = True
+            # 模拟另一个进程先回收了旧锁、随后建起一把新锁
+            lock.write_text(f'{os.getpid()} {int(time.time())}\n', encoding='utf-8')
+            fresh = real(q)
+            # 但我们这一轮「看到」的仍是那把陈旧锁
+            return (fresh[0], fresh[1], old, time.time() - old)
+
+        mod._lock_info = fake
+        try:
+            self.assertFalse(mod.try_reap_alarm_lock(p), '身份对不上时这一轮必须放弃回收')
+        finally:
+            mod._lock_info = real
+        self.assertTrue(lock.exists(), '不得删掉别人的新锁')
+        self.assertEqual(self.read_alarm()['state'], 'pending', '记录没被动')
+
+    def test_soft_timeout_alone_does_not_break_a_live_lock(self):
+        """单凭 mtime 超时不够：持锁进程还活着时不得回收（这是原来那个 TOCTOU 的另一半）。"""
+        rec = self.put_alarm(due=time.time() + 3600)
+        p = self.alarm_path()
+        lock = self.lock_path()
+        lock.write_text(f'{os.getpid()} {int(time.time())}\n', encoding='utf-8')  # 本进程持有
+        old = time.time() - 120                            # 超了软超时（60s），没超硬超时（600s）
+        os.utime(lock, (old, old))
+        self.assertFalse(take_lock(p), '持锁进程还活着时不得回收')
+        self.assertTrue(lock.exists(), '锁必须还在')
+        self.assertEqual(self.read_alarm()['due'], rec['due'], '也不得重置计时')
 
     # --- 身份重新核证 ---------------------------------------------------------
     def test_refused_when_box_not_registered(self):

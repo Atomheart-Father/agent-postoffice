@@ -42,7 +42,8 @@ const RECEIPT_WAIT_MS = Number(process.env.POSTOFFICE_RECEIPT_WAIT || 600) * 100
 const ALARM_MIN = 1
 const ALARM_MAX = 1440
 const ALARM_TEXT = "你设的闹钟到了，请检查刚才安排的任务。"
-const LOCK_STALE_MS = 60_000 // 锁的看门狗：写者崩了以后不至于把闹钟永久卡死
+const LOCK_STALE_MS = 60_000    // 软超时：过了它还要看持锁进程是否还活着
+const LOCK_HARD_MS = 600_000   // 硬超时：超过它才无条件回收（兜住 pid 复用）
 
 type Route = { methods?: string[]; session_id?: string; status?: string }
 type Alarm = {
@@ -147,6 +148,17 @@ const alarmPath = (sessionID: string) => {
   return `${ALARM_DIR}/${safe}.json`
 }
 
+// 只有「这条记录确实是本会话的、信箱对得上、而且已经进入 lettered（= 邮递员确认到期并落了信）」
+// 才允许走闹钟短通道。记录还在 pending 时，inbox 里哪怕出现同编号的信也不认 ——
+// 那样等于绕过了到期判定。正文依旧一个字节都不读。
+const alarmLetterOwns = (rec: Alarm | null, box: string, sessionID: string): Alarm | null => {
+  if (!rec) return null
+  if (rec.session !== sessionID || rec.box !== box) return null
+  if (rec.state !== "lettered") return null
+  if (rec.letter && rec.letter !== rec.id) return null
+  return rec
+}
+
 const readAlarm = async (sessionID: string): Promise<Alarm | null> => {
   try {
     const v = JSON.parse(await readFile(alarmPath(sessionID), "utf8"))
@@ -177,33 +189,92 @@ const dropAlarm = async (sessionID: string) => {
 // 所以既不会永久卡死，也不会悄悄重置计时。
 const lockPath = (sessionID: string) => `${alarmPath(sessionID)}.lock`
 
+// 回收陈旧锁时必须回答两个问题：(a) 别把别人刚创建的新锁删掉；(b) 光看 mtime 不能证明原持锁者
+// 已经退出。做法：
+//   1. 回收动作本身也走一把 O_EXCL 的「回收锁」，所以同一时刻只有一个进程在回收；
+//   2. 删之前重新 stat，比对 dev/ino/mtime 与刚才验证过的那个锁实例一致 —— 变了就说明有人换过锁，
+//      宁可这一轮不删（下轮再试），绝不误删新锁（这就是原来那个 TOCTOU）；
+//   3. 软超时（60s）只在该 pid 已经不在时才回收；超过硬超时（600s）才无条件回收。
+//      pid 被复用只会让我们多等一会儿（等硬超时），不会误删 —— 方向上是安全的那一侧。
+// Python 侧 take_alarm_lock()/try_reap_alarm_lock() 用完全相同的规则与常量。
+const reapPath = (sessionID: string) => `${lockPath(sessionID)}.reap`
+
+type LockInfo = { dev: number; ino: number; mtime: number; age: number }
+
+const lockInfo = async (p: string): Promise<LockInfo | null> => {
+  try {
+    const s = await stat(p)
+    return { dev: Number(s.dev), ino: Number(s.ino), mtime: s.mtimeMs, age: Date.now() - s.mtimeMs }
+  } catch {
+    return null
+  }
+}
+
+const pidAlive = (pid: number) => {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return (e as { code?: string }).code === "EPERM" // 没有权限 ≠ 不存在
+  }
+}
+
+const holderPid = async (p: string) => Number(((await readFile(p, "utf8").catch(() => "")) || "").split(" ")[0])
+
+const expired = async (info: LockInfo, p: string) => {
+  if (info.age <= LOCK_STALE_MS) return false            // 还在软超时内
+  if (info.age > LOCK_HARD_MS) return true              // 硬超时：无条件回收
+  return !(await pidAlive(await holderPid(p)))           // 软超时之后还得看持锁进程还在不在
+}
+
+const createLock = async (p: string) => {
+  const h = await open(p, "wx")
+  try {
+    await h.writeFile(`${process.pid} ${Date.now()}\n`, "utf8")
+  } finally {
+    await h.close()
+  }
+}
+
+const tryReapAlarmLock = async (sessionID: string): Promise<boolean> => {
+  const p = lockPath(sessionID)
+  const before = await lockInfo(p)
+  if (!before || !(await expired(before, p))) return false
+  const rp = reapPath(sessionID)
+  try {
+    await createLock(rp)
+  } catch {
+    const ri = await lockInfo(rp)
+    if (!ri || !(await expired(ri, rp))) return false     // 别人正在回收；它崩了就在硬超时后再说
+    try {
+      await rm(rp, { force: true })
+    } catch {}
+    return false                                        // 这一轮只让一个进程回收
+  }
+  try {
+    const now = await lockInfo(p)
+    if (!now || now.dev !== before.dev || now.ino !== before.ino || now.mtime !== before.mtime) return false
+    await rm(p, { force: true })
+    return true
+  } finally {
+    try {
+      await rm(rp, { force: true })
+    } catch {}
+  }
+}
+
 const takeAlarmLock = async (sessionID: string): Promise<boolean> => {
   await mkdir(ALARM_DIR, { recursive: true })
   const p = lockPath(sessionID)
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const h = await open(p, "wx")
-      try {
-        await h.writeFile(`${process.pid} ${Date.now()}\n`, "utf8")
-      } finally {
-        await h.close()
-      }
+      await createLock(p)
       return true
     } catch (e) {
       if ((e as { code?: string }).code !== "EEXIST") return false
-      let age = 0
-      try {
-        age = Date.now() - (await stat(p)).mtimeMs
-      } catch {
-        continue // 锁刚被别人释放，再抢一次
-      }
-      if (age > LOCK_STALE_MS) {
-        try {
-          await rm(p, { force: true })
-        } catch {}
-        continue
-      }
-      return false
+      if (!(await lockInfo(p))) continue                  // 锁刚被别人释放，再抢一次
+      if (!(await tryReapAlarmLock(sessionID))) return false
     }
   }
   return false
@@ -304,7 +375,7 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
         const todo = files.filter((f) => !ledger.done.has(`${box}::${f}`))
         if (!todo.length || !(await ownsSession(sessionID))) continue
         // 只有与本会话自己的活动闹钟记录 id 完全一致的信，才享受「闹钟」这条极短通道
-        const ownAlarm = await readAlarm(sessionID)
+        const ownAlarm = await alarmLetterOwns(await readAlarm(sessionID), box, sessionID)
         // OpenCode 的 status 表只列非空闲会话：缺席 = 空闲
         let st = "idle"
         try {
@@ -339,7 +410,7 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           const id = fieldOf("回执：")
           const alarmId = fieldOf("闹钟：")
           if (id) receipts.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: receiptSubject(fieldOf), id, mtime })
-          else if (alarmId && ownAlarm && ownAlarm.id === alarmId) {
+          else if (alarmId && ownAlarm && ownAlarm.id === alarmId && file === `${alarmId}.md`) {
             // 闹钟提醒：只渲染那句固定常量，正文一个字节都不读、不注入
             formal.push({ file, src: "postoffice", subj: "闹钟", id: alarmId, mtime, alarm: true })
           } else formal.push({ file, src: "", subj: "", id: "", mtime })
