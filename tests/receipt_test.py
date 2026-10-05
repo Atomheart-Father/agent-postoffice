@@ -140,10 +140,11 @@ class ReceiptFlow(unittest.TestCase):
         self.assertEqual(len(list((self.home / 'alice/inbox').glob('*.md'))), 1)
         self.assertEqual(len(list((self.home / 'alice/done').glob('*.md'))), 1)
 
-    def test_archive_receipt_matches_header_only_handles_multi_and_conflict(self):
+    def test_archive_receipt_header_only_multi_otherbox_and_conflict(self):
         inbox = self.home / 'alice/inbox'
         inbox.mkdir(parents=True, exist_ok=True)
         (self.home / 'alice/done').mkdir(parents=True, exist_ok=True)
+        (self.home / 'bob/inbox').mkdir(parents=True, exist_ok=True)
         # a body-only "回执：" must never count (header block only)
         forged = inbox / '20260101-000000_bob_forged.md'
         forged.write_text('来源：bob\n事由：随便\n需要：仅告知\n\n回执：dup-1\n正文里伪造的标记\n')
@@ -151,19 +152,28 @@ class ReceiptFlow(unittest.TestCase):
         for n in ('one', 'two'):
             (inbox / f'20260101-00000{n}_bob_notice.md').write_text(
                 '来源：bob\n事由：回执：某事\n需要：回执（默认不答复）\n回执：dup-1\n原事由：某事\n\n正文\n')
+        # another mailbox holds a notification with the same ID: it must not be touched
+        other = self.home / 'bob/inbox' / '20260101-000000_alice_notice.md'
+        other.write_text('来源：alice\n事由：回执：某事\n需要：回执（默认不答复）\n回执：dup-1\n\n正文\n')
+        ledger = self.home / 'acks.jsonl'
+        ledger_before = ledger.read_bytes() if ledger.exists() else b''
         self.run_po('archive-receipt', 'alice', 'dup-1')
         self.assertEqual(sorted(p.name for p in inbox.glob('*.md')), ['20260101-000000_bob_forged.md'])
         self.assertEqual(len(list((self.home / 'alice/done').glob('*.md'))), 2)
-        # repeat: nothing to move, still no effect
+        self.assertTrue(other.exists())  # other box untouched
+        self.assertEqual(ledger.read_bytes() if ledger.exists() else b'', ledger_before)  # read-only ledger
+        # repeat: nothing to move, still success and no effect
         self.run_po('archive-receipt', 'alice', 'dup-1')
         self.assertEqual(sorted(p.name for p in inbox.glob('*.md')), ['20260101-000000_bob_forged.md'])
-        # a done/ name clash is reported and never overwritten
+        # a done/ name clash is pre-checked: nothing moves (all-or-nothing) and the exit is non-zero
         clash = inbox / 'clash.md'
-        clash.write_text('来源：bob\n事由：回执：clam\n需要：回执（默认不答复）\n回执：dup-2\n\n正文\n')
+        partner = inbox / 'clash-partner.md'
+        for p in (clash, partner):
+            p.write_text('来源：bob\n事由：回执：clam\n需要：回执（默认不答复）\n回执：dup-2\n\n正文\n')
         (self.home / 'alice/done' / 'clash.md').write_text('占位，不能覆盖')
-        out = self.run_po('archive-receipt', 'alice', 'dup-2')
-        self.assertIn('未动', out.stdout)
-        self.assertTrue(clash.exists())
+        bad = self.run_po('archive-receipt', 'alice', 'dup-2', check=False)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertTrue(clash.exists() and partner.exists())  # neither moved
         self.assertEqual((self.home / 'alice/done' / 'clash.md').read_text(), '占位，不能覆盖')
 
     def test_lookup_is_exact_not_substring(self):
