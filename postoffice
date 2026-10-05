@@ -364,15 +364,24 @@ def find_broadcast_letter(box, bid):
 
 
 def broadcast_delivered(box, bid):
-    """True when this box already holds a letter for this broadcast id, in inbox/ or archived in done/.
+    """True when this box already holds a letter for this broadcast id, wherever the box keeps it.
 
-    Used to make a retried switch announcement per-recipient idempotent even if the state write
-    after the delivery was lost: the delivered letter itself is the evidence.
+    Checked places: inbox/ (not yet filed), done/ (the recipient filed it) and archived/ at any depth
+    (`clear` moved it out of the inbox). The delivered letter itself is the evidence, so a user
+    archiving an old broadcast can never make the post office re-announce it to that box.
     """
     for sub in ("inbox", "done"):
         d = HOME / box / sub
         if d.is_dir() and any(broadcast_letter_id(p) == bid for p in d.glob("*.md")):
             return True
+    arch = HOME / box / "archived"
+    if arch.is_dir():
+        for p in arch.rglob("*.md"):
+            try:
+                if broadcast_letter_id(p) == bid:
+                    return True
+            except OSError:
+                continue
     return False
 
 
@@ -1264,6 +1273,11 @@ def alias_state():
     st = read_json(ALIAS_STATE)
     if not isinstance(st, dict) or not isinstance(st.get("aliases"), dict):
         st = {"version": 1, "aliases": {}}
+    # One counter for the whole state file, not per alias: event ids (and therefore broadcast ids)
+    # must stay unique across aliases confirmed in the same second, and must not restart from 1 when
+    # an alias is removed and added back — the counter only ever goes up.
+    if not isinstance(st.get("seq"), int) or st["seq"] < 0:
+        st["seq"] = 0
     return st
 
 
@@ -1311,8 +1325,10 @@ def process_alias_switches(routes):
     was already announced, so a restart never re-announces and a same-round A→B→A cancels silently.
     Each confirmed switch gets a recoverable event id whose broadcast/handoff/human-notify steps are
     de-duplicated separately, so a half-finished event resumes instead of re-broadcasting. The
-    broadcast step reuses the event's own deterministic id and only reaches recipients with no
-    letter yet, so one event is always exactly one record and one letter per recipient.
+    broadcast id is derived from the state file's own monotonic counter (not the clock), so two
+    aliases confirmed in the same second never collide and re-adding a deleted alias cannot repeat
+    an old id. That step reuses the event's id and only reaches recipients with no letter yet, so one
+    event is always exactly one record and one letter per recipient.
     """
     cfg, err = load_config()
     if cfg is None:
@@ -1370,15 +1386,19 @@ def process_alias_switches(routes):
         ev = next((e for e in a["events"].values()
                    if e.get("from") == confirmed and e.get("to") == target and not e.get("done")), None)
         if ev is None:
-            n = len(a["events"]) + 1
-            eid = f"E{n}_{name}_{confirmed or 'none'}___{target or 'none'}"
-            # `at` is fixed at creation, so the broadcast id this event will use is derivable again
-            # after a restart: same event → same id → the record on disk is reused, never a second one.
-            ev = {"id": eid, "at": time.strftime("%Y%m%d-%H%M%S"), "from": confirmed, "to": target,
+            # The id is built from the state file's own monotonic counter, not from the clock: two
+            # aliases confirmed in the same second would otherwise mint the same broadcast id and one
+            # event would inherit the other's record. `at` only decorates it for humans.
+            st["seq"] = int(st.get("seq") or 0) + 1
+            seq = st["seq"]
+            eid = f"E{seq}_{name}_{confirmed or 'none'}___{target or 'none'}"
+            ev = {"id": eid, "seq": seq, "at": time.strftime("%Y%m%d-%H%M%S"),
+                  "from": confirmed, "to": target,
                   "broadcast": None, "sent": [], "handoff": None, "notified": False, "done": False}
             a["events"][eid] = ev
             save_alias_state(st)                     # persist the id *before* any side effect
         ev.setdefault("sent", [])
+        ev.setdefault("seq", st.get("seq", 1))
         ev.setdefault("at", time.strftime("%Y%m%d-%H%M%S"))
         notify_boxes = [x for x in (spec.get("notify") or []) if x in routes]
         steps_ok = True
@@ -1387,7 +1407,7 @@ def process_alias_switches(routes):
             # reuses that id (no second record) and only reaches the boxes with no letter yet —
             # checked against the boxes themselves, so even a crash between the delivery and the
             # state write cannot re-announce.
-            bid = ev["broadcast"] or f"B{ev['at']}_postoffice-switch"
+            bid = ev["broadcast"] or f"B{ev['at']}_sw{ev['seq']}_{name}"
             pending_boxes = [x for x in notify_boxes if x not in ev["sent"] and not broadcast_delivered(x, bid)]
             if not notify_boxes:
                 ev["broadcast"] = "-"                # nothing to announce; do not retry every round
