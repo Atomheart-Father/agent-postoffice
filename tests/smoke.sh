@@ -826,24 +826,212 @@ bid_now=$(python3 -c "import json,sys;print(list(json.load(open(sys.argv[1]))['a
 po17_round
 bid_after=$(python3 -c "import json,sys;print(list(json.load(open(sys.argv[1]))['aliases']['pm']['events'].values())[0]['broadcast'])" "$P2/alias_state.json")
 [ "$bid_now" = "$bid_after" ] && ok "退修4 事件广播编号跨重启稳定" || bad "退修4 广播编号跨重启变了"
-# 广播成功后、状态落盘前崩溃：靠信箱里已有的那封信判断，不重播
-python3 - "$P2/alias_state.json" <<'PY'
-import json, sys
-p = sys.argv[1]
-st = json.load(open(p))
-ev = list(st["aliases"]["pm"]["events"].values())[0]
-ev["sent"] = []            # 假装送达名单没落盘
-ev["handoff"] = None
-ev["done"] = False
-st["aliases"]["pm"]["confirmed"] = "a"   # 也假装确认没落盘
-json.dump(st, open(p, "w"))
+
+# 退修4b：真·硬中断恢复。第一封广播信真的落地之后，抛一个不被普通 Exception 捕获的中断，
+# 从磁盘重新加载模块再跑一轮，目标仍然是 b —— 这样恢复分支一定被走到。
+# mode=inbox 时信留在收件箱；done 是收件人处理过；arch 是用户用 clear 把它归档了。
+alias_crash() {
+python3 - "$PO" "$P2" "$1" <<'PY'
+import importlib.machinery, importlib.util, json, os, re, sys, time
+from pathlib import Path
+po, home, mode = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+os.environ["POSTOFFICE_HOME"] = str(home)
+os.environ["POSTOFFICE_NO_NOTIFY"] = "1"
+os.environ["POSTOFFICE_ALIAS_STABLE"] = "0"
+ROUTES = json.loads((home / "routes.json").read_text(encoding="utf-8"))
+
+def load():
+    spec = importlib.util.spec_from_loader("po", importlib.machinery.SourceFileLoader("po", po))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+class HardStop(BaseException):
+    pass                                  # 基类不是 Exception：邮递员的 except Exception 抓不到它
+
+# --- 第一轮：信真的写进磁盘，然后立刻被硬中断 ---
+m = load()
+# 第一轮：目标还是 a，只记基线（不发任何信）
+m.process_alias_switches(m.boxes(ROUTES))
+ROUTES["a"]["status"] = "offline"          # 现在目标变成 b
+m.process_alias_switches(m.boxes(ROUTES))  # 起稳定期
+real_write = m.write_letter
+landed = []
+
+def boom(to, sender, subject, need, body, extra_headers=()):
+    p = real_write(to, sender, subject, need, body, extra_headers=extra_headers)
+    landed.append(p)
+    if len(landed) == 1:
+        raise HardStop("模拟硬中断：信已落地，送达状态还没保存")
+    return p
+
+m.write_letter = boom
+crashed = False
+try:
+    m.process_alias_switches(m.boxes(ROUTES))
+except HardStop:
+    crashed = True
+except Exception as e:                    # 被普通异常抓到就算失败，说明中断类型选错了
+    print("BAD 中断被 except Exception 抓到了", e)
+if not crashed:
+    print("BAD 没有触发硬中断")
+    raise SystemExit(0)
+first = landed[0]
+if not first.exists():
+    print("BAD 中断前那封信并没有真的落地")
+    raise SystemExit(0)
+st = json.loads((home / "alias_state.json").read_text(encoding="utf-8"))
+ev0 = list(st["aliases"]["pm"]["events"].values())[0]
+if ev0.get("sent") or ev0.get("broadcast") or ev0.get("done"):
+    print("BAD 中断发生得太晚，送达状态已经落盘了")
+    raise SystemExit(0)
+
+# --- 把那封信放到 mode 指定的位置（模拟用户归档 / 收件人处理）---
+moved = first
+if mode == "done":
+    dst = home / "d1" / "done"
+elif mode == "arch":
+    dst = home / "d1" / "archived" / time.strftime("%Y%m%d-%H%M%S")
+else:
+    dst = first.parent
+dst.mkdir(parents=True, exist_ok=True)
+if mode != "inbox":
+    moved = dst / first.name
+    first.replace(moved)
+
+# --- 从磁盘重新加载模块，跑第二轮：目标仍然是 b（a 仍离线）---
+m2 = load()
+m2.process_alias_switches(m2.boxes(ROUTES))
+st2 = json.loads((home / "alias_state.json").read_text(encoding="utf-8"))
+ev = list(st2["aliases"]["pm"]["events"].values())[0]
+bid = ev.get("broadcast") or ""
+
+def letters_with(box):
+    hits = []
+    for sub in ("inbox", "done"):
+        d = home / box / sub
+        if d.is_dir():
+            hits += [p for p in d.glob("*.md") if f"广播：{bid}" in p.read_text(encoding="utf-8")]
+    a = home / box / "archived"
+    if a.is_dir():
+        hits += [p for p in a.rglob("*.md") if f"广播：{bid}" in p.read_text(encoding="utf-8")]
+    return hits
+
+recs = sorted((home / "broadcasts").glob("*.json"))
+handoffs = list((home / "b" / "inbox").glob("*.md"))
+problems = []
+if len(letters_with("d1")) != 1:
+    problems.append(f"d1 手里有 {len(letters_with('d1'))} 封该广播的信")
+if len(recs) != 1:
+    problems.append(f"广播记录有 {len(recs)} 份")
+if not re.fullmatch(r"B\d{8}-\d{6}_[A-Za-z0-9_.\-]+", bid or ""):
+    problems.append(f"广播编号不合格式：{bid!r}")
+if not ev.get("done"):
+    problems.append("事件没有走到完成")
+if len(handoffs) != 1:
+    problems.append(f"交接提醒有 {len(handoffs)} 封")
+print("OK" if not problems else "BAD:" + "；".join(problems))
 PY
-po17_on a >/dev/null
-n_before=$(po17_n d1)
-po17_round
-[ "$(po17_n d1)" = "$n_before" ] && ok "退修4 送达名单丢失后靠信箱里的信判定，不重播" || bad "退修4 状态丢失后重播了广播"
-[ "$(ls "$P2/broadcasts/"*.json | wc -l | tr -d ' ')" = "$recs2" ] \
-  && ok "退修4 状态丢失后也没有第二份广播记录" || bad "退修4 状态丢失后多了一份广播记录"
+}
+for mode in inbox done arch; do
+  po17_new "crash_$mode" "$SW_CFG" "$SW_ON"   # a 在线开局：脚本里先记基线，再让 a 下线触发切换
+  r=$(alias_crash "$mode")
+  where="信在${mode}"
+  [ "$r" = "OK" ] && ok "退修4b 硬中断后从磁盘恢复（${where}）不重投、不另建记录、仍补完交接" \
+                  || bad "退修4b 硬中断恢复（${where}）：$r"
+done
+
+# 退修4c：两个 alias 在同一秒确认切换，广播编号不能撞。
+# 编号来自状态文件里单调递增的计数器，而不是时钟，所以同秒不同 alias、删掉再加回来都不会撞。
+TWO_SAME='{"version":1,"aliases":{"alpha":{"candidates":["a","b"],"notify":["d1"]},
+                                  "beta":{"candidates":["a","b"],"notify":["d1"]}}}'
+TWO_DIFF='{"version":1,"aliases":{"alpha":{"candidates":["a","b"],"notify":["d1"]},
+                                  "beta":{"candidates":["a","b"],"notify":["d2"]}}}'
+two_aliases() { # $1=notify 配置 $2=标签；结果写进全局 R（不跑子 Shell，P2 要留给调用方继续用）
+  po17_new "two_$2" "$1" "$SW_ON"
+  po17_round                          # 两个 alias 各自记下基线 = a
+  po17_off a                          # 同一轮里 a 下线，两个 alias 一起倒计时
+  po17_round; po17_round
+  python3 - "$P2" "$T/twoR" <<'PY'
+import json, re, sys
+from pathlib import Path
+home = Path(sys.argv[1])
+st = json.loads((home / "alias_state.json").read_text(encoding="utf-8"))
+evs = [e for s in st["aliases"].values() for e in s["events"].values()]
+bids = [e.get("broadcast") for e in evs]
+recs = {}
+for p in (home / "broadcasts").glob("*.json"):
+    r = json.loads(p.read_text(encoding="utf-8"))
+    recs[r["id"]] = r
+problems = []
+if len(evs) != 2:
+    problems.append(f"事件有 {len(evs)} 个")
+if len(set(bids)) != 2 or None in bids:
+    problems.append(f"广播编号相撞或缺失：{bids}")
+for b in bids:
+    if b and not re.fullmatch(r"B\d{8}-\d{6}_[A-Za-z0-9_.\-]+", b):
+        problems.append(f"编号不合格式：{b}")
+if len(recs) != 2:
+    problems.append(f"广播记录有 {len(recs)} 份：{sorted(recs)}")
+for e in evs:                          # 每个事件都要拿到属于自己的那份记录
+    r = recs.get(e.get("broadcast") or "")
+    if r is None:
+        problems.append(f"{e['id']} 没有自己的广播记录")
+    elif not e["id"].startswith("E" + str(e["seq"]) + "_"):
+        problems.append(f"{e['id']} 的序号与事件记录不一致")
+if not all(e.get("done") for e in evs):
+    problems.append("有事件没走到完成")
+open(sys.argv[2], "w", encoding="utf-8").write("OK" if not problems else "BAD:" + "；".join(problems))
+PY
+R=$(cat "$T/twoR")
+}
+two_aliases "$TWO_SAME" same
+[ "$R" = OK ] && ok "退修4c 同秒确认的两个 alias 各有自己的广播编号与记录" || bad "退修4c 同通知对象：$R"
+d1_n=$(po17_n d1)
+[ "$d1_n" = "2" ] && ok "退修4c 同通知对象时 d1 各收一封（不吞掉一个）" || bad "退修4c 同通知对象只收到 ${d1_n} 封"
+two_aliases "$TWO_DIFF" diff
+[ "$R" = OK ] && ok "退修4c 通知对象不同也不共用对方的记录" || bad "退修4c 不同通知对象：$R"
+python3 - "$P2" > "$T/twoids" <<'PY'
+import json, sys
+from pathlib import Path
+home = Path(sys.argv[1])
+st = json.loads((home / "alias_state.json").read_text(encoding="utf-8"))
+print(json.dumps({a: e["broadcast"] for a, s in st["aliases"].items() for e in s["events"].values()}))
+PY
+A_BID=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['alpha'])" "$T/twoids")
+B_BID=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['beta'])" "$T/twoids")
+[ "$A_BID" != "$B_BID" ] && ok "退修4c 两个 alias 的广播编号确实不同" || bad "退修4c 编号仍然相同"
+# 独立回执：各自只记进自己的记录，别的信箱不能替另一个广播回执
+POSTOFFICE_HOME="$P2" "$PO" ack d1 "$A_BID" "alpha 我回执" >/dev/null
+POSTOFFICE_HOME="$P2" "$PO" ack d2 "$B_BID" "beta 我回执" >/dev/null
+r=$(python3 - "$P2" "$A_BID" "$B_BID" <<'PY'
+import json, sys
+from pathlib import Path
+home, a, b = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+recs = {}
+for p in (home / "broadcasts").glob("*.json"):
+    r = json.loads(p.read_text(encoding="utf-8"))
+    recs[r["id"]] = r
+acks = [json.loads(x) for x in (home / "acks.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
+by_id = {}
+for e in acks:
+    if e.get("kind") == "broadcast":
+        by_id.setdefault(e["id"], []).append(e)
+problems = []
+if recs.get(a, {}).get("to") != ["d1"] or recs.get(b, {}).get("to") != ["d2"]:
+    problems.append(f"记录的收件人错了：alpha={recs.get(a, {}).get('to')} beta={recs.get(b, {}).get('to')}")
+if [e["by"] for e in by_id.get(a, [])] != ["d1"]:
+    problems.append(f"alpha 广播的回执是 {[e['by'] for e in by_id.get(a, [])]}")
+if [e["by"] for e in by_id.get(b, [])] != ["d2"]:
+    problems.append(f"beta 广播的回执是 {[e['by'] for e in by_id.get(b, [])]}")
+if sorted(by_id) != sorted([a, b]):
+    problems.append(f"账本里的广播回执编号是 {sorted(by_id)}")
+print("OK" if not problems else "BAD:" + "；".join(problems))
+PY
+)
+[ "$r" = OK ] && ok "退修4c 两个广播各自记账、互不串号" || bad "退修4c 回执串号：$r"
+POSTOFFICE_HOME="$P2" "$PO" ack d1 "$B_BID" "越权" >"$T/xack" 2>&1 \
+  && bad "退修4c 非收件信箱竟能给另一个广播回执" || ok "退修4c 非收件信箱不能给另一个广播回执"
 
 # 退修5：空或不合法的「广播：」信头要拒绝，账本、回执与原信都不动
 po17_new emptybc "$SW_CFG" "$SW_ON"
