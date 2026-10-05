@@ -1,6 +1,6 @@
 // agent-postoffice × OpenCode 投递插件
 // 盯着 routes.json 里 methods 含 "opencode_plugin" 的信箱；有新信且目标会话空闲时，
-// 用 OpenCode 自带 client 给该会话发一条提醒（信路径 + 开头三行）。
+// 用 OpenCode 自带 client 给该会话发一条提醒（普通信给路径 + 开头三行；回执只给元数据 + 查询命令，不附正文）。
 // - 只投给属于本 OpenCode 实例目录的会话；多个实例同时运行时用认领文件保证一封信只投一次
 // - 离线（status: "offline"）的信箱不投，信留在 inbox，上线后补送
 // - 每封只投一次（opencode_delivered.jsonl 账本），重启不重投；每信箱每 10 分钟最多 6 次
