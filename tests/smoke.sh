@@ -692,7 +692,235 @@ kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
 grep -q "已停用" "$T/badcfg" && ok "v1.7 坏配置提示说清功能已停用" || bad "v1.7 坏配置提示不清楚"
 POSTOFFICE_HOME=$MAIN_HOME; export POSTOFFICE_HOME
 
-# 14) 编译/类型检查
+# 14) 审核退修的六处负例：运行时配置校验 / 切换恢复 / 空广播头 / 面板确认框
+# 每个临时邮局跑自己的 postman，稳定期放大到 6 秒，抖动窗口才留得住
+po17_new() { P2="$T/$1"; rm -rf "$P2"; mkdir -p "$P2"; printf '%s' "$2" > "$P2/config.json"
+             printf '%s' "$3" > "$P2/routes.json"; for b in a b d1 d2 h; do mkdir -p "$P2/$b/inbox"; done; }
+po17_on() { POSTOFFICE_HOME="$P2" "$PO" online "$@" >/dev/null; }
+po17_off() { POSTOFFICE_HOME="$P2" "$PO" offline "$@" >/dev/null; }
+po17_n() { ls "$P2/$1/inbox/"*.md 2>/dev/null | wc -l | tr -d ' '; }
+po17_round() { local st="${1:-2}"
+                    POSTOFFICE_HOME="$P2" POSTOFFICE_ALIAS_STABLE=$st POSTOFFICE_POLL=1 POSTOFFICE_NO_NOTIFY=1 \
+                    "$PO" postman >/dev/null 2>&1 & P2M=$!; sleep 1.4; kill $P2M 2>/dev/null; wait $P2M 2>/dev/null; }
+SW_CFG='{"version":1,"aliases":{"pm":{"candidates":["a","b"],"notify":["d1"]}}}'
+SW_ON='{"a":{"status":"online","methods":["notify"]},"b":{"status":"online","methods":["notify"]},
+       "d1":{"status":"online","methods":["notify"]},"d2":{"status":"online","methods":["notify"]},
+       "h":{"status":"online","methods":["notify"]}}'
+SW_OFF='{"a":{"status":"offline","methods":["notify"]},"b":{"status":"offline","methods":["notify"]},
+        "d1":{"status":"online","methods":["notify"]},"d2":{"status":"online","methods":["notify"]},
+        "h":{"status":"online","methods":["notify"]}}'
+
+# 退修1：手改坏的配置在运行时必须被当成没有配置，分组与逻辑地址一起停用，且不动 routes/inbox
+po17_new rtcfg "$SW_CFG" "$SW_ON"
+po17_on a; po17_on b; po17_round                     # 先建立一个正常基线
+printf '%s' '{"version":1,"groups":{"good":["a"]}}' > "$P2/config.json"   # 一份本身合法的配置
+po17_off @good >/dev/null; po17_on @good >/dev/null
+r_before=$(cat "$P2/routes.json"); i_before=$(po17_n a)
+printf '%s' '{"version":2,"groups":{"g":["a"]},"aliases":{"pm":["a"]}}' > "$P2/config.json"
+po17_off @g 2>"$T/rt1"; rc=$?
+[ $rc -ne 0 ] && ok "退修1 运行时版本非法时分组停用" || bad "退修1 运行时版本非法仍改了状态"
+grep -q "配置无效" "$T/rt1" && ok "退修1 提示说清配置无效" || bad "退修1 提示不清楚"
+grep -q "未改动任何信箱状态" "$T/rt1" && ok "退修1 提示明说没改任何状态" || bad "退修1 提示没说清没改状态"
+[ "$(cat "$P2/routes.json")" = "$r_before" ] && ok "退修1 拒绝后 routes 字节不变" || bad "退修1 拒绝后 routes 被改"
+printf '%s' '{"version":1,"groups":{"g":["a","a"]}}' > "$P2/config.json"
+po17_off @g 2>"$T/rt2"; rc=$?
+[ $rc -ne 0 ] && ok "退修1 运行时重复组成员时分组停用" || bad "退修1 重复组成员仍能分组"
+[ "$(cat "$P2/routes.json")" = "$r_before" ] && ok "退修1 重复成员时 routes 不变" || bad "退修1 重复成员改了 routes"
+printf '%s' '{"version":1,"aliases":{"pm":{"candidates":["a"],"notify":["幽灵"]}}}' > "$P2/config.json"
+echo x | POSTOFFICE_HOME="$P2" "$PO" send @pm tester "不该投出去" "回复" >"$T/rt3" 2>&1; rc=$?
+[ $rc -ne 0 ] && ok "退修1 notify 指向已移除信箱时逻辑地址停用" || bad "退修1 已移除信箱仍能发信"
+[ "$(po17_n a)" = "$i_before" ] && ok "退修1 非法配置没有信落进候选信箱" || bad "退修1 非法配置仍投了信"
+POSTOFFICE_HOME="$P2" "$PO" send a tester "物理信箱照常" "回复" >/dev/null 2>&1 \
+  && ok "退修1 非法配置时物理信箱照常发信" || bad "退修1 非法配置连物理信箱也坏了"
+POSTOFFICE_HOME="$P2" "$PO" config show 2>&1 | grep -q "注意：这份配置现在有问题" \
+  && ok "退修1 config show 仍如实列出全部问题" || bad "退修1 config show 看不到问题"
+POSTOFFICE_HOME="$P2" "$PO" config show 2>&1 | grep -q "指向未登记信箱 幽灵" \
+  && ok "退修1 config show 指出具体是哪个信箱" || bad "退修1 show 没指出具体问题"
+
+# 退修2：pending=None 不再同时表示「没有候选」与「没有待确认」；首轮无人等稳定期后通知一次
+po17_new idle1 "$SW_CFG" "$SW_OFF"
+po17_off a; po17_off b
+po17_round                                   # 首见全员离线：只记基线
+[ "$(po17_n d1)" = "0" ] && ok "退修2 首见无人时不立刻广播" || bad "退修2 首见无人就广播"
+po17_round                                   # 刚过稳定期一点点，还不该发
+[ "$(po17_n d1)" = "0" ] && ok "退修2 首轮无人先等稳定期" || bad "退修2 首轮无人没等稳定期"
+po17_round; po17_round                        # 越过稳定期
+[ "$(po17_n d1)" = "1" ] && ok "退修2 首轮无人过稳定期后通知一次" || bad "退修2 首轮无人过稳定期没通知"
+po17_round; po17_round                        # 再跑几轮
+[ "$(po17_n d1)" = "1" ] && ok "退修2 首轮无人只通知一次" || bad "退修2 首轮无人重复通知"
+grep -q "（无在线候选）" "$P2/d1/inbox/"*.md && ok "退修2 无人接任通知说清没有候选" || bad "退修2 通知没写没有候选"
+# 已确认 A 后全员离线：不能 1 秒就广播
+po17_new idle2 "$SW_CFG" "$SW_ON"
+po17_round                                   # 基线 = a
+po17_off a; po17_off b; po17_round
+[ "$(po17_n d1)" = "0" ] && ok "退修2 已确认后全离线不当场广播" || bad "退修2 全离线当场广播"
+po17_round; po17_round
+[ "$(po17_n d1)" = "1" ] && ok "退修2 已确认后全离线过稳定期才广播" || bad "退修2 全离线迟迟不广播"
+# A→无人→A 抖动在稳定期内取消
+po17_new idle3 "$SW_CFG" "$SW_ON"
+po17_round; po17_off a; po17_off b; po17_round
+[ "$(po17_n d1)" = "0" ] && ok "退修2 抖动用例起点没有广播" || bad "退修2 抖动用例起点不对"
+po17_on a; po17_round; po17_round; po17_round
+[ "$(po17_n d1)" = "0" ] && ok "退修2 A→无人→A 抖动被取消" || bad "退修2 抖动没取消"
+# 重启不重复
+po17_round
+[ "$(po17_n d1)" = "0" ] && ok "退修2 重启不重复通知" || bad "退修2 重启重复通知"
+
+# 退修3：删掉 alias 要落盘；重新加入时建立新基线而不是接回旧的待切换
+po17_new rm1 "$SW_CFG" "$SW_ON"
+po17_round
+printf '%s' '{"version":1,"aliases":{}}' > "$P2/config.json"
+po17_round
+python3 -c "import json,sys;print('OK' if json.load(open(sys.argv[1]))['aliases']=={} else 'BAD')" "$P2/alias_state.json" \
+  | grep -q OK && ok "退修3 删除最后一个 alias 已落盘" || bad "退修3 删除 alias 只清了内存"
+printf '%s' "$SW_CFG" > "$P2/config.json"; po17_off a; po17_round; po17_round
+[ "$(po17_n d1)" = "0" ] && ok "退修3 重新加入后从新基线开始" || bad "退修3 重新加入接回了旧待切换"
+python3 -c "import json,sys;print('OK' if json.load(open(sys.argv[1]))['aliases']['pm']['confirmed']=='b' else 'BAD')" "$P2/alias_state.json" \
+  | grep -q OK && ok "退修3 重新加入后基线是新观察到的目标" || bad "退修3 重新加入后基线不对"
+
+# 退修4：同一事件只有一份广播记录、每个收件人一封；广播成功后崩溃也不重播
+po17_new part "$SW_CFG" "$SW_ON"
+po17_round; po17_off a; po17_round
+# 让 d2 收不到信（只读 inbox），模拟「一部分送达、一部分失败」
+python3 - "$P2/config.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+cfg["aliases"]["pm"]["notify"] = ["d1", "d2"]
+json.dump(cfg, open(p, "w"))
+PY
+python3 - "$P2/routes.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+r = json.load(open(p))
+for k in r:
+    r[k]["methods"] = ["notify"]
+json.dump(r, open(p, "w"))
+PY
+po17_on b 2>/dev/null; chmod 555 "$P2/d2/inbox"
+POSTOFFICE_HOME="$P2" POSTOFFICE_ALIAS_STABLE=1 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 2.5
+kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
+recs=$(ls "$P2/broadcasts/"*.json 2>/dev/null | wc -l | tr -d ' ')
+d1n=$(po17_n d1); d2n=$(po17_n d2)
+[ "$d1n" = "1" ] && ok "退修4 部分失败时先到的收件人拿到一封" || bad "退修4 部分失败时第一封没到"
+[ "$d2n" = "0" ] && ok "退修4 部分失败时失败方确实没收到" || bad "退修4 部分失败时竟然都收到了"
+chmod 755 "$P2/d2/inbox"
+POSTOFFICE_HOME="$P2" POSTOFFICE_ALIAS_STABLE=1 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 2.5
+kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
+recs2=$(ls "$P2/broadcasts/"*.json 2>/dev/null | wc -l | tr -d ' ')
+recs_note="记录数 ${recs} 变 ${recs2}"
+[ "$(po17_n d1)" = "$d1n" ] && ok "退修4 恢复后不给已送达方重投" || bad "退修4 恢复后重复投递给已送达方"
+[ "$(po17_n d2)" = "1" ] && ok "退修4 恢复后只补发给失败方" || bad "退修4 恢复后没补发"
+[ "$recs2" = "$recs" ] && ok "退修4 同一事件只有一份广播记录" || bad "退修4 恢复时又建了一份广播记录：${recs_note}"
+grep -q "未完成（已送达 1/2）" "$P2/logs/postman.log" \
+  && ok "退修4 部分失败写明已送达几个" || bad "退修4 部分失败没记进度"
+# 交接只在补齐后才发生，且不重播已成功的广播
+python3 -c "
+import json,sys
+st=json.load(open(sys.argv[1]))
+ev=list(st['aliases']['pm']['events'].values())[0]
+print('OK' if len(ev['sent'])==2 and ev['broadcast'].startswith('B') and ev['done'] else 'BAD:'+json.dumps(ev,ensure_ascii=False))" "$P2/alias_state.json" \
+  | grep -q OK && ok "退修4 事件记录里两个收件人都已送达" || bad "退修4 事件记录里送达名单不对"
+# 稳定 BID：重启换一批也仍是同一个编号
+bid_now=$(python3 -c "import json,sys;print(list(json.load(open(sys.argv[1]))['aliases']['pm']['events'].values())[0]['broadcast'])" "$P2/alias_state.json")
+po17_round
+bid_after=$(python3 -c "import json,sys;print(list(json.load(open(sys.argv[1]))['aliases']['pm']['events'].values())[0]['broadcast'])" "$P2/alias_state.json")
+[ "$bid_now" = "$bid_after" ] && ok "退修4 事件广播编号跨重启稳定" || bad "退修4 广播编号跨重启变了"
+# 广播成功后、状态落盘前崩溃：靠信箱里已有的那封信判断，不重播
+python3 - "$P2/alias_state.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+st = json.load(open(p))
+ev = list(st["aliases"]["pm"]["events"].values())[0]
+ev["sent"] = []            # 假装送达名单没落盘
+ev["handoff"] = None
+ev["done"] = False
+st["aliases"]["pm"]["confirmed"] = "a"   # 也假装确认没落盘
+json.dump(st, open(p, "w"))
+PY
+po17_on a >/dev/null
+n_before=$(po17_n d1)
+po17_round
+[ "$(po17_n d1)" = "$n_before" ] && ok "退修4 送达名单丢失后靠信箱里的信判定，不重播" || bad "退修4 状态丢失后重播了广播"
+[ "$(ls "$P2/broadcasts/"*.json | wc -l | tr -d ' ')" = "$recs2" ] \
+  && ok "退修4 状态丢失后也没有第二份广播记录" || bad "退修4 状态丢失后多了一份广播记录"
+
+# 退修5：空或不合法的「广播：」信头要拒绝，账本、回执与原信都不动
+po17_new emptybc "$SW_CFG" "$SW_ON"
+printf '来源：tester\n事由：空广播头\n需要：回复\n广播：\n\n正文。\n' > "$T/empty_bc.md"
+cp "$T/empty_bc.md" "$P2/d1/inbox/20260101-000000_tester_空广播头.md"
+EMPTY_LID=20260101-000000_tester_空广播头
+acks_before=$(cat "$P2/acks.jsonl" 2>/dev/null | wc -l | tr -d ' ')
+POSTOFFICE_HOME="$P2" "$PO" ack d1 "$EMPTY_LID" "不该记上" >"$T/ebc" 2>&1; rc=$?
+[ $rc -ne 0 ] && ok "退修5 空广播头回执被拒" || bad "退修5 空广播头竟回执成功"
+grep -q "空的或不是广播编号格式" "$T/ebc" && ok "退修5 说清是空/不合法信头" || bad "退修5 提示不清楚"
+[ ! -f "$P2/acks.jsonl" ] || [ "$(cat "$P2/acks.jsonl" 2>/dev/null | wc -l | tr -d ' ')" = "$acks_before" ] \
+  && ok "退修5 被拒时账本没有变化" || bad "退修5 被拒时账本被写了"
+[ -f "$P2/d1/inbox/$EMPTY_LID.md" ] && ok "退修5 被拒时原信留在 inbox" || bad "退修5 被拒时原信被搬走"
+[ "$(ls "$P2/d1/inbox/" | grep -c '回执')" = "0" ] && ok "退修5 被拒时没有生成回执通知" || bad "退修5 被拒时仍生成了回执"
+printf '来源：tester\n事由：坏广播头\n需要：回复\n广播：这不是编号\n\n正文。\n' > "$P2/d1/inbox/20260101-000001_tester_坏广播头.md"
+POSTOFFICE_HOME="$P2" "$PO" ack d1 "20260101-000001_tester_坏广播头" "不该记上" >"$T/ebc2" 2>&1; rc=$?
+[ $rc -ne 0 ] && ok "退修5 非编号格式的广播头被拒" || bad "退修5 非编号格式竟通过"
+grep -q "这不是编号" "$P2/d1/inbox/20260101-000001_tester_坏广播头.md" \
+  && ok "退修5 坏广播头的原信内容没被动过" || bad "退修5 坏广播头原信被改"
+# 原有两条合同仍然成立：正文伪造不算、物理编号与广播编号归一去重
+po17_new normbc "$SW_CFG" "$SW_ON"
+echo 正文 | POSTOFFICE_HOME="$P2" "$PO" broadcast d1,d2 d1 "归一广播" "回复" >"$T/n1" 2>&1
+NB=$(sed -n 's/^广播编号：//p' "$T/n1")
+NL=$(basename "$(ls "$P2"/d1/inbox/*归一广播*.md)" .md)
+POSTOFFICE_HOME="$P2" "$PO" ack d1 "$NL" "按信回执" | grep -q "$NB" \
+  && ok "退修5 归一化去重仍然成立" || bad "退修5 归一化去重坏了"
+POSTOFFICE_HOME="$P2" "$PO" ack d1 "$NB" "再回一次" | grep -q "已回执过" \
+  && ok "退修5 物理编号与广播编号只记一条" || bad "退修5 两种编号记了两条"
+printf '广播：%s\n正文伪造。\n' "$NB" > "$T/forge_bc.md"
+POSTOFFICE_HOME="$P2" "$PO" send d1 d1 "正文伪造广播" "回复" --file "$T/forge_bc.md" >/dev/null 2>&1
+FID=$(basename "$(ls "$P2"/d1/inbox/*正文伪造广播*.md)" .md)
+POSTOFFICE_HOME="$P2" "$PO" ack d1 "$FID" "不该算广播" >/dev/null 2>&1
+grep -q '"kind": "letter"' "$P2/acks.jsonl" \
+  && ok "退修5 正文伪造广播标记仍按普通信处理" || bad "退修5 正文伪造被算成广播"
+
+# 退修6：面板把投递失败单独算出来，页面确认框中英文都要列出失败项与总数
+PANEL_HTML="$(dirname "$PO")/panel/index.html"
+grep -q '{f} 封投递失败需人工处理' "$PANEL_HTML" \
+  && grep -q '{f} failed delivery needing a human' "$PANEL_HTML" \
+  && ok "退修6 中英文确认文案都列投递失败数量" || bad "退修6 确认文案缺投递失败数量"
+grep -q '全部 {n} 封信件和通知' "$PANEL_HTML" \
+  && grep -q 'all {n} letters and notifications' "$PANEL_HTML" \
+  && ok "退修6 中英文确认文案都写明收件箱总数" || bad "退修6 确认文案缺总数"
+grep -q '收件箱里的全部' "$PANEL_HTML" && grep -q "inbox" "$PANEL_HTML" \
+  && ok "退修6 确认文案明确是整个收件箱" || bad "退修6 确认文案没说清是收件箱"
+grep -q 'data-f="${c.failed}"' "$PANEL_HTML" && grep -q 'data-n="${b.pending.length}"' "$PANEL_HTML" \
+  && ok "退修6 归档按钮把失败数与总数传给确认框" || bad "退修6 按钮没传失败数或总数"
+po17_new pnl "$SW_CFG" "$SW_ON"
+POSTOFFICE_HOME="$P2" "$PO" add cbox --claude "面板确认用会话" >/dev/null
+POSTOFFICE_HOME="$P2" "$PO" add obox6 --notify >/dev/null
+python3 - "$P2/routes.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+r = json.load(open(p))
+r["obox6"]["methods"] = ["opencode_plugin"]
+json.dump(r, open(p, "w"))
+PY
+echo x | POSTOFFICE_HOME="$P2" "$PO" send cbox d1 "确认用已提醒" "回复" >/dev/null
+echo x | POSTOFFICE_HOME="$P2" "$PO" send obox6 d1 "确认用投递失败" "回复" >/dev/null
+C1=$(basename "$(ls "$P2"/cbox/inbox/*确认用已提醒*.md)")
+OF6=$(basename "$(ls "$P2"/obox6/inbox/*确认用投递失败*.md)")
+printf '%s\n' "$P2/cbox/inbox/$C1" > "$P2/cbox/.seen"
+printf '{"box":"obox6","file":"%s","result":"FAILED_FINAL"}\n' "$OF6" >> "$P2/opencode_delivered.jsonl"
+PORT6=$((9050 + $$ % 120))
+POSTOFFICE_HOME="$P2" "$PO" panel --no-open --port $PORT6 >/dev/null 2>&1 & PP6=$!; sleep 2
+curl -s "http://127.0.0.1:$PORT6/api/state" | python3 -c '
+import json, sys
+st = {b["name"]: b["counts"] for b in json.load(sys.stdin)["boxes"]}
+good = st.get("cbox") == {"waiting": 0, "reminded": 1, "failed": 0} \
+    and st.get("obox6") == {"waiting": 0, "reminded": 0, "failed": 1}
+print("OK" if good else "BAD:" + json.dumps(st, ensure_ascii=False))' >"$T/p6"
+grep -q "^OK$" "$T/p6" && ok "退修6 面板把失败与已提醒分开算" || bad "退修6 面板分类错：$(cat "$T/p6")"
+curl -s "http://127.0.0.1:$PORT6/" | grep -q 'data-f="\${c.failed}"' \
+  && ok "退修6 面板实际发出的页面带失败数占位" || bad "退修6 实际页面没带失败数"
+kill $PP6 2>/dev/null; wait $PP6 2>/dev/null; unset PP6
+
+# 15) 编译/类型检查
 /usr/bin/python3 -m py_compile "$PO" 2>/dev/null && ok "v1.7 py_compile 通过" || bad "v1.7 py_compile"
 if command -v node >/dev/null 2>&1; then
   node --experimental-strip-types --check "$(dirname "$PO")/opencode/postoffice.ts" 2>/dev/null \

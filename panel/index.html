@@ -108,7 +108,7 @@ const STR = {
     counts: "待投递 {w} / 已提醒待归档 {r}",
     failedLine: "投递失败，需人工处理 {n} 封",
     archiveAll: "归档全部",
-    clearConfirm: "把 {box} 信箱里的全部信件和通知（{w} 封待投递 + {r} 封已提醒未归档）都存档吗？文件会保留在 archived/ 里，待投递的信归档后不再补送。",
+    clearConfirm: "把 {box} 信箱收件箱里的全部 {n} 封信件和通知都存档吗？（{w} 封待投递 + {r} 封已提醒未归档 + {f} 封投递失败需人工处理）文件会保留在 archived/ 里；待投递的信归档后不再补送，投递失败的那几封也一并归档、不再重试。",
     recentAcks: "最近回执", acked: "已回执",
     emptyBoxes: "通讯录是空的，用 postoffice add 登记会话。",
     emptyBroadcasts: "还没有广播。", emptyLog: "还没有记录", emptySwitches: "还没有确认过切换（首次看到只记基线，不广播）。",
@@ -136,7 +136,7 @@ const STR = {
     counts: "{w} waiting / {r} reminded to file",
     failedLine: "{n} failed delivery, needs a human",
     archiveAll: "Archive all",
-    clearConfirm: "Archive every letter and notification in {box} ({w} waiting + {r} reminded but not filed)? Files are kept in archived/, and waiting letters are not delivered after archiving.",
+    clearConfirm: "Archive all {n} letters and notifications in {box}'s inbox ({w} waiting + {r} reminded but not filed + {f} failed delivery needing a human)? Files are kept in archived/; waiting letters are not delivered after archiving, and the failed ones are archived too instead of being retried.",
     recentAcks: "Latest receipts", acked: "acked",
     emptyBoxes: "The address book is empty; register sessions with postoffice add.",
     emptyBroadcasts: "No broadcasts yet.", emptyLog: "No records yet",
@@ -216,7 +216,7 @@ async function load() {
         </button>
         <div class="meta"><span class="chip">${esc(b.app)}</span>${esc(b.ident)}
           · ${esc(counts(c))}${c.failed ? ` · <span class="chip bad">${esc(fmt("failedLine", { n: c.failed }))}</span>` : ""}
-          ${b.pending.length ? `<button class="clear" data-clear="${esc(b.name)}" data-w="${c.waiting}" data-r="${c.reminded}">${esc(t("archiveAll"))}</button>` : ""}</div>
+          ${b.pending.length ? `<button class="clear" data-clear="${esc(b.name)}" data-w="${c.waiting}" data-r="${c.reminded}" data-f="${c.failed}" data-n="${b.pending.length}">${esc(t("archiveAll"))}</button>` : ""}</div>
         ${b.acks && b.acks.length ? `<div class="meta">${esc(t("recentAcks"))}：${b.acks.map((a) =>
           `${esc(a.by)}（${esc(a.note || t("acked"))}）`).join("；")}</div>` : ""}
         ${b.pending.length ? `<div class="pending">${b.pending.map((p) =>
@@ -271,7 +271,8 @@ async function load() {
 $("boxes").addEventListener("click", async (ev) => {
   const c = ev.target.closest(".clear");
   if (c) {
-    const msg = fmt("clearConfirm", { box: c.dataset.clear, w: c.dataset.w, r: c.dataset.r });
+    const msg = fmt("clearConfirm", { box: c.dataset.clear, w: c.dataset.w, r: c.dataset.r,
+                                      f: c.dataset.f || "0", n: c.dataset.n || "0" });
     if (!confirm(msg)) return;
     const r = await fetch("/api/clear", { method: "POST", headers: { "Content-Type": "application/json" },
                                           body: JSON.stringify({ name: c.dataset.clear }) });
