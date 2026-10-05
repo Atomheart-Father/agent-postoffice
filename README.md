@@ -90,7 +90,7 @@ The recipient wakes up, reads, does the work, replies, and moves the letter into
 | Codex | Postman | `codex queue --thread <id>` queues a reminder in the thread |
 | You | Postman | System notification |
 
-Everything lives in `~/agent-postoffice/` (override with `POSTOFFICE_HOME`): `routes.json` is the single config; one directory per mailbox (`inbox/`, `done/`, `CONTACT.md`); logs in `logs/`.
+Everything lives in `~/agent-postoffice/` (override with `POSTOFFICE_HOME`): `routes.json` is the single config; one directory per mailbox (`inbox/`, `done/`, `CONTACT.md`); logs in `logs/`. Set `POSTOFFICE_NO_NOTIFY=1` to keep system notifications off (the post office and the OpenCode plugin then only log that a human should have been told); every human notification is also written to `logs/` as `通知人：…`.
 
 ## What "delivered" means
 

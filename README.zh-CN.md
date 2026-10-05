@@ -90,7 +90,7 @@ MSG
 | Codex | 邮递员 | `codex queue --thread <id>` 往线程里排一条提醒 |
 | 人 | 邮递员 | 系统通知 |
 
-数据都在 `~/agent-postoffice/`（可用环境变量 `POSTOFFICE_HOME` 改）：`routes.json` 是唯一配置；每个信箱一个目录（`inbox/`、`done/`、`CONTACT.md`）；日志在 `logs/`。
+数据都在 `~/agent-postoffice/`（可用环境变量 `POSTOFFICE_HOME` 改）：`routes.json` 是唯一配置；每个信箱一个目录（`inbox/`、`done/`、`CONTACT.md`）；日志在 `logs/`。设 `POSTOFFICE_NO_NOTIFY=1` 可关掉系统通知（邮递员与 OpenCode 插件改为只在日志里留一条“该通知人了”的记录）；每条通知人的内容都会以 `通知人：…` 写进日志。
 
 ## 送达的含义
 

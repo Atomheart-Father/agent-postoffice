@@ -7,7 +7,9 @@
 // - 只投给属于本 OpenCode 实例目录的会话；多个实例同时运行时用认领文件保证一封信只投一次
 // - 离线（status: "offline"）的信箱不投，信留在 inbox，上线后补送
 // - 每封只投一次（opencode_delivered.jsonl 账本），重启不重投；每信箱每 10 分钟最多 6 次
-// - 失败重试一次，再失败弹通知给人；任何异常都吞掉，绝不影响 OpenCode 本身
+// - 失败重试一次（按每个文件各自计数，到上限的单独记 FAILED_FINAL 并通知人）；任何异常都吞掉，绝不影响 OpenCode 本身
+// - prompt 已被接受但本地记账失败：不当作“没投”、不自动重发；认领保留 + 日志 + 通知人核对一次。
+//   恢复规则由人决定：删掉 <信箱>/.claims/<文件名> 才允许再投一次，或把信挪进 done 收账
 // - 不改模型/工具/权限，不新建会话，不批准权限请求
 import type { Plugin } from "@opencode-ai/plugin"
 import { homedir, platform } from "node:os"
@@ -38,6 +40,8 @@ const log = async (msg: string) => {
 const notifyHuman = (text: string) => {
   try {
     const t = text.replace(/"/g, "'").slice(0, 180)
+    void log(`通知人：${t}`) // 系统通知本身不留痕，日志留一条，便于事后核对
+    if (process.env.POSTOFFICE_NO_NOTIFY) return // 静默/测试场景：只记日志，不弹通知
     if (platform() === "darwin")
       spawn("osascript", ["-e", `display notification "${t}" with title "联络总站投递失败"`], { stdio: "ignore" })
     else spawn("notify-send", ["联络总站投递失败", t], { stdio: "ignore" })
@@ -206,25 +210,40 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
           text = parts.join("\n")
         }
         const files2 = claimed.map((g) => g.file).join(",")
-        const attempt = (ledger.failed.get(`${box}::${claimed[0].file}`) ?? 0) + 1
+        // 一批只发一次 prompt，但每个文件按自己的失败次数递增、各自判断是否已到上限
+        const tries = new Map<string, number>()
+        for (const g of claimed) tries.set(g.file, (ledger.failed.get(`${box}::${g.file}`) ?? 0) + 1)
         try {
           await client.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text }] } })
-          for (const g of claimed) {
-            await appendFile(LEDGER, JSON.stringify({ time: new Date().toISOString(), box, file: g.file, session: sessionID, result: "DELIVERED", attempt }) + "\n")
-          }
-          win.push(now)
-          recent.set(box, win)
-          await log(`DELIVERED ${box}/${files2} → ${sessionID}（${reason}，第 ${attempt} 次）`)
         } catch (e) {
-          const final = attempt >= MAX_ATTEMPTS
+          // 投递失败：逐个文件记账（到上限的写 FAILED_FINAL），释放认领以便重试或别的实例接手
+          let finals = 0
           for (const g of claimed) {
+            const attempt = tries.get(g.file)!
+            const final = attempt >= MAX_ATTEMPTS
+            if (final) finals++
             await appendFile(LEDGER, JSON.stringify({ time: new Date().toISOString(), box, file: g.file, session: sessionID, result: final ? "FAILED_FINAL" : "FAILED_RETRYABLE", attempt, detail: String(e).slice(0, 200) }) + "\n")
-            // release the claim so a retry (or another instance) can pick the batch up
             try { await rm(`${ROOT}/${box}/.claims/${g.file}`, { force: true }) } catch {}
           }
-          await log(`FAILED ${box}/${files2}（第 ${attempt} 次）: ${e}`)
-          if (final) notifyHuman(`${box}/${files2} 两次投递失败，请手动转交`)
+          await log(`FAILED ${box}/${files2}: ${e}`)
+          if (finals) notifyHuman(`${box}/${files2} 有 ${finals} 封投递失败已达上限，请手动转交`)
+          continue
         }
+        // prompt 已被接受：算一次唤醒（限流照旧），此后本地记账出错也不能当成“没投”
+        win.push(now)
+        recent.set(box, win)
+        try {
+          for (const g of claimed) {
+            await appendFile(LEDGER, JSON.stringify({ time: new Date().toISOString(), box, file: g.file, session: sessionID, result: "DELIVERED", attempt: tries.get(g.file) }) + "\n")
+          }
+        } catch (e) {
+          // 恢复规则：认领保留 → 本实例与其它实例都不会自动重投；账本缺行 → 下次启动看似待投
+          // 但仍被认领挡住。要重投由人先删认领文件（或把信挪进 done 收账），不会静默重发。
+          await log(`DELIVERED 但记账失败（不重发，认领保留待人工核对）${box}/${files2}: ${e}`)
+          notifyHuman(`${box}/${files2} 已投递但记账失败，请核对 ${LEDGER}`)
+          continue
+        }
+        await log(`DELIVERED ${box}/${files2} → ${sessionID}（${reason}）`)
       }
     } catch (e) {
       await log(`scan 异常（已忽略）: ${e}`)
