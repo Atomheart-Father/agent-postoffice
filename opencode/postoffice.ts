@@ -163,7 +163,7 @@ const alarmLetterOwns = (rec: Alarm | null, box: string, sessionID: string): Ala
   if (!rec) return null
   if (rec.session !== sessionID || rec.box !== box) return null
   if (rec.state !== "lettered") return null
-  if (rec.letter && rec.letter !== rec.id) return null
+  if (rec.letter !== rec.id) return null          // lettered 记录必须指着它自己那封信
   return rec
 }
 
@@ -205,7 +205,7 @@ const lockPath = (sessionID: string) => `${alarmPath(sessionID)}.lock`
 //   3. 软超时（60s）只在该 pid 已经不在时才回收；超过硬超时（600s）才无条件回收。
 //      pid 被复用只会让我们多等一会儿（等硬超时），不会误删 —— 方向上是安全的那一侧。
 // Python 侧 take_alarm_lock()/try_reap_alarm_lock() 用完全相同的规则与常量。
-const reapPath = (sessionID: string) => `${lockPath(sessionID)}.reap`
+const gatePath = (sessionID: string) => `${lockPath(sessionID)}.gate`   // 建锁/回收/释放共用的短临界区
 
 type LockInfo = { dev: number; ino: number; mtime: number; age: number }
 
@@ -245,53 +245,88 @@ const createLock = async (p: string) => {
   }
 }
 
-const tryReapAlarmLock = async (sessionID: string): Promise<boolean> => {
-  const p = lockPath(sessionID)
-  const before = await lockInfo(p)
-  if (!before || !(await expired(before, p))) return false
-  const rp = reapPath(sessionID)
-  try {
-    await createLock(rp)
-  } catch {
-    const ri = await lockInfo(rp)
-    if (!ri || !(await expired(ri, rp))) return false     // 别人正在回收；它崩了就在硬超时后再说
+const takeAlarmGate = async (gp: string): Promise<boolean> => {
+  // O_EXCL 建门，而且只有建门的人会删它 —— 所以门不会有两个持有者。
+  // 崩溃留下的门只有在确认持门进程已经不在之后才会被抢（与锁同一套 pid 规则），
+  // 因此在 ALARM_LOCK_HARD 之前不会把活着的持有者当成崩溃。
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await rm(rp, { force: true })
-    } catch {}
-    return false                                        // 这一轮只让一个进程回收
+      await createLock(gp)
+      return true
+    } catch (e) {
+      if ((e as { code?: string }).code !== "EEXIST") return false
+      const info = await lockInfo(gp)
+      if (!info) continue
+      if (!(await expired(info, gp))) return false
+      try {
+        await rm(gp, { force: true })
+      } catch {
+        return false
+      }
+    }
   }
+  return false
+}
+
+const dropAlarmGate = async (gp: string) => {
   try {
-    const now = await lockInfo(p)
-    if (!now || now.dev !== before.dev || now.ino !== before.ino || now.mtime !== before.mtime) return false
+    await rm(gp, { force: true })
+  } catch {}
+}
+
+const tryReapAlarmLock = async (sessionID: string): Promise<boolean> => {
+  // 整个「判定 + 删除」都在门里，而建锁/回收/释放走的是同一扇门，
+  // 所以进了门之后，本协议内没有任何一步能在我们 unlink 之前把别的锁换到那个路径上。
+  // 这才是「只删我判定为陈旧的那一个实例」成立的原因 —— 而不是 stat 之后再 stat 一次
+  // （那仍然留着 check-to-delete 的窗口）。
+  // 门就是 ALARM_LOCK_HARD 这份租约：临界区只有几个文件操作（远小于一秒），
+  // 租约比它长两个数量级；租约没到期之前还要求持门进程确实不在，因此不会抢活着的持有者。
+  const p = lockPath(sessionID)
+  const gp = gatePath(sessionID)
+  if (!(await takeAlarmGate(gp))) return false
+  try {
+    const info = await lockInfo(p)
+    if (!info || !(await expired(info, p))) return false
     await rm(p, { force: true })
     return true
+  } catch {
+    return false
   } finally {
-    try {
-      await rm(rp, { force: true })
-    } catch {}
+    await dropAlarmGate(gp)
   }
 }
 
 const takeAlarmLock = async (sessionID: string): Promise<boolean> => {
   await mkdir(ALARM_DIR, { recursive: true })
   const p = lockPath(sessionID)
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      await createLock(p)
-      return true
-    } catch (e) {
-      if ((e as { code?: string }).code !== "EEXIST") return false
-      if (!(await lockInfo(p))) continue                  // 锁刚被别人释放，再抢一次
-      if (!(await tryReapAlarmLock(sessionID))) return false
+  const gp = gatePath(sessionID)
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (!(await lockInfo(p))) {
+      if (!(await takeAlarmGate(gp))) continue             // 门被占：下一轮再看，绝不在门外抢锁
+      try {
+        await createLock(p)
+        return true
+      } catch (e) {
+        if ((e as { code?: string }).code !== "EEXIST") return false
+      } finally {
+        await dropAlarmGate(gp)
+      }
+      continue
     }
+    if (!(await tryReapAlarmLock(sessionID)) && (await lockInfo(p))) return false  // 锁还在 = 真有人持锁
   }
   return false
 }
 
 const releaseAlarmLock = async (sessionID: string) => {
+  const p = lockPath(sessionID)
+  const gp = gatePath(sessionID)
+  if (!(await takeAlarmGate(gp))) return                    // 门拿不到就不删：锁会由看门狗回收
   try {
-    await rm(lockPath(sessionID), { force: true })
-  } catch {}
+    if ((await holderPid(p)) === process.pid) await rm(p, { force: true })
+  } catch {} finally {
+    await dropAlarmGate(gp)
+  }
 }
 
 const deliveredAlready = async (box: string, file: string) => {
