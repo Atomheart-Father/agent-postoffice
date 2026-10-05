@@ -1419,6 +1419,11 @@ def reap_lock_path(path):
     return alarm_lock_path(path).with_suffix(".lock.reap")
 
 
+def gate_lock_path(path):
+    """The gate every mutation of the lock runs behind — create, reclaim and release alike."""
+    return alarm_lock_path(path).with_suffix(".lock.gate")
+
+
 def _lock_info(p):
     try:
         st = p.stat()
@@ -1464,70 +1469,115 @@ def _create_lock(p, body):
         os.close(fd)
 
 
-def try_reap_alarm_lock(path):
-    """Reclaim a lock whose holder is provably gone, without ever deleting a *new* lock.
+def take_alarm_gate(gp):
+    """Take the short gate every lock mutation runs behind.
 
-    Two things have to hold. The reclaim itself runs under a second O_EXCL lock so only one
-    process reclaims at a time, and the delete is guarded by re-stat'ing the lock and comparing
-    (dev, ino, mtime) with the instance we judged stale — if anything changed we do not delete and
-    try again next round instead. mtime alone proves nothing, so between the soft and the hard
-    timeout the holder's pid still has to be gone.
+    O_EXCL create, and only the creator ever removes it — so there is never a second gate holder.
+    A gate left behind by a crash is only stolen once its holder is provably gone (same pid rule as
+    the lock itself), so a live holder is never mistaken for a crash before ALARM_LOCK_HARD.
     """
-    p = alarm_lock_path(path)
-    before = _lock_info(p)
-    if before is None or not _lock_expired(before, p):
-        return False
-    rp = reap_lock_path(path)
-    try:
-        _create_lock(rp, f"{os.getpid()} {int(time.time())}\n")
-    except FileExistsError:
-        ri = _lock_info(rp)
-        if ri is None or not _lock_expired(ri, rp):
-            return False
-        try:
-            rp.unlink()
-        except OSError:
-            pass
-        return False
-    except OSError:
-        return False
-    try:
-        now = _lock_info(p)
-        if now is None or now[:3] != before[:3]:
-            return False
-        p.unlink()
-        return True
-    except OSError:
-        return False
-    finally:
-        try:
-            rp.unlink()
-        except OSError:
-            pass
-
-
-def take_alarm_lock(path):
-    p = alarm_lock_path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
     for _ in range(3):
         try:
-            _create_lock(p, f"{os.getpid()} {int(time.time())}\n")
+            _create_lock(gp, f"{os.getpid()} {int(time.time())}\n")
             return True
         except FileExistsError:
-            if _lock_info(p) is None:
+            info = _lock_info(gp)
+            if info is None:
                 continue
-            if not try_reap_alarm_lock(path):
+            if not _lock_expired(info, gp):
+                return False
+            try:
+                gp.unlink()          # 判定为崩溃残留的门；持锁者还活着时不会走到这里
+            except OSError:
                 return False
         except OSError:
             return False
     return False
 
 
-def release_alarm_lock(path):
+def drop_alarm_gate(gp):
     try:
-        alarm_lock_path(path).unlink()
+        gp.unlink()
     except OSError:
         pass
+
+
+def try_reap_alarm_lock(path):
+    """Reclaim a lock whose holder is provably gone, without ever deleting a *new* lock.
+
+    The whole check-and-delete runs behind the gate, and create / reclaim / release all take that
+    same gate, so once we are inside it nothing in this protocol can put a different lock at the
+    path before our unlink. That is what makes "only the instance I judged stale gets removed"
+    true, rather than a stat that is re-checked and still leaves a window.
+
+    The gate lease is ALARM_LOCK_HARD: the critical section is a handful of file operations (well
+    under a second) and the lease is two orders of magnitude longer, and before the lease expires
+    the gate holder's pid must be gone — so a live holder is never stolen from. Past the lease we
+    reclaim unconditionally, which is sound only because the critical section is so short.
+    """
+    p = alarm_lock_path(path)
+    gp = gate_lock_path(path)
+    if not take_alarm_gate(gp):
+        return False
+    try:
+        info = _lock_info(p)
+        if info is None or not _lock_expired(info, p):
+            return False
+        p.unlink()
+        return True
+    except OSError:
+        return False
+    finally:
+        drop_alarm_gate(gp)
+
+
+def take_alarm_lock(path):
+    """Take the per-session alarm lock, or report that somebody else holds it.
+
+    Creating is the only way in and it happens behind the gate, so two processes can never both
+    believe they hold it; releasing and reclaiming happen behind the same gate, so neither can land
+    in the middle of the other's check.
+    """
+    p = alarm_lock_path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    gp = gate_lock_path(path)
+    for _ in range(5):
+        if _lock_info(p) is None:
+            if not take_alarm_gate(gp):
+                continue        # 门被占：下一轮再看，绝不在门外抢锁
+            try:
+                try:
+                    _create_lock(p, f"{os.getpid()} {int(time.time())}\n")
+                    return True
+                except FileExistsError:
+                    pass
+            finally:
+                drop_alarm_gate(gp)
+            continue
+        # 有锁：可能只是崩溃残留，让回收者在门里判定并删除
+        if not try_reap_alarm_lock(path) and _lock_info(p) is not None:
+            return False        # 锁还在 = 真有人持锁（或门被占），本轮让给别人
+    return False
+
+
+def release_alarm_lock(path):
+    """Release the lock we hold — behind the gate, and only when the lock still names our own pid.
+
+    The pid check means a release can never remove somebody else's fresh lock, and the gate means
+    it cannot land in the middle of a reclaimer that has already verified a stale instance.
+    """
+    p = alarm_lock_path(path)
+    gp = gate_lock_path(path)
+    if not take_alarm_gate(gp):
+        return                 # 门拿不到就不删：锁会由看门狗回收，不会永久卡住
+    try:
+        if _holder_pid(p) == os.getpid():
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    finally:
+        drop_alarm_gate(gp)
 
 
 def opencode_session_exists(sid):

@@ -199,6 +199,9 @@ class AlarmScheduler(unittest.TestCase):
     def lock_path(self, session='ses_live'):
         return self.alarm_path(session).with_suffix('.json.lock')
 
+    def gate_path(self, session='ses_live'):
+        return self.alarm_path(session).with_suffix('.json.lock.gate')
+
     def test_postman_skips_while_another_writer_holds_the_lock(self):
         rec = self.put_alarm()
         self.lock_path().write_text('99999 somebody\n', encoding='utf-8')
@@ -285,41 +288,73 @@ class AlarmScheduler(unittest.TestCase):
         self.run_postman()
         self.assertEqual(len(self.inbox()), 1, '锁机制生效后闹钟照常只响一次')
 
-    def test_reclaim_only_targets_the_verified_stale_lock_instance(self):
-        """TOCTOU 定向复现：验证旧锁之后、删除之前，锁被别人换成了新的。
+    def test_no_other_writer_can_get_in_while_a_reclaim_decides(self):
+        """回收者判定「这把锁崩了、可以删」的同一时刻，别人既不能建新锁也不能删锁。
 
-        这里用一个受控的 _lock_info 包装把「替换」钉在第一次 stat 之后那一步：
-        我们第一次看到的是那把陈旧锁，紧接着盘上的锁就被换成一把刚建的新锁。
-        正确实现必须发现 (dev, ino, mtime) 对不上而放弃删除；只看 mtime 的旧实现会把新锁删掉。
+        门（<lock>.gate）就是这个临界区：建锁、回收、释放都走它。所以把「判定」和「删除」
+        之间的窗口打开时，别人的 take 必须失败——只可能有一个写者，那把锁也不该被删掉。
         """
         self.put_alarm()
         p = self.alarm_path()
         lock = self.lock_path()
+        gate = self.gate_path()
         lock.write_text('999999 已崩掉的进程\n', encoding='utf-8')
         old = time.time() - 3600
         os.utime(lock, (old, old))
         mod = _locks()
         real = mod._lock_info
-        swapped = [False]
+        tried = []
 
         def fake(q):
-            st = real(q)
-            if st is None or swapped[0] or Path(q) != lock:
-                return st
-            swapped[0] = True
-            # 模拟另一个进程先回收了旧锁、随后建起一把新锁
-            lock.write_text(f'{os.getpid()} {int(time.time())}\n', encoding='utf-8')
-            fresh = real(q)
-            # 但我们这一轮「看到」的仍是那把陈旧锁
-            return (fresh[0], fresh[1], old, time.time() - old)
+            info = real(q)
+            # 回收者已经拿到门、也判定完，正要 unlink：这一刻别人来抢锁
+            if info is not None and Path(q) == lock and not tried:
+                tried.append(True)
+                self.assertFalse(mod.take_alarm_lock(p), '门被占用时不得让第二个人以为自己也持锁')
+                self.assertEqual(self.read_alarm()['state'], 'pending', '记录没被动')
+            return info
 
         mod._lock_info = fake
         try:
-            self.assertFalse(mod.try_reap_alarm_lock(p), '身份对不上时这一轮必须放弃回收')
+            self.assertTrue(mod.try_reap_alarm_lock(p), '陈旧锁应当被回收')
         finally:
             mod._lock_info = real
-        self.assertTrue(lock.exists(), '不得删掉别人的新锁')
-        self.assertEqual(self.read_alarm()['state'], 'pending', '记录没被动')
+        self.assertTrue(tried, '用例必须在回收窗口里真的试过一次抢锁')
+        self.assertFalse(lock.exists(), '那把崩掉的锁已被回收')
+        self.assertFalse(gate.exists(), '门用完要放掉，不能留成新的卡点')
+
+    def test_a_held_gate_admits_only_one_reaper(self):
+        """回收门自己也要互斥：门被一个活着的进程占着时，第二个回收者进不去。"""
+        self.put_alarm()
+        p = self.alarm_path()
+        lock = self.lock_path()
+        gate = self.gate_path()
+        mod = _locks()
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        self.assertTrue(mod.take_alarm_gate(gate), '先拿到门')
+        lock.write_text('999999 已崩掉的进程\n', encoding='utf-8')
+        old = time.time() - 3600
+        os.utime(lock, (old, old))
+        self.assertFalse(mod.try_reap_alarm_lock(p), '门被占时第二个回收者必须让开')
+        self.assertTrue(lock.exists(), '陈旧锁还在，等门空出来再回收')
+        self.assertFalse(mod.take_alarm_gate(gate), '门也不会有两个持有者')
+        mod.drop_alarm_gate(gate)
+        self.assertFalse(gate.exists(), '门放掉了')
+        self.assertTrue(mod.try_reap_alarm_lock(p), '门空出来之后才能回收')
+
+    def test_release_never_removes_a_lock_it_does_not_hold(self):
+        """释放只删「锁文件里写着自己 pid」的那一把，免得把别人的新锁顺手删掉。"""
+        self.put_alarm()
+        p = self.alarm_path()
+        lock = self.lock_path()
+        self.assertTrue(take_lock(p), '先拿到锁')
+        lock.write_text(f'{os.getpid() + 1} {int(time.time())}\n', encoding='utf-8')  # 换成别人的 pid
+        mod = _locks()
+        mod.release_alarm_lock(p)
+        self.assertTrue(lock.exists(), '不是自己的锁就不能删')
+        lock.write_text(f'{os.getpid()} {int(time.time())}\n', encoding='utf-8')
+        mod.release_alarm_lock(p)
+        self.assertFalse(lock.exists(), '自己的锁才删')
 
     def test_soft_timeout_alone_does_not_break_a_live_lock(self):
         """单凭 mtime 超时不够：持锁进程还活着时不得回收（这是原来那个 TOCTOU 的另一半）。"""

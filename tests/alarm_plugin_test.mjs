@@ -22,6 +22,7 @@ const FIXED = '你设的闹钟到了，请检查刚才安排的任务。'
 const LIVE = 'ses_live_alarm'
 const LIVE2 = 'ses_live_alarm_2'
 const LIVE3 = 'ses_live_alarm_3'
+const LIVE4 = 'ses_live_alarm_4'
 const OTHER = 'ses_someone_else'
 const DIR_OK = join(root, 'proj')
 
@@ -57,11 +58,13 @@ const state = {
     quiet: { methods: ['notify'], session_id: 'ses_notify_only', status: 'online' },
     // 混批用例专用：再给一个信箱，避开前面用例用掉的 10 分钟限流窗口
     lab3: { methods: ['opencode_plugin'], session_id: LIVE3, status: 'online' },
+    // lettered 缺字段的用例专用：再一个独立信箱，避开前面的限流窗口
+    lab4: { methods: ['opencode_plugin'], session_id: LIVE4, status: 'online' },
   },
   busy: new Set(),
   prompts: [],
   failNext: false,
-  sessionDirs: { [LIVE]: DIR_OK, [LIVE2]: DIR_OK, [LIVE3]: DIR_OK, [OTHER]: DIR_OK, ses_notify_only: DIR_OK },
+  sessionDirs: { [LIVE]: DIR_OK, [LIVE2]: DIR_OK, [LIVE3]: DIR_OK, [LIVE4]: DIR_OK, [OTHER]: DIR_OK, ses_notify_only: DIR_OK },
   getFails: false,
 }
 const saveRoutes = async () => writeFile(join(root, 'routes.json'), JSON.stringify(state.routes))
@@ -637,6 +640,25 @@ await t('残留的投递认领不会让已撤回的信被重投', async () => {
   await plugin.event({ event: { type: 'session.idle' } })
   await settle()
   assert.equal(state.prompts.length, before, '没有信就没有投递')
+})
+
+await t('记录已是 lettered 但缺少 letter 字段时不走短通道', async () => {
+  // postman 写 lettered 时总会记 letter=id；缺这个字段说明记录不完整，
+  // 不能因为「看编号对得上」就当成已响的闹钟。
+  await cancel()
+  const { id } = await armLive('lab4', LIVE4, 30)
+  const f = alarmFile(LIVE4)
+  const rec = JSON.parse(await readFile(f, 'utf8'))
+  rec.state = 'lettered'
+  delete rec.letter
+  await writeFile(f, JSON.stringify(rec))
+  await putLetter('lab4', `${id}.md`, alarmLetter(id))
+  state.prompts.length = 0
+  await plugin.event({ event: { type: 'session.idle' } })
+  await settle()
+  assert.equal(state.prompts.length, 1, '一封都该投')
+  assert.ok(!state.prompts[0].body.parts[0].text.includes(FIXED), '缺 letter 字段就该按普通正式信渲染')
+  await cancel()
 })
 
 await plugin.dispose()
