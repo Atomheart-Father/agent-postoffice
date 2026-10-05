@@ -26,7 +26,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -90,6 +90,38 @@ def online(route):
 def pending(name):
     inbox = HOME / name / "inbox"
     return sorted(inbox.glob("*.md")) if inbox.is_dir() else []
+
+
+def claims_dir(name):
+    return HOME / name / ".claims"
+
+
+def claim_letter(name, path):
+    """Mark a letter as claimed for delivery, in the same directory and by the same rule the OpenCode
+    plugin already uses. Every delivery entry takes one before it commits to waking somebody, so
+    `postoffice retract` can refuse a letter that is on its way out. False when somebody holds it."""
+    d = claims_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(d / path.name), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, f"{os.getpid()}\n".encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+def release_claim(name, path):
+    try:
+        claims_dir(name).joinpath(path.name).unlink()
+    except OSError:
+        pass
+
+
+def claimed(name, path):
+    return claims_dir(name).joinpath(path.name).exists()
 
 
 def header(path, n=3):
@@ -1159,6 +1191,89 @@ def cmd_archive_receipt(a):
     return 0
 
 
+def retract_refused_reason(name, path, method):
+    """Why this letter can no longer be pulled back, or "" when the channel has not taken it yet.
+
+    Each channel is judged by its own record, never by another channel's idea of "delivered": the
+    shared claim file the OpenCode plugin, the hook and the postman all take before waking somebody,
+    plus that channel's own ledger. An unknown channel has no record we can trust, so it fails closed.
+    """
+    if claimed(name, path):
+        return "投递进行中（已有投递认领）"
+    if method == "opencode_plugin":
+        ledger = HOME / "opencode_delivered.jsonl"
+        if ledger.exists():
+            for line in ledger.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("box") == name and e.get("file") == path.name \
+                        and e.get("result") in ("DELIVERED", "FAILED_FINAL"):
+                    return f"已送达（插件台账 {e.get('result')}）"
+        return ""
+    if method == "claude_hook":
+        if str(path) in read_lines(HOME / name / ".seen"):
+            return "已送达（Claude 钩子 .seen 已记录）"
+        return ""
+    if method in ("codex_queue", "notify"):
+        woken = read_json(HOME / ".woken.json")
+        if isinstance(woken, dict) and str(path) in woken:
+            return f"已送达（邮递员接受记录 {method}）"
+        return ""
+    return f"无法核实该通道（{method}）是否已接受，fail closed 不撤回"
+
+
+def cmd_retract(a):
+    """Pull back one ordinary letter that its recipient's channel has not accepted yet.
+
+    First release only: `ack` receipts, broadcast copies, handover notes and alarm letters are all
+    derived notices and are refused here -- they belong to whoever asked for them, not to the sender
+    of the letter they point at. The ID is exact (no path, no glob, no prefix), the letter's 来源 must
+    be the box the caller named, and it has to sit in that box's inbox/ right now. Anything the
+    recipient's channel may already have handed over is refused instead of moved, so a retraction can
+    never race a wake-up into "retracted but still delivered". Nothing is written, no notice goes out,
+    the body is untouched, and no correction is sent for you.
+    """
+    routes = boxes(load_routes())
+    if a.to not in routes:
+        sys.exit(f"没有信箱 {a.to}（收件方）；`postoffice list` 看通讯录")
+    if not a.id or any(c in a.id for c in "/\\*?[]") or a.id.startswith("."):
+        sys.exit(f"撤回只接受完整信件编号，不接受路径、通配符或前缀：{a.id!r}")
+    if a.id.endswith(".md"):
+        sys.exit(f"信件编号是文件名去掉 .md，不要带后缀：{a.id!r}")
+    inbox = HOME / a.to / "inbox"
+    path = inbox / f"{a.id}.md"
+    if not inbox.is_dir() or not path.is_file():
+        sys.exit(f"{a.to} 的 inbox/ 里没有编号为 {a.id} 的信；撤回只处理仍在收件方 inbox/ 的信"
+                 f"（已送达、已归档或在别处的都不归它管）")
+    derived = [k for k in ("回执：", "广播：", "闹钟：", "切换事件：") if header_field_present(path, k)]
+    if derived or letter_sender(path) == "postoffice":
+        sys.exit(f"{a.id} 不是普通直发信（信头含 {'、'.join(derived) or '系统来信'}），撤回只用于普通 send 的信")
+    if a.sender not in routes:
+        sys.exit(f"没有信箱 {a.sender}（发信方）；`postoffice list` 看通讯录")
+    sender = letter_sender(path)
+    if sender != a.sender:
+        sys.exit(f"信 {a.id} 的来源是 {sender or '（读不出来）'}，不是你指定的 {a.sender}；不撤回别人的信")
+    method = routes[a.to].get("methods", ["notify"])[0]
+    why = retract_refused_reason(a.to, path, method)
+    if why:
+        sys.exit(f"{a.id} {why}，无法撤回；原信留在 {path}。"
+                 f"要更正就另发一封修正信，不要假装这封没发过")
+    dst_dir = HOME / a.to / "archived" / time.strftime("%Y%m%d-%H%M%S")
+    dst = dst_dir / path.name
+    if dst.exists():
+        sys.exit(f"归档里已有同名文件，未撤回（{dst}）；请人工处理")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    path.replace(dst)
+    log("postman.log", f"撤回 {a.sender} → {a.to} {a.id}：通道 {method} 未接受，原信存档到 {dst}")
+    print(f"已撤回 {a.id}")
+    print(f"原信原样存档到 {dst}（正文未改，没有写任何通知，也没有替你补发修正）")
+    print(f"核实依据：{a.to} 走 {method} 通道，投递认领为空、该通道的送达记录里没有这封信")
+    print("收件方没有被提醒过。如果对方已从别的途径得知内容，要不要另发修正由你决定")
+    return 0
+
+
 def post_broadcast(sender, to, subject, need, body, secs, bid=None, only=None, done_set=None):
     """Create the broadcast record and drop one letter per recipient. Returns (bid, [(name, path)]).
 
@@ -1938,6 +2053,8 @@ def cmd_hook(_a):
             new = [p for p in pending(name) if str(p) not in seen]
             if new:
                 if rate_ok(name):
+                    for p in new:
+                        claim_letter(name, p)   # committed to this wake: `retract` must refuse it now
                     sys.stderr.write(reminder(name, new) + "\n")
                     with seenf.open("a") as f:
                         f.writelines(f"{p}\n" for p in new)
@@ -2069,6 +2186,8 @@ def cmd_postman(_a):
                 group = ([letter] if letter else []) + due
                 names = " ".join(p.name for p in group)
                 sig = f"{name}::" + "|".join(p.name for p in group)
+                for p in group:
+                    claim_letter(name, p)       # committed to this wake: `retract` must refuse it now
                 ok = True
                 try:
                     if method == "codex_queue":
@@ -2088,6 +2207,8 @@ def cmd_postman(_a):
                 if not ok:
                     # nothing in the batch is marked delivered, so every ID stays eligible for retry;
                     # tell the human once per batch signature (no rate tick, nothing was woken)
+                    for p in group:
+                        release_claim(name, p)   # nobody was woken, so let it be claimed again
                     if sig not in failed_batches:
                         failed_batches.add(sig)
                         notify("联络总站：投递失败", f"{name} {names}，将重试")
@@ -2650,6 +2771,11 @@ def main():
     p.add_argument("name")
     p.add_argument("id", metavar="回执ID")
     p.set_defaults(fn=cmd_archive_receipt)
+    p = sp.add_parser("retract", help="撤回一封还没被收件方通道接受的普通信（原样存档，不改正文、不通知、不补发）")
+    p.add_argument("sender", help="发信信箱，必须与信件信头的来源一致")
+    p.add_argument("to", help="收件信箱")
+    p.add_argument("id", metavar="信件编号", help="完整编号（文件名去掉 .md）；不接受路径、通配符或前缀")
+    p.set_defaults(fn=cmd_retract)
     p = sp.add_parser("broadcast", help="广播：给多个信箱各投一封带编号的信，回执汇总成一封给发信方")
     p.add_argument("to", help="收件信箱，逗号分隔；all = 除发信方外全部")
     p.add_argument("sender")

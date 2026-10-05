@@ -111,14 +111,22 @@ const readLedger = async () => {
   return { done, failed }
 }
 
-// 认领：多个 OpenCode 实例同时运行时，只有抢到认领文件的那个投递
+// 认领：多个 OpenCode 实例同时运行时，只有抢到认领文件的那个投递。
+// 抢到之后立刻确认信还在 inbox/ 里：`postoffice retract` 会把还没被接受的信原样挪进 archived/，
+// 若它恰好在「列出待投」与「抢到认领」之间撤回，这里放掉认领并跳过，不投递一封已经不在的信。
 const claim = async (box: string, file: string) => {
   try {
     await mkdir(`${ROOT}/${box}/.claims`, { recursive: true })
     const fh = await open(`${ROOT}/${box}/.claims/${file}`, "wx")
     await fh.close()
+  } catch {
+    return false
+  }
+  try {
+    await stat(`${ROOT}/${box}/inbox/${file}`)
     return true
   } catch {
+    await rm(`${ROOT}/${box}/.claims/${file}`, { force: true })
     return false
   }
 }

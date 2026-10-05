@@ -610,5 +610,34 @@ await t('闹钟记录文件权限收紧（0600）', async () => {
   await cancel()
 })
 
+await t('撤回后的信只在 archived/ 里，插件不会再投它', async () => {
+  // postoffice retract 把还没被接受的信原样挪进 archived/。收件箱里已经没有它了，
+  // 投递路径不该再把它投出去，也不该留下一条 DELIVERED 台账。
+  // （投递认领内部的 stat 复查属于兜底：认领之后、stat 之前被撤回的那个窗口从测试里造不出来，
+  //   这里只覆盖可复现的那一半。）
+  await cancel()
+  await mkdir(join(root, 'lab', 'archived', '20260101-000000'), { recursive: true })
+  const gone = '20260101-000000_boss_已撤回.md'
+  await writeFile(join(root, 'lab', 'archived', '20260101-000000', gone),
+    '来源：boss\n事由：已撤回\n需要：回复\n\n正文。\n')
+  const before = state.prompts.length
+  await plugin.event({ event: { type: 'session.idle' } })
+  await settle()
+  assert.equal(state.prompts.length, before, '一封都不该投递')
+  const ledger = await readFile(join(root, 'opencode_delivered.jsonl'), 'utf8').catch(() => '')
+  assert.ok(!ledger.includes(gone), '台账里不该出现这封信')
+})
+
+await t('残留的投递认领不会让已撤回的信被重投', async () => {
+  await cancel()
+  const gone = '20260101-000001_boss_已撤回二.md'
+  await mkdir(join(root, 'lab', '.claims'), { recursive: true })
+  await writeFile(join(root, 'lab', '.claims', gone), '999\n')
+  const before = state.prompts.length
+  await plugin.event({ event: { type: 'session.idle' } })
+  await settle()
+  assert.equal(state.prompts.length, before, '没有信就没有投递')
+})
+
 await plugin.dispose()
 console.log(process.exitCode ? 'FAIL' : `PASS (${n} checks)`)
