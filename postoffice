@@ -525,20 +525,34 @@ def cmd_receipt(a):
 
 
 def cmd_archive_receipt(a):
-    """Move this box's receipt notification(s) for exactly <id> from inbox to done.
+    """File this box's receipt notification(s) for exactly <id> into done/.
 
-    Matches the `回执：<id>` header only (never the body), moves nothing else, and is idempotent.
-    It never reads the receipt body, never touches the ledger, and never sends or wakes anyone.
-    Undelivered notifications are never archived for you: the id is only known from the reminder."""
+    Only runs when the caller passes the ID; it never auto-archives. Matches the `回执：<id>`
+    header block only (never body text). It never reads the receipt body, never touches the ledger,
+    and never sends or wakes anyone. An existing file in done/ is never overwritten: a name clash is
+    reported and the notification is left in inbox/."""
     routes = boxes(load_routes())
     if a.name not in routes:
         sys.exit(f"没有信箱 {a.name}；`postoffice list` 看通讯录")
     inbox = HOME / a.name / "inbox"
+    done = HOME / a.name / "done"
     matches = sorted(p for p in inbox.glob("*.md") if receipt_query_id(p) == a.id) if inbox.is_dir() else []
+    moved = conflicts = 0
     for p in matches:
-        to_done(p)
-    print(f"已归档 {len(matches)} 封回执通知（{a.id}）" if matches
-          else f"没有待归档的回执通知（{a.id}）")
+        dst = done / p.name
+        if dst.exists():
+            conflicts += 1
+            continue
+        done.mkdir(parents=True, exist_ok=True)
+        p.replace(dst)
+        moved += 1
+    if not matches:
+        print(f"没有待归档的回执通知（{a.id}）")
+    else:
+        parts = [f"已归档 {moved} 封回执通知（{a.id}）"]
+        if conflicts:
+            parts.append(f"{conflicts} 封因 done/ 已有同名文件未动，保留在 inbox")
+        print("；".join(parts))
     return 0
 
 
