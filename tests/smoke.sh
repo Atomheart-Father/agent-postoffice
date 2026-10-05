@@ -73,13 +73,20 @@ bob_before=$(ls "$POSTOFFICE_HOME/bob/inbox/"*.md 2>/dev/null | wc -l | tr -d ' 
 out=$(echo "正文" | "$PO" send alice bob "需要回执的信" "回复")
 lid=$(printf '%s\n' "$out" | awk -F'：' '/^编号/{print $2}')
 [ -n "$lid" ] && ok "send 打印信件编号" || bad "send 编号"
-"$PO" ack alice "$lid" "收到" >/dev/null && ok "ack 普通信记账" || bad "ack 普通信"
+"$PO" ack alice "$lid" "配置已核验OK" >/dev/null && ok "ack 普通信记账" || bad "ack 普通信"
 grep -q "\"id\": \"$lid\"" "$POSTOFFICE_HOME/acks.jsonl" && grep -q "\"to\": \"bob\"" "$POSTOFFICE_HOME/acks.jsonl" \
   && ok "ack 账目含编号与发信方" || bad "ack 账目"
 [ ! -e "$POSTOFFICE_HOME/alice/inbox/$lid.md" ] && [ -e "$POSTOFFICE_HOME/alice/done/$lid.md" ] \
   && ok "ack 把信挪到 done" || bad "ack 挪信"
 bob_after=$(ls "$POSTOFFICE_HOME/bob/inbox/"*.md 2>/dev/null | wc -l | tr -d ' ')
 [ "$bob_after" -eq "$((bob_before+1))" ] && ok "ack 产生一封无需答复的回执通知" || bad "ack 回执通知"
+"$PO" receipt bob "$lid" 2>/dev/null | grep -q "配置已核验OK" \
+  && ok "receipt 按 ID 返回回执正文" || bad "receipt 查询"
+rfile=$(grep -l "^回执：$lid$" "$POSTOFFICE_HOME/bob/inbox/"*.md 2>/dev/null | head -1)
+[ -n "$rfile" ] && ! grep -q "配置已核验OK" "$rfile" \
+  && ok "回执通知不含正文（按需查询）" || bad "回执通知夹带正文"
+"$PO" receipt bob "19000101-000000_nobody_无此信" >/dev/null 2>&1 \
+  && bad "receipt 未知 ID 应报错" || ok "receipt 未知 ID 报错"
 
 # 2. ack --wake：原发信方 inbox 多一封 copy that
 out=$(echo "正文" | "$PO" send alice bob "需要回执的信2" "回复")
@@ -127,8 +134,10 @@ POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/de
 sum=$(grep -l "广播汇总" "$POSTOFFICE_HOME/alice/inbox/"*.md 2>/dev/null | wc -l | tr -d ' ')
 [ "$sum" -eq 1 ] && ok "全员 ack 后发信方收到恰好一封汇总" || bad "汇总封数 sum=$sum"
 sf=$(grep -l "广播汇总" "$POSTOFFICE_HOME/alice/inbox/"*.md 2>/dev/null)
-grep -q "已回执 3/3" $sf && grep -q "收到一号" $sf && grep -q "收到三号" $sf \
-  && ok "汇总内容含全员与各自的一句话" || bad "汇总内容"
+grep -q "已回执 3/3" $sf && grep -q "postoffice receipt alice $bid" $sf && ! grep -q "收到一号" $sf \
+  && ok "汇总只给人数与查询命令、不含各自的一句话" || bad "汇总内容"
+"$PO" receipt alice "$bid" 2>/dev/null | grep -q "收到一号" \
+  && ok "receipt 按广播 ID 返回各人一句话" || bad "广播 receipt"
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null
 [ "$(grep -l "广播汇总" "$POSTOFFICE_HOME/alice/inbox/"*.md 2>/dev/null | wc -l | tr -d ' ')" -eq 1 ] \
   && ok "邮递员重启不重复汇总" || bad "重复汇总"
@@ -140,8 +149,10 @@ bid2=$(printf '%s\n' "$out" | awk -F'：' '/^广播编号/{print $2}')
 sleep 2
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null
 s2=$(grep -l "广播汇总" "$POSTOFFICE_HOME/bob/inbox/"*.md 2>/dev/null)
-grep -q "dave：我回了" $s2 && grep -q "erin：未回执" $s2 \
-  && ok "截止后汇总列出已回执与未回执" || bad "截止汇总内容"
+grep -q "未回执：erin（离线）" $s2 && grep -q "postoffice receipt bob $bid2" $s2 && ! grep -q "我回了" $s2 \
+  && ok "截止后汇总只给未回执与查询命令、不含回执正文" || bad "截止汇总内容"
+"$PO" receipt bob "$bid2" 2>/dev/null | grep -q "我回了" \
+  && ok "receipt 返回截止广播的回执正文" || bad "截止广播 receipt"
 
 # 7. 发信方校验 + 坏广播记录不能搞挂邮递员（审核退回的必修 bug）
 before_bc=$(ls "$POSTOFFICE_HOME/broadcasts/"*.json 2>/dev/null | wc -l | tr -d ' ')
