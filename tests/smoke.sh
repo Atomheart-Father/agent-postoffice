@@ -1,13 +1,33 @@
 #!/bin/bash
 # 冒烟测试：全部在临时目录里跑，不碰真实的 ~/.claude、~/agent-postoffice。
 set -u
+# 与运行环境的 Claude 桌面变量隔离：认人只认用例显式设置的值，
+# 否则在 Claude 桌面会话里跑会被真实身份带偏（认错信箱后干等）。
+unset CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_HOST_SESSION_ID
 PO="$(cd "$(dirname "$0")/.." && pwd)/postoffice"
 T=$(mktemp -d); export HOME="$T" POSTOFFICE_HOME="$T/po" POSTOFFICE_NO_NOTIFY=1
+trap 'kill ${P:-} ${P2:-} ${PM:-} 2>/dev/null' EXIT
 pass=0; fail=0
 ok()  { echo "✅ $1"; pass=$((pass+1)); }
 bad() { echo "❌ $1"; fail=$((fail+1)); }
 hook_in() { echo "{\"transcript_path\":\"$T/$1.jsonl\"}"; }
 hook_cli() { printf '{"transcript_path":"%s/%s.jsonl","session_id":"%s"}' "$T" "$1" "$2"; }
+# 带超时的钩子调用：hook_run [-- env 参数或 VAR=VAL ...] 命令 参数…
+# stdin 收 payload，stdout 回命令输出，退出码即命令退出码；超时则杀掉并返回 124
+# —— 测试只会失败，不会挂死。
+HOOK_WAIT=${POSTOFFICE_TEST_HOOK_WAIT:-25}
+hook_run() {
+  local envs=()
+  while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+  shift 2>/dev/null || true
+  cat > "$T/.hook_in"
+  env ${envs[@]+"${envs[@]}"} "$@" < "$T/.hook_in" > "$T/.hook_out" 2>&1 &
+  local pid=$! i=0 rc=0
+  while kill -0 $pid 2>/dev/null && [ $i -lt "$HOOK_WAIT" ]; do sleep 1; i=$((i+1)); done
+  if kill -0 $pid 2>/dev/null; then kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; rc=124
+  else wait $pid; rc=$?; fi
+  cat "$T/.hook_out"; return $rc
+}
 route_field() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]].get(sys.argv[3],''))" "$POSTOFFICE_HOME/routes.json" "$1" "$2"; }
 route_set() { python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r[sys.argv[2]][sys.argv[3]]=sys.argv[4];json.dump(r,open(p,'w'))" "$POSTOFFICE_HOME/routes.json" "$1" "$2" "$3"; }
 echo '{"type":"custom-title","customTitle":"会话A"}' > "$T/a.jsonl"
@@ -16,11 +36,13 @@ echo '{"type":"custom-title","customTitle":"陌生会话"}' > "$T/x.jsonl"
 "$PO" init >/dev/null
 "$PO" add alice --claude "会话A" --who "测试A" >/dev/null && ok "登记 Claude 信箱" || bad "登记 Claude 信箱"
 "$PO" add bob --notify >/dev/null && ok "登记通知信箱" || bad "登记通知信箱"
+{ [ -z "${CLAUDE_CODE_ENTRYPOINT+x}" ] && [ -z "${CLAUDE_CODE_HOST_SESSION_ID+x}" ]; } \
+  && ok "测试环境已清掉 Claude 桌面变量（认人用例自己设置）" || bad "桌面变量仍在，认人用例会跑偏"
 
 echo "正文" | "$PO" send alice bob "这是一个很长很长很长的中文事由，包含/斜杠:冒号" "仅告知" >/dev/null
 ls "$POSTOFFICE_HOME/alice/inbox/"*.md >/dev/null 2>&1 && ok "发信（长中文事由）" || bad "发信"
 
-out=$(hook_in a | "$PO" hook 2>&1); rc=$?
+out=$(hook_in a | hook_run "$PO" hook); rc=$?
 [ $rc -eq 2 ] && echo "$out" | grep -q "事由：这是一个" && ok "钩子唤醒并带开头三行" || bad "钩子唤醒 rc=$rc"
 
 hook_in a | "$PO" hook 2>/dev/null & P=$!; sleep 12
@@ -29,7 +51,7 @@ hook_in a | "$PO" hook 2>/dev/null & P2=$!; sleep 2
 kill -0 $P 2>/dev/null && bad "旧监视未退场" || ok "新监视接班旧监视"
 kill $P2 2>/dev/null; wait 2>/dev/null
 
-[ $(hook_in x | "$PO" hook; echo $?) -eq 0 ] && ok "未登记会话直接退出" || bad "未登记会话"
+[ $(hook_in x | hook_run "$PO" hook; echo $?) -eq 0 ] && ok "未登记会话直接退出" || bad "未登记会话"
 
 "$PO" offline alice >/dev/null
 echo "离线期间的信" | "$PO" send alice bob "离线测试" "仅告知" >/dev/null
@@ -37,6 +59,7 @@ hook_in a | "$PO" hook 2>"$T/off.err" & P=$!; sleep 12
 kill -0 $P 2>/dev/null && ok "离线时不唤醒" || bad "离线时被唤醒"
 "$PO" online alice >/dev/null; sleep 12
 kill -0 $P 2>/dev/null && bad "上线后没补送" || { grep -q "离线测试" "$T/off.err" && ok "上线后补送" || bad "补送内容不对"; }
+kill -9 $P 2>/dev/null; wait $P 2>/dev/null; P=""
 
 mkdir -p "$T/.claude"; echo '{"theme":"dark","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo other"}]}]}}' > "$T/.claude/settings.json"
 "$PO" install claude >/dev/null; "$PO" install claude >/dev/null
@@ -188,7 +211,7 @@ mkcap() { printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$1" > "$2"; chmod 
 mkfail() { printf '#!/bin/sh\nexit 1\n' > "$1"; chmod +x "$1"; }
 clog() { printf '%s Mapping internal session %s to CLI session %s\n' "$1" "$2" "$3" >> "$T/main.log"; }
 titleonly() { printf '{"transcript_path":"%s/%s.jsonl"}' "$T" "$1"; }
-DHD() { env CLAUDE_CODE_ENTRYPOINT=claude-desktop POSTOFFICE_CLAUDE_MAINLOG="$T/main.log" "$@"; }
+DHD() { hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop POSTOFFICE_CLAUDE_MAINLOG="$T/main.log" -- "$@"; }
 
 # 1) 桌面版无 HOST：按 main.log 反查身份；首次标题匹配自动绑定；改名后仍认人并更新标题
 : > "$T/main.log"
@@ -196,12 +219,12 @@ clog "2026-10-05 02:00:01" local_L1 cli-L1
 printf '{"type":"custom-title","customTitle":"稳定会话"}\n' > "$T/s1.jsonl"
 "$PO" add sbox --claude "稳定会话" >/dev/null
 echo "正文" | "$PO" send sbox tester "首信" "回复" >/dev/null
-out=$(hook_cli s1 cli-L1 | DHD "$PO" hook 2>&1); rc=$?
+out=$(hook_cli s1 cli-L1 | DHD "$PO" hook); rc=$?
 [ $rc -eq 2 ] && printf '%s' "$out" | grep -q "【联络总站新信" && ok "v1.6 桌面日志反查身份并唤醒" || bad "v1.6 日志认人 rc=$rc"
 [ "$(route_field sbox claude_session)" = "local_L1" ] && ok "v1.6 首次标题匹配自动绑定身份" || bad "v1.6 自动绑定"
 printf '{"type":"custom-title","customTitle":"改过的名字"}\n' > "$T/s1.jsonl"
 echo "正文" | "$PO" send sbox tester "改名后" "回复" >/dev/null
-out=$(hook_cli s1 cli-L1 | DHD "$PO" hook 2>&1); rc=$?
+out=$(hook_cli s1 cli-L1 | DHD "$PO" hook); rc=$?
 [ $rc -eq 2 ] && ok "v1.6 会话改名后仍按身份认人" || bad "v1.6 改名后认人 rc=$rc"
 [ "$(route_field sbox claude_title)" = "改过的名字" ] && ok "v1.6 认人时顺手更新标题" || bad "v1.6 更新标题"
 
@@ -209,14 +232,14 @@ out=$(hook_cli s1 cli-L1 | DHD "$PO" hook 2>&1); rc=$?
 clog "2026-10-05 02:05:00" local_L1 cli-L2
 printf '{"type":"custom-title","customTitle":"回退后"}\n' > "$T/s1.jsonl"
 echo "正文" | "$PO" send sbox tester "回退后" "回复" >/dev/null
-out=$(hook_cli s1 cli-L2 | DHD "$PO" hook 2>&1); rc=$?
+out=$(hook_cli s1 cli-L2 | DHD "$PO" hook); rc=$?
 [ $rc -eq 2 ] && ok "v1.6 回退换了 CLI id 照样认人" || bad "v1.6 回退认人 rc=$rc"
 clog "2026-10-05 01:00:00" local_OLD cli-L3
 clog "2026-10-05 03:00:00" local_NEW cli-L3
 printf '{"type":"custom-title","customTitle":"时间戳会话"}\n' > "$T/s3.jsonl"
 "$PO" add tbox --claude "时间戳会话" >/dev/null
 echo "正文" | "$PO" send tbox tester "时间戳" "回复" >/dev/null
-out=$(hook_cli s3 cli-L3 | DHD "$PO" hook 2>&1); rc=$?
+out=$(hook_cli s3 cli-L3 | DHD "$PO" hook); rc=$?
 [ $rc -eq 2 ] && [ "$(route_field tbox claude_session)" = "local_NEW" ] \
   && ok "v1.6 多个映射取最新行内时间戳" || bad "v1.6 时间戳映射=$(route_field tbox claude_session)"
 
@@ -224,19 +247,19 @@ out=$(hook_cli s3 cli-L3 | DHD "$PO" hook 2>&1); rc=$?
 printf '{"type":"custom-title","customTitle":"主机会话"}\n' > "$T/h.jsonl"
 "$PO" add hostbox --claude "主机会话" >/dev/null
 echo "正文" | "$PO" send hostbox tester "主机信" "回复" >/dev/null
-out=$(hook_cli h cli-ignored | env CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_HOST "$PO" hook 2>&1); rc=$?
+out=$(hook_cli h cli-ignored | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_HOST -- "$PO" hook); rc=$?
 [ $rc -eq 2 ] && [ "$(route_field hostbox claude_session)" = "local_HOST" ] \
   && ok "v1.6 优先用 HOST_SESSION_ID 绑定" || bad "v1.6 HOST 绑定 rc=$rc"
 printf '{"type":"custom-title","customTitle":"改个名"}\n' > "$T/h.jsonl"
 echo "正文" | "$PO" send hostbox tester "主机信2" "回复" >/dev/null
-out=$(hook_cli h whatever | env CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_HOST "$PO" hook 2>&1); rc=$?
+out=$(hook_cli h whatever | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_HOST -- "$PO" hook); rc=$?
 [ $rc -eq 2 ] && ok "v1.6 HOST 身份改名后仍认人" || bad "v1.6 HOST 改名 rc=$rc"
 
 # 4) 无映射：桌面版退回标题匹配（未绑定信箱），不臆造绑定，钩子不报错
 printf '{"type":"custom-title","customTitle":"无日志会话"}\n' > "$T/nl.jsonl"
 "$PO" add nolog --claude "无日志会话" >/dev/null
 echo "正文" | "$PO" send nolog tester "无日志" "回复" >/dev/null
-out=$(hook_cli nl cli-NL | env CLAUDE_CODE_ENTRYPOINT=claude-desktop POSTOFFICE_CLAUDE_MAINLOG="$T/nope.log" "$PO" hook 2>&1); rc=$?
+out=$(hook_cli nl cli-NL | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop POSTOFFICE_CLAUDE_MAINLOG="$T/nope.log" -- "$PO" hook); rc=$?
 [ $rc -eq 2 ] && ok "v1.6 日志缺失退回标题匹配" || bad "v1.6 日志缺失 rc=$rc"
 [ -z "$(route_field nolog claude_session)" ] && ok "v1.6 退回标题匹配不臆造绑定" || bad "v1.6 误绑定"
 
@@ -245,24 +268,24 @@ rm -f "$POSTOFFICE_HOME/logs/notify.log"
 "$PO" add twin --claude "撞名标题" >/dev/null; route_set twin claude_session local_TAKEN
 printf '{"type":"custom-title","customTitle":"撞名标题"}\n' > "$T/tw.jsonl"
 echo "正文" | "$PO" send twin tester "撞名信" "回复" >/dev/null
-out=$(hook_cli tw x | env CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_FRESH "$PO" hook 2>&1); rc=$?
+out=$(hook_cli tw x | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_FRESH -- "$PO" hook); rc=$?
 [ $rc -eq 0 ] && ok "v1.6 同名不同身份不接管" || bad "v1.6 撞名接管 rc=$rc"
-hook_cli tw x | env CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_FRESH "$PO" hook >/dev/null 2>&1
+hook_cli tw x | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_FRESH -- "$PO" hook >/dev/null 2>&1
 [ "$(grep -c "会话认人诊断" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null)" = "1" ] && ok "v1.6 同名只诊断一次" || bad "v1.6 同名重复诊断"
 "$PO" add dupa --claude "绑定甲" >/dev/null; route_set dupa claude_session local_DUP
 "$PO" add dupb --claude "绑定乙" >/dev/null; route_set dupb claude_session local_DUP
 echo "正文" | "$PO" send dupa tester "多重绑定信" "回复" >/dev/null
-out=$(hook_cli tw x | env CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_DUP "$PO" hook 2>&1); rc=$?
+out=$(hook_cli tw x | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_DUP -- "$PO" hook); rc=$?
 [ $rc -eq 0 ] && ok "v1.6 身份被多重绑定则不认任何一个" || bad "v1.6 多重绑定认了 rc=$rc"
 "$PO" add n2 --claude "N2" >/dev/null; route_set n2 claude_session local_X
 printf '{"type":"custom-title","customTitle":"N2"}\n' > "$T/n2.jsonl"
 echo "正文" | "$PO" send n2 tester "无身份信" "回复" >/dev/null
-out=$(titleonly n2 | "$PO" hook 2>&1); rc=$?
+out=$(titleonly n2 | hook_run "$PO" hook); rc=$?
 [ $rc -eq 0 ] && ok "v1.6 身份缺失撞已绑定信箱则不认领" || bad "v1.6 未解析却认领 rc=$rc"
 "$PO" add clibox --claude "命令行会话" >/dev/null
 printf '{"type":"custom-title","customTitle":"命令行会话"}\n' > "$T/cb.jsonl"
 echo "正文" | "$PO" send clibox tester "命令行信" "回复" >/dev/null
-out=$(hook_cli cb cli-CMD | env -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_HOST_SESSION_ID "$PO" hook 2>&1); rc=$?
+out=$(hook_cli cb cli-CMD | hook_run -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_HOST_SESSION_ID -- "$PO" hook); rc=$?
 [ $rc -eq 2 ] && [ "$(route_field clibox claude_session)" = "cli-CMD" ] \
   && ok "v1.6 命令行版用 CLI session_id 认人" || bad "v1.6 CLI 身份 rc=$rc"
 [ "$(grep -c "会话认人诊断" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null)" = "3" ] && ok "v1.6 三类认人诊断各一次" || bad "v1.6 诊断计数 $(grep -c "会话认人诊断" "$POSTOFFICE_HOME/logs/notify.log")"

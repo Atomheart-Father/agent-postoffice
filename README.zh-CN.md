@@ -86,7 +86,7 @@ MSG
 | 收件方 | 谁来叫醒 | 怎么叫 |
 |---|---|---|
 | Claude Code | Claude Code 自己的钩子 | 每轮结束、会话打开时，钩子在后台起 `postoffice hook`，空等不调用模型；有信就以退出码 2 结束，Claude Code 把提醒交给会话并唤醒它。命令钩子默认 600 秒超时（实测 10 分钟后会被结束），所以安装时显式设 `timeout` 为 7 天 |
-| OpenCode | 全局插件 | 每 10 秒和每次会话空闲时检查；会话空闲才用 OpenCode 自带接口 `session.promptAsync` 发一条提醒。多个 OpenCode 实例同时开着时，靠认领文件保证只送一次 |
+| OpenCode | 全局插件 | 每 10 秒和每次会话空闲时检查；会话空闲才用 OpenCode 自带接口 `session.promptAsync` 发一条提醒。多个 OpenCode 实例同时开着时靠认领文件保证只送一次；失败后的重试会重新认领，所以同一封信不会被两个实例各投一次 |
 | Codex | 邮递员 | `codex queue --thread <id>` 往线程里排一条提醒 |
 | 人 | 邮递员 | 系统通知 |
 
@@ -105,7 +105,7 @@ MSG
 
 | 项目 | 状态 |
 |---|---|
-| 收发信、去重、限流、在线/离线、ack 记账、回执查询、广播汇总、安装卸载、按需提醒、稳定认人、回执合并 | `tests/smoke.sh` 83 项自动测试 |
+| 收发信、去重、限流、在线/离线、ack 记账、回执查询、广播汇总、安装卸载、按需提醒、稳定认人、回执合并 | `tests/smoke.sh` 84 项自动测试 |
 | 回执提醒精简且只含元数据；`postoffice receipt` 精确 ID 只读，`postoffice archive-receipt` 只归档本箱对应通知 | `tests/receipt_test.py`（15 项，含旧通知文件、shell 引用与归档幂等）和 `tests/receipt_plugin_test.mjs` |
 | Claude 桌面版：空闲几分钟后被外部来信叫醒并处理信件 | 真机多次观察到 |
 | Claude 桌面版：不显式设 timeout 时，钩子 10 分钟后被结束 | 真机观察到（v1.0 的缺陷，v1.1 已显式设 7 天） |
@@ -139,7 +139,7 @@ MSG
 ## 测试
 
 ```bash
-./tests/smoke.sh                                              # 83 项，全在临时目录里跑
+./tests/smoke.sh                                              # 84 项，全在临时目录里跑
 python3 tests/receipt_test.py                                 # 回执：元数据提醒（Claude 钩子与 Codex 队列模拟）、精确查询、不跨箱泄露、只读、旧通知文件、广播、--wake
 node --experimental-strip-types tests/receipt_plugin_test.mjs # OpenCode 插件（模拟客户端，不调用模型）
 ```

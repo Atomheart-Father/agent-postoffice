@@ -11,7 +11,7 @@
 // - 不改模型/工具/权限，不新建会话，不批准权限请求
 import type { Plugin } from "@opencode-ai/plugin"
 import { homedir, platform } from "node:os"
-import { readdir, readFile, appendFile, mkdir, open, stat } from "node:fs/promises"
+import { readdir, readFile, appendFile, mkdir, open, rm, stat } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
@@ -174,13 +174,14 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
         const now = Date.now()
         const win = (recent.get(box) ?? []).filter((t) => now - t < RATE_WIN_MS)
         if (win.length >= RATE_N) continue
-        // 认领（只在首次尝试时）；抢不到就不投这一封
+        // 每次投递前都认领：失败时已释放认领，所以重试照样能拿到；
+        // 抢不到说明别的实例正在投这封，跳过（否则多实例会各投一次）
         const group: { file: string; isReceipt: boolean }[] =
           (letter ? [{ file: letter, isReceipt: false }] : [])
             .concat(due.map((r) => ({ file: r.file, isReceipt: true })))
         const claimed: { file: string; isReceipt: boolean }[] = []
         for (const g of group) {
-          if ((ledger.failed.get(`${box}::${g.file}`) ?? 0) === 0 && !(await claim(box, g.file))) continue
+          if (!(await claim(box, g.file))) continue
           claimed.push(g)
         }
         if (!claimed.length) continue
