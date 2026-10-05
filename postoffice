@@ -25,7 +25,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -34,8 +34,9 @@ SELF = Path(__file__).resolve()
 
 POLL = int(os.environ.get("POSTOFFICE_POLL", 10))   # seconds between inbox checks
 RATE_N, RATE_WIN = 6, 600   # at most 6 wakes per mailbox per 10 minutes
-GRACE = 1200            # postman alerts the human if a hook/plugin mailbox is not woken within 20 min
+GRACE = int(os.environ.get("POSTOFFICE_GRACE", 1200))  # hook/plugin mailbox not woken within 20 min → tell the human
 CONSUME_ALERT = int(os.environ.get("POSTOFFICE_CONSUME_ALERT", 1800))  # reminded but still in inbox after 30 min → tell the human
+RECEIPT_WAIT = int(os.environ.get("POSTOFFICE_RECEIPT_WAIT", 600))  # a merged receipt block waits at most 10 min before riding along
 HOOK_TIMEOUT = 7 * 24 * 3600  # explicit timeout for the async Claude hook (seconds)
 
 METHODS = {
@@ -140,24 +141,87 @@ def receipt_subject(path):
     return s[:60]
 
 
-def reminder(name, files):
-    """Metadata-only wake text. Receipt bodies are never injected; call `receipt` if needed."""
-    lines = []
-    for f in files:
-        qid = receipt_query_id(f)
-        if qid:
-            src = letter_sender(f) or "?"
-            subject = receipt_subject(f)
-            lines.append(f"【联络总站回执｜{name}】来自 {src} 的回执"
-                         + (f"，原事由：{subject}" if subject else ""))
-            lines.append(f"查询：postoffice receipt {shlex.quote(name)} {shlex.quote(qid)}")
-            lines.append("默认不答复")
-        else:
-            lines.append(f"【联络总站新信｜{name}】")
-            lines.append(f"== {f}")
-            lines.append(header(f))
-            lines.append(LETTER_TAIL)
+NEED_NEG = ("仅告知", "无需", "不用回", "默认不答复", "无需操作")
+NEED_POS = ("回复", "审核", "处理", "修改", "决定", "确认")
+
+
+def clean_need(need):
+    """Strip a repeated `需要：` prefix so `send ... "需要：回复"` stores just `回复`."""
+    return re.sub(r"^(?:需要：)+", "", (need or "").strip()).strip()
+
+
+def needs_action(path):
+    """True if this letter asks the reader to do something (drives the 30-minute nudge).
+
+    Priority (first hit wins): a receipt notification / broadcast summary is index mail (never a
+    nudge); then an exact standard value (`回复`/`审核` yes, `仅告知` no); then free text with only
+    negative words (no) or only positive words (yes); mixed or unrecognized is *unknown* and we
+    still nudge (we don't claim zero false positives). Recommended: 需要：回复 / 审核 / 仅告知.
+    """
+    if receipt_query_id(path):
+        return False
+    need = field(path, "需要：")
+    val = clean_need(need[len("需要："):] if need.startswith("需要：") else "")
+    if val in ("回复", "审核"):
+        return True
+    if val == "仅告知":
+        return False
+    neg = any(w in val for w in NEED_NEG)
+    pos = any(w in val for w in NEED_POS)
+    if neg and not pos:
+        return False
+    if pos and not neg:
+        return True
+    return True
+
+
+def mail_split(files):
+    """Split pending letters into (formal, receipt-notifications), preserving order."""
+    formal, receipts = [], []
+    for p in files:
+        (receipts if receipt_query_id(p) else formal).append(p)
+    return formal, receipts
+
+
+def _receipt_item(name, p):
+    src = letter_sender(p) or "?"
+    subj = receipt_subject(p)
+    return src, subj, f"查询：postoffice receipt {shlex.quote(name)} {shlex.quote(receipt_query_id(p))}"
+
+
+def single_receipt_block(name, p):
+    """The compact 3-line wake text for one lone receipt notification (v1.5 shape)."""
+    src, subj, query = _receipt_item(name, p)
+    head = f"【联络总站回执｜{name}】来自 {src} 的回执" + (f"，原事由：{subj}" if subj else "")
+    return "\n".join([head, query, "默认不答复"])
+
+
+def merged_receipts(name, receipts):
+    """One compact block standing in for several receipt notifications (metadata only)."""
+    if not receipts:
+        return ""
+    lines = [f"另有 {len(receipts)} 条回执（默认不答复，需要时按 ID 查询）："]
+    for p in receipts:
+        src, subj, query = _receipt_item(name, p)
+        lines.append(f"- {src}：{subj}  {query}")
     return "\n".join(lines)
+
+
+def reminder(name, files):
+    """Metadata-only wake text: formal letters first, then receipts merged into one trailing block.
+
+    A single receipt with no formal letter keeps the compact 3-line shape; anything else merges.
+    Receipt bodies are never injected — call `postoffice receipt` when the body is actually needed.
+    """
+    formal, receipts = mail_split(files)
+    parts = []
+    for f in formal:
+        parts += [f"【联络总站新信｜{name}】", f"== {f}", header(f), LETTER_TAIL]
+    if len(receipts) == 1 and not formal:
+        parts.append(single_receipt_block(name, receipts[0]))
+    elif receipts:
+        parts.append(merged_receipts(name, receipts))
+    return "\n".join(parts)
 
 
 def rate_ok(name):
@@ -281,6 +345,93 @@ def find_codex():
     return None
 
 
+CLAUDE_MAP_RE = re.compile(r"Mapping internal session (local_\S+) to CLI session (\S+)")
+LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+
+
+def claude_log_files():
+    """main*.log candidates. POSTOFFICE_CLAUDE_MAINLOG overrides with a single path."""
+    env = os.environ.get("POSTOFFICE_CLAUDE_MAINLOG")
+    if env:
+        p = Path(env).expanduser()
+        return [p] if p.is_file() else []
+    d = Path.home() / "Library" / "Logs" / "Claude"
+    if not d.is_dir():
+        return []
+    return [f for f in d.glob("main*.log*") if f.is_file()]
+
+
+def _line_ts(line):
+    m = LOG_TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        return datetime.datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+def resolve_claude_local(cli_id):
+    """Desktop id for the payload's CLI session id, from main*.log; newest in-line timestamp wins.
+
+    Only reached when CLAUDE_CODE_ENTRYPOINT=claude-desktop and HOST_SESSION_ID is missing. The
+    desktop log format is private: any failure returns '' so the hook can degrade gracefully.
+    """
+    if not cli_id:
+        return ""
+    try:
+        files = claude_log_files()
+    except OSError:
+        return ""
+    best_key, best_local = None, ""
+    for i, f in enumerate(files):
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for ln, line in enumerate(fh):
+                    m = CLAUDE_MAP_RE.search(line)
+                    if not m or m.group(2) != cli_id:
+                        continue
+                    ts = _line_ts(line)
+                    key = (ts if ts is not None else float("-inf"), i, ln)
+                    if best_key is None or key > best_key:
+                        best_key, best_local = key, m.group(1)
+        except OSError:
+            continue
+    return best_local
+
+
+def resolve_claude_identity(data):
+    """(identity, source) for a hook payload; identity is '' when it cannot be resolved.
+
+    Identity comes from the env vars Claude Desktop puts on the session process (inherited by the
+    hook): HOST_SESSION_ID (stable across renames/rewinds) and ENTRYPOINT. Only the desktop app
+    without HOST_SESSION_ID falls back to the log mapping; the CLI uses its own session id.
+    """
+    try:
+        entry = os.environ.get("CLAUDE_CODE_ENTRYPOINT") or ""
+        host = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID") or ""
+        cli_id = str(data.get("session_id") or "")
+        if entry == "claude-desktop":
+            return (host, "env") if host else (resolve_claude_local(cli_id), "log")
+        return cli_id, "cli"
+    except Exception:
+        return "", ""
+
+
+def notify_identity_once(key, text):
+    """Tell the human a session-identity diagnostic at most once per key."""
+    f = HOME / ".identity_alerts.json"
+    seen = read_json(f)
+    seen = set(seen) if isinstance(seen, list) else set()
+    if key in seen:
+        return False
+    notify("联络总站：会话认人诊断", text)
+    seen.add(key)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(sorted(seen), ensure_ascii=False) + "\n", encoding="utf-8")
+    return True
+
+
 def opencode_db():
     return Path(os.environ.get("OPENCODE_DB", str(Path.home() / ".local/share/opencode/opencode.db")))
 
@@ -352,11 +503,13 @@ def cmd_add(a):
         sys.exit("信箱名只能用英文字母、数字、下划线、横线")
     routes = load_routes()
     r = dict(routes.get(a.name, {}))
-    for k in ("claude_title", "session_id", "thread_id", "codex_cli"):
+    for k in ("claude_title", "claude_session", "session_id", "thread_id", "codex_cli"):
         r.pop(k, None)
     if a.claude:
         r["methods"] = ["claude_hook"]
         r["claude_title"] = a.claude
+        if a.claude_session:
+            r["claude_session"] = a.claude_session
     elif a.opencode:
         sid, title, directory = opencode_lookup(a.opencode)
         r["methods"] = ["opencode_plugin"]
@@ -396,10 +549,27 @@ def apply_status(name, status):
     routes = load_routes()
     if name not in boxes(routes) or status not in ("online", "offline"):
         return False
-    routes[name]["status"] = status
+    r = routes[name]
+    if status == "online" and r.get("status") != "online":
+        r["online_since"] = time.time()   # only a real offline→online transition resets the 20-minute clock
+    r["status"] = status
     save_routes(routes)
     write_contact(name, routes[name])
     return True
+
+
+def ensure_online_baseline(routes):
+    """Upgrade compatibility: an already-online mailbox with no `online_since` gets the postman's
+    first-run time as its baseline, so old backlog does not all alert at once after an upgrade."""
+    changed = False
+    for name, r in boxes(routes).items():
+        if online(r) and "online_since" not in r:
+            r["online_since"] = time.time()
+            changed = True
+            log("postman.log", f"{name} 补 online_since 基线（升级兼容）")
+    if changed:
+        save_routes(routes)
+    return changed
 
 
 def set_status(name, status):
@@ -437,7 +607,7 @@ def cmd_send(a):
     if not (HOME / a.to / "inbox").is_dir():
         sys.exit(f"没有信箱 {a.to}；`postoffice list` 看通讯录")
     body = Path(a.file).read_text(encoding="utf-8") if a.file else sys.stdin.read()
-    path = write_letter(a.to, a.sender, a.subject, a.need, body)
+    path = write_letter(a.to, a.sender, a.subject, clean_need(a.need), body)
     print(f"已投递：{path}")
     print(f"编号：{path.stem}")
     r = boxes(routes).get(a.to, {})
@@ -574,14 +744,14 @@ def cmd_broadcast(a):
     while (bdir / f"{bid}.json").exists():
         bid = f"B{ts}_{a.sender}-{i}"
         i += 1
-    rec = {"id": bid, "from": a.sender, "subject": a.subject, "need": a.need, "to": to,
+    rec = {"id": bid, "from": a.sender, "subject": a.subject, "need": clean_need(a.need), "to": to,
            "deadline": time.time() + secs, "created": now_str(), "acks": {}, "summarized": False}
     (bdir / f"{bid}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"广播编号：{bid}")
     print(f"截止：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(rec['deadline']))}")
     for n in to:
         text = f"{body.rstrip()}\n\n回执请用：postoffice ack {n} {bid} \"一句话\""
-        path = write_letter(n, a.sender, a.subject, a.need, text, extra_headers=[f"广播：{bid}"])
+        path = write_letter(n, a.sender, a.subject, clean_need(a.need), text, extra_headers=[f"广播：{bid}"])
         print(f"已投递：{path}")
         r = routes.get(n, {})
         if r and not online(r):
@@ -696,12 +866,50 @@ def cmd_hook(_a):
                         title = json.loads(line).get("customTitle") or title
                     except ValueError:
                         pass
-    if not title or not ROUTES.exists():
+    if not ROUTES.exists():
         return 0
-    name = next((k for k, v in boxes(load_routes()).items()
-                 if "claude_hook" in v.get("methods", []) and v.get("claude_title") == title), None)
+    routes = load_routes()
+    all_boxes = boxes(routes)
+    claude_boxes = {k: v for k, v in all_boxes.items() if "claude_hook" in v.get("methods", [])}
+    identity, source = resolve_claude_identity(data)
+    name = None
+    if identity:                                     # rules 1-3: a stable identity was resolved
+        bound = [k for k, v in claude_boxes.items() if v.get("claude_session") == identity]
+        if len(bound) == 1:
+            name = bound[0]
+            if title and all_boxes[name].get("claude_title") != title:
+                routes[name]["claude_title"] = title     # a rename no longer loses the session
+                save_routes(routes)
+                log("claude_hook.log", f"{name} 按身份 {identity}（{source}）认人，标题更新为「{title}」")
+        elif len(bound) > 1:                         # one identity claimed by several boxes: recognize none
+            if notify_identity_once(f"dup::{identity}", f"身份 {identity} 被多个信箱绑定，均不认领"):
+                log("claude_hook.log", f"身份 {identity} 绑定多个信箱 {bound}，不认；已通知人")
+            return 0
+    if name is None:                                 # rules 2/3/4: try the current title (exactly one box)
+        cands = [k for k, v in claude_boxes.items() if title and v.get("claude_title") == title]
+        if len(cands) == 1:
+            c = cands[0]
+            bound = all_boxes[c].get("claude_session")
+            if identity and not bound:               # rule 2: first title match with an identity → bind it
+                routes[c]["claude_session"] = identity
+                save_routes(routes)
+                log("claude_hook.log", f"{c} 首次按标题匹配，绑定身份 {identity}（{source}）")
+                name = c
+            elif identity and bound and bound != identity:   # rule 3: same title, different identity
+                if notify_identity_once(f"{identity}::{c}", f"{c} 已绑定别的会话（{bound}），本次 {identity} 不接管"):
+                    log("claude_hook.log", f"同名不接管：{c} 已绑 {bound}，本次 {identity}；已通知人")
+                return 0
+            elif not identity and not bound:         # rule 4: no identity, title matches an unbound box
+                log("claude_hook.log", f"{c} 身份解析不到，退回标题匹配")
+                name = c
+            elif not identity and bound:             # rule 4: title matches a bound box → do not silently claim
+                if notify_identity_once(f"unresolved::{c}", f"{c} 已绑定 {bound}，但本次会话身份解析不到，不认领"):
+                    log("claude_hook.log", f"{c} 已绑 {bound} 但身份解析不到；不认，已诊断通知")
+                return 0
+            else:                                    # identity == bound: already handled by rule 1
+                name = c
     if not name:
-        log("claude_hook.log", f"未登记会话「{title}」，不监视")
+        log("claude_hook.log", f"未登记会话「{title or ''}」" + (f" 身份={identity}" if identity else "") + "，不监视")
         return 0
 
     box = HOME / name
@@ -739,7 +947,7 @@ def cmd_hook(_a):
                     sys.stderr.write(reminder(name, new) + "\n")
                     with seenf.open("a") as f:
                         f.writelines(f"{p}\n" for p in new)
-                    rate_mark(name, len(new))
+                    rate_mark(name)          # merged receipts: one wake counts once, however many letters
                     for p in new:
                         log("claude_hook.log", f"{name} 唤醒 {p.name}")
                     pidf.unlink(missing_ok=True)
@@ -758,6 +966,7 @@ def cmd_postman(_a):
     state = HOME / ".delivered.json"
     delivered = set(json.loads(state.read_text())) if state.exists() else set()
     throttled = set()
+    failed_batches = set()
     log("postman.log", f"邮递员上岗 v{VERSION}")
     print(f"{now_str()} 邮递员上岗（{HOME}），Ctrl+C 停止", flush=True)
 
@@ -783,6 +992,8 @@ def cmd_postman(_a):
             r = routes.get(p.parent.parent.name)
             if w["alerted"] or not r or not online(r) or time.time() - w["t"] < CONSUME_ALERT:
                 continue
+            if not needs_action(p):                  # 仅告知/回执/广播汇总: backlog only, never a nudge
+                continue
             notify(f"联络总站：{p.parent.parent.name} 已提醒但 {CONSUME_ALERT // 60} 分钟未处理",
                    (field(p, "事由") or p.name) + "（会话可能没加载、卡住或在忙长任务）")
             log("postman.log", f"未处理 {p.parent.parent.name} {p.name}：提醒后 {CONSUME_ALERT // 60} 分钟仍在 inbox，已通知人")
@@ -793,7 +1004,9 @@ def cmd_postman(_a):
 
     while True:
         try:
-            routes = boxes(load_routes())
+            full = load_routes()
+            ensure_online_baseline(full)
+            routes = boxes(full)
         except Exception as e:
             log("postman.log", f"routes.json 读取失败：{e}")
             time.sleep(POLL)
@@ -815,16 +1028,19 @@ def cmd_postman(_a):
                 if not online(r):
                     continue                  # offline: letters wait, nobody is reminded
                 method = r.get("methods", ["notify"])[0]
-                for p in pending(name):
-                    key = str(p)
-                    if key in delivered:
-                        continue
-                    if method in ("claude_hook", "opencode_plugin"):
+                if method in ("claude_hook", "opencode_plugin"):
+                    for p in pending(name):
+                        key = str(p)
+                        if key in delivered:
+                            continue
                         done = (key in read_lines(HOME / name / ".seen")) if method == "claude_hook" \
                             else (f"{name}::{p.name}" in oc_ok)
+                        # count from when the letter landed OR when this box last came online, whichever is later,
+                        # so offline time never counts against the 20-minute grace
+                        start = max(p.stat().st_mtime, float(r.get("online_since", 0) or 0))
                         if done:
                             log("postman.log", f"{method} {name} {p.name} 已送达")
-                        elif time.time() - p.stat().st_mtime > GRACE:
+                        elif time.time() - start > GRACE:
                             notify(f"联络总站：{name} 20 分钟未被唤醒", field(p, "事由") or p.name)
                             log("postman.log", f"{method} {name} {p.name} 超 20 分钟未送达，已通知人")
                             mark(key, reminded=False)
@@ -832,34 +1048,55 @@ def cmd_postman(_a):
                         else:
                             continue
                         mark(key)
-                        continue
-                    if not rate_ok(name):
-                        if name not in throttled:
-                            notify("联络总站：投递暂停", f"{name} 10 分钟内信件过多")
-                            log("postman.log", f"THROTTLE {name}")
-                            throttled.add(name)
-                        continue
-                    throttled.discard(name)
-                    ok = True
-                    try:
-                        if method == "codex_queue":
-                            cli = r.get("codex_cli") or find_codex()
-                            msg = reminder(name, [p])
-                            res = subprocess.run([cli, "queue", "--thread", r["thread_id"], "--message", msg],
-                                                 capture_output=True, text=True, timeout=60)
-                            ok = res.returncode == 0
-                            log("postman.log", f"codex_queue {name} {p.name} rc={res.returncode} "
-                                               f"{res.stdout.strip()[:200]} {res.stderr.strip()[:200]}")
-                        else:
-                            notify(f"联络总站：给 {name} 的新信", field(p, "事由") or p.name)
-                            log("postman.log", f"notify {name} {p.name}")
-                    except Exception as e:
-                        ok = False
-                        log("postman.log", f"投递异常 {name} {p.name}: {e}")
-                    if not ok:
-                        notify("联络总站：投递失败", f"{name} {p.name}，请手动转交")
-                    rate_mark(name)
-                    mark(key, reminded=ok and method == "codex_queue")  # failures are not retried; the human was notified once
+                    continue
+                # codex_queue / notify: formal letters go out one at a time, receipts merge into one trailing block
+                leftovers = [p for p in pending(name) if str(p) not in delivered]
+                formal, receipts = mail_split(leftovers)
+                if not formal and not receipts:
+                    continue
+                letter = formal[0] if formal else None
+                # with a letter: only receipts that have waited long enough ride along; without one: all of them
+                due = list(receipts) if letter is None \
+                    else [p for p in receipts if time.time() - p.stat().st_mtime > RECEIPT_WAIT]
+                if letter is None and not due:
+                    continue
+                if not rate_ok(name):
+                    if name not in throttled:
+                        notify("联络总站：投递暂停", f"{name} 10 分钟内信件过多")
+                        log("postman.log", f"THROTTLE {name}")
+                        throttled.add(name)
+                    continue
+                throttled.discard(name)
+                group = ([letter] if letter else []) + due
+                names = " ".join(p.name for p in group)
+                sig = f"{name}::" + "|".join(p.name for p in group)
+                ok = True
+                try:
+                    if method == "codex_queue":
+                        cli = r.get("codex_cli") or find_codex()
+                        res = subprocess.run([cli, "queue", "--thread", r["thread_id"], "--message", reminder(name, group)],
+                                             capture_output=True, text=True, timeout=60)
+                        ok = res.returncode == 0
+                        log("postman.log", f"codex_queue {name} {names} rc={res.returncode} "
+                                           f"{res.stdout.strip()[:200]} {res.stderr.strip()[:200]}")
+                    else:
+                        notify(f"联络总站：给 {name} 的新信",
+                               (field(letter, "事由") or letter.name) if letter else f"{len(due)} 条回执")
+                        log("postman.log", f"notify {name} {names}")
+                except Exception as e:
+                    ok = False
+                    log("postman.log", f"投递异常 {name} {names}: {e}")
+                if not ok:
+                    # nothing in the batch is marked delivered, so every ID stays eligible for retry;
+                    # tell the human once per batch signature (no rate tick, nothing was woken)
+                    if sig not in failed_batches:
+                        failed_batches.add(sig)
+                        notify("联络总站：投递失败", f"{name} {names}，将重试")
+                    continue
+                failed_batches.discard(sig)
+                rate_mark(name)                  # one wake for the whole batch (a merged receipt block counts once)
+                for p in group:
+                    mark(str(p), reminded=(method == "codex_queue"))
         except Exception as e:
             log("postman.log", f"邮递员本轮异常（已忽略，继续）：{e}")
         time.sleep(POLL)
@@ -1060,8 +1297,10 @@ def cmd_doctor(_a):
         elif m == "claude_hook":
             logf = LOGS / "claude_hook.log"
             seen = logf.exists() and f"{name} 监视上岗" in logf.read_text(encoding="utf-8")
+            binding = r.get("claude_session")
             print(("✅ " if seen else "… ") + f"{name}：Claude 会话「{r.get('claude_title')}」"
-                  + ("已上岗过" if seen else "还没上岗过（该会话跑完一轮后才会挂上）"))
+                  + (f"绑定 {binding}" if binding else "未绑定桌面会话（首次收信会自动绑定）")
+                  + ("，已上岗过" if seen else "，还没上岗过（该会话跑完一轮后才会挂上）"))
     print("全部正常" if ok else "有问题，按上面提示处理")
 
 
@@ -1221,10 +1460,11 @@ def main():
     p = sp.add_parser("add", help="登记/更新一个信箱")
     p.add_argument("name")
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--claude", metavar="会话标题", help="Claude Code 会话（按会话标题认人）")
+    g.add_argument("--claude", metavar="会话标题", help="Claude Code 会话（按桌面会话 id 稳定认人，解析不到才退回标题）")
     g.add_argument("--opencode", metavar="会话标题或ID", help="OpenCode 会话")
     g.add_argument("--codex", metavar="THREAD_ID", help="Codex 线程")
     g.add_argument("--notify", action="store_true", help="没有自动通道，只弹通知给人")
+    p.add_argument("--claude-session", metavar="LOCAL_ID", help="直接指定 Claude 桌面会话 id（local_…），配合 --claude")
     p.add_argument("--who", help="一句话说明这是谁")
     p.set_defaults(fn=cmd_add)
     p = sp.add_parser("remove", help="从通讯录移除")

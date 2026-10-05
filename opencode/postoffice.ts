@@ -2,6 +2,8 @@
 // 盯着 routes.json 里 methods 含 "opencode_plugin" 的信箱；有新信且目标会话空闲时，
 // 用 OpenCode 自带 client 给该会话发一条提醒（普通信给路径 + 开头三行；回执只给来源/原事由 +
 // 查询命令 + “默认不答复”，不附正文；归档用 postoffice archive-receipt，见 skill）。
+// 同一轮正式信在前；没有正式信时把积压回执合并成一条“另有 N 条回执”清单，超过等待时限的回执
+// 也会随下一次正式投递带上，绝不被正式信永远挤掉。
 // - 只投给属于本 OpenCode 实例目录的会话；多个实例同时运行时用认领文件保证一封信只投一次
 // - 离线（status: "offline"）的信箱不投，信留在 inbox，上线后补送
 // - 每封只投一次（opencode_delivered.jsonl 账本），重启不重投；每信箱每 10 分钟最多 6 次
@@ -22,6 +24,7 @@ const POLL_MS = 10_000
 const RATE_N = 6
 const RATE_WIN_MS = 600_000
 const MAX_ATTEMPTS = 2
+const RECEIPT_WAIT_MS = Number(process.env.POSTOFFICE_RECEIPT_WAIT || 600) * 1000
 
 type Route = { methods?: string[]; session_id?: string; status?: string }
 
@@ -79,6 +82,10 @@ const head3 = async (path: string) => {
   }
 }
 
+// the original subject of a receipt notification (metadata only)
+const receiptSubject = (fieldOf: (k: string) => string) =>
+  (fieldOf("原事由：") || fieldOf("事由：")).replace(/^(回执：|copy that：|copy that:)/, "").slice(0, 60)
+
 // POSIX single-quote a value for a shell command shown to the model (paths/ids may hold spaces, ();')
 const shq = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'"
 
@@ -132,57 +139,90 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
           continue
         }
         if (st !== "idle") continue
+        // 读开头块分出正式信与回执通知；正文永不注入
+        type Item = { file: string; src: string; subj: string; id: string; mtime: number }
+        const formal: string[] = []
+        const receipts: Item[] = []
         for (const file of todo) {
-          const k = `${box}::${file}`
-          const tried = ledger.failed.get(k) ?? 0
-          if (tried >= MAX_ATTEMPTS) continue
-          const now = Date.now()
-          const win = (recent.get(box) ?? []).filter((t) => now - t < RATE_WIN_MS)
-          if (win.length >= RATE_N) break
-          if (tried === 0 && !(await claim(box, file))) continue
+          const key = `${box}::${file}`
+          if ((ledger.failed.get(key) ?? 0) >= MAX_ATTEMPTS) continue
           const path = `${ROOT}/${box}/inbox/${file}`
+          let raw: string
+          let mtime = 0
           try {
-            await stat(path)
+            mtime = (await stat(path)).mtimeMs
+            raw = await readFile(path, "utf8")
           } catch {
             continue
           }
-          // metadata only: read the header block (up to the first blank line) so a letter body
-          // that merely starts with "回执：" is never mistaken for a receipt notification
-          const raw = await readFile(path, "utf8")
           const head = raw.split("\n\n", 1)[0].split("\n")
-          const fieldOf = (key: string) => {
-            const l = head.find((x) => x.startsWith(key))
-            return l ? l.slice(key.length).trim() : ""
+          const fieldOf = (k: string) => {
+            const l = head.find((x) => x.startsWith(k))
+            return l ? l.slice(k.length).trim() : ""
           }
-          const receiptId = fieldOf("回执：")
-          let text: string
-          if (receiptId) {
-            const src = fieldOf("来源：").split("（")[0].trim()
-            const subj = (fieldOf("原事由：") || fieldOf("事由："))
-              .replace(/^(回执：|copy that：|copy that:)/, "").slice(0, 60)
-            text =
-              `【联络总站回执｜${box}】来自 ${src} 的回执` + (subj ? `，原事由：${subj}` : "") + `\n` +
-              `查询：postoffice receipt ${shq(box)} ${shq(receiptId)}\n` +
-              `默认不答复`
-          } else {
-            text =
-              `【联络总站新信｜${box}】\n== ${path}\n${await head3(path)}\n` +
-              `按信件“需要”字段处理；回信/回执/归档规则见 postoffice skill。`
+          const id = fieldOf("回执：")
+          if (id) receipts.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: receiptSubject(fieldOf), id, mtime })
+          else formal.push(file)
+        }
+        // 有正式信：先送一封；没有正式信：把回执合并成一条。
+        // 回执超过 10 分钟就随下一次投递带上，绝不被正式信永远挤掉。
+        const letter: string | null = formal.length ? formal[0] : null
+        const due = letter === null
+          ? receipts
+          : receipts.filter((r) => Date.now() - r.mtime > RECEIPT_WAIT_MS)
+        if (!letter && !due.length) continue
+        const now = Date.now()
+        const win = (recent.get(box) ?? []).filter((t) => now - t < RATE_WIN_MS)
+        if (win.length >= RATE_N) continue
+        // 认领（只在首次尝试时）；抢不到就不投这一封
+        const group: { file: string; isReceipt: boolean }[] =
+          (letter ? [{ file: letter, isReceipt: false }] : [])
+            .concat(due.map((r) => ({ file: r.file, isReceipt: true })))
+        const claimed: { file: string; isReceipt: boolean }[] = []
+        for (const g of group) {
+          if ((ledger.failed.get(`${box}::${g.file}`) ?? 0) === 0 && !(await claim(box, g.file))) continue
+          claimed.push(g)
+        }
+        if (!claimed.length) continue
+        const claimedFormal = claimed.filter((g) => !g.isReceipt).map((g) => g.file)
+        const claimedReceipts = claimed.filter((g) => g.isReceipt)
+          .map((g) => receipts.find((r) => r.file === g.file)!).filter(Boolean)
+        let text: string
+        if (claimedFormal.length === 0 && claimedReceipts.length === 1) {
+          const r = claimedReceipts[0]
+          text = `【联络总站回执｜${box}】来自 ${r.src} 的回执` + (r.subj ? `，原事由：${r.subj}` : "") + `\n` +
+                 `查询：postoffice receipt ${shq(box)} ${shq(r.id)}\n默认不答复`
+        } else {
+          const parts: string[] = []
+          for (const f of claimedFormal) {
+            parts.push(`【联络总站新信｜${box}】\n== ${ROOT}/${box}/inbox/${f}\n${await head3(`${ROOT}/${box}/inbox/${f}`)}\n` +
+              `按信件“需要”字段处理；回信/回执/归档规则见 postoffice skill。`)
           }
-          const attempt = tried + 1
-          try {
-            await client.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text }] } })
-            await appendFile(LEDGER, JSON.stringify({ time: new Date().toISOString(), box, file, session: sessionID, result: "DELIVERED", attempt }) + "\n")
-            win.push(now)
-            recent.set(box, win)
-            await log(`DELIVERED ${box}/${file} → ${sessionID}（${reason}，第 ${attempt} 次）`)
-          } catch (e) {
-            const final = attempt >= MAX_ATTEMPTS
-            await appendFile(LEDGER, JSON.stringify({ time: new Date().toISOString(), box, file, session: sessionID, result: final ? "FAILED_FINAL" : "FAILED_RETRYABLE", attempt, detail: String(e).slice(0, 200) }) + "\n")
-            await log(`FAILED ${box}/${file}（第 ${attempt} 次）: ${e}`)
-            if (final) notifyHuman(`${box}/${file} 两次投递失败，请手动转交`)
+          if (claimedReceipts.length) {
+            parts.push(`另有 ${claimedReceipts.length} 条回执（默认不答复，需要时按 ID 查询）：\n` +
+              claimedReceipts.map((r) => `- ${r.src}：${r.subj}  查询：postoffice receipt ${shq(box)} ${shq(r.id)}`).join("\n"))
           }
-          break // 一次只投一封，等会话再次空闲
+          text = parts.join("\n")
+        }
+        const files2 = claimed.map((g) => g.file).join(",")
+        const attempt = (ledger.failed.get(`${box}::${claimed[0].file}`) ?? 0) + 1
+        try {
+          await client.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text }] } })
+          for (const g of claimed) {
+            await appendFile(LEDGER, JSON.stringify({ time: new Date().toISOString(), box, file: g.file, session: sessionID, result: "DELIVERED", attempt }) + "\n")
+          }
+          win.push(now)
+          recent.set(box, win)
+          await log(`DELIVERED ${box}/${files2} → ${sessionID}（${reason}，第 ${attempt} 次）`)
+        } catch (e) {
+          const final = attempt >= MAX_ATTEMPTS
+          for (const g of claimed) {
+            await appendFile(LEDGER, JSON.stringify({ time: new Date().toISOString(), box, file: g.file, session: sessionID, result: final ? "FAILED_FINAL" : "FAILED_RETRYABLE", attempt, detail: String(e).slice(0, 200) }) + "\n")
+            // release the claim so a retry (or another instance) can pick the batch up
+            try { await rm(`${ROOT}/${box}/.claims/${g.file}`, { force: true }) } catch {}
+          }
+          await log(`FAILED ${box}/${files2}（第 ${attempt} 次）: ${e}`)
+          if (final) notifyHuman(`${box}/${files2} 两次投递失败，请手动转交`)
         }
       }
     } catch (e) {
