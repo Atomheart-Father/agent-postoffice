@@ -11,6 +11,7 @@ Run `postoffice --help` for commands. Python 3.9+, standard library only.
 """
 import argparse
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -1375,8 +1376,9 @@ def broadcast_record(bid):
 
 
 ALARM_TEXT = "你设的闹钟到了，请检查刚才安排的任务。"   # the one and only alarm reminder text
-ALARM_LOCK_STALE = int(os.environ.get("POSTOFFICE_ALARM_LOCK_STALE", 60))    # soft
-ALARM_LOCK_HARD = int(os.environ.get("POSTOFFICE_ALARM_LOCK_HARD", 600))   # hard cap
+ALARM_LOCK_WAIT = float(os.environ.get("POSTOFFICE_ALARM_LOCK_WAIT", 5))    # 秒；拿不到锁时的退避上限
+ALARM_MIN = 1                # 分钟
+ALARM_MAX = 1440             # 一天
 
 
 def alarms_dir():
@@ -1430,169 +1432,160 @@ def alarm_lock_path(path):
     return path.with_suffix(".json.lock")
 
 
-def reap_lock_path(path):
-    return alarm_lock_path(path).with_suffix(".lock.reap")
+def take_alarm_lock(path):
+    """Take the per-session kernel lock without blocking; returns the held fd or None.
 
-
-def gate_lock_path(path):
-    """The gate every mutation of the lock runs behind — create, reclaim and release alike."""
-    return alarm_lock_path(path).with_suffix(".lock.gate")
-
-
-def _lock_info(p):
+    flock(2) is the whole primitive, and that is the point: the kernel drops it when the holder
+    dies, is killed or the machine reboots, so there is no mtime watchdog, no pid probe, no reaper
+    lock and no stat-identity dance to get wrong. The lock file is created once and never unlinked
+    or replaced, which removes the ABA case outright: a holder that comes back after a long pause
+    unlocks its own descriptor and can never remove a successor's lock -- there is no unlink on
+    this path at all.
+    """
+    p = alarm_lock_path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(p), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        st = p.stat()
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        os.close(fd)
         return None
-    return (st.st_dev, st.st_ino, st.st_mtime, time.time() - st.st_mtime)
+    return fd
 
 
-def _holder_pid(p):
+def release_alarm_lock(fd):
+    """Unlock and close. Only touches our own descriptor, so nothing else can be affected."""
+    if fd is None:
+        return
     try:
-        return int(p.read_text(encoding="utf-8").split(" ")[0])
-    except (OSError, ValueError):
-        return 0
-
-
-def _pid_alive(pid):
-    # pid 被复用只会让我们多等到硬超时，不会误删 —— 方向上是安全的那一侧
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
-        return True     # 没有权限 ≠ 不存在
-    return True
-
-
-def _lock_expired(info, p):
-    _, _, _, age = info
-    if age <= ALARM_LOCK_STALE:
-        return False
-    if age > ALARM_LOCK_HARD:
-        return True
-    return not _pid_alive(_holder_pid(p))
-
-
-def _create_lock(p, body):
-    fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    try:
-        os.write(fd, body.encode())
+        pass
     finally:
         os.close(fd)
 
 
-def take_alarm_gate(gp):
-    """Take the short gate every lock mutation runs behind.
+def with_alarm_lock(session):
+    """Context manager: the kernel lock for one session, retried briefly then given up on.
 
-    O_EXCL create, and only the creator ever removes it — so there is never a second gate holder.
-    A gate left behind by a crash is only stolen once its holder is provably gone (same pid rule as
-    the lock itself), so a live holder is never mistaken for a crash before ALARM_LOCK_HARD.
+    Whoever holds it may be mid-write or may have been killed outright -- in the second case the
+    kernel has already released it, so a bounded retry is all the waiting there ever is.
     """
-    for _ in range(3):
+    import contextlib
+    import time as _time
+
+    @contextlib.contextmanager
+    def cm():
+        path = alarm_file(session)
+        deadline = _time.time() + ALARM_LOCK_WAIT
+        fd = None
+        while fd is None:
+            fd = take_alarm_lock(path)
+            if fd is not None:
+                break
+            if _time.time() >= deadline:
+                yield None
+                return
+            _time.sleep(0.05)
         try:
-            _create_lock(gp, f"{os.getpid()} {int(time.time())}\n")
-            return True
-        except FileExistsError:
-            info = _lock_info(gp)
-            if info is None:
-                continue
-            if not _lock_expired(info, gp):
-                return False
-            try:
-                gp.unlink()          # 判定为崩溃残留的门；持锁者还活着时不会走到这里
-            except OSError:
-                return False
-        except OSError:
-            return False
-    return False
+            yield fd
+        finally:
+            release_alarm_lock(fd)
+
+    return cm()
 
 
-def drop_alarm_gate(gp):
-    try:
-        gp.unlink()
-    except OSError:
-        pass
+def archive_alarm_letter(box, aid):
+    """File an undelivered alarm letter out of the way. Returns where it went, or None."""
+    src = HOME / box / "inbox" / f"{aid}.md"
+    if not src.exists():
+        return None
+    dst_dir = HOME / box / "archived" / time.strftime("%Y%m%d-%H%M%S")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    src.replace(dst_dir / src.name)
+    return dst_dir / src.name
 
 
-def try_reap_alarm_lock(path):
-    """Reclaim a lock whose holder is provably gone, without ever deleting a *new* lock.
-
-    The whole check-and-delete runs behind the gate, and create / reclaim / release all take that
-    same gate, so once we are inside it nothing in this protocol can put a different lock at the
-    path before our unlink. That is what makes "only the instance I judged stale gets removed"
-    true, rather than a stat that is re-checked and still leaves a window.
-
-    The gate lease is ALARM_LOCK_HARD: the critical section is a handful of file operations (well
-    under a second) and the lease is two orders of magnitude longer, and before the lease expires
-    the gate holder's pid must be gone — so a live holder is never stolen from. Past the lease we
-    reclaim unconditionally, which is sound only because the critical section is so short.
-    """
-    p = alarm_lock_path(path)
-    gp = gate_lock_path(path)
-    if not take_alarm_gate(gp):
-        return False
-    try:
-        info = _lock_info(p)
-        if info is None or not _lock_expired(info, p):
-            return False
-        p.unlink()
-        return True
-    except OSError:
-        return False
-    finally:
-        drop_alarm_gate(gp)
-
-
-def take_alarm_lock(path):
-    """Take the per-session alarm lock, or report that somebody else holds it.
-
-    Creating is the only way in and it happens behind the gate, so two processes can never both
-    believe they hold it; releasing and reclaiming happen behind the same gate, so neither can land
-    in the middle of the other's check.
-    """
-    p = alarm_lock_path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    gp = gate_lock_path(path)
-    for _ in range(5):
-        if _lock_info(p) is None:
-            if not take_alarm_gate(gp):
-                continue        # 门被占：下一轮再看，绝不在门外抢锁
-            try:
-                try:
-                    _create_lock(p, f"{os.getpid()} {int(time.time())}\n")
-                    return True
-                except FileExistsError:
-                    pass
-            finally:
-                drop_alarm_gate(gp)
-            continue
-        # 有锁：可能只是崩溃残留，让回收者在门里判定并删除
-        if not try_reap_alarm_lock(path) and _lock_info(p) is not None:
-            return False        # 锁还在 = 真有人持锁（或门被占），本轮让给别人
-    return False
+def cmd_alarm_set(a):
+    """Set one alarm for one session. The caller is the plugin, which has already resolved which
+    mailbox this session owns; the box and session are re-checked against the registry here so a
+    stale mapping cannot write a record."""
+    routes = load_routes()
+    box, sid, delay = a.box, a.session, int(a.delay)
+    if delay < ALARM_MIN or delay > ALARM_MAX:
+        sys.exit(f"延迟要在 {ALARM_MIN}–{ALARM_MAX} 分钟之间，收到 {delay}")
+    rec = {"box": box, "session": sid}
+    ok, why = verify_alarm_identity(routes, rec)
+    if not ok:
+        sys.exit(why)
+    with with_alarm_lock(sid) as fd:
+        if fd is None:
+            sys.exit("另一个进程正在改这个会话的闹钟，这次没有落下任何记录")
+        cur = read_alarm(sid)
+        if isinstance(cur, dict) and cur.get("state") in ("pending", "lettered"):
+            due = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(cur.get("due") or 0)))
+            sys.exit(f"这个会话已经有一个活动闹钟（{cur.get('id')}，{due} 到期）。"
+                     f"要改时间先 postoffice_alarm_cancel() 取消，再重新设。")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        new = {"id": f"A{stamp}_{re.sub(r'[^A-Za-z0-9_.-]', '_', box)[:24]}",
+               "box": box, "session": sid, "due": time.time() + delay * 60,
+               "created": time.time(), "state": "pending"}
+        write_alarm(new)
+    log("postman.log", f"闹钟 {new['id']}：{box} {sid} 将在 {delay} 分钟后提醒")
+    print(f"已设闹钟：{new['id']}")
+    print(f"到期时间：{time.strftime('%Y-%m-%d %H:%M', time.localtime(new['due']))}"
+          f"（{delay} 分钟后，按本机时间）")
+    print(f"绑定：只唤醒 {box} 这个信箱里当前绑定的那个会话；换绑或下线都会让它保留不丢")
+    print(f"现在结束本轮：不要 sleep、不要轮询、不要空转。到期时邮局只投一句固定短提醒"
+          f"「{ALARM_TEXT}」")
+    return 0
 
 
-def release_alarm_lock(path):
-    """Release the lock we hold — behind the gate, and only when the lock still names our own pid.
-
-    The pid check means a release can never remove somebody else's fresh lock, and the gate means
-    it cannot land in the middle of a reclaimer that has already verified a stale instance.
-    """
-    p = alarm_lock_path(path)
-    gp = gate_lock_path(path)
-    if not take_alarm_gate(gp):
-        return                 # 门拿不到就不删：锁会由看门狗回收，不会永久卡住
-    try:
-        if _holder_pid(p) == os.getpid():
-            try:
-                p.unlink()
-            except OSError:
-                pass
-    finally:
-        drop_alarm_gate(gp)
+def cmd_alarm_cancel(a):
+    """Cancel this session's alarm. Only ever touches the record bound to this session and box."""
+    routes = load_routes()
+    box, sid = a.box, a.session
+    rec = read_alarm(sid)
+    if not isinstance(rec, dict) or not rec.get("id"):
+        print("本会话当前没有活动闹钟，无需取消。")
+        return 0
+    if rec.get("session") != sid or rec.get("box") != box:
+        sys.exit(f"这条闹钟属于 {rec.get('box')}，不是 {box}；没有动它")
+    offline = bool(routes.get(box, {}).get("status") == "offline")
+    if not offline:
+        ok, why = verify_alarm_identity(routes, rec)
+        if not ok:
+            sys.exit(why)
+    with with_alarm_lock(sid) as fd:
+        if fd is None:
+            sys.exit("另一个进程正在改这个会话的闹钟，这次没有改动")
+        cur = read_alarm(sid)
+        if not isinstance(cur, dict) or not cur.get("id"):
+            print("这个闹钟刚刚已经被取消。")
+            return 0
+        if cur.get("session") != sid or cur.get("box") != box:
+            sys.exit(f"这条闹钟属于 {cur.get('box')}，不是 {box}；没有动它")
+        aid = cur["id"]
+        where = ""
+        if cur.get("state") == "lettered" and cur.get("letter") == aid and alarm_delivered(box, aid):
+            where = "已经送达过了"
+        elif offline:
+            # 信箱当下离线：身份是唯一的，但没人收，所以只清定时器，不碰 inbox 里的提醒
+            where = "信箱当前离线，没有待送达的提醒需要撤回；只清掉这个会话的定时器。"
+        else:
+            moved = archive_alarm_letter(box, aid)
+            if moved:
+                where = f"提醒已投递但还没送达，原信存档到 {moved}，不会再响"
+            else:
+                where = "定时器已清掉，信箱里没有待响的提醒"
+        try:
+            alarm_file(sid).unlink()
+        except FileNotFoundError:
+            pass
+    log("postman.log", f"闹钟 {aid} 已取消（{box} {sid}）：{where}")
+    print(f"已取消闹钟 {aid}：{where}")
+    print("只清掉了这个会话的运行态记录，没有碰别的信箱，也没有改任何信件正文。")
+    return 0
 
 
 def opencode_session_exists(sid):
@@ -1662,7 +1655,8 @@ def process_alarms(routes):
     for path, _seen in list_alarms():
         # 每个会话一把锁：抢不到说明插件工具正在改同一条记录，这一轮跳过（不排队、不覆盖）。
         # 拿到锁之后必须重读，因为刚才那次读可能和写者撞在一起。
-        if not take_alarm_lock(path):
+        fd = take_alarm_lock(path)
+        if fd is None:
             log("postman.log", f"闹钟记录 {path.stem} 正被另一个进程改动，这一轮跳过")
             continue
         try:
@@ -1670,7 +1664,7 @@ def process_alarms(routes):
             if isinstance(rec, dict) and rec.get("id"):
                 handle_alarm(routes, path, rec, now)
         finally:
-            release_alarm_lock(path)
+            release_alarm_lock(fd)
 
 
 def handle_alarm(routes, path, rec, now):
@@ -2851,6 +2845,15 @@ def main():
     p.add_argument("to", help="收件信箱")
     p.add_argument("id", metavar="信件编号", help="完整编号（文件名去掉 .md）；不接受路径、通配符或前缀")
     p.set_defaults(fn=cmd_retract)
+    p = sp.add_parser("alarm-set", help="给一个 OpenCode 会话设一次性闹钟（由插件工具调用；在内核锁内改记录）")
+    p.add_argument("--box", required=True, help="该会话绑定的信箱")
+    p.add_argument("--session", required=True, help="OpenCode 会话 ID")
+    p.add_argument("--delay", required=True, type=int, metavar="分钟", help=f"{ALARM_MIN}–{ALARM_MAX}")
+    p.set_defaults(fn=cmd_alarm_set)
+    p = sp.add_parser("alarm-cancel", help="取消一个会话的闹钟（由插件工具调用）")
+    p.add_argument("--box", required=True, help="该会话绑定的信箱")
+    p.add_argument("--session", required=True, help="OpenCode 会话 ID")
+    p.set_defaults(fn=cmd_alarm_cancel)
     p = sp.add_parser("broadcast", help="广播：给多个信箱各投一封带编号的信，回执汇总成一封给发信方")
     p.add_argument("to", help="收件信箱，逗号分隔；all = 除发信方外全部")
     p.add_argument("sender")
