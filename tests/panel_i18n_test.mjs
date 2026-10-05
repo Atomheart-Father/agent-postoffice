@@ -30,10 +30,12 @@ const STATE = {
     {
       name: 'dev"one', app: "OpenCode", method: "opencode_plugin", who: "开发者 <script>",
       online: true, ident: "ses_abc",
-      counts: { waiting: 2, reminded: 1, failed: 0 },
+      counts: { waiting: 2, reminded: 1, failed: 1 },
       pending: [
         { file: "a.md", status: "waiting", subject: "<img src=x onerror=1>", from: "manager_a" },
-        { file: "b.md", status: "reminded", subject: "A&B 交接", from: "manager_b" },
+        { file: "b.md", status: "waiting", subject: "第二封待投递", from: "manager_a" },
+        { file: "c.md", status: "reminded", subject: "A&B 交接", from: "manager_b" },
+        { file: "d.md", status: "failed", subject: "投递失败那封", from: "manager_b" },
       ],
       acks: [{ by: "manager_a", note: "收到 & 已归档" }],
     },
@@ -41,7 +43,7 @@ const STATE = {
       counts: { waiting: 0, reminded: 0, failed: 0 }, pending: [], acks: [] },
   ],
   groups: [{ name: "codex", members: ["mgr_a", "mgr_b"], online: 1, total: 2,
-             counts: { waiting: 2, reminded: 1, failed: 0 } }],
+             counts: { waiting: 2, reminded: 1, failed: 1 } }],
   aliases: [{ name: "boss", target: "manager_a",
               candidates: [{ name: "manager_a", online: true, known: true },
                            { name: "manager_b", online: false, known: true }],
@@ -172,22 +174,30 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
   has(a.els["log"].innerHTML, "通知人：原始内容", "英文界面下原始日志仍是原文");
 }
 
-// 5) The clear confirmation covers both statistics and follows the language; archive stays a POST.
+// 5) The clear confirmation covers all three statistics and the total, follows the language,
+//    and archive stays a POST. The failed count must be in there: clear archives the whole inbox.
 {
-  for (const [l, index, needle, other] of [
-    ["zh-Hans-CN", 0, "2 封待投递 + 1 封已提醒未归档", "2 waiting + 1 reminded"],
-    ["en-US", 1, "2 waiting + 1 reminded but not filed", "2 封待投递"],
+  for (const [l, index, needles, other] of [
+    ["zh-Hans-CN", 0, ["全部 4 封信件和通知", "2 封待投递", "1 封已提醒未归档",
+                      "1 封投递失败需人工处理", "收件箱"], "2 waiting"],
+    ["en-US", 1, ["all 4 letters and notifications", "2 waiting", "1 reminded but not filed",
+                  "1 failed delivery needing a human", "inbox"], "2 封待投递"],
   ]) {
     const e = makeEnv({ langs: [l] }); await settle();
-    e.fire("boxes", "click", { target: target(".clear", { dataset: { clear: "dev_one", w: "2", r: "1" } }) });
+    e.fire("boxes", "click", { target: target(".clear", { dataset: { clear: "dev_one", w: "2", r: "1",
+                                                                    f: "1", n: "4" } }) });
     await settle();
     is(e.confirmations.length, 1, `${l} 归档前有一次确认`);
-    has(e.confirmations[0], needle, `${l} 确认文案覆盖两态数量`);
+    for (const needle of needles) has(e.confirmations[0], needle, `${l} 确认文案含「${needle}」`);
     hasNot(e.confirmations[0], other, `${l} 确认文案不含另一种语言`);
     const post = e.calls.filter((c) => c.method === "POST");
     is(post.length, 1, `${l} 归档只发一次写请求`);
     is(post[0].url, "/api/clear", `${l} 归档走 /api/clear`);
   }
+  // The button must pass the real counts from the snapshot, including failed.
+  const btn = makeEnv({ langs: ["en-US"] }); await settle();
+  has(btn.els["boxes"].innerHTML, 'data-f="1"', "归档按钮带上投递失败数量");
+  has(btn.els["boxes"].innerHTML, 'data-n="4"', "归档按钮带上收件箱总数");
   const none = makeEnv({ langs: ["en-US"] }); await settle();
   is((none.els["boxes"].innerHTML.match(/data-clear=/g) || []).length, 1,
      "只有有信的信箱显示归档按钮（空信箱不给按钮）");

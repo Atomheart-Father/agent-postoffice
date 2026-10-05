@@ -136,6 +136,19 @@ def header_field(path, key):
     return ""
 
 
+def header_field_present(path, key):
+    """True when the header block carries this key at all, even with an empty value.
+
+    Distinguishes "this letter says nothing about broadcasts" from "this letter claims to be a
+    broadcast copy but the value is blank", which must not be treated as an ordinary letter.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(line.startswith(key) for line in text.split("\n\n", 1)[0].splitlines())
+
+
 def receipt_query_id(path):
     """The id a receipt notification carries in its *header*, else ''. Never matched from the body."""
     return header_field(path, "回执：")
@@ -144,6 +157,11 @@ def receipt_query_id(path):
 def broadcast_letter_id(path):
     """The broadcast id this letter was delivered under, from its header only, else ''."""
     return header_field(path, "广播：")
+
+
+def looks_like_bid(value):
+    """A broadcast id shape check: `B<digits>-<digits>_<sender>` (the real format), nothing looser."""
+    return bool(re.fullmatch(r"B\d{8}-\d{6}_[A-Za-z0-9_.\-]+", value or ""))
 
 
 def receipt_subject(path):
@@ -345,6 +363,19 @@ def find_broadcast_letter(box, bid):
     return None
 
 
+def broadcast_delivered(box, bid):
+    """True when this box already holds a letter for this broadcast id, in inbox/ or archived in done/.
+
+    Used to make a retried switch announcement per-recipient idempotent even if the state write
+    after the delivery was lost: the delivered letter itself is the evidence.
+    """
+    for sub in ("inbox", "done"):
+        d = HOME / box / sub
+        if d.is_dir() and any(broadcast_letter_id(p) == bid for p in d.glob("*.md")):
+            return True
+    return False
+
+
 def to_done(path):
     """ack means processed: move the letter out of inbox/ into done/. Already in done/: no-op."""
     if not path or path.parent.name == "done":
@@ -505,11 +536,17 @@ def _reject_dup_keys(pairs):
     return dict(pairs)
 
 
-def load_config():
+def load_config(validate=True):
     """(cfg, error). cfg is None when config.json is absent or unusable; error is a human line.
 
     Read fresh every time it is used. A broken config only disables the group/alias features and
     never guesses an address from a stale cache; plain mailbox mail keeps working.
+
+    With validate=True (the default, and what every runtime caller uses) the *whole* config is run
+    through config_errors first: a hand-edited file with version=2, a duplicated group member or a
+    notify box that no longer exists is treated exactly like an unparsable one, so groups and
+    logical addresses are disabled instead of half-working. `config show` passes validate=False
+    because its job is to print what is wrong.
     """
     if not CONFIG.exists():
         return None, ""
@@ -521,6 +558,13 @@ def load_config():
         return None, f"{CONFIG.name} 读不出来（{e}）；分组与逻辑地址已停用，物理信箱照常"
     if not isinstance(cfg, dict):
         return None, f"{CONFIG.name} 顶层必须是对象；分组与逻辑地址已停用，物理信箱照常"
+    if validate:
+        bad = config_errors(cfg, load_routes())
+        if bad:
+            head = bad[0] if len(bad) == 1 else f"{len(bad)} 处问题，第一处：{bad[0]}"
+            return None, (f"{CONFIG.name} 配置无效（{head}）；"
+                          f"分组与逻辑地址已停用，物理信箱照常；未改动任何信箱状态。"
+                          f"`postoffice config show` 看全部问题")
     return cfg, ""
 
 
@@ -848,7 +892,7 @@ def cmd_config(a):
     """`config import FILE` replaces the whole file atomically (after validating and backing up);
     `config show` only reads. Neither one creates a default config or touches mailbox state."""
     if a.action == "show":
-        cfg, err = load_config()
+        cfg, err = load_config(validate=False)   # show's job is to print what is wrong, not to bail out
         if err:
             sys.exit(err)
         if cfg is None:
@@ -953,7 +997,7 @@ def resolve_ack_target(name, ref):
     A letter that claims a broadcast which does not exist (or is not addressed here) is an error,
     never a silent downgrade to a plain letter ack.
     """
-    rec = broadcast_record(ref)
+    rec = broadcast_record(ref) if looks_like_bid(ref) else None
     if rec is not None:
         if name not in rec.get("to", []):
             sys.exit(f"{ref} 是广播，但不是发给 {name} 的，不记账")
@@ -963,7 +1007,11 @@ def resolve_ack_target(name, ref):
     if not letter:
         sys.exit(f"找不到编号 {ref} 的信：编号是文件名去掉 .md，或广播编号；也可能不是发给 {name} 的")
     bid = broadcast_letter_id(letter)
-    if bid:
+    if bid or header_field_present(letter, "广播："):
+        # A `广播：` header is a claim about this letter: blank or malformed is an error, never a
+        # silent downgrade to a plain letter ack (nothing is written when this exits).
+        if not looks_like_bid(bid):
+            sys.exit(f"{ref} 的「广播：」信头是空的或不是广播编号格式；不记账，也不改账本或原信")
         rec = broadcast_record(bid)
         if rec is None:
             sys.exit(f"{ref} 标着广播 {bid}，但没有这份广播的记录；不记账（可 `postoffice list` 核对）")
@@ -1072,27 +1120,42 @@ def cmd_archive_receipt(a):
     return 0
 
 
-def post_broadcast(sender, to, subject, need, body, secs):
+def post_broadcast(sender, to, subject, need, body, secs, bid=None, only=None, done_set=None):
     """Create the broadcast record and drop one letter per recipient. Returns (bid, [(name, path)]).
 
     Recipients are validated by the caller; this is the single place a broadcast is created, so a
     system-initiated switch reuses exactly the same delivery and tallying path as `broadcast`.
+
+    `bid` pins the id (a switch event derives one from its own event id, so a resumed step can
+    never mint a second record); an id already on disk is reused rather than suffixed.
+    `only` limits delivery to the recipients that still need a letter and `done_set` collects them
+    as each letter lands, so a partial failure resumes per recipient instead of re-posting.
     """
-    ts = time.strftime("%Y%m%d-%H%M%S")
     bdir = broadcasts_dir()
     bdir.mkdir(parents=True, exist_ok=True)
-    bid, i = f"B{ts}_{sender}", 2
-    while (bdir / f"{bid}.json").exists():
-        bid = f"B{ts}_{sender}-{i}"
-        i += 1
-    rec = {"id": bid, "from": sender, "subject": subject, "need": clean_need(need), "to": to,
-           "deadline": time.time() + secs, "created": now_str(), "acks": {}, "summarized": False}
-    (bdir / f"{bid}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if not bid:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        bid, i = f"B{ts}_{sender}", 2
+        while (bdir / f"{bid}.json").exists():
+            bid = f"B{ts}_{sender}-{i}"
+            i += 1
+    rec = read_json(bdir / f"{bid}.json")
+    if not isinstance(rec, dict) or rec.get("id") != bid:
+        rec = {"id": bid, "from": sender, "subject": subject, "need": clean_need(need), "to": list(to),
+               "deadline": time.time() + secs, "created": now_str(), "acks": {}, "summarized": False}
+        (bdir / f"{bid}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n",
+                                          encoding="utf-8")
     out = []
     for n in to:
+        if only is not None and n not in only:
+            continue
         text = f"{body.rstrip()}\n\n回执请用：postoffice ack {n} {bid} \"一句话\""
         out.append((n, write_letter(n, sender, subject, clean_need(need), text,
                                      extra_headers=[f"广播：{bid}"])))
+        if done_set is not None:
+            # Recorded after the letter really landed, so a caller that dies mid-batch still knows
+            # exactly who got it and never re-posts to them.
+            done_set.add(n)
     return bid, out
 
 
@@ -1247,7 +1310,9 @@ def process_alias_switches(routes):
     The actual target is recomputed from config+routes every round; ALIAS_STATE only remembers what
     was already announced, so a restart never re-announces and a same-round A→B→A cancels silently.
     Each confirmed switch gets a recoverable event id whose broadcast/handoff/human-notify steps are
-    de-duplicated separately, so a half-finished event resumes instead of re-broadcasting.
+    de-duplicated separately, so a half-finished event resumes instead of re-broadcasting. The
+    broadcast step reuses the event's own deterministic id and only reaches recipients with no
+    letter yet, so one event is always exactly one record and one letter per recipient.
     """
     cfg, err = load_config()
     if cfg is None:
@@ -1255,10 +1320,15 @@ def process_alias_switches(routes):
             notify_once(f"cfg::{err}", "联络总站：配置不可用", err)
         return
     st = alias_state()
-    for name in list(st["aliases"]):                 # an alias dropped from config loses its pending state
+    dirty = False
+    for name in list(st["aliases"]):
+        # An alias dropped from config loses its whole history *and that is persisted*: otherwise a
+        # restart would read the stale pending state back and resume a switch nobody asked for, or
+        # re-adding the alias would inherit an old baseline instead of making a new one.
         if name not in (cfg.get("aliases") or {}):
             del st["aliases"][name]
-    dirty = False
+            dirty = True
+            log("postman.log", f"alias @{name} 已从配置移除，清掉它的切换基线与待确认")
     for name, raw in (cfg.get("aliases") or {}).items():
         spec, aerr = normalize_alias(raw)
         if spec is None or not isinstance(spec.get("candidates"), list) or not spec["candidates"]:
@@ -1268,19 +1338,27 @@ def process_alias_switches(routes):
         a = st["aliases"].setdefault(name, {"seen": False, "confirmed": None, "pending": None,
                                             "pending_since": 0.0, "events": {}})
         target = alias_target(spec, routes)
-        if not a.get("seen"):                        # first sighting is a baseline, not a switch
-            a.update(seen=True, confirmed=target, pending=None, pending_since=0.0)
+        if not a.get("seen"):
+            # First sighting is a baseline, not a switch: it never announces the current target.
+            # A baseline with nobody online is remembered as "not announced yet" so the spec's
+            # once-only "no one can take it" notice still happens after the stability window.
+            a.update(seen=True, confirmed=target, pending=None, pending_since=0.0,
+                     idle_announced=target is not None)
             dirty = True
             log("postman.log", f"alias @{name} 登记初始目标 {target or '（无在线候选）'}（不广播）")
             continue
         confirmed = a.get("confirmed")
-        if target == confirmed:
-            if a.get("pending"):
+        # `pending` is None both when nothing is pending and when the pending switch is "nobody can
+        # take it" — so the in-flight marker is `pending_since`, not `pending`.
+        armed = float(a.get("pending_since") or 0) > 0
+        idle_notice = confirmed is None and not a.get("idle_announced")
+        if target == confirmed and not idle_notice:
+            if armed:
                 a["pending"], a["pending_since"] = None, 0.0
                 dirty = True
                 log("postman.log", f"alias @{name} 稳定期内回到 {confirmed or '（无在线候选）'}，撤销待切换")
             continue
-        if a.get("pending") != target:
+        if not armed or a.get("pending") != target:
             a["pending"], a["pending_since"] = target, time.time()
             dirty = True
             log("postman.log", f"alias @{name} 待切换 → {target or '（无在线候选）'}"
@@ -1293,16 +1371,32 @@ def process_alias_switches(routes):
                    if e.get("from") == confirmed and e.get("to") == target and not e.get("done")), None)
         if ev is None:
             n = len(a["events"]) + 1
-            ev = {"id": f"E{n}_{name}_{confirmed or 'none'}___{target or 'none'}", "from": confirmed,
-                  "to": target, "broadcast": None, "handoff": None, "notified": False, "done": False}
-            a["events"][ev["id"]] = ev
-            save_alias_state(st)
-        notify_boxes = [n for n in (spec.get("notify") or []) if n in routes]
+            eid = f"E{n}_{name}_{confirmed or 'none'}___{target or 'none'}"
+            # `at` is fixed at creation, so the broadcast id this event will use is derivable again
+            # after a restart: same event → same id → the record on disk is reused, never a second one.
+            ev = {"id": eid, "at": time.strftime("%Y%m%d-%H%M%S"), "from": confirmed, "to": target,
+                  "broadcast": None, "sent": [], "handoff": None, "notified": False, "done": False}
+            a["events"][eid] = ev
+            save_alias_state(st)                     # persist the id *before* any side effect
+        ev.setdefault("sent", [])
+        ev.setdefault("at", time.strftime("%Y%m%d-%H%M%S"))
+        notify_boxes = [x for x in (spec.get("notify") or []) if x in routes]
         steps_ok = True
-        if ev["broadcast"] is None:                   # step 1: one real broadcast to the notify boxes
+        if ev["broadcast"] != "-" and len(ev["sent"]) < len(notify_boxes):
+            # Step 1: one real broadcast with a deterministic id, delivered per recipient. A retry
+            # reuses that id (no second record) and only reaches the boxes with no letter yet —
+            # checked against the boxes themselves, so even a crash between the delivery and the
+            # state write cannot re-announce.
+            bid = ev["broadcast"] or f"B{ev['at']}_postoffice-switch"
+            pending_boxes = [x for x in notify_boxes if x not in ev["sent"] and not broadcast_delivered(x, bid)]
             if not notify_boxes:
                 ev["broadcast"] = "-"                # nothing to announce; do not retry every round
+                save_alias_state(st)
+            elif not pending_boxes:                  # every box already holds this broadcast
+                ev["broadcast"] = bid
+                save_alias_state(st)
             else:
+                landed = set()
                 try:
                     bid, sent = post_broadcast(
                         "postoffice", notify_boxes, f"逻辑地址 @{name} 改由 {target or '（无在线候选）'} 受理",
@@ -1312,12 +1406,19 @@ def process_alias_switches(routes):
                         f"现在：{target or '（无在线候选）'}\n"
                         f"原因：{reason}\n\n"
                         f"这封信只报告收件路由变化：不授予任何额外权限、不替人开始工作、不移动已投递的信。",
-                        1800)
+                        1800, bid=bid, only=pending_boxes, done_set=landed)
                     ev["broadcast"] = bid
-                    log("postman.log", f"alias 切换广播 {bid} → {notify_boxes}")
+                    ev["sent"] = sorted(set(ev["sent"]) | landed)
+                    log("postman.log", f"alias 切换广播 {bid} → {notify_boxes}"
+                                       f"（已送达 {len(ev['sent'])}/{len(notify_boxes)}）")
                 except Exception as e:
+                    # Letters that landed before the failure count as delivered, so the retry only
+                    # reaches the recipients that never got one; the event keeps the same bid.
+                    ev["broadcast"] = bid
+                    ev["sent"] = sorted(set(ev["sent"]) | landed)
                     steps_ok = False
-                    log("postman.log", f"alias @{name} 切换广播失败：{e}")
+                    log("postman.log", f"alias @{name} 切换广播未完成（已送达 {len(ev['sent'])}/"
+                                       f"{len(notify_boxes)}）：{e}")
                     notify_once(f"switch::{ev['id']}::bcast", "联络总站：切换广播失败",
                                 f"@{name} {confirmed or '（无）'} → {target or '（无）'}：{e}；下轮重试")
             save_alias_state(st)
@@ -1352,7 +1453,7 @@ def process_alias_switches(routes):
                         f"后={target or '（无在线候选）'} 原因={reason} "
                         f"通知={'、'.join(notify_boxes) or '无'} "
                         f"交接={target if ev['handoff'] not in (None, '-') else '无'}")
-        a.update(confirmed=target, pending=None, pending_since=0.0)
+        a.update(confirmed=target, pending=None, pending_since=0.0, idle_announced=True)
         dirty = True
     if dirty:
         save_alias_state(st)
