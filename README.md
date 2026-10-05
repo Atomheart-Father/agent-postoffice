@@ -65,7 +65,7 @@ MSG
 
 The recipient wakes up, reads, does the work, replies, and moves the letter into its own `done/`.
 
-**Receipt rule (copy that / ack)**: a letter you must answer before you can continue ("need: reply / review") still gets a proper `send` back. For "FYI" letters and the closing copy that, use `ack` instead: it records the receipt and files the letter into `done/`, with a metadata-only notification (source, original subject, lookup ID) through the existing idle delivery channel — the body stays in the ledger. `send` prints the **letter ID** (the file name minus `.md`), which is what `ack` takes. A broadcast (`broadcast`) sends one tagged letter per recipient; they ack the broadcast ID, and the sender gets **one** summary once everyone has replied or the deadline passes. To read a receipt body, run `postoffice receipt <box> <id>` (exact ID; read-only — no send, no ack, no moving letters, no waking; an unknown ID or another mailbox's receipt is refused).
+**Receipt rule (copy that / ack)**: a letter you must answer before you can continue ("need: reply / review") still gets a proper `send` back. For "FYI" letters and the closing copy that, use `ack` instead: it records the receipt and files the letter into `done/`, with a metadata-only notification (source, original subject, lookup ID) through the existing idle delivery channel — the body stays in the ledger. A receipt notification defaults to no reply and no further ack: read it, move it to `done/`, and only follow up with `send` when an omitted part of the original request is needed to continue. `send` prints the **letter ID** (the file name minus `.md`), which is what `ack` takes. A broadcast (`broadcast`) sends one tagged letter per recipient; they ack the broadcast ID, and the sender gets **one** summary once everyone has replied or the deadline passes. To read a receipt body, run `postoffice receipt <box> <id>` (exact ID; read-only — no send, no ack, no moving letters, no waking; an unknown ID or another mailbox's receipt is refused).
 
 | Command | What it does |
 |---|---|
@@ -121,7 +121,7 @@ In these cases a Claude session can't be woken for a while; letters are never lo
 - **After pressing Stop or rewinding a session in the app**: the app kills that session's background process, the watcher goes with it, and it comes back with the next message.
 - **A session completely untouched for 7 days**: the watcher expires. Every turn restarts the 7-day clock.
 - **Codex thread not loaded**: `codex queue` still returns success but the thread won't wake; the 30-minute "reminded but unprocessed" alert covers it.
-- **After upgrading agent-postoffice**: restart Claude Desktop and OpenCode so the new hook and plugin are loaded — an OpenCode instance that is already running keeps its old plugin until restarted.
+- **After upgrading agent-postoffice**: updating the script in place needs no Claude restart — the existing watcher loads the new code on the next `Stop`/`SessionStart` hook, whereas restarting the Claude app drops every session's watcher until it runs another turn. A running OpenCode instance keeps its old plugin until you restart it. Reload the Claude app only when the hook configuration itself changed (first install, or hooks added/removed).
 
 ## Future work
 
