@@ -21,6 +21,7 @@ const { PostofficePlugin } = await import('../opencode/postoffice.ts')
 const FIXED = '你设的闹钟到了，请检查刚才安排的任务。'
 const LIVE = 'ses_live_alarm'
 const LIVE2 = 'ses_live_alarm_2'
+const LIVE3 = 'ses_live_alarm_3'
 const OTHER = 'ses_someone_else'
 const DIR_OK = join(root, 'proj')
 
@@ -54,11 +55,13 @@ const state = {
     lab2: { methods: ['opencode_plugin'], session_id: LIVE2, status: 'online' },
     other: { methods: ['opencode_plugin'], session_id: OTHER, status: 'online' },
     quiet: { methods: ['notify'], session_id: 'ses_notify_only', status: 'online' },
+    // 混批用例专用：再给一个信箱，避开前面用例用掉的 10 分钟限流窗口
+    lab3: { methods: ['opencode_plugin'], session_id: LIVE3, status: 'online' },
   },
   busy: new Set(),
   prompts: [],
   failNext: false,
-  sessionDirs: { [LIVE]: DIR_OK, [LIVE2]: DIR_OK, [OTHER]: DIR_OK, ses_notify_only: DIR_OK },
+  sessionDirs: { [LIVE]: DIR_OK, [LIVE2]: DIR_OK, [LIVE3]: DIR_OK, [OTHER]: DIR_OK, ses_notify_only: DIR_OK },
   getFails: false,
 }
 const saveRoutes = async () => writeFile(join(root, 'routes.json'), JSON.stringify(state.routes))
@@ -104,13 +107,22 @@ const nowStampLocal = () => {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
 }
 let lastArmSecond = null
-const armLive = async (box = 'lab', sid = LIVE, minutes = 30) => {
+// fired=true 时把记录推进到 lettered（邮递员到期后的状态），投递用例都走这个；
+// 留 pending 是为了那条负例：pending 记录不得让同编号的信享受闹钟短通道。
+const armLive = async (box = 'lab', sid = LIVE, minutes = 30, fired = true) => {
   // 编号精确到秒：同一秒里连设两个闹钟会撞号（台账按文件名去重），所以等下一个整秒
   while (lastArmSecond !== null && nowStampLocal().slice(-6) === lastArmSecond)
     await new Promise((r) => setTimeout(r, 120))
   const r = await out(await schedule({ delay_minutes: minutes }, ctx(sid)))
   const m = r.match(/编号 (A[0-9-]+_[A-Za-z0-9_.-]+)/)
   assert.ok(m, `schedule 应当给出闹钟编号：${r}`)
+  if (fired) {
+    const fresh = await readAlarm(sid)
+    fresh.state = 'lettered'
+    fresh.letter = fresh.id
+    fresh.lettered_at = Math.floor(Date.now() / 1000)
+    await writeFile(alarmFile(sid), JSON.stringify(fresh) + '\n')
+  }
   const rec = await readAlarm(sid)
   assert.equal(rec.box, box, '记录里的信箱应当是当前唯一映射')
   lastArmSecond = nowStampLocal().slice(-6)
@@ -432,6 +444,54 @@ await t('闹钟信正文里的注入尝试无效：只得到那句常量', async
   await cancel()
 })
 
+await t('记录还在 pending 时不享受闹钟短通道（不得绕过到期判定）', async () => {
+  state.prompts.length = 0
+  await cancel()
+  const { id } = await armLive('lab', LIVE, 30, false)
+  assert.equal((await readAlarm(LIVE)).state, 'pending', '这条记录还没到期')
+  await putLetter('lab', `${id}.md`, alarmLetter(id))
+  await plugin.event({ event: { type: 'session.idle' } })
+  await settle()
+  assert.equal(state.prompts.length, 1, '信仍会投，但不按闹钟短通道')
+  const text = state.prompts[0].body.parts[0].text
+  assert.ok(text.includes('联络总站新信'), 'pending 记录要按普通信渲染：' + text)
+  assert.ok(text.includes('== '), '普通信形态给路径：' + text)
+  assert.ok(!text.trim().startsWith('\u23f0'), '不得占用闹钟短通道：' + text)
+  await cancel()
+})
+
+await t('记录已 lettered 但文件名与 id 不一致时不走短通道', async () => {
+  state.prompts.length = 0
+  await cancel()
+  const { id } = await armLive('lab', LIVE, 30, true)
+  await putLetter('lab', `${id}-copy.md`, alarmLetter(id))   // 文件名不是记录里的那封信
+  await plugin.event({ event: { type: 'session.idle' } })
+  await settle()
+  assert.equal(state.prompts.length, 1)
+  const text = state.prompts[0].body.parts[0].text
+  assert.ok(text.includes('联络总站新信'), '文件名对不上按普通信处理：' + text)
+  assert.ok(!text.includes(FIXED), '不得当作已响的闹钟：' + text)
+  await rm(join(root, 'lab', 'inbox', `${id}-copy.md`), { force: true })
+  await cancel()
+})
+
+await t('记录属于别的信箱时不走短通道', async () => {
+  state.prompts.length = 0
+  await cancel()
+  const { id } = await armLive('lab2', LIVE2, 30, true)
+  const rec = await readAlarm(LIVE2)
+  rec.box = 'lab'                       // 记录说在 lab，但本会话的信箱是 lab2
+  await writeFile(alarmFile(LIVE2), JSON.stringify(rec) + '\n')
+  await putLetter('lab2', `${id}.md`, alarmLetter(id))
+  await plugin.event({ event: { type: 'session.idle' } })
+  await settle()
+  assert.equal(state.prompts.length, 1)
+  const text = state.prompts[0].body.parts[0].text
+  assert.ok(text.includes('联络总站新信'), '信箱对不上按普通信处理：' + text)
+  await rm(join(root, 'lab2', 'inbox', `${id}.md`), { force: true })
+  await cancel(ctx(LIVE2))
+})
+
 await t('伪造「闹钟：」信头不享受精简通道：按普通信路径渲染', async () => {
   state.prompts.length = 0
   await cancel()
@@ -476,17 +536,21 @@ await t('会话忙时不打断，等下一次 idle', async () => {
 
 await t('闹钟信与普通信混在 inbox：先送正式信那条流程不乱，提醒仍只有短句', async () => {
   state.prompts.length = 0
-  await putLetter('lab', '20260101-120000_sender_普通信.md',
+  await putLetter('lab3', '20260101-120000_sender_普通信.md',
     '来源：someone\n事由：普通信\n需要：仅告知\n\n正文\n')
-  const { id: cid } = await armLive()
-  await putLetter('lab', `${cid}.md`, alarmLetter(cid))
-  await plugin.event({ event: { type: 'session.idle' } })
-  await settle()
+  const { id: cid } = await armLive('lab3', LIVE3, 30, true)
+  await putLetter('lab3', `${cid}.md`, alarmLetter(cid))
+  // 每轮只投一封正式信，所以两封需要两轮 idle
+  for (let i = 0; i < 2; i++) {
+    await plugin.event({ event: { type: 'session.idle' } })
+    await settle()
+  }
   const texts = state.prompts.map((p) => p.body.parts[0].text)
-  assert.ok(texts.length >= 1)
-  for (const x of texts) assert.ok(x.includes(FIXED) || x.includes('联络总站新信'), '每条都是自己的形态')
-  const alarmTexts = texts.filter((x) => x.includes(FIXED))
-  for (const x of alarmTexts) assert.ok(!x.includes('来源：'), '闹钟那条不得展开信头')
+  assert.ok(texts.length >= 2, '两封都要投出去：' + JSON.stringify(texts))
+  assert.ok(texts.some((x) => x.includes(FIXED)), '闹钟那条是极短提醒：' + JSON.stringify(texts))
+  assert.ok(texts.some((x) => x.includes('联络总站新信')), '普通信那条按自己的形态：')
+  for (const x of texts.filter((y) => y.includes(FIXED))) assert.ok(!x.includes('来源：'), '闹钟那条不得展开信头')
+  assert.equal(state.prompts[0].path.id, LIVE3, '投给 lab3 绑定的那个会话')
 })
 
 // ---------------------------------------------------------------- 取消排队中的提醒
