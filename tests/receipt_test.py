@@ -14,6 +14,11 @@ import unittest
 PO = Path(__file__).resolve().parents[1] / 'postoffice'
 SENTINEL = 'SENTINEL-RECEIPT-BODY-7f3a9c'
 
+# 与运行环境的 Claude 桌面变量隔离：在 Claude 桌面会话里跑也不会按真实身份认人
+for _var in ('CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_HOST_SESSION_ID'):
+    os.environ.pop(_var, None)
+HOOK_TIMEOUT = 60  # 钩子最多等这么久，超时算失败，绝不挂死整轮测试
+
 
 def query_cmd(box, receipt_id):
     """Exactly what the reminder prints: the command with POSIX-quoted arguments."""
@@ -297,7 +302,7 @@ class ReceiptFlow(unittest.TestCase):
 
         def run(*args, body='', check=True):
             return subprocess.run([os.sys.executable, str(PO), *args], input=body, text=True,
-                                  capture_output=True, env=env, check=check)
+                                  capture_output=True, env=env, check=check, timeout=HOOK_TIMEOUT)
 
         run('init')
         run('add', 'alice', '--notify')
@@ -311,12 +316,13 @@ class ReceiptFlow(unittest.TestCase):
         t.write_text(json.dumps({'type': 'custom-title', 'customTitle': 'Quote Test'}))
         res = subprocess.run([os.sys.executable, str(PO), 'hook'],
                              input=json.dumps({'transcript_path': str(t)}),
-                             text=True, capture_output=True, env=env)
+                             text=True, capture_output=True, env=env, timeout=HOOK_TIMEOUT)
         self.assertEqual(res.returncode, 2)
         line = lambda p: next(l[len(p):] for l in res.stderr.splitlines() if l.startswith(p))
         query = line('查询：')
         shell_env = dict(env, PATH=str(PO.parent) + os.pathsep + env.get('PATH', ''))
-        got = subprocess.run(['sh', '-c', query], text=True, capture_output=True, env=shell_env)
+        got = subprocess.run(['sh', '-c', query], text=True, capture_output=True,
+                             env=shell_env, timeout=HOOK_TIMEOUT)
         self.assertEqual(got.returncode, 0, got.stderr)
         self.assertIn(SENTINEL, got.stdout)
         # archive is now a CLI call, not an inlined shell line: it moves only this box's notification

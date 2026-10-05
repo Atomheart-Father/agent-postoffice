@@ -19,11 +19,12 @@ try {
     '来源：bob\n事由：回执：核查结果\n需要：回执（默认不答复）\n回执：original\n原事由：核查结果\n' +
     `回执内容：${SENTINEL}\n`)
   let busy = true
+  let boom = false // 模拟投递失败（promptAsync 抛错）
   const prompts = []
   plugin = await PostofficePlugin({ directory: root, client: { session: {
     get: async () => ({ data: { directory: root } }),
     status: async () => ({ data: busy ? { 'session-1': { type: 'busy' } } : {} }),
-    promptAsync: async (p) => prompts.push(p),
+    promptAsync: async (p) => { if (boom) throw new Error('mock delivery failure'); prompts.push(p) },
   } } })
   const scan = async () => {
     await plugin.event({ event: { type: 'session.idle' } })
@@ -66,7 +67,34 @@ try {
   assert.equal((merged.match(/orig2/g) || []).length, 1, 'merged lookup id appears once')
   await scan()
   assert.equal(prompts.length, 2, 'nothing redelivered')
-  console.log('PASS: offline, busy, idle metadata-only receipt, lookup command, dedup, merged trailing receipt')
+
+  // retry must re-claim: with two instances live, a failed batch is retried by exactly one of them
+  let plugin2 = null
+  try {
+    await writeFile(join(root, 'alice/inbox/20260101-000020_frank_letter.md'),
+      '来源：frank\n事由：需要重试的信\n需要：回复\n\n正文\n')
+    const prompts2 = []
+    plugin2 = await PostofficePlugin({ directory: root, client: { session: {
+      get: async () => ({ data: { directory: root } }),
+      status: async () => ({ data: {} }),
+      promptAsync: async (p) => { if (boom) throw new Error('mock delivery failure'); prompts2.push(p) },
+    } } })
+    const scan2 = async () => {
+      await plugin2.event({ event: { type: 'session.idle' } })
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    boom = true
+    await scan()
+    assert.equal(prompts.length, 2, 'a failed delivery pushes no prompt')
+    boom = false
+    await Promise.all([scan(), scan2()])
+    assert.equal(prompts.length + prompts2.length, 3, 'after a failure exactly one instance retries')
+    await scan(); await scan2()
+    assert.equal(prompts.length + prompts2.length, 3, 'the retried letter is never delivered twice')
+  } finally {
+    if (plugin2) await plugin2.dispose()
+  }
+  console.log('PASS: offline, busy, idle metadata-only receipt, lookup command, dedup, merged trailing receipt, single-instance retry')
 } finally {
   if (plugin) await plugin.dispose()
   await rm(root, { recursive: true, force: true })

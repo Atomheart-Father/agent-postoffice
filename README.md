@@ -86,7 +86,7 @@ The recipient wakes up, reads, does the work, replies, and moves the letter into
 | Recipient | Who wakes it | How |
 |---|---|---|
 | Claude Code | Claude Code's own hooks | At the end of every turn and when a session starts, a hook launches `postoffice hook` in the background; it waits without calling the model. On new mail it exits with code 2, and Claude Code hands the reminder to the session and wakes it. Command hooks default to a 600 s timeout (observed: killed after 10 minutes), so the installer sets an explicit 7-day `timeout` |
-| OpenCode | Global plugin | Checks every 10 s and whenever a session goes idle; only when the session is idle does it send a reminder through OpenCode's own `session.promptAsync`. With several OpenCode instances open, claim files ensure a letter is delivered once |
+| OpenCode | Global plugin | Checks every 10 s and whenever a session goes idle; only when the session is idle does it send a reminder through OpenCode's own `session.promptAsync`. With several OpenCode instances open, claim files ensure a letter is delivered once; a failed delivery releases its claim and the retry re-claims, so two instances never each retry the same letter |
 | Codex | Postman | `codex queue --thread <id>` queues a reminder in the thread |
 | You | Postman | System notification |
 
@@ -105,7 +105,7 @@ If a letter that **needs action** (its `need:` header says reply / review / …)
 
 | Item | Status |
 |---|---|
-| Send/receive, dedup, rate limit, online/offline, clear, ack bookkeeping, receipt lookup, broadcast summaries, install/uninstall, need-based alerts, stable Claude identity, merged receipts | 83 automated checks in `tests/smoke.sh` |
+| Send/receive, dedup, rate limit, online/offline, clear, ack bookkeeping, receipt lookup, broadcast summaries, install/uninstall, need-based alerts, stable Claude identity, merged receipts | 84 automated checks in `tests/smoke.sh` |
 | Receipt reminders are short and metadata-only; `postoffice receipt` is exact-ID/read-only and `postoffice archive-receipt` files only the matching notification | `tests/receipt_test.py` (15 checks, incl. legacy notifications, shell-quoted commands and archive idempotence) and `tests/receipt_plugin_test.mjs` |
 | Claude Desktop: idle for minutes, woken by external mail, processes the letter | Observed repeatedly on a real machine |
 | Claude Desktop: without an explicit timeout the hook is killed after 10 minutes | Observed (a v1.0 bug; v1.1 sets 7 days) |
@@ -139,7 +139,7 @@ In these cases a Claude session can't be woken for a while; letters are never lo
 ## Tests
 
 ```bash
-./tests/smoke.sh                                              # 83 checks, entirely in a temp directory
+./tests/smoke.sh                                              # 84 checks, entirely in a temp directory
 python3 tests/receipt_test.py                                 # receipt flow: metadata-only reminders (Claude hook and a Codex-queue mock), exact lookup, no cross-box leak, read-only, legacy notifications, broadcast, --wake
 node --experimental-strip-types tests/receipt_plugin_test.mjs # OpenCode plugin (mock client, no model calls)
 ```
