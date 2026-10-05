@@ -1,7 +1,8 @@
 // Exercise the exported plugin's event seam without an actual model invocation.
 // v1.4: a receipt reminder must be metadata-only (lookup ID + command), never the receipt body.
+// v1.6: formal letters go first; a receipt that has waited long enough rides along as one merged block.
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, utimes } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 const root = await mkdtemp(join(tmpdir(), 'postoffice-receipt-plugin-'))
@@ -47,7 +48,25 @@ try {
   assert.doesNotMatch(text, /归档/, 'archive command is not inlined in the reminder')
   await scan()
   assert.equal(prompts.length, 1, 'same receipt never redelivered')
-  console.log('PASS: offline, busy, idle metadata-only receipt, lookup command, dedup')
+
+  // v1.6: a pending formal letter goes first and a receipt that has waited too long rides along
+  await writeFile(join(root, 'alice/inbox/20260101-000010_carol_letter.md'),
+    '来源：carol\n事由：正式信\n需要：回复\n\n正文\n')
+  const lateReceipt = join(root, 'alice/inbox/20260101-000011_dave_notice.md')
+  await writeFile(lateReceipt,
+    '来源：dave\n事由：回执：另一件\n需要：回执（默认不答复）\n回执：orig2\n原事由：另一件\n\n正文\n')
+  const old = new Date(Date.now() - 20 * 60 * 1000)
+  await utimes(lateReceipt, old, old)
+  await scan()
+  assert.equal(prompts.length, 2, 'formal letter delivered')
+  const merged = prompts[1].body.parts[0].text
+  assert.match(merged, /【联络总站新信｜alice】/, 'formal letter first')
+  assert.match(merged, /另有 1 条回执（默认不答复，需要时按 ID 查询）：/, 'receipt merged into one trailing block')
+  assert.match(merged, /postoffice receipt 'alice' 'orig2'/, 'merged block carries the lookup command')
+  assert.equal((merged.match(/orig2/g) || []).length, 1, 'merged lookup id appears once')
+  await scan()
+  assert.equal(prompts.length, 2, 'nothing redelivered')
+  console.log('PASS: offline, busy, idle metadata-only receipt, lookup command, dedup, merged trailing receipt')
 } finally {
   if (plugin) await plugin.dispose()
   await rm(root, { recursive: true, force: true })
