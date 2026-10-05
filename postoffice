@@ -363,6 +363,30 @@ def find_broadcast_letter(box, bid):
     return None
 
 
+def box_letters(box):
+    """Every letter this box holds, wherever it keeps them: inbox/, done/ and the archived/ tree."""
+    for sub in ("inbox", "done"):
+        d = HOME / box / sub
+        if d.is_dir():
+            yield from sorted(d.glob("*.md"))
+    arch = HOME / box / "archived"
+    if arch.is_dir():
+        yield from sorted(arch.rglob("*.md"))
+
+
+def letter_tagged(box, key, value):
+    """The letter in this box whose header carries `key: value`, else None. Header block only."""
+    if not value:
+        return None
+    for p in box_letters(box):
+        try:
+            if header_field(p, key) == value:
+                return p
+        except OSError:
+            continue
+    return None
+
+
 def broadcast_delivered(box, bid):
     """True when this box already holds a letter for this broadcast id, wherever the box keeps it.
 
@@ -370,19 +394,16 @@ def broadcast_delivered(box, bid):
     (`clear` moved it out of the inbox). The delivered letter itself is the evidence, so a user
     archiving an old broadcast can never make the post office re-announce it to that box.
     """
-    for sub in ("inbox", "done"):
-        d = HOME / box / sub
-        if d.is_dir() and any(broadcast_letter_id(p) == bid for p in d.glob("*.md")):
-            return True
-    arch = HOME / box / "archived"
-    if arch.is_dir():
-        for p in arch.rglob("*.md"):
-            try:
-                if broadcast_letter_id(p) == bid:
-                    return True
-            except OSError:
-                continue
-    return False
+    return letter_tagged(box, "广播：", bid) is not None
+
+
+def handover_delivered(box, event_id):
+    """The handover note this box already holds for this switch event, else None.
+
+    Same idea as `broadcast_delivered`: the note carries the event id in its header, so a hard
+    interrupt between "the note landed" and "the state write" cannot produce a second note.
+    """
+    return letter_tagged(box, "切换事件：", event_id) is not None
 
 
 def to_done(path):
@@ -1323,12 +1344,14 @@ def process_alias_switches(routes):
 
     The actual target is recomputed from config+routes every round; ALIAS_STATE only remembers what
     was already announced, so a restart never re-announces and a same-round A→B→A cancels silently.
-    Each confirmed switch gets a recoverable event id whose broadcast/handoff/human-notify steps are
+    Each confirmed switch gets a recoverable event id whose broadcast/handover/human-notify steps are
     de-duplicated separately, so a half-finished event resumes instead of re-broadcasting. The
     broadcast id is derived from the state file's own monotonic counter (not the clock), so two
     aliases confirmed in the same second never collide and re-adding a deleted alias cannot repeat
-    an old id. That step reuses the event's id and only reaches recipients with no letter yet, so one
-    event is always exactly one record and one letter per recipient.
+    an old id. Both the broadcast and the handover note carry that identity in their header, and the
+    box itself is the second source of truth, so one event is always exactly one record, one
+    broadcast letter and one handover note per recipient — even across a hard interrupt between the
+    delivery and the state write.
     """
     cfg, err = load_config()
     if cfg is None:
@@ -1446,21 +1469,30 @@ def process_alias_switches(routes):
             if not target or target not in routes:
                 ev["handoff"] = "-"                  # nobody to hand over to
             else:
-                try:
-                    path = write_letter(target, "postoffice", f"交接：@{name} 现在由你受理", "仅告知",
-                                        f"逻辑地址 @{name} 现在由你受理。\n\n"
-                                        f"之前：{confirmed or '（无在线候选）'}\n"
-                                        f"原因：{reason}\n"
-                                        f"交接路径：{spec.get('handoff') or '（未配置）'}\n\n"
-                                        f"这封提醒只报告收件路由变化：不授予你额外权限、不自动开始任务、"
-                                        f"已投递的旧信不会搬走。")
-                    ev["handoff"] = path.stem
-                    log("postman.log", f"alias 交接提醒 {path.name} → {target}")
-                except Exception as e:
-                    steps_ok = False
-                    log("postman.log", f"alias @{name} 交接提醒失败：{e}")
-                    notify_once(f"switch::{ev['id']}::handoff", "联络总站：交接提醒失败",
-                                f"@{name} → {target}：{e}；下轮重试")
+                # Same resumable identity as the broadcast: the note carries the event id in its
+                # header, so an interrupt between "the note landed" and "the state write" resumes by
+                # finding the note itself instead of sending a second one.
+                prior = letter_tagged(target, "切换事件：", ev["id"])
+                if prior is not None:
+                    ev["handoff"] = prior.stem
+                    log("postman.log", f"alias @{name} 交接提醒已存在（{prior.name}）→ {target}，不重投")
+                else:
+                    try:
+                        path = write_letter(target, "postoffice", f"交接：@{name} 现在由你受理", "仅告知",
+                                            f"逻辑地址 @{name} 现在由你受理。\n\n"
+                                            f"之前：{confirmed or '（无在线候选）'}\n"
+                                            f"原因：{reason}\n"
+                                            f"交接路径：{spec.get('handoff') or '（未配置）'}\n\n"
+                                            f"这封提醒只报告收件路由变化：不授予你额外权限、不自动开始任务、"
+                                            f"已投递的旧信不会搬走。",
+                                            extra_headers=[f"切换事件：{ev['id']}"])
+                        ev["handoff"] = path.stem
+                        log("postman.log", f"alias 交接提醒 {path.name} → {target}")
+                    except Exception as e:
+                        steps_ok = False
+                        log("postman.log", f"alias @{name} 交接提醒失败：{e}")
+                        notify_once(f"switch::{ev['id']}::handoff", "联络总站：交接提醒失败",
+                                    f"@{name} → {target}：{e}；下轮重试")
             save_alias_state(st)
         if not steps_ok:                              # resume this same event next round; never start a new one
             continue
