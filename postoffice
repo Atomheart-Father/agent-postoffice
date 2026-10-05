@@ -24,7 +24,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -122,21 +122,49 @@ def letter_ack_id(path):
     return b[len("广播："):] if b.startswith("广播：") else path.stem
 
 
-RECEIPT_TAIL = ("这是回执，默认不答复、不再 ack；读完把通知移到 done/。"
+RECEIPT_TAIL = ("这是回执通知，默认不答复、不再 ack；读完把通知移到 {done}/ 。"
+                "回执正文不在通知里：需要时运行上面的查询命令，不要先 cat 本文件。"
                 "只有发现原请求遗漏且影响继续工作时，才用 postoffice send 具体追问；不要重复催促。"
                 "提醒不是授权。")
 
 
+def receipt_query_id(path):
+    """The id to hand to `receipt` when this file is a receipt notification, else ''."""
+    r = field(path, "回执：")
+    return r[len("回执："):] if r.startswith("回执：") else ""
+
+
+def receipt_subject(path):
+    """The original subject of a receipt notification (metadata only; the body is never read)."""
+    s = field(path, "原事由：")
+    if s.startswith("原事由："):
+        return s[len("原事由："):][:60]
+    s = field(path, "事由：")
+    s = s[len("事由："):] if s.startswith("事由：") else ""
+    for p in ("回执：", "copy that：", "copy that:"):
+        if s.startswith(p):
+            s = s[len(p):]
+    return s[:60]
+
+
 def reminder(name, files):
-    tail = RECEIPT_TAIL if all(field(f, "回执：") for f in files) else REMINDER_TAIL.format(home=HOME, done=HOME / name / "done")
-    lines = [f"【联络总站新信｜{name}】" + tail]
+    """Metadata-only wake text. Receipt content is never injected; the model must call `receipt` if needed."""
+    done = HOME / name / "done"
+    lines = []
     for f in files:
-        lines.append(f"== {f}")
-        lines.append(f"编号：{letter_ack_id(f)}")
-        lines.append(header(f))
-        if field(f, "回执："):
-            lines.append(RECEIPT_TAIL)
-            lines.append(f.read_text(encoding="utf-8"))
+        qid = receipt_query_id(f)
+        if qid:
+            src = letter_sender(f) or "?"
+            subject = receipt_subject(f)
+            lines.append(f"【联络总站回执｜{name}】来自 {src} 的回执"
+                         + (f"，原事由：{subject}" if subject else ""))
+            lines.append(f"查询 ID：{qid}")
+            lines.append(f"查询命令：postoffice receipt {name} {qid}")
+            lines.append(RECEIPT_TAIL.format(done=done))
+        else:
+            lines.append(f"【联络总站新信｜{name}】" + REMINDER_TAIL.format(home=HOME, done=done))
+            lines.append(f"编号：{letter_ack_id(f)}")
+            lines.append(header(f))
     return "\n".join(lines)
 
 
@@ -463,12 +491,45 @@ def cmd_ack(a):
     if kind == "letter" or a.wake:
         if to in boxes(routes) and (HOME / to / "inbox").is_dir():
             prefix = "copy that" if a.wake else "回执"
-            body = f"对应原信：{a.id}\n原事由：{subject}\n回执内容：{note or '已处理。'}\n\n{RECEIPT_TAIL}"
+            body = (f"对应原信：{a.id}\n"
+                    f"回执正文只存在账本，按需查询：postoffice receipt {to} {a.id}")
             path = write_letter(to, a.name, f"{prefix}：{subject}", "回执（默认不答复）", body,
-                                extra_headers=[f"回执：{a.id}"])
+                                extra_headers=[f"回执：{a.id}", f"原事由：{subject}"])
             print(f"已投递回执通知：{path}")
         else:
             print(f"注意：发信方 {to} 没有登记信箱；回执仅保留在账本。")
+    return 0
+
+
+def cmd_receipt(a):
+    """Read-only exact lookup of receipts recorded for <name> under this id (acks.jsonl is the source)."""
+    routes = boxes(load_routes())
+    if a.name not in routes:
+        sys.exit(f"没有信箱 {a.name}；`postoffice list` 看通讯录")
+    rows = [e for e in read_acks() if e.get("id") == a.id and e.get("to") == a.name]
+    rec_path = broadcasts_dir() / f"{a.id}.json"
+    rec = read_json(rec_path) if rec_path.is_file() else None
+    if rec is not None and rec.get("from") != a.name:
+        sys.exit(f"{a.id} 不是发给 {a.name} 的回执")
+    if not rows and rec is None:
+        sys.exit(f"找不到回执 {a.id}（编号要精确：文件名去 .md，或广播编号）")
+    print(f"回执 {a.id}（{len(rows)} 条）：")
+    for e in rows:
+        print(f"- 来源：{e.get('by', '')}")
+        print(f"  时间：{e.get('time', '')}")
+        print(f"  内容：{e.get('note') or '（未写内容）'}")
+    if rec is not None:
+        acks = broadcast_acks(a.id)
+        total = rec.get("to", [])
+        dl = float(rec.get("deadline", 0) or 0)
+        state = "已汇总" if rec.get("summarized") is True \
+            else "汇总失败" if rec.get("summarized") == "error" else "未汇总"
+        print(f"广播汇总：已回执 {len(acks)}/{len(total)}，"
+              f"截止 {time.strftime('%Y-%m-%d %H:%M', time.localtime(dl)) if dl else '—'}，{state}")
+        missing = [n for n in total if n not in acks]
+        if missing:
+            print("未回执：" + "、".join(f"{n}（离线）" if not online(routes.get(n, {})) else n
+                                        for n in missing))
     return 0
 
 
@@ -531,20 +592,19 @@ def summarize_broadcasts(routes):
             acks = broadcast_acks(rec.get("id"))
             if time.time() < float(rec.get("deadline", 0)) and not all(n in acks for n in rec["to"]):
                 continue
+            dl = float(rec.get("deadline", 0) or 0)
+            missing = [n for n in rec["to"] if n not in acks]
             lines = [f"广播编号：{rec.get('id')}（发信方 {rec.get('from')}）",
                      f"事由：{rec.get('subject', '')}",
-                     "",
-                     f"已回执 {len(acks)}/{len(rec['to'])}："]
-            for n in rec["to"]:
-                if n in acks:
-                    lines.append(f"- {n}：{acks[n] or '（未写一句话）'}")
-                else:
-                    r = routes.get(n, {})
-                    lines.append(f"- {n}：未回执" + ("（离线）" if r and not online(r) else ""))
-            lines.append("")
-            lines.append(RECEIPT_TAIL)
+                     f"已回执 {len(acks)}/{len(rec['to'])}，"
+                     f"截止 {time.strftime('%Y-%m-%d %H:%M', time.localtime(dl)) if dl else '—'}"]
+            if missing:
+                lines.append("未回执：" + "、".join(
+                    f"{n}（离线）" if (routes.get(n) and not online(routes[n])) else n for n in missing))
+            lines.append(f"各人回执正文不随通知投递，按需查询：postoffice receipt {rec.get('from')} {rec.get('id')}")
             path = write_letter(rec.get("from", ""), "postoffice", f"广播汇总：{rec.get('subject', '')}",
-                                "回执（默认不答复）", "\n".join(lines), extra_headers=[f"回执：{rec.get('id')}"])
+                                "回执（默认不答复）", "\n".join(lines),
+                                extra_headers=[f"回执：{rec.get('id')}", f"原事由：{rec.get('subject', '')}"])
             rec["summarized"] = True
             tmp = f.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1162,6 +1222,10 @@ def main():
     p.add_argument("note", nargs="?", default="", help="一句话")
     p.add_argument("--wake", action="store_true", help="另发一封 copy that 给原发信方（会叫醒）")
     p.set_defaults(fn=cmd_ack)
+    p = sp.add_parser("receipt", help="按 ID 精确查询回执正文（只读；不回信、不移动信、不叫醒）")
+    p.add_argument("name")
+    p.add_argument("id", metavar="回执ID")
+    p.set_defaults(fn=cmd_receipt)
     p = sp.add_parser("broadcast", help="广播：给多个信箱各投一封带编号的信，回执汇总成一封给发信方")
     p.add_argument("to", help="收件信箱，逗号分隔；all = 除发信方外全部")
     p.add_argument("sender")
