@@ -25,7 +25,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -38,6 +38,11 @@ GRACE = int(os.environ.get("POSTOFFICE_GRACE", 1200))  # hook/plugin mailbox not
 CONSUME_ALERT = int(os.environ.get("POSTOFFICE_CONSUME_ALERT", 1800))  # reminded but still in inbox after 30 min → tell the human
 RECEIPT_WAIT = int(os.environ.get("POSTOFFICE_RECEIPT_WAIT", 600))  # a merged receipt block waits at most 10 min before riding along
 HOOK_TIMEOUT = 7 * 24 * 3600  # explicit timeout for the async Claude hook (seconds)
+ALIAS_STABLE = int(os.environ.get("POSTOFFICE_ALIAS_STABLE", 60))  # a new alias target must hold this long before a switch is announced
+SWITCH_LOG = "alias_switch.log"
+CONFIG = HOME / "config.json"        # groups + logical addresses (v1.7); absent = feature off
+ALIAS_STATE = HOME / "alias_state.json"  # switch de-duplication only, never a second source of online truth
+NAME_RE = re.compile(r"[A-Za-z0-9_.\-]+")  # group / alias names: no paths, spaces, globs
 
 METHODS = {
     "claude_hook": "Claude Code 收信钩子（Stop/SessionStart 钩子，asyncRewake）",
@@ -116,16 +121,29 @@ def notify(title, text):
         pass
 
 
-def receipt_query_id(path):
-    """The id a receipt notification carries in its *header*, else ''. Never matched from the body."""
+def header_field(path, key):
+    """Value of a `key：…` line inside the header block only (everything before the blank line).
+
+    Never matched from the body, so a letter cannot forge a receipt or broadcast marker.
+    """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
     for line in text.split("\n\n", 1)[0].splitlines():
-        if line.startswith("回执："):
-            return line[len("回执："):]
+        if line.startswith(key):
+            return line[len(key):].strip()
     return ""
+
+
+def receipt_query_id(path):
+    """The id a receipt notification carries in its *header*, else ''. Never matched from the body."""
+    return header_field(path, "回执：")
+
+
+def broadcast_letter_id(path):
+    """The broadcast id this letter was delivered under, from its header only, else ''."""
+    return header_field(path, "广播：")
 
 
 def receipt_subject(path):
@@ -317,11 +335,12 @@ def find_letter(box, lid):
 
 
 def find_broadcast_letter(box, bid):
+    """This box's copy of a broadcast letter (header only, so a forged body marker never matches)."""
     inbox = HOME / box / "inbox"
     if not inbox.is_dir():
         return None
     for p in sorted(inbox.glob("*.md")):
-        if field(p, "广播：") == f"广播：{bid}":
+        if broadcast_letter_id(p) == bid:
             return p
     return None
 
@@ -474,6 +493,226 @@ def write_contact(name, r):
     (HOME / name / "CONTACT.md").write_text(text, encoding="utf-8")
 
 
+# ---------- config.json: groups + logical addresses (v1.7) ----------
+
+def _reject_dup_keys(pairs):
+    """json hook: a repeated key is a config bug, not a last-one-wins merge."""
+    seen = set()
+    for k, _v in pairs:
+        if k in seen:
+            raise ValueError(f"重复键 {k!r}")
+        seen.add(k)
+    return dict(pairs)
+
+
+def load_config():
+    """(cfg, error). cfg is None when config.json is absent or unusable; error is a human line.
+
+    Read fresh every time it is used. A broken config only disables the group/alias features and
+    never guesses an address from a stale cache; plain mailbox mail keeps working.
+    """
+    if not CONFIG.exists():
+        return None, ""
+    try:
+        cfg = json.loads(CONFIG.read_text(encoding="utf-8"), object_pairs_hook=_reject_dup_keys)
+    except ValueError as e:
+        return None, f"{CONFIG.name} 不是合法 JSON（{e}）；分组与逻辑地址已停用，物理信箱照常"
+    except OSError as e:
+        return None, f"{CONFIG.name} 读不出来（{e}）；分组与逻辑地址已停用，物理信箱照常"
+    if not isinstance(cfg, dict):
+        return None, f"{CONFIG.name} 顶层必须是对象；分组与逻辑地址已停用，物理信箱照常"
+    return cfg, ""
+
+
+def require_config(feature):
+    cfg, err = load_config()
+    if err:
+        sys.exit(err)
+    if cfg is None:
+        sys.exit(f"还没有 {CONFIG}，{feature}未启用。"
+                 f"用 `postoffice config import FILE` 导入，`postoffice config show` 看现状")
+    return cfg
+
+
+def normalize_alias(value):
+    """(spec, error). The plain array form means candidates only: no notify, no handoff."""
+    if isinstance(value, list):
+        return {"candidates": value, "notify": [], "handoff": ""}, ""
+    if not isinstance(value, dict):
+        return None, "必须是候选信箱数组，或含 candidates 的对象"
+    extra = sorted(set(value) - {"candidates", "notify", "handoff"})
+    if extra:
+        return None, f"对象里有不支持的字段：{'、'.join(extra)}（只有 candidates / notify / handoff）"
+    if "candidates" not in value:
+        return None, "对象缺 candidates"
+    return {"candidates": value["candidates"], "notify": value.get("notify", []),
+            "handoff": value.get("handoff", "")}, ""
+
+
+def config_errors(cfg, routes):
+    """Every reason a candidate config cannot be imported, as human lines. [] = importable."""
+    if not isinstance(cfg, dict):
+        return ["顶层必须是 JSON 对象"]
+    errs = []
+    if cfg.get("version") != 1:
+        errs.append(f"version 必须是 1（现在读到 {cfg.get('version')!r}）")
+    groups, aliases = cfg.get("groups", {}), cfg.get("aliases", {})
+    if not isinstance(groups, dict):
+        errs.append("groups 必须是对象")
+        groups = {}
+    if not isinstance(aliases, dict):
+        errs.append("aliases 必须是对象")
+        aliases = {}
+    known = set(boxes(routes))
+    for kind, table in (("group", groups), ("alias", aliases)):
+        for name in table:
+            if not isinstance(name, str) or not NAME_RE.fullmatch(name) or not name.strip("."):
+                errs.append(f"{kind} 名字不合法：{name!r}（只允许英文字母、数字、下划线、横线、点）")
+    for name in sorted(set(map(str, groups)) & set(map(str, aliases))):
+        errs.append(f"{name} 同时是 group 和 alias：两者共用一个名字空间")
+
+    def ref_error(kind, name, ref, where):
+        if not isinstance(ref, str) or not ref:
+            errs.append(f"{kind} {name} 的{where}必须是信箱名")
+        elif ref in groups or ref in aliases:
+            errs.append(f"{kind} {name} 的{where}指向逻辑地址 {ref}：不支持嵌套，只能填物理信箱")
+        elif ref not in known:
+            errs.append(f"{kind} {name} 的{where}指向未登记信箱 {ref}")
+
+    for name, members in groups.items():
+        if not isinstance(members, list):
+            errs.append(f"group {name} 必须是信箱数组")
+            continue
+        if len(members) != len(set(map(str, members))):
+            errs.append(f"group {name} 有重复成员")
+        for m in members:
+            ref_error("group", name, m, "成员")
+    for name, value in aliases.items():
+        spec, err = normalize_alias(value)
+        if err:
+            errs.append(f"alias {name}：{err}")
+            continue
+        cands = spec["candidates"]
+        if not isinstance(cands, list) or not cands:
+            errs.append(f"alias {name} 的 candidates 必须是非空数组")
+            continue
+        if len(cands) != len(set(map(str, cands))):
+            errs.append(f"alias {name} 的 candidates 有重复项")
+        for c in cands:
+            ref_error("alias", name, c, "候选")
+        notify = spec["notify"]
+        if not isinstance(notify, list):
+            errs.append(f"alias {name} 的 notify 必须是信箱数组")
+            continue
+        if len(notify) != len(set(map(str, notify))):
+            errs.append(f"alias {name} 的 notify 有重复项")
+        for c in notify:
+            ref_error("alias", name, c, "通知对象")
+        if not isinstance(spec["handoff"], str):
+            errs.append(f"alias {name} 的 handoff 必须是字符串路径")
+    return errs
+
+
+def alias_target(spec, routes):
+    """First candidate that is a registered, online mailbox; None when nobody can take it."""
+    for c in spec["candidates"]:
+        r = routes.get(c)
+        if r and online(r):
+            return c
+    return None
+
+
+def resolve_alias(cfg, name, routes):
+    """(target, status_lines, spec) for a send to @name. Exits before any body is read."""
+    raw = (cfg.get("aliases") or {}).get(name)
+    if raw is None:
+        if name in (cfg.get("groups") or {}):
+            sys.exit(f"@{name} 是分组，不是逻辑地址；发信请写具体信箱名")
+        sys.exit(f"配置里没有逻辑地址 @{name}；`postoffice config show` 看有哪些")
+    spec, err = normalize_alias(raw)
+    if err:
+        sys.exit(f"配置里的 @{name} 不可用：{err}")
+    cands = spec["candidates"]
+    known = boxes(routes)
+    target, lines = None, []
+    for c in cands:
+        r = known.get(c)
+        if r is None:
+            sys.exit(f"@{name} 引用了未登记信箱 {c}；没有投递到任何信箱")
+        if target is None and online(r):
+            target = c
+        lines.append(f"- {c}：{'在线' if online(r) else '离线'}")
+    if target is None:
+        sys.exit(f"发送失败：@{name} 当前没有在线信箱\n候选：\n" + "\n".join(lines))
+    return target, lines, spec
+
+
+def group_scope(ref, routes):
+    """(label, members) for a group ref like `@codex`. A plain mailbox name stays a single box."""
+    name = ref[1:] if ref.startswith("@") else ref
+    if not ref.startswith("@") and name in boxes(routes):
+        return name, [name]
+    cfg = require_config("分组开关")
+    groups = cfg.get("groups") or {}
+    if name in groups:
+        members = list(groups[name] or [])
+        missing = [m for m in members if m not in boxes(routes)]
+        if missing:
+            sys.exit(f"分组 @{name} 引用了未登记信箱：{'、'.join(missing)}；未改动任何信箱状态")
+        return f"@{name}", members
+    if name in (cfg.get("aliases") or {}):
+        sys.exit(f"{ref} 是逻辑地址（alias），不能做分组开关；发信用 `postoffice send {ref} …`")
+    if not ref.startswith("@"):
+        sys.exit(f"{name} 是配置里的逻辑名字；分组操作请写 @{name}")
+    sys.exit(f"配置里没有分组 @{name}；`postoffice config show` 看有哪些分组")
+
+
+def set_group_status(ref, status, quiet=False):
+    """Validate every member first, then reuse the single-mailbox transition rules."""
+    routes = load_routes()
+    label, members = group_scope(ref, routes)
+    for m in members:
+        if m not in boxes(routes):
+            sys.exit(f"信箱 {m} 已不在通讯录；未改动任何信箱状态")
+    for m in members:
+        if status == "online" and routes[m].get("status") != "online":
+            routes[m]["online_since"] = time.time()   # only a real offline→online transition resets the clock
+        routes[m]["status"] = status
+    if members:
+        save_routes(routes)
+        for m in members:
+            write_contact(m, routes[m])
+        log("postman.log", f"{label} 整组设为 {status}（{len(members)} 个信箱）")
+    if not quiet:
+        print(f"{label}：{len(members)} 个信箱已设为 {status}")
+        for m in members:
+            n = len(pending(m))
+            tail = (f"新信照收，但不提醒；当前积压 {n} 封" if status == "offline"
+                    else f"积压的 {n} 封会在 {POLL} 秒内送达（受每 {RATE_WIN // 60} 分钟 {RATE_N} 次的限流）")
+            print(f"- {m}：{tail}")
+        if not members:
+            print("（空组：没有成员，什么都没改）")
+    return label, len(members)
+
+
+def clear_group(ref, quiet=False):
+    """Archive each member's backlog (kept on disk, never sent); report per member where it went."""
+    routes = load_routes()
+    label, members = group_scope(ref, routes)
+    total, lines = 0, []
+    for m in members:
+        dst, n = clear_backlog(m)
+        total += n
+        lines.append(f"- {m}：" + ("没有积压的信" if not n else f"{n} 封存档到 {dst}（不会再送出）"))
+    log("postman.log", f"{label} 清空积压 {total} 封")
+    if not quiet:
+        print(f"{label}：{len(members)} 个信箱的积压")
+        for line in lines:
+            print(line)
+        print(f"合计 {total} 封")
+    return label, total
+
+
 # ---------- commands ----------
 
 def cmd_init(_a=None, quiet=False):
@@ -596,23 +835,142 @@ def clear_backlog(name):
 
 
 def cmd_clear(a):
+    if a.name.startswith("@"):
+        clear_group(a.name)
+        return 0
     if a.name not in boxes(load_routes()):
         sys.exit(f"没有信箱 {a.name}")
     dst, n = clear_backlog(a.name)
     print(f"{a.name} 没有积压的信" if not n else f"已把 {n} 封积压信存档到 {dst}（不会再送出；需要时手动挪回 inbox/）")
 
 
+def cmd_config(a):
+    """`config import FILE` replaces the whole file atomically (after validating and backing up);
+    `config show` only reads. Neither one creates a default config or touches mailbox state."""
+    if a.action == "show":
+        cfg, err = load_config()
+        if err:
+            sys.exit(err)
+        if cfg is None:
+            print(f"还没有 {CONFIG}：分组与逻辑地址未启用（物理信箱照常）。"
+                  f"\n用 `postoffice config import FILE` 导入；`postoffice config show` 随时查看。")
+            return 0
+        full = load_routes()
+        routes = boxes(full)
+        bad = config_errors(cfg, full)
+        print(f"配置：{CONFIG}")
+        print(f"  groups {len(cfg.get('groups') or {})} 个，aliases {len(cfg.get('aliases') or {})} 个")
+        for name, members in (cfg.get("groups") or {}).items():
+            if not isinstance(members, list):
+                members = []
+            print(f"  @{name}：{sum(1 for m in members if m in routes and online(routes[m]))}/{len(members)} 在线")
+            for m in members:
+                print(f"    - {_box_mark(m, routes)}")
+        st = alias_state()
+        for name, raw in (cfg.get("aliases") or {}).items():
+            spec, aerr = normalize_alias(raw)
+            if spec is None or not isinstance(spec.get("candidates"), list):
+                print(f"  @{name}：不可用（{aerr}）")
+                continue
+            target = alias_target(spec, routes)
+            print(f"  @{name} → {target or '（当前没有在线候选）'}")
+            for c in spec["candidates"]:
+                print(f"    - {_box_mark(c, routes)}")
+            print(f"    切换通知：{'、'.join(spec['notify']) or '（无）'}")
+            print(f"    交接路径：{spec['handoff'] or '（无，只作元数据，邮局不读这个文件）'}")
+            a = st["aliases"].get(name) or {}
+            if a.get("confirmed") is None and not a.get("seen"):
+                print("    切换记录：还没有基线（邮递员首次看到时登记，不广播）")
+            elif a.get("pending"):
+                left = max(0, int(ALIAS_STABLE - (time.time() - float(a.get("pending_since") or 0))))
+                print(f"    切换记录：已确认 {a.get('confirmed') or '（无）'}；待切换 {a['pending'] or '（无在线候选）'}"
+                      f"（稳定期还剩 {left} 秒）")
+            else:
+                print(f"    切换记录：已确认 {a.get('confirmed') or '（无）'}")
+        if bad:
+            print("注意：这份配置现在有问题，相关操作会报错：")
+            for e in bad:
+                print(f"  - {e}")
+        return 0
+
+    src = Path(a.file).expanduser()
+    try:
+        raw = src.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"读不了 {src}：{e}（{CONFIG.name} 保持原样）")
+    try:
+        cfg = json.loads(raw, object_pairs_hook=_reject_dup_keys)
+    except ValueError as e:
+        sys.exit(f"{src} 不是合法 JSON：{e}（{CONFIG.name} 保持原样）")
+    bad = config_errors(cfg, load_routes())
+    if bad:
+        sys.exit(f"配置没通过校验（{CONFIG.name} 保持原样）：\n" + "\n".join(f"- {e}" for e in bad))
+    bk = None
+    if CONFIG.exists():
+        LOGS.mkdir(parents=True, exist_ok=True)
+        bk = LOGS / f"config.json.{time.strftime('%Y%m%d-%H%M%S')}.bak"
+        shutil.copy2(CONFIG, bk)
+    tmp = CONFIG.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(CONFIG)                       # whole-file replace, never a merge
+    print(f"已导入配置：{CONFIG}" + (f"（旧文件备份：{bk}）" if bk else ""))
+    print(f"  groups {len(cfg.get('groups') or {})} 个，aliases {len(cfg.get('aliases') or {})} 个")
+    return 0
+
+
+def _box_mark(name, routes):
+    r = routes.get(name)
+    if r is None:
+        return f"{name}：未登记"
+    return f"{name}：{'在线' if online(r) else '离线'}"
+
+
 def cmd_send(a):
     routes = load_routes()
-    if not (HOME / a.to / "inbox").is_dir():
-        sys.exit(f"没有信箱 {a.to}；`postoffice list` 看通讯录")
+    to, extra = a.to, []
+    if a.to.startswith("@"):
+        # resolve once, right now: a pending switch never delays or re-routes a new letter
+        target, lines, _spec = resolve_alias(require_config("逻辑地址"), a.to[1:], routes)
+        print(f"解析 {a.to} → {target}")
+        print("\n".join(lines))
+        to, extra = target, [f"逻辑地址：{a.to}"]
+    if not (HOME / to / "inbox").is_dir():
+        sys.exit(f"没有信箱 {to}；`postoffice list` 看通讯录")
     body = Path(a.file).read_text(encoding="utf-8") if a.file else sys.stdin.read()
-    path = write_letter(a.to, a.sender, a.subject, clean_need(a.need), body)
+    path = write_letter(to, a.sender, a.subject, clean_need(a.need), body, extra_headers=extra)
     print(f"已投递：{path}")
     print(f"编号：{path.stem}")
-    r = boxes(routes).get(a.to, {})
+    r = boxes(routes).get(to, {})
     if r and not online(r):
-        print(f"注意：{a.to} 目前离线，信会留在信箱，等它上线再提醒。")
+        print(f"注意：{to} 目前离线，信会留在信箱，等它上线再提醒。")
+
+
+def resolve_ack_target(name, ref):
+    """(bid, kind, letter, to, subject) — the broadcast id this ack really means.
+
+    `ref` is either a broadcast id or the physical letter id whose *header* carries `广播：<bid>`;
+    both normalise to the same bid, so acking one way and then the other records one receipt.
+    A letter that claims a broadcast which does not exist (or is not addressed here) is an error,
+    never a silent downgrade to a plain letter ack.
+    """
+    rec = broadcast_record(ref)
+    if rec is not None:
+        if name not in rec.get("to", []):
+            sys.exit(f"{ref} 是广播，但不是发给 {name} 的，不记账")
+        return rec["id"], "broadcast", find_broadcast_letter(name, rec["id"]), rec.get("from", ""), \
+            rec.get("subject", "")
+    letter = find_letter(name, ref)
+    if not letter:
+        sys.exit(f"找不到编号 {ref} 的信：编号是文件名去掉 .md，或广播编号；也可能不是发给 {name} 的")
+    bid = broadcast_letter_id(letter)
+    if bid:
+        rec = broadcast_record(bid)
+        if rec is None:
+            sys.exit(f"{ref} 标着广播 {bid}，但没有这份广播的记录；不记账（可 `postoffice list` 核对）")
+        if name not in rec.get("to", []):
+            sys.exit(f"{ref} 属于广播 {bid}，但不是发给 {name} 的，不记账")
+        return rec["id"], "broadcast", letter, rec.get("from", ""), rec.get("subject", "")
+    return ref, "letter", letter, letter_sender(letter), field(letter, "事由：").replace("事由：", "", 1)
 
 
 def cmd_ack(a):
@@ -620,43 +978,35 @@ def cmd_ack(a):
     routes = load_routes()
     if a.name not in boxes(routes):
         sys.exit(f"没有信箱 {a.name}；`postoffice list` 看通讯录")
-    for e in read_acks():
-        if e.get("by") == a.name and e.get("id") == a.id:
-            print(f"已回执过：{a.id}（{e.get('time', '')}）")
+    bid, kind, letter, to, subject = resolve_ack_target(a.name, a.id)
+    for e in read_acks():                    # dedup on the normalised id, so mixing the two forms counts once
+        if e.get("by") == a.name and e.get("id") == bid:
+            print(f"已回执过：{bid}（{e.get('time', '')}）")
+            if letter:
+                to_done(letter)
             return 0
     note = a.note or ""
-    rec_path = broadcasts_dir() / f"{a.id}.json"
-    rec = read_json(rec_path) if rec_path.is_file() else None
-    if rec is not None:
-        if a.name not in rec.get("to", []):
-            sys.exit(f"{a.id} 是广播，但不是发给 {a.name} 的，不记账")
-        kind, to, subject = "broadcast", rec.get("from", ""), rec.get("subject", "")
-        letter = find_broadcast_letter(a.name, a.id)
-    else:
-        letter = find_letter(a.name, a.id)
-        if not letter:
-            sys.exit(f"找不到编号 {a.id} 的信：编号是文件名去掉 .md，或广播编号；也可能不是发给 {a.name} 的")
-        kind, to, subject = "letter", letter_sender(letter), field(letter, "事由：").replace("事由：", "", 1)
     if not to:
         sys.exit(f"这封信没有可识别的发信方，无法记账：{a.id}")
     if letter and receipt_query_id(letter):
         to_done(letter)
         print("回执通知已归档，不再产生回执。")
         return 0
-    append_ack({"time": now_str(), "by": a.name, "id": a.id, "kind": kind, "note": note, "to": to})
+    rec = broadcast_record(bid) if kind == "broadcast" else None
+    append_ack({"time": now_str(), "by": a.name, "id": bid, "kind": kind, "note": note, "to": to})
     to_done(letter)
     if kind == "broadcast":
-        done = sum(1 for e in read_acks() if e.get("id") == a.id and e.get("kind") == "broadcast")
-        print(f"已回执：{a.id}（广播 {done}/{len(rec.get('to', []))}，不会单独叫醒 {to}）")
+        done = sum(1 for e in read_acks() if e.get("id") == bid and e.get("kind") == "broadcast")
+        print(f"已回执：{bid}（广播 {done}/{len(rec.get('to', []))}，不会单独叫醒 {to}）")
     else:
-        print(f"已回执：{a.id}（空闲时通知 {to}，默认不答复）")
+        print(f"已回执：{bid}（空闲时通知 {to}，默认不答复）")
     if kind == "letter" or a.wake:
         if to in boxes(routes) and (HOME / to / "inbox").is_dir():
             prefix = "copy that" if a.wake else "回执"
-            body = (f"对应原信：{a.id}\n"
-                    f"回执正文只存在账本，按需查询：postoffice receipt {shlex.quote(to)} {shlex.quote(a.id)}")
+            body = (f"对应原信：{bid}\n"
+                    f"回执正文只存在账本，按需查询：postoffice receipt {shlex.quote(to)} {shlex.quote(bid)}")
             path = write_letter(to, a.name, f"{prefix}：{subject}", "回执（默认不答复）", body,
-                                extra_headers=[f"回执：{a.id}", f"原事由：{subject}"])
+                                extra_headers=[f"回执：{bid}", f"原事由：{subject}"])
             print(f"已投递回执通知：{path}")
         else:
             print(f"注意：发信方 {to} 没有登记信箱；回执仅保留在账本。")
@@ -699,16 +1049,18 @@ def cmd_archive_receipt(a):
 
     Only runs when the caller passes the ID; it never auto-archives. Matches the `回执：<id>`
     header block only (never body text). It never reads the receipt body, never touches the ledger,
-    and never sends or wakes anyone. If ANY match would overwrite an existing done/ file, nothing is
-    moved and the command exits non-zero (both source and target are kept)."""
+    and never sends or wakes anyone. It first prints how many notifications matched — one id can
+    cover several — then checks every match: if ANY would overwrite an existing done/ file,
+    nothing is moved and the command exits non-zero (both source and target are kept)."""
     routes = boxes(load_routes())
     if a.name not in routes:
         sys.exit(f"没有信箱 {a.name}；`postoffice list` 看通讯录")
     inbox = HOME / a.name / "inbox"
     done = HOME / a.name / "done"
     matches = sorted(p for p in inbox.glob("*.md") if receipt_query_id(p) == a.id) if inbox.is_dir() else []
+    print(f"匹配 {len(matches)} 封回执通知（{a.id}）")   # count first, so a wrong id is obvious before anything moves
     if not matches:
-        print(f"没有待归档的回执通知（{a.id}）")
+        print("没有待归档的回执通知")
         return 0
     clashes = [p.name for p in matches if (done / p.name).exists()]
     if clashes:
@@ -718,6 +1070,30 @@ def cmd_archive_receipt(a):
         p.replace(done / p.name)
     print(f"已归档 {len(matches)} 封回执通知（{a.id}）")
     return 0
+
+
+def post_broadcast(sender, to, subject, need, body, secs):
+    """Create the broadcast record and drop one letter per recipient. Returns (bid, [(name, path)]).
+
+    Recipients are validated by the caller; this is the single place a broadcast is created, so a
+    system-initiated switch reuses exactly the same delivery and tallying path as `broadcast`.
+    """
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    bdir = broadcasts_dir()
+    bdir.mkdir(parents=True, exist_ok=True)
+    bid, i = f"B{ts}_{sender}", 2
+    while (bdir / f"{bid}.json").exists():
+        bid = f"B{ts}_{sender}-{i}"
+        i += 1
+    rec = {"id": bid, "from": sender, "subject": subject, "need": clean_need(need), "to": to,
+           "deadline": time.time() + secs, "created": now_str(), "acks": {}, "summarized": False}
+    (bdir / f"{bid}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    out = []
+    for n in to:
+        text = f"{body.rstrip()}\n\n回执请用：postoffice ack {n} {bid} \"一句话\""
+        out.append((n, write_letter(n, sender, subject, clean_need(need), text,
+                                     extra_headers=[f"广播：{bid}"])))
+    return bid, out
 
 
 def cmd_broadcast(a):
@@ -737,21 +1113,10 @@ def cmd_broadcast(a):
             sys.exit(f"没有信箱 {n}；`postoffice list` 看通讯录")
     body = Path(a.file).read_text(encoding="utf-8") if a.file else sys.stdin.read()
     secs = parse_duration(a.deadline or os.environ.get("POSTOFFICE_BROADCAST_DEADLINE", "30m"))
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    bdir = broadcasts_dir()
-    bdir.mkdir(parents=True, exist_ok=True)
-    bid, i = f"B{ts}_{a.sender}", 2
-    while (bdir / f"{bid}.json").exists():
-        bid = f"B{ts}_{a.sender}-{i}"
-        i += 1
-    rec = {"id": bid, "from": a.sender, "subject": a.subject, "need": clean_need(a.need), "to": to,
-           "deadline": time.time() + secs, "created": now_str(), "acks": {}, "summarized": False}
-    (bdir / f"{bid}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    bid, sent = post_broadcast(a.sender, to, a.subject, a.need, body, secs)
     print(f"广播编号：{bid}")
-    print(f"截止：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(rec['deadline']))}")
-    for n in to:
-        text = f"{body.rstrip()}\n\n回执请用：postoffice ack {n} {bid} \"一句话\""
-        path = write_letter(n, a.sender, a.subject, clean_need(a.need), text, extra_headers=[f"广播：{bid}"])
+    print(f"截止：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + secs))}")
+    for n, path in sent:
         print(f"已投递：{path}")
         r = routes.get(n, {})
         if r and not online(r):
@@ -788,6 +1153,14 @@ def summarize_broadcasts(routes):
             rec = read_json(f)
             if not rec or rec.get("summarized") or not rec.get("to"):
                 continue
+            if not (HOME / rec.get("from", "") / "inbox").is_dir():
+                # a system-initiated broadcast has no mailbox to summarise back to; record it once, never retry
+                rec["summarized"] = True
+                tmp = f.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                tmp.replace(f)
+                log("postman.log", f"广播 {rec.get('id')} 由系统发出、无收件信箱，跳过汇总")
+                continue
             acks = broadcast_acks(rec.get("id"))
             if time.time() < float(rec.get("deadline", 0)) and not all(n in acks for n in rec["to"]):
                 continue
@@ -822,6 +1195,167 @@ def summarize_broadcasts(routes):
                 tmp.replace(f)
             except Exception as e2:
                 log("postman.log", f"广播 {f.name} 标记 error 也失败：{e2}")
+
+
+def alias_state():
+    st = read_json(ALIAS_STATE)
+    if not isinstance(st, dict) or not isinstance(st.get("aliases"), dict):
+        st = {"version": 1, "aliases": {}}
+    return st
+
+
+def save_alias_state(st):
+    tmp = ALIAS_STATE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(ALIAS_STATE)
+
+
+def notify_once(key, title, text, store=".notify_once.json"):
+    """Tell the human about a recurring condition at most once per key (keeps its own small ledger)."""
+    f = HOME / store
+    seen = read_json(f)
+    seen = set(seen) if isinstance(seen, list) else set()
+    if key in seen:
+        return False
+    notify(title, text)
+    seen.add(key)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(sorted(seen), ensure_ascii=False) + "\n", encoding="utf-8")
+    return True
+
+
+def switch_reason(old, new, spec):
+    """Why the target moved, read off the actual change (never a canned 'went offline')."""
+    cands = spec["candidates"]
+    if new is None:
+        return "候选全离线"
+    if old is None:
+        return "候选上线"
+    if old not in cands or new not in cands:
+        return "配置调整"
+    if cands.index(new) < cands.index(old):
+        return "高优先级候选恢复"
+    if cands.index(new) > cands.index(old):
+        return "原目标下线"
+    return "配置调整"
+
+
+def process_alias_switches(routes):
+    """One postman round: confirm a target that has held steady for ALIAS_STABLE seconds, then
+    announce the switch exactly once.
+
+    The actual target is recomputed from config+routes every round; ALIAS_STATE only remembers what
+    was already announced, so a restart never re-announces and a same-round A→B→A cancels silently.
+    Each confirmed switch gets a recoverable event id whose broadcast/handoff/human-notify steps are
+    de-duplicated separately, so a half-finished event resumes instead of re-broadcasting.
+    """
+    cfg, err = load_config()
+    if cfg is None:
+        if err:
+            notify_once(f"cfg::{err}", "联络总站：配置不可用", err)
+        return
+    st = alias_state()
+    for name in list(st["aliases"]):                 # an alias dropped from config loses its pending state
+        if name not in (cfg.get("aliases") or {}):
+            del st["aliases"][name]
+    dirty = False
+    for name, raw in (cfg.get("aliases") or {}).items():
+        spec, aerr = normalize_alias(raw)
+        if spec is None or not isinstance(spec.get("candidates"), list) or not spec["candidates"]:
+            notify_once(f"alias::{name}", "联络总站：配置里的逻辑地址不可用",
+                        f"@{name}：{aerr or 'candidates 必须是非空数组'}；该 alias 不参与切换广播")
+            continue
+        a = st["aliases"].setdefault(name, {"seen": False, "confirmed": None, "pending": None,
+                                            "pending_since": 0.0, "events": {}})
+        target = alias_target(spec, routes)
+        if not a.get("seen"):                        # first sighting is a baseline, not a switch
+            a.update(seen=True, confirmed=target, pending=None, pending_since=0.0)
+            dirty = True
+            log("postman.log", f"alias @{name} 登记初始目标 {target or '（无在线候选）'}（不广播）")
+            continue
+        confirmed = a.get("confirmed")
+        if target == confirmed:
+            if a.get("pending"):
+                a["pending"], a["pending_since"] = None, 0.0
+                dirty = True
+                log("postman.log", f"alias @{name} 稳定期内回到 {confirmed or '（无在线候选）'}，撤销待切换")
+            continue
+        if a.get("pending") != target:
+            a["pending"], a["pending_since"] = target, time.time()
+            dirty = True
+            log("postman.log", f"alias @{name} 待切换 → {target or '（无在线候选）'}"
+                               f"（稳定 {ALIAS_STABLE} 秒后确认）")
+            continue
+        if time.time() - float(a.get("pending_since") or 0) < ALIAS_STABLE:
+            continue
+        reason = switch_reason(confirmed, target, spec)
+        ev = next((e for e in a["events"].values()
+                   if e.get("from") == confirmed and e.get("to") == target and not e.get("done")), None)
+        if ev is None:
+            n = len(a["events"]) + 1
+            ev = {"id": f"E{n}_{name}_{confirmed or 'none'}___{target or 'none'}", "from": confirmed,
+                  "to": target, "broadcast": None, "handoff": None, "notified": False, "done": False}
+            a["events"][ev["id"]] = ev
+            save_alias_state(st)
+        notify_boxes = [n for n in (spec.get("notify") or []) if n in routes]
+        steps_ok = True
+        if ev["broadcast"] is None:                   # step 1: one real broadcast to the notify boxes
+            if not notify_boxes:
+                ev["broadcast"] = "-"                # nothing to announce; do not retry every round
+            else:
+                try:
+                    bid, sent = post_broadcast(
+                        "postoffice", notify_boxes, f"逻辑地址 @{name} 改由 {target or '（无在线候选）'} 受理",
+                        "仅告知",
+                        f"逻辑地址 @{name} 的受理信箱有变化。\n"
+                        f"之前：{confirmed or '（无在线候选）'}\n"
+                        f"现在：{target or '（无在线候选）'}\n"
+                        f"原因：{reason}\n\n"
+                        f"这封信只报告收件路由变化：不授予任何额外权限、不替人开始工作、不移动已投递的信。",
+                        1800)
+                    ev["broadcast"] = bid
+                    log("postman.log", f"alias 切换广播 {bid} → {notify_boxes}")
+                except Exception as e:
+                    steps_ok = False
+                    log("postman.log", f"alias @{name} 切换广播失败：{e}")
+                    notify_once(f"switch::{ev['id']}::bcast", "联络总站：切换广播失败",
+                                f"@{name} {confirmed or '（无）'} → {target or '（无）'}：{e}；下轮重试")
+            save_alias_state(st)
+        if steps_ok and ev["handoff"] is None:        # step 2: tell the new target (path only, never read)
+            if not target or target not in routes:
+                ev["handoff"] = "-"                  # nobody to hand over to
+            else:
+                try:
+                    path = write_letter(target, "postoffice", f"交接：@{name} 现在由你受理", "仅告知",
+                                        f"逻辑地址 @{name} 现在由你受理。\n\n"
+                                        f"之前：{confirmed or '（无在线候选）'}\n"
+                                        f"原因：{reason}\n"
+                                        f"交接路径：{spec.get('handoff') or '（未配置）'}\n\n"
+                                        f"这封提醒只报告收件路由变化：不授予你额外权限、不自动开始任务、"
+                                        f"已投递的旧信不会搬走。")
+                    ev["handoff"] = path.stem
+                    log("postman.log", f"alias 交接提醒 {path.name} → {target}")
+                except Exception as e:
+                    steps_ok = False
+                    log("postman.log", f"alias @{name} 交接提醒失败：{e}")
+                    notify_once(f"switch::{ev['id']}::handoff", "联络总站：交接提醒失败",
+                                f"@{name} → {target}：{e}；下轮重试")
+            save_alias_state(st)
+        if not steps_ok:                              # resume this same event next round; never start a new one
+            continue
+        if not ev["notified"]:                        # step 3: the human hears about it exactly once
+            notify("联络总站：逻辑地址已切换",
+                   f"@{name}：{confirmed or '（无在线候选）'} → {target or '（无在线候选）'}（{reason}）")
+            ev["notified"] = True
+        ev["done"] = True
+        log(SWITCH_LOG, f"{ev['id']} alias=@{name} 前={confirmed or '（无在线候选）'} "
+                        f"后={target or '（无在线候选）'} 原因={reason} "
+                        f"通知={'、'.join(notify_boxes) or '无'} "
+                        f"交接={target if ev['handoff'] not in (None, '-') else '无'}")
+        a.update(confirmed=target, pending=None, pending_since=0.0)
+        dirty = True
+    if dirty:
+        save_alias_state(st)
 
 
 def disp_width(text):
@@ -1024,6 +1558,7 @@ def cmd_postman(_a):
                         pass
             check_consumed(routes)
             summarize_broadcasts(routes)
+            process_alias_switches(routes)
             for name, r in routes.items():
                 if not online(r):
                     continue                  # offline: letters wait, nobody is reminded
@@ -1336,16 +1871,141 @@ def broadcast_rows(limit=10):
     return rows
 
 
+def group_rows(routes=None, snap=None):
+    """Groups with their online count and the same delivery counts as a mailbox."""
+    cfg, _ = load_config()
+    routes = boxes(load_routes()) if routes is None else routes
+    snap = delivery_snapshot(routes) if snap is None else snap
+    out = []
+    for name, members in ((cfg or {}).get("groups") or {}).items():
+        if not isinstance(members, list):
+            continue
+        counts = {"waiting": 0, "reminded": 0, "failed": 0}
+        for m in members:
+            _letters, c = mail_state(m, snap)
+            for k in counts:
+                counts[k] += c[k]
+        out.append({"name": name, "members": members, "total": len(members),
+                    "online": sum(1 for m in members if m in routes and online(routes[m])),
+                    "counts": counts})
+    return out
+
+
+def alias_rows():
+    """Where each logical address resolves right now, plus what is still inside its stability window."""
+    cfg, _ = load_config()
+    routes = boxes(load_routes())
+    st = alias_state()
+    out = []
+    for name, raw in ((cfg or {}).get("aliases") or {}).items():
+        spec, aerr = normalize_alias(raw)
+        if spec is None or not isinstance(spec.get("candidates"), list):
+            out.append({"name": name, "error": aerr or "candidates 必须是非空数组"})
+            continue
+        a = st["aliases"].get(name) or {}
+        left = 0
+        if a.get("pending") and a.get("pending_since"):
+            left = max(0, int(ALIAS_STABLE - (time.time() - float(a["pending_since"]))))
+        out.append({"name": name, "target": alias_target(spec, routes), "confirmed": a.get("confirmed"),
+                    "pending": a.get("pending"), "pending_in": left, "notify": spec.get("notify") or [],
+                    "handoff": spec.get("handoff") or "",
+                    "candidates": [{"name": c, "known": c in routes,
+                                    "online": bool(routes.get(c)) and online(routes.get(c, {}))}
+                                   for c in spec["candidates"]]})
+    return out
+
+
+def switch_rows(limit=10):
+    """The last confirmed switches, newest first (from logs/alias_switch.log)."""
+    lf = LOGS / SWITCH_LOG
+    if not lf.exists():
+        return []
+    out = []
+    for line in lf.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]:
+        parts = line.split(" ", 2)
+        out.append({"id": parts[0], "t": parts[1] if len(parts) > 1 else "", "text": line})
+    return out[::-1]
+
+
+def delivery_snapshot(routes):
+    """{box: {"reminded": set(file), "failed": set(file)}} read once from the existing ledgers.
+
+    "Reminded" means the channel accepted the reminder, per channel: the Claude `.seen` file, the
+    OpenCode plugin's DELIVERED rows, and the postman's `.woken.json` (accept records). `.delivered.json`
+    is deliberately not read — it also holds the 20-minute fallback marks, which are not reminders —
+    and FAILED_FINAL is never counted as delivered. One snapshot feeds both the counts and the list so
+    the panel cannot show two different stories. No new state store.
+    """
+    out = {}
+    woken = {}
+    wf = HOME / ".woken.json"
+    if wf.exists():
+        try:
+            data = json.loads(wf.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                woken = data
+        except ValueError:
+            woken = {}
+    oc = {}
+    ledger = HOME / "opencode_delivered.jsonl"
+    if ledger.exists():
+        for line in ledger.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("box") and e.get("file"):
+                oc.setdefault(e["box"], []).append((e.get("result"), e["file"]))
+    for name, r in routes.items():
+        method = r.get("methods", ["notify"])[0]
+        reminded, failed = set(), set()
+        if method == "claude_hook":
+            seen = read_lines(HOME / name / ".seen")
+            reminded = {p.name for p in pending(name) if str(p) in seen}
+        elif method == "opencode_plugin":
+            for result, fname in oc.get(name, []):
+                if result == "DELIVERED":
+                    reminded.add(fname)
+                elif result == "FAILED_FINAL":
+                    failed.add(fname)
+        else:
+            reminded = {Path(k).name for k in woken
+                        if Path(k).parent.parent.name == name and (HOME / name / "inbox" / Path(k).name).is_file()}
+        out[name] = {"reminded": reminded, "failed": failed}
+    return out
+
+
+def mail_state(name, snap):
+    """One letter's delivery status plus the box's three counts, from the same snapshot."""
+    s = snap.get(name, {"reminded": set(), "failed": set()})
+    letters, counts = [], {"waiting": 0, "reminded": 0, "failed": 0}
+    for p in pending(name):
+        if p.name in s["reminded"]:
+            status = "reminded"
+        elif p.name in s["failed"]:
+            status = "failed"
+        else:
+            status = "waiting"
+        counts[status] += 1
+        letters.append({"file": p.name, "status": status,
+                        "subject": field(p, "事由").replace("事由：", "")[:60],
+                        "from": field(p, "来源").replace("来源：", "").split("（")[0][:30]})
+    return letters, counts
+
+
 def panel_state():
     rows = []
-    for name, r in boxes(load_routes()).items():
+    full = load_routes()
+    routes = boxes(full)
+    snap = delivery_snapshot(routes)
+    for name, r in routes.items():
         m = r.get("methods", ["notify"])[0]
+        letters, counts = mail_state(name, snap)
         rows.append({
             "name": name, "app": APP.get(m, m), "method": m, "who": r.get("who", ""),
             "online": online(r),
             "ident": r.get("claude_title") or r.get("session_id") or r.get("thread_id") or "",
-            "pending": [{"file": p.name, "subject": field(p, "事由").replace("事由：", "")[:60],
-                         "from": field(p, "来源").replace("来源：", "").split("（")[0][:30]} for p in pending(name)],
+            "pending": letters, "counts": counts,
             "acks": recent_acks(name),
         })
     lines = []
@@ -1365,7 +2025,10 @@ def panel_state():
                         pass
                 lines.append((t, f.split(".")[0], line[20:]))
     lines.sort()
+    cfg, cfg_err = load_config()
     return {"home": str(HOME), "boxes": rows, "broadcasts": broadcast_rows(),
+            "groups": group_rows(routes, snap), "aliases": alias_rows(), "switches": switch_rows(),
+            "config": str(CONFIG) if cfg is not None else "", "config_error": cfg_err,
             "log": [{"t": t, "src": s, "msg": m} for t, s, m in lines[-40:]][::-1]}
 
 
@@ -1403,21 +2066,28 @@ def cmd_panel(a):
             if self.path not in ("/api/status", "/api/clear") or not self._local() \
                     or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self._send(403, b'{"ok":false}')
+            message = ""
             try:
                 d = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-                name = str(d["name"])
                 if self.path == "/api/clear":
+                    name = str(d["name"])
                     ok = name in boxes(load_routes())
                     if ok:
                         _, n = clear_backlog(name)
                         log("postman.log", f"面板：清空 {name} 积压 {n} 封")
+                elif d.get("group"):        # group button: same transition rules, same origin check
+                    set_group_status("@" + str(d["group"]), str(d["status"]), quiet=True)
+                    ok = True
                 else:
+                    name = str(d["name"])
                     ok = apply_status(name, str(d["status"]))
                     if ok:
                         log("postman.log", f"面板：{name} 设为{'在线' if d['status'] == 'online' else '离线'}")
             except (ValueError, KeyError):
                 ok = False
-            self._send(200 if ok else 400, json.dumps({"ok": ok}).encode())
+            except SystemExit as e:        # an unknown group or a missing member: say why, change nothing
+                ok, message = False, str(e)
+            self._send(200 if ok else 400, json.dumps({"ok": ok, "error": message if not ok else ""}).encode())
 
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", port), H)
@@ -1452,6 +2122,15 @@ def cmd_panel(a):
         webbrowser.open(url)
     srv.serve_forever()
 
+def group_or_box(a, status):
+    """`online`/`offline`: @GROUP switches the whole group, a plain name stays a single mailbox."""
+    if a.name.startswith("@"):
+        set_group_status(a.name, status)
+    else:
+        set_status(a.name, status)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="postoffice", description="本机 AI 会话之间的邮局（Claude Code / OpenCode / Codex）")
     ap.add_argument("--version", action="version", version=VERSION)
@@ -1470,14 +2149,14 @@ def main():
     p = sp.add_parser("remove", help="从通讯录移除")
     p.add_argument("name")
     p.set_defaults(fn=cmd_remove)
-    p = sp.add_parser("online", help="设为在线（补送积压的信）")
-    p.add_argument("name")
-    p.set_defaults(fn=lambda a: set_status(a.name, "online"))
-    p = sp.add_parser("offline", help="设为离线（照收信，不提醒）")
-    p.add_argument("name")
-    p.set_defaults(fn=lambda a: set_status(a.name, "offline"))
-    p = sp.add_parser("clear", help="清空积压：把还没送出的信存档到 archived/，不再投递")
-    p.add_argument("name")
+    p = sp.add_parser("online", help="设为在线（补送积压的信）；@GROUP 一次上线整组")
+    p.add_argument("name", help="信箱名，或 @GROUP")
+    p.set_defaults(fn=lambda a: group_or_box(a, "online"))
+    p = sp.add_parser("offline", help="设为离线（照收信，不提醒）；@GROUP 一次下线整组")
+    p.add_argument("name", help="信箱名，或 @GROUP")
+    p.set_defaults(fn=lambda a: group_or_box(a, "offline"))
+    p = sp.add_parser("clear", help="清空积压：把还没送出的信存档到 archived/，不再投递；@GROUP 整组")
+    p.add_argument("name", help="信箱名，或 @GROUP")
     p.set_defaults(fn=cmd_clear)
     p = sp.add_parser("send", help="发信：正文从标准输入或 --file")
     p.add_argument("to")
@@ -1486,6 +2165,12 @@ def main():
     p.add_argument("need")
     p.add_argument("--file")
     p.set_defaults(fn=cmd_send)
+    g = sp.add_parser("config", help="分组与逻辑地址：import 整文件替换，show 只读查看").add_subparsers(
+        dest="action", required=True)
+    p = g.add_parser("import", help="导入 config.json（先校验，再备份旧文件，临时文件原子替换）")
+    p.add_argument("file", help="要导入的 JSON 文件")
+    p.set_defaults(fn=cmd_config)
+    g.add_parser("show", help="看当前分组、逻辑地址与解析结果（不创建配置、不改状态）").set_defaults(fn=cmd_config)
     p = sp.add_parser("ack", help="回执记账并通知发信方；收到回执默认不答复（--wake：普通信只改标题，广播另投通知）")
     p.add_argument("name")
     p.add_argument("id", metavar="信件编号|广播编号")
