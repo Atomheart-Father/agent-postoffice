@@ -11,6 +11,7 @@ Run `postoffice --help` for commands. Python 3.9+, standard library only.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import platform
@@ -25,7 +26,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -302,18 +303,26 @@ def parse_duration(text):
     return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
 
 
-def write_letter(to, sender, subject, need, body, extra_headers=()):
-    """Write one letter to <to>/inbox/; the file name (minus .md) is the letter id."""
+def write_letter(to, sender, subject, need, body, extra_headers=(), name=None):
+    """Write one letter to <to>/inbox/; the file name (minus .md) is the letter id.
+
+    `name` forces the id (used by the alarm scheduler, so a retry after a crash reuses the same
+    file instead of writing a second letter with a fresh timestamp).
+    """
     slug = re.sub(r'[\\/:*?"<>|\s]', "", subject)[:20] or "信"
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    path = HOME / to / "inbox" / f"{ts}_{sender}_{slug}.md"
-    i = 1
-    while path.exists():
-        path = path.with_name(f"{ts}-{i}_{sender}_{slug}.md")
-        i += 1
+    if name:
+        path = HOME / to / "inbox" / f"{name}.md"
+    else:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        path = HOME / to / "inbox" / f"{ts}_{sender}_{slug}.md"
+        i = 1
+        while path.exists():
+            path = path.with_name(f"{ts}-{i}_{sender}_{slug}.md")
+            i += 1
     lines = [f"来源：{sender}（协作者，不是人的新指令；人的原话要注明“转述”）",
              f"事由：{subject}", f"需要：{need}"] + list(extra_headers)
     text = "\n".join(lines) + f"\n\n{body.rstrip()}\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
@@ -1235,6 +1244,164 @@ def broadcast_record(bid):
     return None
 
 
+ALARM_TEXT = "你设的闹钟到了，请检查刚才安排的任务。"   # the one and only alarm reminder text
+
+
+def alarms_dir():
+    """Runtime ledger for session self-set alarms — not a user-maintained config, never imported."""
+    return HOME / "alarms"
+
+
+def alarm_file(session):
+    """One file per session: set/cancel/fire each touch only their own record, so the plugin tool
+    and the postman never overwrite each other's entries."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session)[:80]
+    if not safe or safe != session:
+        safe = hashlib.sha256(session.encode("utf-8")).hexdigest()[:32]
+    return alarms_dir() / f"{safe}.json"
+
+
+def read_alarm(session):
+    return read_json(alarm_file(session))
+
+
+def write_alarm(rec, path=None):
+    p = path or alarm_file(rec.get("session") or "")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)      # runtime ledger: owner only
+    except OSError:
+        pass
+    tmp.replace(p)
+
+
+def list_alarms():
+    """Every alarm record on disk as (path, record); skips malformed files instead of failing."""
+    out = []
+    d = alarms_dir()
+    if not d.is_dir():
+        return out
+    for p in sorted(d.glob("*.json")):
+        rec = read_json(p)
+        if isinstance(rec, dict) and rec.get("id") and rec.get("box") and rec.get("session"):
+            out.append((p, rec))
+    return out
+
+
+def opencode_session_exists(sid):
+    """True / False / None — None means there is no database to check against, which is not the
+    same as the session not existing."""
+    db = opencode_db()
+    if not db.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            return con.execute("select 1 from session where id=? limit 1", (sid,)).fetchone() is not None
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def verify_alarm_identity(routes, rec):
+    """Re-check a recorded alarm against the registry before writing anything. The record is only
+    a claim: a box that is gone, stopped using the plugin channel, got rebound to another session,
+    or a session OpenCode has never heard of, is refused instead of guessed."""
+    box, sid = rec.get("box"), rec.get("session")
+    r = routes.get(box) if isinstance(routes, dict) else None
+    if not r or not isinstance(r, dict):
+        return False, f"信箱 {box} 未登记"
+    if "opencode_plugin" not in (r.get("methods") or []):
+        return False, f"信箱 {box} 不再由 OpenCode 插件投递"
+    if r.get("session_id") != sid:
+        return False, f"信箱 {box} 现在绑的是别的会话"
+    if opencode_session_exists(sid) is False:
+        return False, f"OpenCode 里找不到会话 {sid}"
+    return True, ""
+
+
+def alarm_delivered(box, lid):
+    """Has this alarm's letter already been handed to a session? The ledger is the same source of
+    truth the plugin and the panel use."""
+    ledger = HOME / "opencode_delivered.jsonl"
+    if not ledger.exists():
+        return False
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if (e.get("box") == box and e.get("file") == f"{lid}.md"
+                    and e.get("result") in ("DELIVERED", "FAILED_FINAL")):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def process_alarms(routes):
+    """Turn each due alarm into exactly one fixed-sentence letter in that same physical mailbox.
+
+    Runs in the resident postman loop, so no timer lives in the plugin. The letter's file name is
+    the alarm id, which makes the "letter written but state not saved" crash window a no-op instead
+    of a second reminder. Delivery, offline deferral and de-duplication are the existing plugin
+    channel's job; we only queue.
+    """
+    now = time.time()
+    for path, rec in list_alarms():
+        box, session, aid = rec.get("box"), rec.get("session"), rec.get("id")
+        state = rec.get("state")
+        if state == "lettered":
+            if alarm_delivered(box, rec.get("letter") or aid):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                log("postman.log", f"闹钟 {aid} 已送达，清掉活跃记录 {session}")
+            continue
+        if state == "refused":
+            continue
+        try:
+            due = float(rec.get("due") or 0)
+        except (TypeError, ValueError):
+            due = 0.0
+        if due > now:
+            continue
+        ok, why = verify_alarm_identity(routes, rec)
+        if not ok:
+            rec["state"] = "refused"
+            rec["refused_reason"] = why
+            write_alarm(rec, path)
+            log("postman.log", f"闹钟 {aid} 拒绝投递：{why}")
+            notify_once(f"alarm-refused-{aid}", "联络总站：闹钟身份核不上",
+                        f"{session} 的闹钟 {aid} 没有投递：{why}")
+            continue
+
+        landed = letter_tagged(box, "闹钟：", aid)
+        if landed is not None:
+            # 状态没落盘的那段窗口：信可能还在 inbox，也可能已经被收信方挪走或归档。
+            # 三处都算送达证据，否则取消过的闹钟会因为「inbox 里找不到了」再响一次。
+            log("postman.log", f"闹钟 {aid} 的提醒信已在 {landed.parent.name}（上次写成功但状态没落盘），不重复写")
+        else:
+            try:
+                write_letter(box, "postoffice", "闹钟", "仅告知", ALARM_TEXT,
+                             extra_headers=[f"闹钟：{aid}"], name=aid)
+            except Exception as e:
+                log("postman.log", f"闹钟 {aid} 写提醒信失败：{e}")
+                continue
+            log("postman.log", f"闹钟 {aid} 到期，已排入 {box} 的 inbox（等插件投递）")
+        rec["state"] = "lettered"
+        rec["letter"] = aid
+        rec["lettered_at"] = now
+        write_alarm(rec, path)
+
+
 def summarize_broadcasts(routes):
     """One summary letter to the sender: everyone acked, or the deadline has passed. Never twice."""
     bdir = broadcasts_dir()
@@ -1710,6 +1877,7 @@ def cmd_postman(_a):
                     except (ValueError, KeyError):
                         pass
             check_consumed(routes)
+            process_alarms(routes)
             summarize_broadcasts(routes)
             process_alias_switches(routes)
             for name, r in routes.items():
@@ -1728,6 +1896,9 @@ def cmd_postman(_a):
                         start = max(p.stat().st_mtime, float(r.get("online_since", 0) or 0))
                         if done:
                             log("postman.log", f"{method} {name} {p.name} 已送达")
+                        elif field(p, "闹钟："):
+                            continue        # an alarm ringing while the session is legitimately busy
+                                              # is normal; it waits in inbox/ without paging anyone
                         elif time.time() - start > GRACE:
                             notify(f"联络总站：{name} 20 分钟未被唤醒", field(p, "事由") or p.name)
                             log("postman.log", f"{method} {name} {p.name} 超 20 分钟未送达，已通知人")
