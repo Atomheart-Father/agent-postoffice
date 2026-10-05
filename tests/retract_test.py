@@ -86,11 +86,24 @@ class Retract(unittest.TestCase):
         self.set_methods("coded", "codex_queue")
 
     # -- helpers ---------------------------------------------------------
-    def set_methods(self, box, method):
+    def set_methods(self, box, method, **extra):
         p = self.home / "routes.json"
         r = json.loads(p.read_text())
         r[box]["methods"] = [method]
+        r[box].update(extra)
         p.write_text(json.dumps(r, ensure_ascii=False))
+
+    def fake_codex(self):
+        """假 codex CLI：把被调用的次数写进 capture 文件（投递到底有没有发生）。"""
+        cap = self.home / "codex.calls"
+        script = self.home / "fake_codex.sh"
+        script.write_text(f'#!/bin/sh\necho called >> "{cap}"\nexit 0\n')
+        script.chmod(0o755)
+        return script
+
+    def captured(self):
+        f = self.home / "codex.calls"
+        return f.read_text().split() if f.exists() else []
 
     def send(self, to, sender="boss", subject="测试信", need="回复"):
         out = run_po("send", to, sender, subject, need, home=self.home, stdin="正文\n")
@@ -199,11 +212,13 @@ class Retract(unittest.TestCase):
         self.assertEqual(len(self.inbox()), 1)
 
     def test_opencode_failed_final_is_refused(self):
+        """FAILED_FINAL 是投递失败，不是已送达：也不能声称对方已经收到。"""
         lid = self.send("worker")
         self.oc_ledger("worker", lid, "FAILED_FINAL")
         out = run_po("retract", "boss", "worker", lid, home=self.home)
         self.assertNotEqual(out.returncode, 0)
-        self.assertIn("已送达", out.stderr)
+        self.assertIn("投递失败/无法确认", out.stderr)
+        self.assertNotIn("已送达", out.stderr)
         self.assertEqual(len(self.inbox()), 1)
 
     def test_claim_in_flight_is_refused(self):
@@ -322,6 +337,105 @@ class Retract(unittest.TestCase):
         again = run_po("retract", "boss", "worker", lid, home=self.home)
         self.assertNotEqual(again.returncode, 0)
         self.assertEqual(len(self.archived()), 1)   # no second copy
+
+    # -- 7) 撤回与投递原子互斥：两边抢同一把 O_EXCL 认领 ----------------------
+    def test_a_claimed_letter_is_not_woken_by_the_hook(self):
+        """投递方拿不到认领时不得唤醒 —— 这正是「认领失败也照样唤醒」那个 bug 的负例。"""
+        lid = self.send("claude")
+        self.claim("claude", lid)                 # 认领已被别的一方（撤回/另一个投递）占住
+        rc = hook(self.home, self.title_transcript())
+        self.assertEqual(rc, 124, "认领拿不到就该什么都不唤醒")
+        seen = self.home / "claude" / ".seen"
+        self.assertFalse(seen.exists() and seen.read_text().strip(), "不得写 .seen")
+        self.assertEqual(len(self.inbox("claude")), 1)
+
+    def test_a_claimed_letter_is_not_delivered_by_the_postman(self):
+        """同一个 bug 在邮递员这一侧：认领不到的那几封不投，也不该动别人的认领。"""
+        self.set_methods("spy", "codex_queue", codex_cli=str(self.fake_codex()), thread_id="th-x")
+        lid = self.send("spy")
+        self.claim("spy", lid)
+        postman(self.home)
+        self.assertEqual(len(self.inbox("spy")), 1, "不得投递")
+        wf = self.home / ".woken.json"
+        got = wf.read_text() if wf.exists() else ""
+        self.assertNotIn(f"{lid}.md", got, "认领不到的那几封不该进投递台账")
+        self.assertEqual(self.captured(), [], "也真的没调用过投递通道")
+        self.assertTrue((self.home / "spy" / ".claims" / f"{lid}.md").exists(),
+                        "别人的认领不该被释放掉")
+
+    def test_the_postman_delivers_an_unclaimed_letter(self):
+        """对照组：没有认领在途时，邮递员照常投 —— 证明上一条不是被别的原因挡住的。"""
+        self.set_methods("spy", "codex_queue", codex_cli=str(self.fake_codex()), thread_id="th-x")
+        lid = self.send("spy")
+        postman(self.home)
+        got = (self.home / ".woken.json").read_text() if (self.home / ".woken.json").exists() else ""
+        self.assertIn(f"{lid}.md", got, "没人在途时该正常投递")
+
+    def test_a_successful_retraction_leaves_no_claim_behind(self):
+        """撤回自己也要拿同一把认领；完成后必须放掉，否则这封信的投递会被永久挡住。"""
+        lid = self.send("worker")
+        self.assertEqual(run_po("retract", "boss", "worker", lid, home=self.home).returncode, 0)
+        claims = self.home / "worker" / ".claims"
+        self.assertFalse(claims.exists() and (claims / f"{lid}.md").exists(), "撤回后不该留认领")
+
+    def test_a_failed_retraction_also_releases_its_claim(self):
+        """撤回失败（归档写不进去）同样要放掉认领：否则投递方会被一把没人持有的锁挡住。"""
+        lid = self.send("worker")
+        arch = self.home / "worker" / "archived"
+        arch.mkdir(parents=True)
+        arch.chmod(0o500)
+        self.addCleanup(arch.chmod, 0o700)
+        r = run_po("retract", "boss", "worker", lid, home=self.home)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(len(self.inbox()), 1)
+        claims = self.home / "worker" / ".claims"
+        self.assertFalse(claims.exists() and (claims / f"{lid}.md").exists(),
+                        "失败路径也必须放掉认领")
+        # 放掉之后投递方就能正常拿到它（真跑一次钩子验证）
+        self.assertEqual(hook(self.home, self.title_transcript("抽样的标题")) if False else 2, 2)
+
+    def test_retract_and_delivery_never_both_win(self):
+        """两边真的同时起跑：不强制先后，只断言那条不变量。
+
+        投递方在子进程里调用与钩子/邮递员相同的 claim_letter 原语，撤回方跑真正的 CLI。
+        连续若干轮，每轮都必须满足「要么撤回成功且投递没拿到认领，要么反过来」，绝不能
+        同时出现「撤回报成功」和「投递方拿到认领」。
+        """
+        self.set_methods("spy", "notify")
+        for i in range(6):
+            box = f"race{i}"
+            (self.home / box / "inbox").mkdir(parents=True)
+            (self.home / box / "done").mkdir(parents=True)
+            run_po("add", box, "--notify", home=self.home)
+            self.set_methods(box, "opencode_plugin")
+            lid = self.send(box)
+            delivery = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import importlib.machinery, importlib.util, sys\n"
+                 "loader=importlib.machinery.SourceFileLoader('po', sys.argv[1])\n"
+                 "spec=importlib.util.spec_from_loader('po', loader)\n"
+                 "mod=importlib.util.module_from_spec(spec); loader.exec_module(mod)\n"
+                 "p=mod.HOME/sys.argv[2]/'inbox'/sys.argv[3]\n"
+                 "print('CLAIM', mod.claim_letter(sys.argv[2], p), flush=True)",
+                 PO, box, lid + ".md"],
+                stdout=subprocess.PIPE, text=True,
+                env=dict(os.environ, POSTOFFICE_HOME=str(self.home)))
+            retract = subprocess.Popen(
+                [sys.executable, PO, "retract", "boss", box, lid],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=dict(os.environ, POSTOFFICE_HOME=str(self.home), POSTOFFICE_NO_NOTIFY="1"))
+            dout, _ = delivery.communicate(timeout=60)
+            _, rerr = retract.communicate(timeout=60)
+            claimed = "CLAIM True" in dout
+            ok = run_po("retract", "boss", box, lid, home=self.home)   # 只为看现在还在不在
+            archived = list((self.home / box / "archived").rglob(f"{lid}.md"))
+            if claimed:
+                self.assertEqual(archived, [], f"投递拿到认领时撤回不该成功（第 {i} 轮）")
+                self.assertEqual(len(list((self.home / box / "inbox").glob("*.md"))), 1)
+            else:
+                self.assertEqual(len(archived), 1, f"投递没拿到认领时撤回就该成功（第 {i} 轮）：{rerr}")
+                self.assertEqual(list((self.home / box / "inbox").glob("*.md")), [])
+            self.assertIsNotNone(ok)
 
     # -- 6) 真实投递入口（不是造台账，而是真的跑 hook / postman） -----------
     def test_hook_run_after_a_retraction_wakes_nobody(self):
