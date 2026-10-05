@@ -32,7 +32,7 @@
 ## 实施证据
 
 - 版本 1.3.0 → 1.4.0。改动文件：`postoffice`、`opencode/postoffice.ts`、`skill/postoffice/SKILL.md`、`docs/MAILBOX_GUIDE.md`、`docs/SPEC_broadcast_ack.md`、`README.md`、`README.zh-CN.md`、`tests/{smoke.sh,receipt_test.py,receipt_plugin_test.mjs}`。
-- 新增只读命令 `postoffice receipt <信箱> <回执ID>`：只读 `acks.jsonl`（`id`+`to` 精确匹配），普通回执给来源/时间/内容；广播命中 `broadcasts/<id>.json` 且 `from==信箱` 时追加「已回执 n/m、截止、汇总状态、未回执」，不泄露他箱；未知/非我/未登记非零退出。
+- 新增只读命令 `postoffice receipt <信箱> <回执ID>`：只读 `acks.jsonl`（`id`+`to` 精确匹配），普通回执给来源/时间/内容；广播命中广播记录且 `from==信箱` 时追加「已回执 n/m、截止、汇总状态、未回执」，不泄露他箱；未知/非我/未登记非零退出。（初版按 `broadcasts/<id>.json` 定位；现行改用精确 ID 扫描，见“审阅修订一”。）
 - `reminder()` 与插件提醒改为**元数据**：`来源`、`原事由`（截短 60）、`查询 ID`、`查询命令`，不读文件正文；旧通知（正文在文件里）同样只按前 6 行元数据提醒。
 - `cmd_ack` 通知正文不再含 note，改为指针 `postoffice receipt <to> <id>`；`summarize_broadcasts` 汇总只给人数/截止/未回者 + 查询命令，不再列各人一句话。
 - 提醒样本（示意）：`【联络总站回执｜<box>】来自 <sender> 的回执，原事由：<subject>` / `查询 ID：<id>` / `查询命令：postoffice receipt <box> <id>` / `默认不答复…回执正文不在通知里…`。
