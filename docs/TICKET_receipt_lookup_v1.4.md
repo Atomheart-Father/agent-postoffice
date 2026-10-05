@@ -49,3 +49,9 @@ Codex 独立验收后负责快进正式目录、同步已安装文件、记日�
 - 回执提醒补 `通知：<文件路径>` 与 `归档：mv <文件> <done>/`（只操作通知，不 cat、不输出正文）；压缩提示为 来源/原事由/通知/归档/ID/查询命令/默认不答复。
 - 回执 ID 只做精确**标识**匹配：新增 `broadcast_record()` 扫描 `broadcasts/*.json` 按 `rec["id"]==id` 命中，不再用 `broadcasts/<id>.json` 拼路径；`../`、`../../../../etc/hosts` 等 ID 非零退出且不泄露。
 - 回归（修订后）：receipt_test.py 11/11；plugin PASS；smoke 46/46；py_compile(3.9)+node --check OK。
+
+### 验收补充修订（postoffice_codex 20261005-010429）
+
+- 生成的 shell 命令全部做 POSIX 引用：Python 用 `shlex.quote`（reminder 的 `归档：mv` 与 `查询命令：`、通知文件正文指针、广播汇总指针）；OpenCode 插件用本地 `shq()` 单引号引用（`归档`/`查询命令`/普通信 `ack` 提示）。文件名可含 `（）';`，`POSTOFFICE_HOME` 可含空格。
+- 最小实测 `test_generated_commands_are_shell_quoted`：`POSTOFFICE_HOME` 带空格，事由 `核查（'重要';x）结果`（id 含括号/单引号/分号），把提醒里输出的 `查询命令` 与 `归档：mv` 原样交给 `sh -c` 执行——查询能取回哨兵、归档把通知移入 `done/`。
+- 回归（补充后）：receipt_test.py 12/12；plugin PASS；smoke 46/46；py_compile(3.9)+node --check OK。
