@@ -1678,7 +1678,11 @@ def handle_alarm(routes, path, rec, now):
     box, session, aid = rec.get("box"), rec.get("session"), rec.get("id")
     state = rec.get("state")
     if state == "lettered":
-        if alarm_delivered(box, rec.get("letter") or aid):
+        # lettered 记录必须指着它自己那封信：缺 letter 或指错了都当作记录不完整，
+        # 不拿它去判定送达——和插件侧的 alarmLetterOwns 同一个口径。
+        if rec.get("letter") != aid:
+            return
+        if alarm_delivered(box, rec["letter"]):
             try:
                 path.unlink()
             except FileNotFoundError:

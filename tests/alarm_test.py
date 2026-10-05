@@ -178,6 +178,34 @@ class AlarmScheduler(unittest.TestCase):
         self.run_postman()
         self.assertEqual(len(self.inbox()), 1, 'postman 重启后不得写第二封')
 
+    def mark_delivered_for(self, lid, result='DELIVERED'):
+        with (self.home / 'opencode_delivered.jsonl').open('a', encoding='utf-8') as f:
+            f.write(json.dumps({'time': 'now', 'box': 'lab', 'file': lid + '.md',
+                                'session': 'ses_live', 'result': result}) + '\n')
+
+    def test_lettered_record_without_its_letter_is_not_trusted(self):
+        """lettered 记录缺 letter 字段（或指错了信）时不拿它判定送达 —— 插件侧同一个口径。
+
+        少写一个字段就让「已送达」成立，等于把活跃记录留在盘上；判定只认 letter == id。
+        """
+        for extra, why in (({}, '缺 letter'), ({'letter': 'A20260101-000000_other'}, 'letter 指错了信')):
+            with self.subTest(why=why):
+                self.setUp()
+                rec = self.put_alarm(state='lettered', **extra)
+                self.write_letter(rec['id'])
+                self.mark_delivered_for(rec['id'])
+                self.run_postman()
+                self.assertIsNotNone(self.read_alarm(),
+                                    f'{why} 时不得清掉活跃记录（当成了已送达）')
+
+    def test_lettered_record_whose_letter_matched_is_cleared(self):
+        """对照组：letter 字段正确时，记录照常在送达后被清掉。"""
+        rec = self.put_alarm(state='lettered', letter='A20260101-000000_lab')
+        self.write_letter(rec['id'])
+        self.mark_delivered_for(rec['id'])
+        self.run_postman()
+        self.assertIsNone(self.read_alarm(), 'letter 正确且台账已送达时应清掉记录')
+
     def test_letter_already_filed_is_not_written_again(self):
         """状态没落盘、而信已被收信方挪走或归档：也必须认得出那封信，不得再响一次。"""
         for sub in ('done', 'archived/20260101-000000'):
