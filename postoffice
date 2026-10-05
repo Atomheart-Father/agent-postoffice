@@ -1245,6 +1245,7 @@ def broadcast_record(bid):
 
 
 ALARM_TEXT = "你设的闹钟到了，请检查刚才安排的任务。"   # the one and only alarm reminder text
+ALARM_LOCK_STALE = int(os.environ.get("POSTOFFICE_ALARM_LOCK_STALE", 60))
 
 
 def alarms_dir():
@@ -1288,6 +1289,49 @@ def list_alarms():
         if isinstance(rec, dict) and rec.get("id") and rec.get("box") and rec.get("session"):
             out.append((p, rec))
     return out
+
+
+# 同一会话的闹钟记录同时被插件工具（设/取消）和本邮递员（到期）改，跨进程没有共享内存，
+# 所以每个会话一把 O_EXCL 原子锁：抢不到就说明有人在改，这一轮跳过（不动记录本身）。
+# 看门狗负责崩溃恢复：锁文件超过 ALARM_LOCK_STALE 秒即视为失效并清掉，只删锁不碰记录，
+# 所以既不会永久卡死，也不会悄悄重置计时。插件侧用同名同规则的锁，两边因此互斥。
+def alarm_lock_path(path):
+    return path.with_suffix(".json.lock")
+
+
+def take_alarm_lock(path):
+    p = alarm_lock_path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - p.stat().st_mtime
+            except OSError:
+                continue        # 锁刚被别人释放，再抢一次
+            if age > ALARM_LOCK_STALE:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+                continue
+            return False
+        except OSError:
+            return False
+        try:
+            os.write(fd, f"{os.getpid()} {int(time.time())}\n".encode())
+        finally:
+            os.close(fd)
+        return True
+    return False
+
+
+def release_alarm_lock(path):
+    try:
+        alarm_lock_path(path).unlink()
+    except OSError:
+        pass
 
 
 def opencode_session_exists(sid):
@@ -1354,52 +1398,67 @@ def process_alarms(routes):
     channel's job; we only queue.
     """
     now = time.time()
-    for path, rec in list_alarms():
-        box, session, aid = rec.get("box"), rec.get("session"), rec.get("id")
-        state = rec.get("state")
-        if state == "lettered":
-            if alarm_delivered(box, rec.get("letter") or aid):
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
-                log("postman.log", f"闹钟 {aid} 已送达，清掉活跃记录 {session}")
-            continue
-        if state == "refused":
+    for path, _seen in list_alarms():
+        # 每个会话一把锁：抢不到说明插件工具正在改同一条记录，这一轮跳过（不排队、不覆盖）。
+        # 拿到锁之后必须重读，因为刚才那次读可能和写者撞在一起。
+        if not take_alarm_lock(path):
+            log("postman.log", f"闹钟记录 {path.stem} 正被另一个进程改动，这一轮跳过")
             continue
         try:
-            due = float(rec.get("due") or 0)
-        except (TypeError, ValueError):
-            due = 0.0
-        if due > now:
-            continue
-        ok, why = verify_alarm_identity(routes, rec)
-        if not ok:
-            rec["state"] = "refused"
-            rec["refused_reason"] = why
-            write_alarm(rec, path)
-            log("postman.log", f"闹钟 {aid} 拒绝投递：{why}")
-            notify_once(f"alarm-refused-{aid}", "联络总站：闹钟身份核不上",
-                        f"{session} 的闹钟 {aid} 没有投递：{why}")
-            continue
+            rec = read_json(path)
+            if isinstance(rec, dict) and rec.get("id"):
+                handle_alarm(routes, path, rec, now)
+        finally:
+            release_alarm_lock(path)
 
-        landed = letter_tagged(box, "闹钟：", aid)
-        if landed is not None:
-            # 状态没落盘的那段窗口：信可能还在 inbox，也可能已经被收信方挪走或归档。
-            # 三处都算送达证据，否则取消过的闹钟会因为「inbox 里找不到了」再响一次。
-            log("postman.log", f"闹钟 {aid} 的提醒信已在 {landed.parent.name}（上次写成功但状态没落盘），不重复写")
-        else:
+
+def handle_alarm(routes, path, rec, now):
+    """One alarm record, already re-read under this session's lock."""
+    box, session, aid = rec.get("box"), rec.get("session"), rec.get("id")
+    state = rec.get("state")
+    if state == "lettered":
+        if alarm_delivered(box, rec.get("letter") or aid):
             try:
-                write_letter(box, "postoffice", "闹钟", "仅告知", ALARM_TEXT,
-                             extra_headers=[f"闹钟：{aid}"], name=aid)
-            except Exception as e:
-                log("postman.log", f"闹钟 {aid} 写提醒信失败：{e}")
-                continue
-            log("postman.log", f"闹钟 {aid} 到期，已排入 {box} 的 inbox（等插件投递）")
-        rec["state"] = "lettered"
-        rec["letter"] = aid
-        rec["lettered_at"] = now
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            log("postman.log", f"闹钟 {aid} 已送达，清掉活跃记录 {session}")
+        return
+    if state == "refused":
+        return
+    try:
+        due = float(rec.get("due") or 0)
+    except (TypeError, ValueError):
+        due = 0.0
+    if due > now:
+        return
+    ok, why = verify_alarm_identity(routes, rec)
+    if not ok:
+        rec["state"] = "refused"
+        rec["refused_reason"] = why
         write_alarm(rec, path)
+        log("postman.log", f"闹钟 {aid} 拒绝投递：{why}")
+        notify_once(f"alarm-refused-{aid}", "联络总站：闹钟身份核不上",
+                    f"{session} 的闹钟 {aid} 没有投递：{why}")
+        return
+
+    landed = letter_tagged(box, "闹钟：", aid)
+    if landed is not None:
+        # 状态没落盘的那段窗口：信可能还在 inbox，也可能已经被收信方挪走或归档。
+        # 三处都算送达证据，否则取消过的闹钟会因为「inbox 里找不到了」再响一次。
+        log("postman.log", f"闹钟 {aid} 的提醒信已在 {landed.parent.name}（上次写成功但状态没落盘），不重复写")
+    else:
+        try:
+            write_letter(box, "postoffice", "闹钟", "仅告知", ALARM_TEXT,
+                         extra_headers=[f"闹钟：{aid}"], name=aid)
+        except Exception as e:
+            log("postman.log", f"闹钟 {aid} 写提醒信失败：{e}")
+            return
+        log("postman.log", f"闹钟 {aid} 到期，已排入 {box} 的 inbox（等插件投递）")
+    rec["state"] = "lettered"
+    rec["letter"] = aid
+    rec["lettered_at"] = now
+    write_alarm(rec, path)
 
 
 def summarize_broadcasts(routes):
