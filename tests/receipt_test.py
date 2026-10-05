@@ -61,15 +61,27 @@ class ReceiptFlow(unittest.TestCase):
         self.run_po('send', 'bob', 'alice', '核查结果', '回复', body='请核查配置和测试')
         original = next((self.home / 'bob/inbox').glob('*.md'))
         self.run_po('ack', 'bob', original.stem, SENTINEL)
+        receipt = next((self.home / 'alice/inbox').glob('*.md'))
         t = self.as_claude('alice', 'Receipt Slice')
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn(SENTINEL, result.stderr)
         self.assertIn('postoffice receipt alice ' + original.stem, result.stderr)
         self.assertIn('默认不答复', result.stderr)
+        self.assertIn(str(receipt), result.stderr)
+        self.assertIn('归档：mv', result.stderr)
         got = self.run_po('receipt', 'alice', original.stem)
         self.assertIn(SENTINEL, got.stdout)
         self.assertIn('来源：bob', got.stdout)
+
+    def test_normal_letter_reminder_keeps_path_and_id(self):
+        self.run_po('send', 'alice', 'bob', '待办事项', '回复', body='请处理')
+        letter = next((self.home / 'alice/inbox').glob('*.md'))
+        t = self.as_claude('alice', 'Normal Letter')
+        result = self.hook(t)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('== ' + str(letter), result.stderr)
+        self.assertIn('编号：' + letter.stem, result.stderr)
 
     def test_lookup_is_exact_not_substring(self):
         self.run_po('send', 'bob', 'alice', '主题', '回复', body='x')
@@ -91,6 +103,11 @@ class ReceiptFlow(unittest.TestCase):
         self.assertNotIn(SENTINEL, missing.stdout + missing.stderr)
         unreg = self.run_po('receipt', 'ghostx', original.stem, check=False)
         self.assertNotEqual(unreg.returncode, 0)
+        # an id is an identifier, never a path: no traversal, no leak
+        for evil in ('../' + original.stem, '../../../../etc/hosts', 'B../secret'):
+            bad = self.run_po('receipt', 'alice', evil, check=False)
+            self.assertNotEqual(bad.returncode, 0, evil)
+            self.assertNotIn(SENTINEL, bad.stdout + bad.stderr, evil)
 
     def test_query_is_readonly(self):
         self.run_po('send', 'bob', 'alice', '主题', '回复', body='x')

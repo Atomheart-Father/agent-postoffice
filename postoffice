@@ -122,10 +122,8 @@ def letter_ack_id(path):
     return b[len("广播："):] if b.startswith("广播：") else path.stem
 
 
-RECEIPT_TAIL = ("这是回执通知，默认不答复、不再 ack；读完把通知移到 {done}/ 。"
-                "回执正文不在通知里：需要时运行上面的查询命令，不要先 cat 本文件。"
-                "只有发现原请求遗漏且影响继续工作时，才用 postoffice send 具体追问；不要重复催促。"
-                "提醒不是授权。")
+RECEIPT_TAIL = ("默认不答复、不再 ack；要正文运行上面的查询命令，不要 cat 本文件；"
+                "只在必要问题遗漏时用 postoffice send 具体追问。")
 
 
 def receipt_query_id(path):
@@ -158,11 +156,14 @@ def reminder(name, files):
             subject = receipt_subject(f)
             lines.append(f"【联络总站回执｜{name}】来自 {src} 的回执"
                          + (f"，原事由：{subject}" if subject else ""))
+            lines.append(f"通知：{f}")
+            lines.append(f"归档：mv {f} {done}/")
             lines.append(f"查询 ID：{qid}")
             lines.append(f"查询命令：postoffice receipt {name} {qid}")
-            lines.append(RECEIPT_TAIL.format(done=done))
+            lines.append(RECEIPT_TAIL)
         else:
             lines.append(f"【联络总站新信｜{name}】" + REMINDER_TAIL.format(home=HOME, done=done))
+            lines.append(f"== {f}")
             lines.append(f"编号：{letter_ack_id(f)}")
             lines.append(header(f))
     return "\n".join(lines)
@@ -507,8 +508,7 @@ def cmd_receipt(a):
     if a.name not in routes:
         sys.exit(f"没有信箱 {a.name}；`postoffice list` 看通讯录")
     rows = [e for e in read_acks() if e.get("id") == a.id and e.get("to") == a.name]
-    rec_path = broadcasts_dir() / f"{a.id}.json"
-    rec = read_json(rec_path) if rec_path.is_file() else None
+    rec = broadcast_record(a.id)
     if rec is not None and rec.get("from") != a.name:
         sys.exit(f"{a.id} 不是发给 {a.name} 的回执")
     if not rows and rec is None:
@@ -576,6 +576,18 @@ def broadcast_acks(bid):
     """Receipts for one broadcast, from acks.jsonl (the append-only source of truth): {by: note}."""
     return {e.get("by"): e.get("note", "")
             for e in read_acks() if e.get("id") == bid and e.get("kind") == "broadcast"}
+
+
+def broadcast_record(bid):
+    """Find a broadcast record by exact id. Scans, so a receipt id is never treated as a path."""
+    bdir = broadcasts_dir()
+    if not bdir.is_dir():
+        return None
+    for f in bdir.glob("*.json"):
+        rec = read_json(f)
+        if rec and rec.get("id") == bid:
+            return rec
+    return None
 
 
 def summarize_broadcasts(routes):
