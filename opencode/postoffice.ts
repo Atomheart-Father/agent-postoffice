@@ -19,6 +19,8 @@
 // 无映射、多个映射、信箱离线、身份核不上时一律拒绝，模型无法指定别的信箱或会话。
 // 闹钟记录落在 <HOME>/alarms/<session>.json（运行态账本，0600），由常驻邮递员到期时写成
 // 一封固定短句的信，再复用上面这条 idle 投递通道送达 —— 插件本身不实现计时器。
+// 到期的提示是**常量**：只有与本会话自己的活动闹钟记录 id 完全一致的信才走闹钟通道，
+// 渲染时直接用 ALARM_TEXT，一个字的信件正文都不读；伪造的信头或陈旧记录按普通信路径处理。
 import type { Plugin, ToolDefinition } from "@opencode-ai/plugin"
 import { homedir, platform } from "node:os"
 import { readdir, readFile, writeFile, appendFile, mkdir, open, rm, rename, stat, chmod } from "node:fs/promises"
@@ -40,6 +42,7 @@ const RECEIPT_WAIT_MS = Number(process.env.POSTOFFICE_RECEIPT_WAIT || 600) * 100
 const ALARM_MIN = 1
 const ALARM_MAX = 1440
 const ALARM_TEXT = "你设的闹钟到了，请检查刚才安排的任务。"
+const LOCK_STALE_MS = 60_000 // 锁的看门狗：写者崩了以后不至于把闹钟永久卡死
 
 type Route = { methods?: string[]; session_id?: string; status?: string }
 type Alarm = {
@@ -168,6 +171,50 @@ const dropAlarm = async (sessionID: string) => {
   } catch {}
 }
 
+// 同一会话的闹钟记录会同时被插件工具（设/取消）和常驻邮递员（到期）改，
+// 跨进程没有共享内存，所以每个会话一把原子锁：靠 O_EXCL 抢占，抢不到就说明有人在改。
+// 崩溃恢复靠看门狗 —— 锁文件超过 LOCK_STALE_MS 就当失效并清掉，只删锁、不碰记录本身，
+// 所以既不会永久卡死，也不会悄悄重置计时。
+const lockPath = (sessionID: string) => `${alarmPath(sessionID)}.lock`
+
+const takeAlarmLock = async (sessionID: string): Promise<boolean> => {
+  await mkdir(ALARM_DIR, { recursive: true })
+  const p = lockPath(sessionID)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const h = await open(p, "wx")
+      try {
+        await h.writeFile(`${process.pid} ${Date.now()}\n`, "utf8")
+      } finally {
+        await h.close()
+      }
+      return true
+    } catch (e) {
+      if ((e as { code?: string }).code !== "EEXIST") return false
+      let age = 0
+      try {
+        age = Date.now() - (await stat(p)).mtimeMs
+      } catch {
+        continue // 锁刚被别人释放，再抢一次
+      }
+      if (age > LOCK_STALE_MS) {
+        try {
+          await rm(p, { force: true })
+        } catch {}
+        continue
+      }
+      return false
+    }
+  }
+  return false
+}
+
+const releaseAlarmLock = async (sessionID: string) => {
+  try {
+    await rm(lockPath(sessionID), { force: true })
+  } catch {}
+}
+
 const deliveredAlready = async (box: string, file: string) => {
   const { done } = await readLedger()
   return done.has(`${box}::${file}`)
@@ -200,9 +247,11 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
     }
   }
 
-  // 反查“这个会话自己的物理信箱”：唯一匹配 + 走插件通道 + 在线 + 属于本实例目录。
-  // 任何一条不成立都拒绝 —— 宁可没有闹钟，也不能把提醒投到别人的信箱去。
-  const ownBox = async (sessionID: string): Promise<{ box?: string; why?: string }> => {
+// 反查“这个会话自己的物理信箱”：唯一匹配 + 走插件通道 + 属于本实例目录。
+// 任何一条不成立都拒绝 —— 宁可没有闹钟，也不能把提醒投到别人的信箱去。
+// 路由离线单独标出来：离线时身份仍然是唯一的，只是当下没人收 —— 取消自己的定时器
+// 可以照常做（不碰任何信箱文件），设新闹钟则拒绝。
+const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: string; offline?: boolean }> => {
     let routes: Record<string, Route> = {}
     try {
       routes = JSON.parse(await readFile(`${ROOT}/routes.json`, "utf8"))
@@ -221,9 +270,13 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
     if (hits.length > 1)
       return { why: `本会话同时对应多个信箱（${hits.map((h) => h[0]).join("、")}），无法确定唯一目标` }
     const [box, route] = hits[0]
-    if (route.status === "offline") return { why: `信箱 ${box} 当前离线` }
     if (!(await ownsSessionNow(sessionID))) return { why: "无法确认本会话属于当前 OpenCode 实例" }
-    return { box }
+    return route.status === "offline" ? { box, offline: true } : { box }
+  }
+
+  const ownBox = async (sessionID: string) => {
+    const r = await resolveOwnBox(sessionID)
+    return r.offline ? { why: `信箱 ${r.box} 当前离线` } : r
   }
 
   async function scan(reason: string) {
@@ -250,6 +303,8 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
         }
         const todo = files.filter((f) => !ledger.done.has(`${box}::${f}`))
         if (!todo.length || !(await ownsSession(sessionID))) continue
+        // 只有与本会话自己的活动闹钟记录 id 完全一致的信，才享受「闹钟」这条极短通道
+        const ownAlarm = await readAlarm(sessionID)
         // OpenCode 的 status 表只列非空闲会话：缺席 = 空闲
         let st = "idle"
         try {
@@ -261,7 +316,7 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
         if (st !== "idle") continue
         // 读开头块分出正式信、闹钟提醒与回执通知；正文永不注入
         type Item = { file: string; src: string; subj: string; id: string; mtime: number }
-        type Formal = Item & { alarm?: boolean; line?: string }
+        type Formal = Item & { alarm?: boolean }
         const formal: Formal[] = []
         const receipts: Item[] = []
         for (const file of todo) {
@@ -284,10 +339,9 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
           const id = fieldOf("回执：")
           const alarmId = fieldOf("闹钟：")
           if (id) receipts.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: receiptSubject(fieldOf), id, mtime })
-          else if (alarmId) {
-            // 闹钟提醒：只带正文第一行（固定短句），不展开信头、路径或其余正文
-            const first = (raw.split("\n\n", 2)[1] ?? "").split("\n").find((l) => l.trim()) ?? ""
-            formal.push({ file, src: "postoffice", subj: "闹钟", id: alarmId, mtime, alarm: true, line: first.trim().slice(0, 120) })
+          else if (alarmId && ownAlarm && ownAlarm.id === alarmId) {
+            // 闹钟提醒：只渲染那句固定常量，正文一个字节都不读、不注入
+            formal.push({ file, src: "postoffice", subj: "闹钟", id: alarmId, mtime, alarm: true })
           } else formal.push({ file, src: "", subj: "", id: "", mtime })
         }
         // 有正式信：先送一封；没有正式信：把回执合并成一条。
@@ -319,8 +373,8 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
         let text: string
         const alarmFormal = claimedFormal.length === 1 && formal.find((f) => f.file === claimedFormal[0])?.alarm
         if (alarmFormal) {
-          const f = formal.find((x) => x.file === claimedFormal[0])!
-          text = `⏰ ${f.line || ALARM_TEXT}`
+          // 固定短句：常量，不来自信件
+          text = `⏰ ${ALARM_TEXT}`
         } else if (claimedFormal.length === 0 && claimedReceipts.length === 1) {
           const r = claimedReceipts[0]
           text = `【联络总站回执｜${box}】来自 ${r.src} 的回执` + (r.subj ? `，原事由：${r.subj}` : "") + `\n` +
@@ -433,63 +487,92 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
           if (!who.box)
             return `没设闹钟：${who.why}。邮局不会把提醒投给身份不确定的信箱，` +
               `请让本会话在邮局登记（postoffice add …）后再设。`
-          const existing = await readAlarm(ctx.sessionID)
-          if (existing)
-            return `没设新闹钟：本会话已有一个活动闹钟（编号 ${existing.id}，原定到期 ${wallClock(existing.due)}）。` +
-              `先调用 postoffice_alarm_cancel 取消它，再设新的；直接再设一次不会重置旧闹钟。`
-          const now = Math.floor(Date.now() / 1000)
-          const rec: Alarm = {
-            id: `A${stamp()}_${who.box}`,
-            box: who.box,
-            session: ctx.sessionID,
-            due: now + raw * 60,
-            created: now,
-            state: "pending",
-          }
+          // 抢锁成功才算拿到这个会话的闹钟所有权：两个实例同时设，只有一个能进去。
+          // 拿不到锁直接拒绝，不排队、不覆盖别人的记录。
+          if (!(await takeAlarmLock(ctx.sessionID)))
+            return `没设闹钟：本会话的闹钟正被另一个进程改动（多半是邮递员在处理到期闹钟），` +
+              `请稍后再试一次；这次没有落下任何记录。`
           try {
-            await writeAlarm(rec)
-          } catch (e) {
-            await log(`设闹钟失败 ${ctx.sessionID}: ${e}`)
-            return `没设闹钟：写入运行态账本失败（${e}），没有留下任何记录。`
+            // 锁内重读：外面那次读可能和别的写者同时发生，判定必须以锁内看到的为准
+            const existing = await readAlarm(ctx.sessionID)
+            if (existing)
+              return `没设新闹钟：本会话已有一个活动闹钟（编号 ${existing.id}，原定到期 ${wallClock(existing.due)}）。` +
+                `先调用 postoffice_alarm_cancel 取消它，再设新的；直接再设一次不会重置旧闹钟。`
+            const now = Math.floor(Date.now() / 1000)
+            const rec: Alarm = {
+              id: `A${stamp()}_${who.box}`,
+              box: who.box,
+              session: ctx.sessionID,
+              due: now + raw * 60,
+              created: now,
+              state: "pending",
+            }
+            try {
+              await writeAlarm(rec)
+            } catch (e) {
+              await log(`设闹钟失败 ${ctx.sessionID}: ${e}`)
+              return `没设闹钟：写入运行态账本失败（${e}），没有留下任何记录。`
+            }
+            await log(`ALARM SET ${rec.id} ${rec.box} ${rec.session} due=${rec.due}`)
+            return (
+              `已设 ${raw} 分钟闹钟（编号 ${rec.id}，信箱 ${rec.box}，到期 ${wallClock(rec.due)}）。\n` +
+              `等待期间不需要模型参与：请现在结束本轮，不要 sleep、不要轮询、不要空转；` +
+              `你安排的那个任务要能脱离本轮自己跑下去，到点邮局会发一条固定短提醒把你叫回来。\n` +
+              `要提前取消就调用 postoffice_alarm_cancel。`
+            )
+          } finally {
+            await releaseAlarmLock(ctx.sessionID)
           }
-          await log(`ALARM SET ${rec.id} ${rec.box} ${rec.session} due=${rec.due}`)
-          return (
-            `已设 ${raw} 分钟闹钟（编号 ${rec.id}，信箱 ${rec.box}，到期 ${wallClock(rec.due)}）。\n` +
-            `等待期间不需要模型参与：请现在结束本轮，不要 sleep、不要轮询、不要空转；` +
-            `你安排的那个任务要能脱离本轮自己跑下去，到点邮局会发一条固定短提醒把你叫回来。\n` +
-            `要提前取消就调用 postoffice_alarm_cancel。`
-          )
         },
       }),
       postoffice_alarm_cancel: asTool({
         description:
           "取消**当前这个会话自己**的活动闹钟（不带任何参数）。没有活动闹钟时会明确告诉你“没有活动闹钟”。" +
-          "如果提醒已经到期进了投递队列但还没送达，会把它移进 archived/ 存档，这样取消后不会再响。",
+          "如果提醒已经到期进了投递队列但还没送达，会把它移进 archived/ 存档，这样取消后不会再响。" +
+          "本会话当前的信箱归属核不上（或已改绑给别人）时会拒绝，不会去动任何信箱的文件。",
         args: {},
         async execute(_args, ctx) {
-          const rec = await readAlarm(ctx.sessionID)
-          if (!rec) return "本会话当前没有活动闹钟，无需取消。"
-          const lid = rec.letter || rec.id
-          const file = `${lid}.md`
-          const inInbox = `${ROOT}/${rec.box}/inbox/${file}`
-          let extra: string
-          if (await deliveredAlready(rec.box, file)) {
-            extra = "这条闹钟已经送达过了，无法取消；这里只清掉运行态记录。"
-          } else if (existsSync(inInbox)) {
-            try {
-              const dst = `${ROOT}/${rec.box}/archived/${stamp()}`
-              await mkdir(dst, { recursive: true })
-              await rename(inInbox, `${dst}/${file}`)
-              extra = "提醒已到期进了投递队列但尚未送达，已把它移进 archived/ 存档（文件保留），不会再响。"
-            } catch (e) {
-              extra = `提醒已在 inbox 里但存档失败（${e}）；它仍可能送达一次。`
+          const who = await resolveOwnBox(ctx.sessionID)
+          if (!who.box)
+            return `没取消：${who.why}。归属核不上时邮局不会去动任何信箱的文件，` +
+              `请先让本会话在通讯录里对应唯一信箱（postoffice add … / doctor 看绑定），再试一次。`
+          if (!(await takeAlarmLock(ctx.sessionID)))
+            return `没取消：本会话的闹钟正被另一个进程改动（多半是邮递员正好在处理它），` +
+              `请稍后再试一次；这次没有动任何记录或文件。`
+          try {
+            // 锁内重读并核对归属：记录可能来自另一个会话/信箱，或路由已改绑
+            const rec = await readAlarm(ctx.sessionID)
+            if (!rec) return "本会话当前没有活动闹钟，无需取消。"
+            if (rec.session !== ctx.sessionID || rec.box !== who.box)
+              return `没取消：运行态记录（信箱 ${rec.box}、会话 ${rec.session}）与本会话当前归属` +
+                `（信箱 ${who.box}）不一致，为安全起见不动任何信箱的文件。请用 postoffice doctor 检查绑定。`
+            const lid = rec.letter || rec.id
+            const file = `${lid}.md`
+            const inInbox = `${ROOT}/${rec.box}/inbox/${file}`
+            let extra: string
+            if (who.offline) {
+              // 信箱当下离线：身份是唯一的，但没人收，所以只清自己的定时器，不碰 inbox
+              extra = "信箱当前离线，没有待送达的提醒需要撤回；只清掉这个会话的定时器。";
+            } else if (await deliveredAlready(rec.box, file)) {
+              extra = "这条闹钟已经送达过了，无法取消；这里只清掉运行态记录。"
+            } else if (existsSync(inInbox)) {
+              try {
+                const dst = `${ROOT}/${rec.box}/archived/${stamp()}`
+                await mkdir(dst, { recursive: true })
+                await rename(inInbox, `${dst}/${file}`)
+                extra = "提醒已到期进了投递队列但尚未送达，已把它移进 archived/ 存档（文件保留），不会再响。"
+              } catch (e) {
+                extra = `提醒已在 inbox 里但存档失败（${e}）；它仍可能送达一次。`
+              }
+            } else {
+              extra = "还没到期，没有需要撤回的提醒。"
             }
-          } else {
-            extra = "还没到期，没有需要撤回的提醒。"
+            await dropAlarm(ctx.sessionID)
+            await log(`ALARM CANCEL ${rec.id} ${rec.box} ${rec.session}`)
+            return `已取消闹钟（编号 ${rec.id}，原定到期 ${wallClock(rec.due)}）。${extra}`
+          } finally {
+            await releaseAlarmLock(ctx.sessionID)
           }
-          await dropAlarm(ctx.sessionID)
-          await log(`ALARM CANCEL ${rec.id} ${rec.box} ${rec.session}`)
-          return `已取消闹钟（编号 ${rec.id}，原定到期 ${wallClock(rec.due)}）。${extra}`
         },
       }),
     },

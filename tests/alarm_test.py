@@ -165,6 +165,47 @@ class AlarmScheduler(unittest.TestCase):
                 self.assertEqual(self.read_alarm()['state'], 'lettered',
                                  f'信已在 {sub} 时也应补记为已投递信')
 
+    # --- 跨进程互斥：邮递员 vs 插件的取消 ---------------------------------------
+    # 插件工具的 cancel 和邮递员到期用的是同一把锁（<session>.json.lock，O_EXCL + 看门狗），
+    # 所以「读完 pending → cancel 删记录 → 才把信投进 inbox」这个窗口不会发生。
+    def lock_path(self, session='ses_live'):
+        return self.alarm_path(session).with_suffix('.json.lock')
+
+    def test_postman_skips_while_another_writer_holds_the_lock(self):
+        rec = self.put_alarm()
+        self.lock_path().write_text('99999 somebody\n', encoding='utf-8')
+        self.run_postman()
+        self.assertEqual(self.inbox(), [], '别人正在改这条记录时不得往 inbox 写信')
+        self.assertEqual(self.read_alarm()['state'], 'pending', '也不得改状态')
+        self.assertTrue(self.lock_path().exists(), '别人的锁不该被抢走或删除')
+
+    def test_stale_lock_does_not_deadlock_or_reset_the_timer(self):
+        rec = self.put_alarm(due=time.time() + 3600)
+        lock = self.lock_path()
+        lock.write_text('99999 crashed\n', encoding='utf-8')
+        old = time.time() - 3600            # 远超看门狗窗口
+        os.utime(lock, (old, old))
+        self.run_postman()
+        self.assertFalse(lock.exists(), '陈旧锁应被清掉，不该永久卡死')
+        self.assertEqual(self.read_alarm()['due'], rec['due'], '不得悄悄重置计时')
+        self.assertEqual(self.inbox(), [], '没到期就不该写信')
+
+    def test_alarm_cancelled_before_due_is_never_delivered(self):
+        """cancel 抢先删掉记录后，邮递员这一轮什么也不做（模拟同一条记录上 cancel 与 postman 交错）。"""
+        rec = self.put_alarm()
+        self.alarm_path().unlink()                     # cancel 已经把记录删了
+        self.run_postman()
+        self.assertEqual(self.inbox(), [], '取消之后不得再冒出提醒信')
+        self.assertIsNone(self.read_alarm(), '也不得把记录写回来')
+
+    def test_lock_is_released_so_the_next_round_still_works(self):
+        self.put_alarm()
+        self.run_postman()
+        self.assertEqual(len(self.inbox()), 1)
+        self.assertFalse(self.lock_path().exists(), '处理完必须释放锁')
+        self.run_postman()
+        self.assertEqual(len(self.inbox()), 1, '下一轮仍正常工作且不重复')
+
     # --- 身份重新核证 ---------------------------------------------------------
     def test_refused_when_box_not_registered(self):
         self.put_alarm(box='幽灵')
