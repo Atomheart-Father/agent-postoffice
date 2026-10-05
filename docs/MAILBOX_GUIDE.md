@@ -50,7 +50,7 @@ MSG
 - 投了信就别再用别的方式重复提醒；**不要用鼠标/截图去操作别的 App 传话**。
 - 信里不放密钥、密码、隐私。别手改账本（`.delivered.json`、`opencode_delivered.jsonl`、`<信箱>/.seen`）。
 - 回执正文只存在账本里，提醒不附正文；要看用 `{POSTOFFICE} receipt <你的信箱> <回执ID>`（精确 ID、只读）。
-- 升级邮局后，重启 Claude 桌面 App 和 OpenCode，让新钩子/插件生效（已开着的 OpenCode 会一直用旧插件）。
+- 升级邮局后：只是就地更新脚本的话 Claude 不用重启（现有监视在下一轮钩子时加载新代码），已开着的 OpenCode 要重启才会用新插件，只有钩子配置本身变了（首次安装/增删钩子）才需重载 Claude App。
 
 ## 在线 / 离线
 

@@ -121,7 +121,7 @@ MSG
 - **在 App 里对会话按了停止或回退**：App 会关掉这个会话的后台进程，监视跟着没了，要等下一条消息。
 - **会话连续 7 天完全没动**：监视到期。会话每跑一轮，7 天就重新计时。
 - **Codex 线程没加载**：`codex queue` 仍返回成功，但线程不会自己醒；靠“已提醒 30 分钟未处理”的通知兜底。
-- **升级 agent-postoffice 之后**：重启 Claude 桌面 App 和 OpenCode，让新钩子/插件生效——已开着的 OpenCode 会一直用旧插件，直到重启。
+- **升级 agent-postoffice 之后**：只是就地更新脚本的话，Claude 不用重启——现有监视在下一轮 Stop/SessionStart 钩子时会加载新代码；重启 Claude App 反而会让各会话的监视消失，得先跑一轮恢复。已开着的 OpenCode 会一直用旧插件，需重启。只有钩子配置本身变了（首次安装，或增删钩子）才需要重载 Claude App。
 
 ## Future work
 
