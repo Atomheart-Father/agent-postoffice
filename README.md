@@ -16,7 +16,7 @@ coder (OpenCode) ──writes a letter──▶ ~/agent-postoffice/boss/inbox/xx
 - **Delivered once**: each letter triggers one reminder, even across restarts; at most 6 wakes per mailbox per 10 minutes, so agents can't spam each other.
 - **Online / offline**: a session out of quota? `postoffice offline <name>` — letters are kept locally and not sent; `online` delivers the backlog; `clear` archives it instead (nothing is deleted).
 - **Post office only**: agents should talk only through the post office, never call `codex queue` directly — messages that bypass it ignore the offline switch, pile up while the recipient has no quota, and all pop out when it comes back.
-- **Receipts default to no reply**: `postoffice ack` records a receipt (and files the letter into `done/`) with a metadata-only notification through the existing idle delivery channel — source, original subject and a lookup ID, never the receipt body, so it costs almost no context. Read the body only when needed with `postoffice receipt <box> <id>`. A broadcast becomes one summary: `broadcast` sends each recipient a letter tagged with an ID, they `ack` it, and when everyone has replied (or the deadline passes) the sender gets exactly one summary letter (per-person notes are looked up on demand).
+- **Receipts default to no reply**: `postoffice ack` records a receipt (and files the letter into `done/`) with a metadata-only notification through the existing idle delivery channel — source, original subject and a lookup ID, never the receipt body. Read the body only when needed with `postoffice receipt <box> <id>`. A broadcast becomes one summary: `broadcast` sends each recipient a letter tagged with an ID, they `ack` it, and when everyone has replied (or the deadline passes) the sender gets exactly one summary letter (per-person notes are looked up on demand).
 - **Control panel**: `postoffice panel` opens a local web page with one switch per session to cut or restore its connection, plus the backlog, broadcast progress and recent delivery log.
 - **Fallbacks**: if a session can't be woken (not open), you get one system notification after 20 minutes; if a reminder went out but the letter is still in the inbox after 30 minutes (session stuck, Codex thread not loaded…), you get one too.
 - Pure standard-library Python 3.9+, no dependencies. macOS first (Linux works: notifications via `notify-send`, and you keep the postman running yourself).
@@ -65,12 +65,12 @@ MSG
 
 The recipient wakes up, reads, does the work, replies, and moves the letter into its own `done/`.
 
-**Receipt rule (copy that / ack)**: a letter you must answer before you can continue ("need: reply / review") still gets a proper `send` back. For "FYI" letters and the closing copy that, use `ack` instead: it records the receipt and files the letter into `done/`, with a metadata-only notification (source, original subject, lookup ID) through the existing idle delivery channel — the body stays in the ledger. `send` prints the **letter ID** (the file name minus `.md`), which is what `ack` takes. A broadcast (`broadcast`) sends one tagged letter per recipient; they ack the broadcast ID, and the sender gets **one** summary once everyone has replied or the deadline passes. To read a receipt body, run `postoffice receipt <box> <id>` (exact ID; read-only).
+**Receipt rule (copy that / ack)**: a letter you must answer before you can continue ("need: reply / review") still gets a proper `send` back. For "FYI" letters and the closing copy that, use `ack` instead: it records the receipt and files the letter into `done/`, with a metadata-only notification (source, original subject, lookup ID) through the existing idle delivery channel — the body stays in the ledger. `send` prints the **letter ID** (the file name minus `.md`), which is what `ack` takes. A broadcast (`broadcast`) sends one tagged letter per recipient; they ack the broadcast ID, and the sender gets **one** summary once everyone has replied or the deadline passes. To read a receipt body, run `postoffice receipt <box> <id>` (exact ID; read-only — no send, no ack, no moving letters, no waking; an unknown ID or another mailbox's receipt is refused).
 
 | Command | What it does |
 |---|---|
 | `postoffice panel` | Open the web control panel (listens on 127.0.0.1 only), including broadcast progress |
-| `postoffice ack boss 20261004-223334_coder_hello "one line"` | Record a receipt: file the letter into `done/`, notify the sender when idle; `--wake` keeps the `copy that` title |
+| `postoffice ack boss 20261004-223334_coder_hello "one line"` | Record a receipt: file the letter into `done/`, notify the sender when idle. For a letter the notification is sent anyway, so `--wake` only changes the subject to `copy that`; for a broadcast (which otherwise sends no per-recipient notification) `--wake` sends one extra `copy that` notification |
 | `postoffice receipt boss 20261004-223334_coder_hello` | Read a receipt body by exact ID (read-only; letter ID or broadcast ID); never wakes anyone |
 | `postoffice broadcast all boss "subject" "need"` | Send every other mailbox a tagged letter; `--deadline 30m`; acks are summarized into one letter to you |
 | `postoffice offline codex1` | Recipient out of quota / away: letters are kept, no reminders |
@@ -104,13 +104,14 @@ If a letter was reminded but not processed within 30 minutes, the postman notifi
 
 | Item | Status |
 |---|---|
-| Send/receive, dedup, rate limit, online/offline, clear, ack bookkeeping, broadcast summaries, install/uninstall, unprocessed alert | 41 automated checks in `tests/smoke.sh` |
+| Send/receive, dedup, rate limit, online/offline, clear, ack bookkeeping, receipt lookup, broadcast summaries, install/uninstall, unprocessed alert | 46 automated checks in `tests/smoke.sh` |
+| Receipt reminders are metadata-only; `postoffice receipt` is exact-ID, read-only and never leaks another mailbox | `tests/receipt_test.py` (12 checks, incl. legacy notifications and shell-quoted commands) and `tests/receipt_plugin_test.mjs` |
 | Claude Desktop: idle for minutes, woken by external mail, processes the letter | Observed repeatedly on a real machine |
 | Claude Desktop: without an explicit timeout the hook is killed after 10 minutes | Observed (a v1.0 bug; v1.1 sets 7 days) |
 | Claude Desktop: with the long timeout, still wakes after 30+ minutes idle | Measured: watcher alive 33 min, woken 3 s after mail arrived |
 | Claude Desktop: Stop or rewind in the app kills the session's background process and its watcher | Observed (see "Known limitations") |
 | OpenCode: idle session gets the reminder within 10 s | Observed repeatedly |
-| Codex: `codex queue` wakes a loaded, idle thread | Not yet tested |
+| Codex: `codex queue` delivers to a loaded thread | Observed in live use between sessions; not tested in isolation from the postman |
 
 ## Known limitations
 
@@ -120,6 +121,7 @@ In these cases a Claude session can't be woken for a while; letters are never lo
 - **After pressing Stop or rewinding a session in the app**: the app kills that session's background process, the watcher goes with it, and it comes back with the next message.
 - **A session completely untouched for 7 days**: the watcher expires. Every turn restarts the 7-day clock.
 - **Codex thread not loaded**: `codex queue` still returns success but the thread won't wake; the 30-minute "reminded but unprocessed" alert covers it.
+- **After upgrading agent-postoffice**: restart Claude Desktop and OpenCode so the new hook and plugin are loaded — an OpenCode instance that is already running keeps its old plugin until restarted.
 
 ## Future work
 
@@ -136,15 +138,13 @@ In these cases a Claude session can't be woken for a while; letters are never lo
 ## Tests
 
 ```bash
-./tests/smoke.sh   # runs entirely in a temp directory; never touches your real config
+./tests/smoke.sh                                              # 46 checks, entirely in a temp directory
+python3 tests/receipt_test.py                                 # receipt flow: metadata-only reminders (Claude hook and a Codex-queue mock), exact lookup, no cross-box leak, read-only, legacy notifications, broadcast, --wake
+node --experimental-strip-types tests/receipt_plugin_test.mjs # OpenCode plugin (mock client, no model calls)
 ```
+
+None of these touches your real config, mailboxes or ledger, and none calls a model.
 
 ## License
 
 MIT
-
-## Receipt handling (v1.4)
-
-Receipt reminders and broadcast summaries carry **metadata only** — source, original subject, lookup ID and the `postoffice receipt <box> <id>` command — never the receipt body, note, or per-person broadcast one-liners. This keeps whole exchanges out of the model context. They default to no reply and no further ack: read and move to `done/`. Read a body on demand with `postoffice receipt`; it is read-only (no send, no ack, no moving letters, no waking), matches IDs exactly, and never leaks other mailboxes' receipts. Only follow up with `send` when an omitted part of the original request is needed to continue work. Offline mailboxes retain notifications. `acks.jsonl` stays the single source of receipt bodies; notifications store index metadata only, and legacy notifications with a body are read metadata-only too.
-
-Run `python3 tests/receipt_test.py` (metadata-only reminders across the Claude hook, a Codex queue mock, exact lookup, no-leak, read-only, legacy ledger, broadcast, `--wake`, loop prevention), `node --experimental-strip-types tests/receipt_plugin_test.mjs` (OpenCode plugin), and `bash tests/smoke.sh`.
