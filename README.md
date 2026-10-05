@@ -17,7 +17,7 @@ coder (OpenCode) ──writes a letter──▶ ~/agent-postoffice/boss/inbox/xx
 - **Online / offline**: a session out of quota? `postoffice offline <name>` — letters are kept locally and not sent; `online` delivers the backlog; `clear` archives it instead (nothing is deleted).
 - **Post office only**: agents should talk only through the post office, never call `codex queue` directly — messages that bypass it ignore the offline switch, pile up while the recipient has no quota, and all pop out when it comes back.
 - **Receipts default to no reply**: `postoffice ack` records a receipt (and files the letter into `done/`) with a short metadata-only notification through the existing idle delivery channel — source, original subject and one lookup command, never the receipt body. A single receipt is at most three lines; several receipts landing in one wake are merged into one trailing "N receipts" block, with formal letters always first. Read the body only when needed with `postoffice receipt <box> <id>`, and file the notification with `postoffice archive-receipt <box> <id>`. A broadcast becomes one summary: `broadcast` sends each recipient a letter tagged with an ID, they `ack` it, and when everyone has replied (or the deadline passes) the sender gets exactly one summary letter (per-person notes are looked up on demand).
-- **Control panel**: `postoffice panel` opens a local web page with one switch per session to cut or restore its connection, plus the backlog, broadcast progress and recent delivery log.
+- **Control panel**: `postoffice panel` opens a local web page with one switch per session to cut or restore its connection, plus broadcast progress and the recent delivery log. Each mailbox shows **waiting / reminded-to-file / delivery-failed** counts taken from the same per-letter snapshot as the list (waiting = nothing sent yet, reminded-to-file = the channel accepted the reminder but the letter is still in `inbox/`, failed = that channel gave up and a human has to look). No new state store: reminded comes from the Claude `.seen` file, the plugin's `DELIVERED` rows or the postman's accept records — never from the 20-minute fallback marks, and `FAILED_FINAL` counts as failed, not delivered. The page follows your browser language (Chinese for `zh*`, English otherwise) and has a visible 中文 / English switch that only redraws: it never changes a status, never calls a write endpoint and never wakes a session. Mailbox names, letter subjects, receipt bodies, handover paths and raw log lines are always shown verbatim in the original wording.
 - **Fallbacks**: if a session can't be woken (not open), you get one system notification after 20 minutes — the clock starts from the later of when the letter landed and when that mailbox last came online (`online_since`, reset only on a real offline→online transition and seeded at the postman's first run after an upgrade), so offline time never counts. If a reminder went out but a letter that *needs action* is still in the inbox after 30 minutes (session stuck, Codex thread not loaded…), you get one too. Classification: receipt notifications and broadcast summaries never nag; an exact `need: 回复`/`审核` does, an exact `仅告知` doesn't; free text with only positive words (reply/review/handle/change/decide/confirm) nags, only negative words (FYI / no-reply / no action needed) doesn't, and mixed or unrecognized text still nags — we don't claim zero false positives.
 - Pure standard-library Python 3.9+, no dependencies. macOS first (Linux works: notifications via `notify-send`, and you keep the postman running yourself).
 
@@ -69,7 +69,11 @@ The recipient wakes up, reads, does the work, replies, and moves the letter into
 
 | Command | What it does |
 |---|---|
-| `postoffice panel` | Open the web control panel (listens on 127.0.0.1 only), including broadcast progress |
+| `postoffice panel` | Open the web control panel (listens on 127.0.0.1 only), including broadcast progress, group switches and where each logical address resolves |
+| `postoffice config import ./postoffice-config.json` | Install `config.json`: groups + logical addresses (validates first, backs up the old file, atomic whole-file replace — no merge) |
+| `postoffice config show` | Read-only: groups, logical addresses, who each one resolves to right now (creates nothing) |
+| `postoffice offline @codex` / `online @codex` / `clear @codex` | Switch a whole group at once (`@` + group name); validates every member first, then reuses the single-mailbox rules |
+| `postoffice send @project.manager me "subject" "need" ` | Send to a logical address: the first online candidate is picked **at send time** and the resolution is printed; if nobody is online it fails and lists the candidates (nothing is dropped into a candidate inbox) |
 | `postoffice ack boss 20261004-223334_coder_hello "one line"` | Record a receipt: file the letter into `done/`, notify the sender when idle. For a letter the notification is sent anyway, so `--wake` only changes the subject to `copy that`; for a broadcast (which otherwise sends no per-recipient notification) `--wake` sends one extra `copy that` notification |
 | `postoffice receipt boss 20261004-223334_coder_hello` | Read a receipt body by exact ID (read-only; letter ID or broadcast ID); never wakes anyone |
 | `postoffice archive-receipt boss 20261004-223334_coder_hello` | File this box's receipt notification for that exact ID into `done/` (idempotent; never reads the body, sends, or wakes) |
@@ -81,6 +85,28 @@ The recipient wakes up, reads, does the work, replies, and moves the letter into
 | `postoffice postman` | Run the postman in the foreground (if you don't want it at login) |
 | `postoffice uninstall claude` / `postman` | Remove the hooks / the login item |
 
+## Groups and logical addresses (optional)
+
+Without `~/agent-postoffice/config.json` none of this exists and everything else behaves exactly as before. Import a config and you get two things:
+
+```json
+{
+  "version": 1,
+  "groups": { "codex": ["manager_a", "reviewer_a"] },
+  "aliases": {
+    "project.manager": { "candidates": ["manager_a", "manager_b"],
+                         "notify": ["coordinator_a"],
+                         "handoff": "/path/to/handoff.md" }
+  }
+}
+```
+
+- **Groups** are just names for existing mailboxes: `offline @codex` / `online @codex` / `clear @codex` reuse the single-mailbox behaviour (no group runtime state, the mailbox status stays the only truth), and the panel gets a small Groups area with an all-on / all-off button through the same status endpoint and local-origin check.
+- **Logical addresses** let a sender write `send @project.manager …` instead of hard-coding a manager. The alias picks the first online candidate when `send` runs. Letters already delivered are never moved or re-routed; a pending switch never delays a new letter.
+- **Switch announcements**: once a new target has been stable for 60 s (`POSTOFFICE_ALIAS_STABLE` shortens it in tests) the postman confirms the switch once — one regular broadcast to the `notify` boxes (acks are tallied as usual), one `need: FYI` handover note to the new target carrying the handoff *path* (the post office never reads that file), a `logs/alias_switch.log` line with event id, before/after, reason, notify boxes and handover target, plus one system notification. The first sighting only records a baseline (no broadcast), a flap inside the stability window is cancelled silently, and a restart keeps the baseline and the de-duplication record. With no online candidate only `notify` and you are told — nothing is dropped into a candidate inbox. Broadcast and handover are de-duplicated per step, so a failed handover resumes without re-broadcasting.
+- Import refuses anything it cannot honour: an unknown mailbox, a name that is both a group and an alias, nesting, duplicate members/candidates/notify targets, names with paths, spaces or globs, and duplicate JSON keys. A refused import leaves the old file byte-identical.
+- These notes only report a routing change. They grant nobody extra permission, start no work, and are not a new authorisation from the human.
+
 ## How it works
 
 | Recipient | Who wakes it | How |
@@ -90,14 +116,17 @@ The recipient wakes up, reads, does the work, replies, and moves the letter into
 | Codex | Postman | `codex queue --thread <id>` queues a reminder in the thread |
 | You | Postman | System notification |
 
-Everything lives in `~/agent-postoffice/` (override with `POSTOFFICE_HOME`): `routes.json` is the single config; one directory per mailbox (`inbox/`, `done/`, `CONTACT.md`); logs in `logs/`. Set `POSTOFFICE_NO_NOTIFY=1` to keep system notifications off (the post office and the OpenCode plugin then only log that a human should have been told); every human notification is also written to `logs/` as `通知人：…`.
+Everything lives in `~/agent-postoffice/` (override with `POSTOFFICE_HOME`): `routes.json` is the single config; one directory per mailbox (`inbox/`, `done/`, `CONTACT.md`); logs in `logs/`. Set `POSTOFFICE_NO_NOTIFY=1` to keep system notifications off — the OpenCode plugin and the postman then only write a log line instead of popping one. The plugin always logs a `通知人：…` line to `logs/opencode_plugin.log` before it notifies; the postman writes to `logs/notify.log` when notifications are suppressed.
 
 ## What "delivered" means
 
-The post office distinguishes two things:
+The post office distinguishes three things:
 
+- **Waiting**: nothing has been sent yet — the mailbox was offline, the session is busy, or the reminder is still queued.
 - **Reminded**: the hook woke the Claude session / the plugin sent OpenCode a reminder / `codex queue` returned success. This only means the reminder went out.
 - **Processed**: the recipient moved the letter into its `done/`.
+
+A letter that was reminded but is still in `inbox/` is what the panel counts as "reminded, to file"; `FAILED_FINAL` from the plugin is shown as "delivery failed" instead, because nobody is going to act on it on its own.
 
 If a letter that **needs action** (its `need:` header says reply / review / …) was reminded but not processed within 30 minutes, the postman notifies you once; FYI letters, receipt notifications and broadcast summaries are backlog only and never nag. Known case: when a Codex thread isn't loaded, `codex queue` still returns success but the thread won't resume on its own — this alert covers it.
 
@@ -105,7 +134,10 @@ If a letter that **needs action** (its `need:` header says reply / review / …)
 
 | Item | Status |
 |---|---|
-| Send/receive, dedup, rate limit, online/offline, clear, ack bookkeeping, receipt lookup, broadcast summaries, install/uninstall, need-based alerts, stable Claude identity, merged receipts | 84 automated checks in `tests/smoke.sh` |
+| Send/receive, dedup, rate limit, online/offline, clear, ack bookkeeping, receipt lookup, broadcast summaries, install/uninstall, need-based alerts, stable Claude identity, merged receipts | automated checks in `tests/smoke.sh` |
+| Config import validation, group switches, logical-address resolution and fallback, switch announcements (baseline / stable / cancelled flap / nobody / recovery / primary returns / resume after a failed handover), panel groups and buttons, ack by physical letter ID, archive-before-count | the same run of `tests/smoke.sh` (187 checks total, the v1.7 group runs in its own temp post office; six mutants of the new rules were verified to fail these checks) |
+| Panel per-letter status and counts (waiting / reminded-to-file / failed), the Chinese/English switch, verbatim escaped user content, confirmation wording covering both statistics | `tests/panel_i18n_test.mjs` (runs the real page script against a DOM stub: default by browser language, manual choice persisted, unusable storage still switchable, switching issues no write call, user content escaped and untranslated; six mutants verified to fail) plus the `tests/smoke.sh` API checks for the three statistics, `.delivered.json` fallbacks and `FAILED_FINAL` |
+| Group switches and logical addresses against real provider quotas, and the handover path file | Not verified on a real machine: no real config was imported and no real group was switched (v1.7 is not released yet) |
 | Receipt reminders are short and metadata-only; `postoffice receipt` is exact-ID/read-only and `postoffice archive-receipt` files only the matching notification | `tests/receipt_test.py` (15 checks, incl. legacy notifications, shell-quoted commands and archive idempotence) and `tests/receipt_plugin_test.mjs` |
 | Claude Desktop: idle for minutes, woken by external mail, processes the letter | Observed repeatedly on a real machine |
 | Claude Desktop: without an explicit timeout the hook is killed after 10 minutes | Observed (a v1.0 bug; v1.1 sets 7 days) |
@@ -127,7 +159,6 @@ In these cases a Claude session can't be woken for a while; letters are never lo
 ## Future work
 
 - **Waking a stopped Claude session**: when a session's background process is gone, hooks can't help. Possible approach: relay through the Claude app's own cross-session messaging via an always-on session (costs one model call per relay).
-- **Delivery stage in the panel**: show "queued / reminded / processed" per letter.
 - **Linux**: install the postman as a systemd user service.
 
 ## Safety
@@ -139,9 +170,10 @@ In these cases a Claude session can't be woken for a while; letters are never lo
 ## Tests
 
 ```bash
-./tests/smoke.sh                                              # 84 checks, entirely in a temp directory
+./tests/smoke.sh                                              # 187 checks, entirely in temp directories
 python3 tests/receipt_test.py                                 # receipt flow: metadata-only reminders (Claude hook and a Codex-queue mock), exact lookup, no cross-box leak, read-only, legacy notifications, broadcast, --wake
 node --experimental-strip-types tests/receipt_plugin_test.mjs # OpenCode plugin (mock client, no model calls)
+node --experimental-strip-types tests/panel_i18n_test.mjs     # panel page: per-letter statistics, Chinese/English switch, verbatim user content
 ```
 
 None of these touches your real config, mailboxes or ledger, and none calls a model.

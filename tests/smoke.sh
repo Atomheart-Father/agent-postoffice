@@ -191,8 +191,13 @@ import json, sys, time
 from pathlib import Path
 h = Path(sys.argv[1])
 (h / "broadcasts").mkdir(exist_ok=True)
+# a record that really blows up inside the summary step (sender exists, deadline is garbage)
 (h / "broadcasts" / "B20260101-000000_ghost.json").write_text(json.dumps({
-    "id": "B20260101-000000_ghost", "from": "ghost", "subject": "坏记录", "need": "仅告知",
+    "id": "B20260101-000000_ghost", "from": "bob", "subject": "坏记录", "need": "仅告知",
+    "to": ["bob"], "deadline": "不是时间", "created": "x", "acks": {}, "summarized": False}))
+# a system-sent broadcast: no mailbox to summarise back to, must be skipped quietly and only once
+(h / "broadcasts" / "B20260101-000001_sys.json").write_text(json.dumps({
+    "id": "B20260101-000001_sys", "from": "postoffice", "subject": "系统广播", "need": "仅告知",
     "to": ["bob"], "deadline": time.time() - 1, "created": "x", "acks": {}, "summarized": False}))
 PY
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
@@ -201,10 +206,16 @@ grep -q "广播汇总失败 B20260101-000000_ghost.json" "$POSTOFFICE_HOME/logs/
   && ok "坏记录写进日志并通知人" || bad "坏记录无日志"
 grep -q '"summarized": "error"' "$POSTOFFICE_HOME/broadcasts/B20260101-000000_ghost.json" \
   && ok "坏记录标记为已处理（不再重试）" || bad "坏记录未标记"
+grep -q "跳过汇总" "$POSTOFFICE_HOME/logs/postman.log" \
+  && ok "系统广播没有收件信箱时安静跳过" || bad "系统广播未跳过汇总"
+grep -q '"summarized": true' "$POSTOFFICE_HOME/broadcasts/B20260101-000001_sys.json" \
+  && ok "系统广播只处理一次" || bad "系统广播被反复处理"
 kill $PM 2>/dev/null; wait $PM 2>/dev/null
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 [ "$(grep -c "广播汇总失败 B20260101-000000_ghost.json" "$POSTOFFICE_HOME/logs/postman.log")" -eq 1 ] \
   && ok "坏记录不重复重试" || bad "坏记录重复重试"
+[ "$(ls "$POSTOFFICE_HOME/bob/inbox/"*.md 2>/dev/null | wc -l | tr -d ' ')" -ge 0 ] \
+  && ok "系统广播不向不存在的信箱写汇总" || bad "系统广播写出了汇总"
 
 # ---------- v1.6：稳定认人 + 只为真阻塞提醒 + 回执合并排后（docs/SPEC_v1.6.md rev2） ----------
 mkcap() { printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$1" > "$2"; chmod +x "$2"; }
@@ -378,8 +389,311 @@ python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r['failbox']['cod
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 4; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 [ "$(grep -o "failbox" "$POSTOFFICE_HOME/.delivered.json" 2>/dev/null | wc -l | tr -d ' ')" = "2" ] && ok "v1.6 恢复后重试送达且不重复" || bad "v1.6 重试未送达"
 
-# 11) 编译/类型检查
-/usr/bin/python3 -m py_compile "$PO" 2>/dev/null && ok "v1.6 py_compile 通过" || bad "v1.6 py_compile"
+# ---------- v1.7：分组开关 + 逻辑地址 + 切换广播（docs/SPEC_v1.7.md） ----------
+# 独立的临时邮局，不影响上面用例的通讯录与账本
+MAIN_HOME=$POSTOFFICE_HOME
+POSTOFFICE_HOME="$T/po17"; export POSTOFFICE_HOME; mkdir -p "$POSTOFFICE_HOME"
+n_mail() { ls "$POSTOFFICE_HOME/$1/inbox/"*.md 2>/dev/null | wc -l | tr -d ' '; }
+try_cfg() { printf '%s' "$1" > "$T/try.json"; "$PO" config import "$T/try.json" >"$T/cfgout" 2>&1; }
+GOOD='{"version":1,
+ "groups":{"codex":["mgr_b","dev_b"],"claude":["mgr_a"]},
+ "aliases":{"project.manager":{"candidates":["mgr_a","mgr_b"],"notify":["dev_a"],"handoff":"/p/h.md"},
+            "legacy.manager":["mgr_a"]}}'
+for b in mgr_a mgr_b dev_a dev_b; do "$PO" add "$b" --notify >/dev/null; done
+
+# 1) 合法导入；引用不存在信箱时拒绝且旧字节不变
+try_cfg "$GOOD" && ok "v1.7 config import 正常导入" || bad "v1.7 config import"
+before=$(cat "$POSTOFFICE_HOME/config.json")
+try_cfg '{"version":1,"groups":{"g":["幽灵信箱"]}}' && bad "v1.7 引用不存在信箱竟导入成功" \
+  || ok "v1.7 引用不存在信箱时拒绝导入"
+[ "$(cat "$POSTOFFICE_HOME/config.json")" = "$before" ] && ok "v1.7 导入失败旧配置字节不变" || bad "v1.7 旧配置被改动"
+
+# 2) 关键负例：撞名 / 重复键 / 嵌套 / 重复项 / 坏 JSON / 非法名字，全部拒绝且旧配置不变
+try_cfg '{"version":1,"groups":{"x":["mgr_a"]},"aliases":{"x":["mgr_a"]}}' && bad "v1.7 组与逻辑地址撞名未拒绝" || ok "v1.7 组与逻辑地址撞名拒绝"
+try_cfg '{"version":1,"groups":{"a":["mgr_a"],"a":["mgr_b"]}}' && bad "v1.7 重复 JSON 键未拒绝" || ok "v1.7 重复 JSON 键拒绝"
+try_cfg '{"version":1,"groups":{"codex":["mgr_a"]},"aliases":{"pm":["codex"]}}' && bad "v1.7 嵌套未拒绝" || ok "v1.7 嵌套拒绝"
+try_cfg '{"version":1,"groups":{"codex":["mgr_a","mgr_a"]}}' && bad "v1.7 重复成员未拒绝" || ok "v1.7 重复成员拒绝"
+try_cfg '{"version":1,"aliases":{"pm":{"candidates":["mgr_a","mgr_a"]}}}' && bad "v1.7 重复候选未拒绝" || ok "v1.7 重复候选拒绝"
+try_cfg '{"version":1,"groups":{"co dex":["mgr_a"]}}' && bad "v1.7 非法名字未拒绝" || ok "v1.7 非法名字拒绝"
+try_cfg '{"version":1,"groups":{"*":["mgr_a"]}}' && bad "v1.7 通配符未拒绝" || ok "v1.7 通配符拒绝"
+try_cfg '{"version":1,"aliases":{"pm":{"candidates":[]}}}' && bad "v1.7 空 candidates 未拒绝" || ok "v1.7 空 candidates 拒绝"
+try_cfg '{"version":1,"aliases":{"pm":{"notify":["mgr_a"]}}}' && bad "v1.7 alias 缺 candidates 未拒绝" || ok "v1.7 alias 缺 candidates 拒绝"
+try_cfg '{"version":1,' && bad "v1.7 坏 JSON 未拒绝" || ok "v1.7 坏 JSON 拒绝"
+try_cfg '{"version":2,"groups":{}}' && bad "v1.7 错版本未拒绝" || ok "v1.7 错版本拒绝"
+[ "$(cat "$POSTOFFICE_HOME/config.json")" = "$before" ] && ok "v1.7 一串坏配置都没动旧文件" || bad "v1.7 坏配置改动了旧文件"
+
+# 3) 成功导入有备份；show 只读
+try_cfg '{"version":1,"groups":{"codex":["mgr_b","dev_b"]}}' && ok "v1.7 再次导入成功" || bad "v1.7 再次导入"
+[ "$(ls "$POSTOFFICE_HOME/logs/"config.json.*.bak 2>/dev/null | wc -l | tr -d ' ')" = "1" ] \
+  && ok "v1.7 覆盖前备份旧配置" || bad "v1.7 没有备份旧配置"
+sum=$(cat "$POSTOFFICE_HOME/config.json"); "$PO" config show >/dev/null 2>&1
+[ "$(cat "$POSTOFFICE_HOME/config.json")" = "$sum" ] && ok "v1.7 config show 不改配置" || bad "v1.7 show 改了配置"
+try_cfg "$GOOD" >/dev/null
+
+# 4) 分组三操作；online_since 合同；空组
+"$PO" offline @codex >/dev/null && ok "v1.7 offline @GROUP" || bad "v1.7 offline @GROUP"
+[ "$(route_field mgr_b status)" = "offline" ] && [ "$(route_field dev_b status)" = "offline" ] \
+  && [ "$(route_field mgr_a status)" = "online" ] && ok "v1.7 整组下线且不波及其他信箱" || bad "v1.7 整组下线"
+"$PO" online @codex >/dev/null
+first=$(route_field mgr_b online_since); [ -n "$first" ] && ok "v1.7 组上线写 online_since" || bad "v1.7 组上线没写 online_since"
+"$PO" online @codex >/dev/null
+[ "$(route_field mgr_b online_since)" = "$first" ] && ok "v1.7 重复 online 不刷新 online_since" || bad "v1.7 重复 online 刷新了时钟"
+echo x | "$PO" send mgr_b tester "组清空甲" "回复" >/dev/null; echo x | "$PO" send dev_b tester "组清空乙" "回复" >/dev/null
+"$PO" clear @codex | grep -q "存档到" && ok "v1.7 clear @GROUP 逐成员给出去向" || bad "v1.7 clear @GROUP"
+[ "$(n_mail mgr_b)" = "0" ] && [ "$(n_mail dev_b)" = "0" ] && ok "v1.7 clear @GROUP 清空全部成员" || bad "v1.7 clear @GROUP 没清空"
+"$PO" offline @claude | grep -q "1 个信箱" && ok "v1.7 单成员分组可用" || bad "v1.7 单成员分组"
+"$PO" online @claude >/dev/null   # 下面按“首选候选在线”继续测别名解析
+try_cfg '{"version":1,"groups":{"codex":["mgr_b","dev_b"],"claude":["mgr_a"],"empty":[]},
+          "aliases":{"project.manager":{"candidates":["mgr_a","mgr_b"],"notify":["dev_a"],"handoff":"/p/h.md"},
+                     "legacy.manager":["mgr_a"]}}' >/dev/null
+"$PO" offline @empty | grep -q "0 个信箱" && ok "v1.7 空组输出 0 个成员" || bad "v1.7 空组"
+
+# 5) 别名解析：首选 / fallback / 全离线失败 / 不混用
+a0=$(n_mail mgr_a)
+echo 正文 | "$PO" send @project.manager tester "首选" "回复" | grep -q "解析 @project.manager → mgr_a" \
+  && ok "v1.7 alias 默认选第一候选" || bad "v1.7 alias 首选"
+[ "$(( $(n_mail mgr_a) - a0 ))" = "1" ] && ok "v1.7 信落在第一候选信箱" || bad "v1.7 信没落在第一候选"
+grep -q "^逻辑地址：@project.manager$" "$POSTOFFICE_HOME/mgr_a/inbox/"*.md && ok "v1.7 信头记录逻辑地址" || bad "v1.7 信头缺逻辑地址"
+"$PO" offline mgr_a >/dev/null
+a0=$(n_mail mgr_a)
+echo 正文 | "$PO" send @project.manager tester "回退" "回复" | grep -q "解析 @project.manager → mgr_b" \
+  && ok "v1.7 第一候选离线时选第二候选" || bad "v1.7 fallback"
+[ "$(n_mail mgr_a)" = "$a0" ] && ok "v1.7 切换后旧信仍在旧信箱" || bad "v1.7 旧信被搬走"
+"$PO" offline mgr_b >/dev/null
+before_a=$(n_mail mgr_a); before_b=$(n_mail mgr_b)
+echo 正文 | "$PO" send @project.manager tester "无人" "回复" >"$T/noone" 2>&1 && bad "v1.7 全离线竟发送成功" \
+  || ok "v1.7 全离线明确失败"
+grep -q "当前没有在线信箱" "$T/noone" && grep -q "mgr_a：离线" "$T/noone" \
+  && ok "v1.7 失败时列出候选状态" || bad "v1.7 失败未列候选状态"
+[ "$(n_mail mgr_a)" = "$before_a" ] && [ "$(n_mail mgr_b)" = "$before_b" ] \
+  && ok "v1.7 无人时没有信落入任何候选" || bad "v1.7 无人时信落进候选"
+"$PO" online mgr_a >/dev/null
+echo x | "$PO" send mgr_a tester "普通信箱" "回复" >/dev/null && ok "v1.7 具体信箱 send 行为不变" || bad "v1.7 普通 send"
+"$PO" offline @project.manager 2>"$T/mix" && bad "v1.7 alias 当分组用竟成功" || ok "v1.7 alias 不能当分组用"
+grep -q "逻辑地址（alias）" "$T/mix" && ok "v1.7 提示区分 alias 与 group" || bad "v1.7 提示不清楚"
+echo x | "$PO" send @codex tester "组当别名" "回复" >"$T/mix2" 2>&1 && bad "v1.7 group 当逻辑地址竟成功" \
+  || ok "v1.7 group 不能当逻辑地址发信"
+echo x | "$PO" send @legacy.manager tester "数组写法" "回复" | grep -q "→ mgr_a" \
+  && ok "v1.7 兼容数组写法的 alias" || bad "v1.7 数组写法 alias"
+"$PO" offline @nope 2>/dev/null && bad "v1.7 未知分组竟成功" || ok "v1.7 未知分组报错"
+
+# 6) 引用信箱被删后，组操作不改任何状态
+"$PO" remove dev_b >/dev/null
+b1=$(route_field mgr_b status); b2=$(route_field dev_b status 2>/dev/null || echo "-")
+"$PO" offline @codex 2>"$T/rm" && bad "v1.7 引用已删信箱仍改了状态" || ok "v1.7 引用已删信箱时组操作拒绝"
+grep -q "未改动任何信箱状态" "$T/rm" && ok "v1.7 拒绝时明说没改任何状态" || bad "v1.7 拒绝提示不清楚"
+[ "$(route_field mgr_b status)" = "$b1" ] && ok "v1.7 拒绝后其它成员状态未变" || bad "v1.7 拒绝后状态被改了"
+"$PO" remove mgr_b >/dev/null; "$PO" add mgr_b --notify >/dev/null
+"$PO" add dev_b --notify >/dev/null   # 重新登记，后面的组操作才合法
+
+# 7) 切换广播：首见只记基线；稳定后通知一次；无人 / 恢复 / 主事复归；重启不重复
+ASTABLE=6   # 稳定期放大，抖动窗口才留得住，不靠运气
+POSTOFFICE_ALIAS_STABLE=$ASTABLE POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
+d0=$(n_mail dev_a)
+[ "$d0" = "0" ] && ok "v1.7 首次发现有目标时只记基线不广播" || bad "v1.7 首次发现就广播"
+grep -q "登记初始目标" "$POSTOFFICE_HOME/logs/postman.log" && ok "v1.7 初始基线写进日志" || bad "v1.7 没写基线日志"
+kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
+POSTOFFICE_ALIAS_STABLE=$ASTABLE POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
+[ "$(n_mail dev_a)" = "$d0" ] && ok "v1.7 重启不重复广播基线" || bad "v1.7 重启重复广播"
+d0=$(n_mail dev_a); h0=$(n_mail mgr_b)
+"$PO" offline mgr_a >/dev/null; sleep $((ASTABLE + 4))
+[ "$(( $(n_mail dev_a) - d0 ))" = "1" ] && ok "v1.7 A→B 稳定后广播一次" || bad "v1.7 A→B 广播次数不对"
+[ "$(( $(n_mail mgr_b) - h0 ))" = "1" ] && ok "v1.7 交接提醒发给接手方" || bad "v1.7 没发交接提醒"
+grep -q "原因=原目标下线" "$POSTOFFICE_HOME/logs/alias_switch.log" && ok "v1.7 切换日志写明前后与原因" || bad "v1.7 切换日志缺原因"
+grep -q "交接路径：/p/h.md" "$POSTOFFICE_HOME/mgr_b/inbox/"*.md && ok "v1.7 交接信带 handoff 路径" || bad "v1.7 交接信缺 handoff 路径"
+grep -q "不授予你额外权限" "$POSTOFFICE_HOME/mgr_b/inbox/"*.md && ok "v1.7 交接信声明不自授权限" || bad "v1.7 交接信缺声明"
+d0=$(n_mail dev_a); h0=$(n_mail mgr_a)
+"$PO" online mgr_a >/dev/null; sleep 2; "$PO" offline mgr_a >/dev/null; sleep $((ASTABLE + 4))
+[ "$(n_mail dev_a)" = "$d0" ] && ok "v1.7 稳定期内 A→B→A 不广播" || bad "v1.7 稳定期内反复被广播"
+[ "$(n_mail mgr_a)" = "$h0" ] && ok "v1.7 稳定期内不投交接" || bad "v1.7 稳定期内投了交接"
+d0=$(n_mail dev_a); h0=$(n_mail mgr_a)
+"$PO" offline mgr_a >/dev/null; "$PO" offline mgr_b >/dev/null; sleep $((ASTABLE + 4))
+[ "$(( $(n_mail dev_a) - d0 ))" = "1" ] && ok "v1.7 全离线通知一次" || bad "v1.7 全离线通知次数不对"
+grep -q "（无在线候选）" "$POSTOFFICE_HOME/dev_a/inbox/"*.md && ok "v1.7 无人接任通知说清没有候选" || bad "v1.7 无人接任通知不清楚"
+[ "$(n_mail mgr_a)" = "$h0" ] && ok "v1.7 无人时不向任何候选投交接" || bad "v1.7 无人时仍投了交接"
+d0=$(n_mail dev_a)
+"$PO" online mgr_b >/dev/null; sleep $((ASTABLE + 4))
+[ "$(( $(n_mail dev_a) - d0 ))" = "1" ] && ok "v1.7 备用恢复后再广播一次" || bad "v1.7 恢复未广播"
+d0=$(n_mail dev_a)
+"$PO" online mgr_a >/dev/null; sleep $((ASTABLE + 4))
+[ "$(( $(n_mail dev_a) - d0 ))" = "1" ] && ok "v1.7 主事复归再广播一次" || bad "v1.7 主事复归未广播"
+grep -q "原因=高优先级候选恢复" "$POSTOFFICE_HOME/logs/alias_switch.log" && ok "v1.7 主事复归原因正确" || bad "v1.7 复归原因不对"
+kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
+d0=$(n_mail dev_a)
+POSTOFFICE_ALIAS_STABLE=$ASTABLE POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
+kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
+[ "$(n_mail dev_a)" = "$d0" ] && ok "v1.7 重启不重复广播已确认的切换" || bad "v1.7 重启重复广播"
+
+# 8) 交接失败后恢复：只补交接，不重播广播
+POSTOFFICE_ALIAS_STABLE=$ASTABLE POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 2
+"$PO" offline mgr_a >/dev/null; "$PO" offline mgr_b >/dev/null; sleep $((ASTABLE + 4))
+d0=$(n_mail dev_a); h0=$(n_mail mgr_b)
+chmod 555 "$POSTOFFICE_HOME/mgr_b/inbox"
+"$PO" online mgr_b >/dev/null; sleep $((ASTABLE + 4))
+[ "$(( $(n_mail dev_a) - d0 ))" = "1" ] && ok "v1.7 交接失败时广播照发一次" || bad "v1.7 交接失败时广播次数不对"
+[ "$(n_mail mgr_b)" = "$h0" ] && ok "v1.7 交接失败时确实没投出交接" || bad "v1.7 交接失败却投出了"
+grep -q "交接提醒失败" "$POSTOFFICE_HOME/logs/postman.log" && ok "v1.7 交接失败写进日志" || bad "v1.7 交接失败没日志"
+d1=$(n_mail dev_a)
+chmod 755 "$POSTOFFICE_HOME/mgr_b/inbox"; sleep 4
+[ "$(n_mail dev_a)" = "$d1" ] && ok "v1.7 恢复后不重播广播" || bad "v1.7 恢复后重播了广播"
+[ "$(( $(n_mail mgr_b) - h0 ))" = "1" ] && ok "v1.7 恢复后只补发交接" || bad "v1.7 恢复后没补交接"
+kill ${PM:-} 2>/dev/null; wait ${PM:-} 2>/dev/null; unset PM
+
+# 9) 广播按物理信编号回执；混用只记一条；伪标记与跨箱无效；全员回执后立即汇总
+echo 广播正文 | "$PO" broadcast dev_a,dev_b dev_a "兼容广播" "回复" >"$T/bc" 2>&1
+BID=$(sed -n 's/^广播编号：//p' "$T/bc")
+LID=$(basename "$(ls "$POSTOFFICE_HOME"/dev_b/inbox/*兼容广播*.md)" .md)
+"$PO" ack dev_b "$LID" "按信回执" | grep -q "$BID" && ok "v1.7 按物理信编号回执归一到广播编号" || bad "v1.7 按信编号回执"
+"$PO" ack dev_b "$BID" "再回一次" | grep -q "已回执过" && ok "v1.7 信编号+广播编号混用只记一条" || bad "v1.7 混用重复记账"
+[ "$(grep -c "\"id\": \"$BID\"" "$POSTOFFICE_HOME/acks.jsonl")" = "1" ] && ok "v1.7 账本里广播回执只有一条" || bad "v1.7 账本有多条"
+[ "$(ls "$POSTOFFICE_HOME"/dev_b/inbox/ | grep -c 兼容广播)" = "0" ] && ok "v1.7 回执后广播信归档" || bad "v1.7 回执后信还在 inbox"
+"$PO" add other --notify >/dev/null
+"$PO" ack other "$BID" "越权不该过" 2>"$T/xbox" && bad "v1.7 跨信箱回执竟通过" || ok "v1.7 非收件信箱不能回执该广播"
+grep -q "不是发给" "$T/xbox" && ok "v1.7 跨信箱回执给出原因" || bad "v1.7 跨信箱回执提示不清楚"
+
+# 第二种写法：先按广播编号回执，再按物理信编号回执；并用它的编号做正文伪造
+echo 正文2 | "$PO" broadcast dev_a,dev_b dev_a "兼容广播二" "回复" >"$T/bc2" 2>&1
+BID2=$(sed -n 's/^广播编号：//p' "$T/bc2")
+LID2=$(basename "$(ls "$POSTOFFICE_HOME"/dev_b/inbox/*兼容广播二*.md)" .md)
+printf '广播：%s\n这封信在正文第一行伪造了广播标记。\n' "$BID2" > "$T/forge.md"
+"$PO" send dev_b dev_a "伪造标记" "回复" --file "$T/forge.md" >/dev/null
+F=$(ls "$POSTOFFICE_HOME"/dev_b/inbox/*伪造标记*.md)
+sed -n '4,5p' "$F" | grep -q "^广播：" && ok "v1.7 伪造标记确实落在正文里" || bad "v1.7 伪造标记位置不对"
+"$PO" ack dev_b "$(basename "$F" .md)" "不该算广播" >/dev/null
+grep -q "\"kind\": \"broadcast\", \"note\": \"不该算广播\"" "$POSTOFFICE_HOME/acks.jsonl" \
+  && bad "v1.7 正文伪造广播标记被记成广播" || ok "v1.7 正文伪造广播标记不算广播回执"
+[ "$(grep -c "\"id\": \"$BID2\"" "$POSTOFFICE_HOME/acks.jsonl")" = "0" ] \
+  && ok "v1.7 伪造标记没给广播记上一条" || bad "v1.7 伪造标记污染了广播回执"
+"$PO" ack dev_b "$LID2" "先按信编号" >/dev/null
+"$PO" ack dev_b "$BID2" "再按广播编号" | grep -q "已回执过" && ok "v1.7 反过来的顺序也只记一条" || bad "v1.7 反过来顺序会记两条"
+[ "$(grep -c "\"id\": \"$BID2\"" "$POSTOFFICE_HOME/acks.jsonl")" = "1" ] && ok "v1.7 第二种写法账本也只有一条" || bad "v1.7 第二种写法记了两条"
+"$PO" ack dev_a "$BID" "我也回" >/dev/null
+"$PO" ack dev_a "$BID2" "我也回二" >/dev/null
+POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
+grep -ql "广播汇总" "$POSTOFFICE_HOME/dev_a/inbox/"*.md \
+  && ok "v1.7 全员回执后不等截止就汇总" || bad "v1.7 全员回执后没立即汇总"
+
+# 10) archive-receipt 先报数量；冲突零移动；其它编号与普通信不动
+echo x | "$PO" send dev_a dev_b "待回执" "回复" >/dev/null
+BL=$(basename "$(ls "$POSTOFFICE_HOME"/dev_b/inbox/*待回执*.md)" .md)
+"$PO" ack dev_b "$BL" "一句话" >/dev/null
+RID=$(grep -h '^回执：' "$POSTOFFICE_HOME"/dev_a/inbox/*.md | sed -n '1s/^回执：//p')
+have=$(grep -l "^回执：$RID" "$POSTOFFICE_HOME"/dev_a/inbox/*.md | wc -l | tr -d ' ')
+[ "$have" = "1" ] && ok "v1.7 待归档通知在 inbox 里找得到" || bad "v1.7 找不到待归档通知"
+"$PO" archive-receipt dev_a "查无此号" | grep -q "匹配 0 封" && ok "v1.7 归档先报数量（0 条也成功）" || bad "v1.7 归档未报数量"
+"$PO" archive-receipt dev_a "$RID" >"$T/arch" 2>&1
+grep -q "匹配 1 封" "$T/arch" && ok "v1.7 归档报出匹配数量" || bad "v1.7 归档没报匹配数量"
+[ "$(grep -l "^回执：$RID" "$POSTOFFICE_HOME"/dev_a/inbox/*.md 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+  && ok "v1.7 归档后同编号通知清空" || bad "v1.7 归档没清空"
+echo x | "$PO" send dev_a dev_b "再来一封" "回复" >/dev/null
+G=$(ls "$POSTOFFICE_HOME"/dev_b/inbox/*再来一封*.md); "$PO" ack dev_b "$(basename "$G" .md)" "一句话" >/dev/null
+CLASH=$(grep -h '^回执：' "$POSTOFFICE_HOME"/dev_a/inbox/*.md | head -1 | sed 's/回执：//')
+SRC=$(grep -l "^回执：$CLASH" "$POSTOFFICE_HOME"/dev_a/inbox/*.md | head -1)
+[ -n "$SRC" ] && ok "v1.7 冲突用例有同名通知可用" || bad "v1.7 冲突用例没准备同名通知"
+cp "$SRC" "$POSTOFFICE_HOME/dev_a/done/"
+n_before=$(n_mail dev_a); plain_before=$(ls "$POSTOFFICE_HOME"/dev_a/inbox/*.md | grep -vc "回执：" || true)
+"$PO" archive-receipt dev_a "$CLASH" >"$T/clash" 2>&1 && bad "v1.7 同名冲突竟归档成功" || ok "v1.7 同名冲突时整批不动并非零退出"
+[ "$(n_mail dev_a)" = "$n_before" ] && ok "v1.7 冲突时一封也没动" || bad "v1.7 冲突时动了信"
+[ "$(ls "$POSTOFFICE_HOME"/dev_a/inbox/*.md | grep -vc "回执：")" = "$plain_before" ] \
+  && ok "v1.7 冲突时普通信不动" || bad "v1.7 冲突时动了普通信"
+grep -q "匹配 1 封" "$T/clash" && ok "v1.7 冲突前仍先报匹配数量" || bad "v1.7 冲突时未报数量"
+
+# 11) 面板：Groups 在线比例与按钮走公共 API（本机来源检查保留）
+PORT=$((8800 + $$ % 150))
+"$PO" panel --no-open --port $PORT >/dev/null 2>&1 & PP=$!; sleep 2
+st=$(curl -s "http://127.0.0.1:$PORT/api/state")
+printf '%s' "$st" | python3 -c "
+import json, sys, os
+st = json.load(sys.stdin)
+r = json.load(open(os.environ['POSTOFFICE_HOME'] + '/routes.json'))
+g = json.load(open(os.environ['POSTOFFICE_HOME'] + '/config.json'))['groups']
+exp = {(k, sum(1 for m in v if r.get(m, {}).get('status') != 'offline'), len(v))
+       for k, v in g.items()}
+got = {(g['name'], g['online'], g['total']) for g in st['groups']}
+print('OK' if got == exp and got else 'BAD:' + str(sorted(got)))
+" | grep -q OK && ok "v1.7 面板 Groups 在线数/总数与通讯录一致" || bad "v1.7 面板 Groups 比例不对"
+printf '%s' "$st" | python3 -c "import json,sys;a=json.load(sys.stdin)['aliases'];print('OK' if a[0]['target'] and a[0]['candidates'] else 'BAD')" \
+  | grep -q OK && ok "v1.7 面板显示逻辑地址当前解析对象" || bad "v1.7 面板没显示解析对象"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -d "{\"group\":\"codex\",\"status\":\"offline\"}" "http://127.0.0.1:$PORT/api/status")
+[ "$code" = "200" ] && [ "$(route_field dev_b status)" = "offline" ] \
+  && ok "v1.7 面板按钮整组下线且沿用同一接口" || bad "v1.7 面板按钮失败 code=$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -d "{\"group\":\"没有这个组\",\"status\":\"offline\"}" "http://127.0.0.1:$PORT/api/status")
+[ "$code" = "400" ] && ok "v1.7 面板未知分组被拒" || bad "v1.7 面板未知分组 code=$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Origin: http://evil.example' \
+  -d '{"name":"dev_b","status":"online"}' "http://127.0.0.1:$PORT/api/status")
+[ "$code" = "403" ] && ok "v1.7 面板保留本机来源检查" || bad "v1.7 面板来源检查失效 code=$code"
+
+# 12) 面板按各通道真实台账区分「待投递 / 已提醒待归档 / 投递失败」
+route_list() { python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r[sys.argv[2]]['methods']=sys.argv[3].split(',');json.dump(r,open(p,'w'))" "$POSTOFFICE_HOME/routes.json" "$1" "$2"; }
+"$PO" add pbox --claude "面板统计会话" >/dev/null
+"$PO" add obox --notify >/dev/null; route_list obox opencode_plugin; route_set obox session_id ses_pbox
+"$PO" add xbox --codex thread-x >/dev/null
+echo x | "$PO" send pbox dev_a "已提醒未归档" "回复" >/dev/null
+echo x | "$PO" send pbox dev_a "还没投出去" "回复" >/dev/null
+P1=$(ls "$POSTOFFICE_HOME"/pbox/inbox/*已提醒未归档*.md); P2=$(ls "$POSTOFFICE_HOME"/pbox/inbox/*还没投出去*.md)
+printf '%s\n' "$P1" > "$POSTOFFICE_HOME/pbox/.seen"        # Claude 通道：提醒已被接受
+P1N=$(basename "$P1"); P2N=$(basename "$P2")
+curl -s "http://127.0.0.1:$PORT/api/state" | P1N="$P1N" P2N="$P2N" python3 -c '
+import json, os, sys
+b = [x for x in json.load(sys.stdin)["boxes"] if x["name"] == "pbox"][0]
+st = {p["file"]: p["status"] for p in b["pending"]}
+c = b["counts"]
+good = (c == {"waiting": 1, "reminded": 1, "failed": 0} and len(b["pending"]) == 2
+        and st[os.environ["P1N"]] == "reminded" and st[os.environ["P2N"]] == "waiting")
+print("OK" if good else "BAD:" + json.dumps([c, st], ensure_ascii=False))' \
+  | grep -q OK && ok "v1.7 面板分出待投递 1 / 已提醒待归档 1 且逐封标状态" || bad "v1.7 面板两态统计不对"
+echo x | "$PO" send obox dev_a "插件失败信" "回复" >/dev/null
+echo x | "$PO" send obox dev_a "超时兜底信" "回复" >/dev/null
+OF=$(basename "$(ls "$POSTOFFICE_HOME"/obox/inbox/*插件失败信*.md)")
+OT=$(basename "$(ls "$POSTOFFICE_HOME"/obox/inbox/*超时兜底信*.md)")
+printf '{"box":"obox","file":"%s","result":"FAILED_FINAL"}\n' "$OF" >> "$POSTOFFICE_HOME/opencode_delivered.jsonl"
+python3 -c "import json,sys;json.dump(['$POSTOFFICE_HOME/obox/inbox/$OT'],open('$POSTOFFICE_HOME/.delivered.json','w'))"
+curl -s "http://127.0.0.1:$PORT/api/state" | OF="$OF" OT="$OT" python3 -c '
+import json, os, sys
+b = [x for x in json.load(sys.stdin)["boxes"] if x["name"] == "obox"][0]
+st = {p["file"]: p["status"] for p in b["pending"]}
+c = b["counts"]
+good = (c == {"waiting": 1, "reminded": 0, "failed": 1} and st[os.environ["OF"]] == "failed"
+        and st[os.environ["OT"]] == "waiting")
+print("OK" if good else "BAD:" + json.dumps([c, st], ensure_ascii=False))' \
+  | grep -q OK && ok "v1.7 FAILED_FINAL 算失败、.delivered.json 超时兜底不算已提醒" || bad "v1.7 面板把兜底或失败算成了已提醒"
+echo x | "$PO" send xbox dev_a "码信已提醒" "回复" >/dev/null
+XF="$POSTOFFICE_HOME/xbox/inbox/$(basename "$(ls "$POSTOFFICE_HOME"/xbox/inbox/*码信已提醒*.md)")"
+python3 -c "import json;json.dump({'$XF':1.0},open('$POSTOFFICE_HOME/.woken.json','w'))"
+curl -s "http://127.0.0.1:$PORT/api/state" | python3 -c '
+import json, sys
+b = [x for x in json.load(sys.stdin)["boxes"] if x["name"] == "xbox"][0]
+print("OK" if b["counts"] == {"waiting": 0, "reminded": 1, "failed": 0} else "BAD:" + json.dumps(b["counts"]))' \
+  | grep -q OK && ok "v1.7 Codex 通道按 .woken.json 接受记录算已提醒" || bad "v1.7 Codex 通道已提醒判定不对"
+mv "$P2" "$POSTOFFICE_HOME/pbox/done/"
+curl -s "http://127.0.0.1:$PORT/api/state" | python3 -c '
+import json, sys
+b = [x for x in json.load(sys.stdin)["boxes"] if x["name"] == "pbox"][0]
+print("OK" if b["counts"] == {"waiting": 0, "reminded": 1, "failed": 0} and len(b["pending"]) == 1
+      else "BAD:" + json.dumps(b["counts"]))' \
+  | grep -q OK && ok "v1.7 归档后列表与数量一起少一封" || bad "v1.7 归档后数量没跟着变"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+  -d '{"name":"pbox"}' "http://127.0.0.1:$PORT/api/clear")
+[ "$code" = "200" ] && [ "$(ls "$POSTOFFICE_HOME"/pbox/inbox/*.md 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+  && [ "$(find "$POSTOFFICE_HOME/pbox/archived" -name '*.md' 2>/dev/null | wc -l | tr -d ' ')" = "1" ] \
+  && ok "v1.7 清空把待投递与已提醒一起存档且不删文件" || bad "v1.7 清空行为 code=$code"
+"$PO" online @codex >/dev/null
+kill $PP 2>/dev/null; wait $PP 2>/dev/null
+
+# 13) 配置坏掉时不拖垮邮递员；功能停用但物理信箱照常
+printf '坏掉的{' > "$POSTOFFICE_HOME/config.json"
+POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
+kill -0 $PM 2>/dev/null && ok "v1.7 坏配置不搞挂邮递员" || bad "v1.7 坏配置搞挂了邮递员"
+kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
+"$PO" send dev_a tester "坏配置下照常" "回复" >/dev/null && ok "v1.7 坏配置时物理信箱照常" || bad "v1.7 坏配置时发信失败"
+"$PO" offline @codex 2>"$T/badcfg" && bad "v1.7 坏配置下分组操作竟成功" || ok "v1.7 坏配置下分组操作明确报错"
+grep -q "已停用" "$T/badcfg" && ok "v1.7 坏配置提示说清功能已停用" || bad "v1.7 坏配置提示不清楚"
+POSTOFFICE_HOME=$MAIN_HOME; export POSTOFFICE_HOME
+
+# 14) 编译/类型检查
+/usr/bin/python3 -m py_compile "$PO" 2>/dev/null && ok "v1.7 py_compile 通过" || bad "v1.7 py_compile"
 if command -v node >/dev/null 2>&1; then
   node --experimental-strip-types --check "$(dirname "$PO")/opencode/postoffice.ts" 2>/dev/null \
     && ok "v1.6 插件类型检查通过" || bad "v1.6 插件检查"

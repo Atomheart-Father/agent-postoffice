@@ -7,11 +7,11 @@
 <style>
   :root {
     --bg: #f6f5f1; --card: #ffffff; --ink: #1d1d1b; --muted: #77756e; --line: #e4e1d8;
-    --on: #2f7d4f; --off: #b04a3a; --chip: #efede6; --accent: #1d1d1b;
+    --on: #2f7d4f; --off: #b04a3a; --chip: #efede6; --accent: #1d1d1b; --warn: #8a6d1f;
   }
   @media (prefers-color-scheme: dark) {
     :root { --bg: #161615; --card: #1f1f1d; --ink: #ecebe6; --muted: #9a988f; --line: #2e2e2b;
-            --on: #5fbf85; --off: #e07a68; --chip: #2a2a27; --accent: #ecebe6; }
+            --on: #5fbf85; --off: #e07a68; --chip: #2a2a27; --accent: #ecebe6; --warn: #d7b45a; }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--ink);
@@ -20,6 +20,10 @@
   header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   h1 { font-size: 22px; margin: 0; letter-spacing: .02em; }
   .home { color: var(--muted); font-size: 13px; font-family: ui-monospace, Menlo, monospace; }
+  .langs { display: flex; gap: 6px; }
+  .langs button { font: inherit; font-size: 12px; color: var(--muted); background: none;
+                  border: 1px solid var(--line); border-radius: 999px; padding: 1px 10px; cursor: pointer; }
+  .langs button[aria-pressed="true"] { color: var(--ink); border-color: var(--muted); }
   .hint { color: var(--muted); font-size: 13px; margin: 6px 0 20px; }
   .box { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
          padding: 14px 16px; margin-bottom: 10px; display: grid;
@@ -30,6 +34,8 @@
   .meta { color: var(--muted); font-size: 13px; grid-column: 1; overflow-wrap: anywhere; }
   .chip { display: inline-block; background: var(--chip); border-radius: 999px; padding: 0 8px;
           font-size: 12px; margin-right: 6px; color: var(--ink); }
+  .chip.bad { color: var(--off); }
+  .chip.mid { color: var(--warn); }
   .pending { grid-column: 1 / -1; margin-top: 6px; font-size: 13px; }
   .pending div { padding: 3px 0; border-top: 1px dashed var(--line); }
   .pending b { font-weight: 500; }
@@ -53,77 +59,252 @@
   .clear { margin-left: 10px; font: inherit; font-size: 12px; color: var(--off); background: none;
            border: 1px solid var(--off); border-radius: 999px; padding: 0 10px; cursor: pointer; }
   .err { color: var(--off); font-size: 13px; min-height: 1.5em; }
+  .gname { font-weight: 600; }
+  .gall { display: flex; gap: 6px; grid-row: 1 / span 2; grid-column: 2; }
+  .gall button { font: inherit; font-size: 12px; color: var(--muted); background: none;
+                 border: 1px solid var(--line); border-radius: 999px; padding: 1px 10px; cursor: pointer; }
+  .gall button:hover { color: var(--ink); border-color: var(--muted); }
+  .settle { color: var(--muted); font-size: 12.5px; }
   @media (max-width: 520px) { .state { display: none; } }
 </style>
 </head>
 <body>
 <main>
-  <header><h1>联络总站</h1><span class="home" id="home"></span></header>
-  <p class="hint">关掉开关 = 该会话离线：信照收，存在本地，不发给它；打开后积压的信 10 秒内补送。不想补送就先点“清空积压”（存档到 archived/，不删除）。页面每 5 秒刷新。</p>
+  <header>
+    <h1 id="title">联络总站</h1>
+    <span class="home" id="home"></span>
+    <span class="langs" id="langs" role="group">
+      <button type="button" data-lang="zh">中文</button>
+      <button type="button" data-lang="en">English</button>
+    </span>
+  </header>
+  <p class="hint" id="hint"></p>
   <div class="err" id="err"></div>
   <section id="boxes"></section>
-  <h2>广播</h2>
+  <h2 id="h-groups"></h2>
+  <section id="groups"></section>
+  <h2 id="h-aliases"></h2>
+  <section id="aliases"></section>
+  <h2 id="h-switches"></h2>
+  <div class="log" id="switches"></div>
+  <h2 id="h-broadcasts"></h2>
   <section id="broadcasts"></section>
-  <h2>最近投递记录</h2>
+  <h2 id="h-log"></h2>
   <div class="log" id="log"></div>
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+// One small string table, no framework and no build step. User content (letter subjects, mailbox
+// names, receipt bodies, handoff paths, raw log lines) is never translated — only our own wording is.
+const STR = {
+  zh: {
+    title: "联络总站",
+    langLabel: "切换界面语言",
+    hint: "关掉开关 = 该会话离线：信照收，存在本地，不发给它；打开后积压的信 10 秒内补送。不想补送就先点“归档全部”（信会存到 archived/，不删除，待投递的信归档后不再补送）。页面每 5 秒刷新。",
+    online: "在线", offline: "离线",
+    waiting: "待投递", reminded: "已提醒待归档", failed: "投递失败，需人工处理",
+    counts: "待投递 {w} / 已提醒待归档 {r}",
+    failedLine: "投递失败，需人工处理 {n} 封",
+    archiveAll: "归档全部",
+    clearConfirm: "把 {box} 信箱里的全部信件和通知（{w} 封待投递 + {r} 封已提醒未归档）都存档吗？文件会保留在 archived/ 里，待投递的信归档后不再补送。",
+    recentAcks: "最近回执", acked: "已回执",
+    emptyBoxes: "通讯录是空的，用 postoffice add 登记会话。",
+    emptyBroadcasts: "还没有广播。", emptyLog: "还没有记录", emptySwitches: "还没有确认过切换（首次看到只记基线，不广播）。",
+    bErr: "汇总失败", bDone: "已汇总", bOpen: "收集中", bDeadline: "截止",
+    hGroups: "分组与逻辑地址", hAliases: "逻辑地址", hSwitches: "切换记录",
+    hBroadcasts: "广播", hLog: "最近投递记录",
+    noGroups: "没有配置分组。用 postoffice config import FILE 导入 config.json。",
+    noAliases: "没有配置逻辑地址。",
+    groupAll: "全开", groupNone: "全关", groupEmpty: "（空组）",
+    groupOn: "{o}/{n} 在线", groupMail: "待投递 {w} / 已提醒待归档 {r}",
+    aliasNone: "当前没有在线候选", aliasBad: "不可用", notRegistered: "未登记",
+    aliasNotify: "通知 {n}", aliasPending: "已确认 {a}；待切换 {b}（稳定期还剩 {s} 秒，未确认前新信已按当前状态投递）",
+    cfgBad: "配置不可用：{e}",
+    errClear: "归档失败", errStatus: "修改失败", errOffline: "连不上面板服务（postoffice panel 是否还开着？）",
+    errGroup: "分组开关失败",
+    ariaToggle: "{name} {state}，点击切换",
+    from: "来自",
+  },
+  en: {
+    title: "Post Office",
+    langLabel: "Switch interface language",
+    hint: "Switch off = that session is offline: letters are still kept locally, nothing is sent to it; switch it back on and the backlog is delivered within 10 s. To skip the backlog use “Archive all” (letters move to archived/, nothing is deleted, and waiting letters are not delivered after archiving). The page refreshes every 5 s.",
+    online: "online", offline: "offline",
+    waiting: "waiting", reminded: "reminded, to file", failed: "delivery failed, needs a human",
+    counts: "{w} waiting / {r} reminded to file",
+    failedLine: "{n} failed delivery, needs a human",
+    archiveAll: "Archive all",
+    clearConfirm: "Archive every letter and notification in {box} ({w} waiting + {r} reminded but not filed)? Files are kept in archived/, and waiting letters are not delivered after archiving.",
+    recentAcks: "Latest receipts", acked: "acked",
+    emptyBoxes: "The address book is empty; register sessions with postoffice add.",
+    emptyBroadcasts: "No broadcasts yet.", emptyLog: "No records yet",
+    emptySwitches: "No confirmed switch yet (the first sighting only records a baseline).",
+    bErr: "summary failed", bDone: "summarised", bOpen: "collecting", bDeadline: "deadline",
+    hGroups: "Groups and logical addresses", hAliases: "Logical addresses",
+    hSwitches: "Switch history", hBroadcasts: "Broadcasts", hLog: "Latest delivery log",
+    noGroups: "No groups configured. Import a config.json with postoffice config import FILE.",
+    noAliases: "No logical addresses configured.",
+    groupAll: "All on", groupNone: "All off", groupEmpty: "(empty group)",
+    groupOn: "{o}/{n} online", groupMail: "{w} waiting / {r} reminded to file",
+    aliasNone: "no online candidate", aliasBad: "unusable", notRegistered: "not registered",
+    aliasNotify: "notify {n}",
+    aliasPending: "confirmed {a}; switching to {b} in {s} s (new letters already go by the current state)",
+    cfgBad: "Configuration unusable: {e}",
+    errClear: "Archive failed", errStatus: "Change failed",
+    errOffline: "Cannot reach the panel service (is postoffice panel still running?)",
+    errGroup: "Group switch failed",
+    ariaToggle: "{name} {state}, click to switch",
+    from: "from",
+  },
+};
+
+const fmt = (key, vars) => {
+  let s = STR[lang][key] ?? key;
+  for (const k in vars) s = s.replaceAll("{" + k + "}", vars[k]);
+  return s;
+};
+const t = (key) => STR[lang][key] ?? key;
+
+// zh by browser language, English for anything else; a manual choice wins and survives a reload,
+// and an unavailable storage must not break the switch.
+let lang = "en";
+const store = {
+  get() { try { return window.localStorage.getItem("postoffice.lang"); } catch { return null; } },
+  set(v) { try { window.localStorage.setItem("postoffice.lang", v); } catch {} },
+};
+const browserLang = () => {
+  try { return String((navigator.languages && navigator.languages[0]) || navigator.language || ""); } catch { return ""; }
+};
+lang = store.get() || (browserLang().toLowerCase().startsWith("zh") ? "zh" : "en");
+
+function applyLang(next) {
+  lang = next === "zh" ? "zh" : "en";
+  store.set(lang);              // display only: never a status / clear / ack call, never a wake-up
+  document.documentElement.lang = lang === "zh" ? "zh" : "en";
+  document.title = t("title");
+  $("title").textContent = t("title");
+  $("hint").textContent = t("hint");
+  $("h-groups").textContent = t("hGroups");
+  $("h-aliases").textContent = t("hAliases");
+  $("h-switches").textContent = t("hSwitches");
+  $("h-broadcasts").textContent = t("hBroadcasts");
+  $("h-log").textContent = t("hLog");
+  $("langs").setAttribute("aria-label", t("langLabel"));
+  for (const b of $("langs").children) b.setAttribute("aria-pressed", String(b.dataset.lang === lang));
+  return load();
+}
+
+const counts = (c) => fmt("counts", { w: c.waiting, r: c.reminded });
+const statusChip = (s) => `<span class="chip ${s === "failed" ? "bad" : s === "reminded" ? "mid" : ""}">${
+  s === "waiting" ? t("waiting") : s === "reminded" ? t("reminded") : t("failed")}</span>`;
+
 async function load() {
   try {
     const st = await (await fetch("/api/state")).json();
     $("err").textContent = "";
     $("home").textContent = st.home;
-    $("boxes").innerHTML = st.boxes.length ? st.boxes.map((b) => `
+    $("boxes").innerHTML = st.boxes.length ? st.boxes.map((b) => {
+      const c = b.counts || { waiting: 0, reminded: 0, failed: 0 };
+      return `
       <div class="box ${b.online ? "" : "offline"}">
         <div class="name">${esc(b.name)}<small>${esc(b.who)}</small></div>
         <button class="toggle ${b.online ? "on" : ""}" data-name="${esc(b.name)}" data-online="${b.online}"
-                aria-label="${esc(b.name)} ${b.online ? "在线，点击设为离线" : "离线，点击设为在线"}">
-          <span class="state">${b.online ? "在线" : "离线"}</span><span class="track"></span>
+                aria-label="${esc(fmt("ariaToggle", { name: b.name, state: b.online ? t("online") : t("offline") }))}">
+          <span class="state">${b.online ? t("online") : t("offline")}</span><span class="track"></span>
         </button>
         <div class="meta"><span class="chip">${esc(b.app)}</span>${esc(b.ident)}
-          · 积压 ${b.pending.length} 封${b.pending.length ? `<button class="clear" data-clear="${esc(b.name)}">清空积压</button>` : ""}</div>
-        ${b.acks && b.acks.length ? `<div class="meta">最近回执：${b.acks.map((a) =>
-          `${esc(a.by)}（${esc(a.note || "已回执")}）`).join("；")}</div>` : ""}
+          · ${esc(counts(c))}${c.failed ? ` · <span class="chip bad">${esc(fmt("failedLine", { n: c.failed }))}</span>` : ""}
+          ${b.pending.length ? `<button class="clear" data-clear="${esc(b.name)}" data-w="${c.waiting}" data-r="${c.reminded}">${esc(t("archiveAll"))}</button>` : ""}</div>
+        ${b.acks && b.acks.length ? `<div class="meta">${esc(t("recentAcks"))}：${b.acks.map((a) =>
+          `${esc(a.by)}（${esc(a.note || t("acked"))}）`).join("；")}</div>` : ""}
         ${b.pending.length ? `<div class="pending">${b.pending.map((p) =>
-          `<div><b>${esc(p.subject || p.file)}</b> <span class="meta">来自 ${esc(p.from)}</span></div>`).join("")}</div>` : ""}
-      </div>`).join("") : `<p class="hint">通讯录是空的，用 <code>postoffice add</code> 登记会话。</p>`;
+          `<div>${statusChip(p.status)} <b>${esc(p.subject || p.file)}</b> <span class="meta">${esc(t("from"))} ${esc(p.from)}</span></div>`).join("")}</div>` : ""}
+      </div>`; }).join("") : `<p class="hint">${esc(t("emptyBoxes"))}</p>`;
+    const groups = st.groups || [];
+    $("groups").innerHTML = (st.config_error ? `<p class="hint">${esc(fmt("cfgBad", { e: st.config_error }))}</p>` : "")
+      + (groups.length ? groups.map((g) => {
+        const c = g.counts || { waiting: 0, reminded: 0, failed: 0 };
+        return `
+      <div class="box">
+        <div class="gname">@${esc(g.name)}<small>${esc(fmt("groupOn", { o: g.online, n: g.total }))}</small></div>
+        <div class="gall">
+          <button data-group="${esc(g.name)}" data-status="online">${esc(t("groupAll"))}</button>
+          <button data-group="${esc(g.name)}" data-status="offline">${esc(t("groupNone"))}</button>
+        </div>
+        <div class="meta">${g.members.map((m) => `<span class="chip">${esc(m)}</span>`).join("") || esc(t("groupEmpty"))}
+          ${g.members.length ? ` · ${esc(fmt("groupMail", { w: c.waiting, r: c.reminded }))}` : ""}</div>
+      </div>`; }).join("") : `<p class="hint">${esc(t("noGroups"))}</p>`);
+    const al = st.aliases || [];
+    $("aliases").innerHTML = al.length ? al.map((a) => {
+      if (a.error) {
+        return `<div class="box"><div class="gname">@${esc(a.name)}<small>${esc(t("aliasBad"))}</small></div>
+          <div class="meta">${esc(a.error)}</div></div>`;
+      }
+      return `
+      <div class="box">
+        <div class="gname">@${esc(a.name)}<small>${esc(a.target || t("aliasNone"))}</small></div>
+        <div class="meta">${a.candidates.map((c) =>
+          `<span class="chip">${esc(c.name)}${c.known ? "" : `（${esc(t("notRegistered"))}）`}${c.known ? (c.online ? ` ${esc(t("online"))}` : ` ${esc(t("offline"))}`) : ""}</span>`).join("")}
+          ${a.notify && a.notify.length ? `<span class="chip">${esc(fmt("aliasNotify", { n: a.notify.map(esc).join("、") }))}</span>` : ""}</div>
+        ${a.pending ? `<div class="settle">${esc(fmt("aliasPending", { a: a.confirmed || t("aliasNone"), b: a.pending || t("aliasNone"), s: a.pending_in }))}</div>` : ""}
+      </div>`; }).join("") : `<p class="hint">${esc(t("noAliases"))}</p>`;
+    const sw = st.switches || [];
+    $("switches").innerHTML = sw.length ? sw.map((s) => `<div>${esc(s.text)}</div>`).join("")
+      : `<span>${esc(t("emptySwitches"))}</span>`;   // raw log lines stay in the original wording
     const bcs = st.broadcasts || [];
     $("broadcasts").innerHTML = bcs.length ? bcs.map((b) => `
       <div class="box">
-        <div class="name">${esc(b.subject)}<small>来自 ${esc(b.from)}</small></div>
+        <div class="name">${esc(b.subject)}<small>${esc(t("from"))} ${esc(b.from)}</small></div>
         <div class="state">${b.acked}/${b.total}</div>
-        <div class="meta"><span class="chip">${b.error ? "汇总失败" : b.summarized ? "已汇总" : "收集中"}</span>${esc(b.id)} · 截止 ${esc(b.deadline)}
+        <div class="meta"><span class="chip">${esc(b.error ? t("bErr") : b.summarized ? t("bDone") : t("bOpen"))}</span>${esc(b.id)} · ${esc(t("bDeadline"))} ${esc(b.deadline)}
           <span class="meter"><i style="width:${b.total ? Math.round(b.acked * 100 / b.total) : 0}%"></i></span></div>
-      </div>`).join("") : `<p class="hint">还没有广播。</p>`;
+      </div>`).join("") : `<p class="hint">${esc(t("emptyBroadcasts"))}</p>`;
     $("log").innerHTML = st.log.map((l) => `<div><span>${esc(l.t.slice(5))} ${esc(l.src)}</span> ${esc(l.msg)}</div>`).join("")
-      || `<span>还没有记录</span>`;
+      || `<span>${esc(t("emptyLog"))}</span>`;       // raw log lines stay in the original wording
   } catch (e) {
-    $("err").textContent = "连不上面板服务（postoffice panel 是否还开着？）";
+    $("err").textContent = t("errOffline");
   }
 }
 
 $("boxes").addEventListener("click", async (ev) => {
   const c = ev.target.closest(".clear");
   if (c) {
-    if (!confirm(`把 ${c.dataset.clear} 还没送出的信全部存档？存档后不会再发给它（文件留在 archived/ 里）。`)) return;
+    const msg = fmt("clearConfirm", { box: c.dataset.clear, w: c.dataset.w, r: c.dataset.r });
+    if (!confirm(msg)) return;
     const r = await fetch("/api/clear", { method: "POST", headers: { "Content-Type": "application/json" },
                                           body: JSON.stringify({ name: c.dataset.clear }) });
-    if (!r.ok) $("err").textContent = "清空失败";
+    if (!r.ok) $("err").textContent = t("errClear");
     return load();
   }
-  const t = ev.target.closest(".toggle");
-  if (!t) return;
-  const status = t.dataset.online === "true" ? "offline" : "online";
+  const tg = ev.target.closest(".toggle");
+  if (!tg) return;
+  const status = tg.dataset.online === "true" ? "offline" : "online";
   const r = await fetch("/api/status", { method: "POST", headers: { "Content-Type": "application/json" },
-                                         body: JSON.stringify({ name: t.dataset.name, status }) });
-  if (!r.ok) $("err").textContent = "修改失败";
+                                         body: JSON.stringify({ name: tg.dataset.name, status }) });
+  if (!r.ok) $("err").textContent = t("errStatus");
   load();
 });
 
-load();
+$("groups").addEventListener("click", async (ev) => {
+  const b = ev.target.closest("button[data-group]");
+  if (!b) return;
+  const r = await fetch("/api/status", { method: "POST", headers: { "Content-Type": "application/json" },
+                                         body: JSON.stringify({ group: b.dataset.group, status: b.dataset.status }) });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    $("err").textContent = e.error || t("errGroup");
+  }
+  load();
+});
+
+$("langs").addEventListener("click", (ev) => {
+  const b = ev.target.closest("button[data-lang]");
+  if (b) applyLang(b.dataset.lang);   // display only
+});
+
+applyLang(lang);
 setInterval(load, 5000);
 </script>
 </body>
