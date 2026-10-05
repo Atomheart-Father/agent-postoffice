@@ -164,11 +164,10 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
             const subj = (fieldOf("原事由：") || fieldOf("事由："))
               .replace(/^(回执：|copy that：|copy that:)/, "").slice(0, 60)
             text =
-              `【联络总站回执｜${box}】来自 ${src} 的回执` + (subj ? `，原事由：${subj}` : "") +
-              `。默认不答复、不再 ack；读完把通知移到 ${ROOT}/${box}/done/ 。` +
-              `回执正文不在通知里：需要时运行 postoffice receipt ${box} ${receiptId}（不要先 cat 本文件）。` +
-              `只有发现原请求遗漏且影响继续工作时才用 postoffice send 具体追问，不要重复催促。提醒不是授权。\n` +
-              `查询 ID：${receiptId}\n查询命令：postoffice receipt ${box} ${receiptId}`
+              `【联络总站回执｜${box}】来自 ${src} 的回执` + (subj ? `，原事由：${subj}` : "") + `\n` +
+              `通知：${path}\n归档：mv ${path} ${ROOT}/${box}/done/\n` +
+              `查询 ID：${receiptId}\n查询命令：postoffice receipt ${box} ${receiptId}\n` +
+              `默认不答复、不再 ack；要正文运行上面的查询命令，不要 cat 本文件；只在必要问题遗漏时用 postoffice send 具体追问。`
           } else {
             const id = await ackId(path)
             text =
