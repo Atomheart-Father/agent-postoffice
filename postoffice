@@ -1191,14 +1191,14 @@ def cmd_archive_receipt(a):
     return 0
 
 
-def retract_refused_reason(name, path, method):
+def retract_refused_reason(name, path, method, skip_claim=False):
     """Why this letter can no longer be pulled back, or "" when the channel has not taken it yet.
 
     Each channel is judged by its own record, never by another channel's idea of "delivered": the
     shared claim file the OpenCode plugin, the hook and the postman all take before waking somebody,
     plus that channel's own ledger. An unknown channel has no record we can trust, so it fails closed.
     """
-    if claimed(name, path):
+    if claimed(name, path) and not skip_claim:
         return "投递进行中（已有投递认领）"
     if method == "opencode_plugin":
         ledger = HOME / "opencode_delivered.jsonl"
@@ -1208,9 +1208,12 @@ def retract_refused_reason(name, path, method):
                     e = json.loads(line)
                 except ValueError:
                     continue
-                if e.get("box") == name and e.get("file") == path.name \
-                        and e.get("result") in ("DELIVERED", "FAILED_FINAL"):
-                    return f"已送达（插件台账 {e.get('result')}）"
+                if e.get("box") == name and e.get("file") == path.name:
+                    if e.get("result") == "DELIVERED":
+                        return "已送达（插件台账 DELIVERED）"
+                    if e.get("result") == "FAILED_FINAL":
+                        # 失败不等于送达，也不等于没送达：不确定就不撤
+                        return "投递失败/无法确认对方是否收到（插件台账 FAILED_FINAL）"
         return ""
     if method == "claude_hook":
         if str(path) in read_lines(HOME / name / ".seen"):
@@ -1260,12 +1263,24 @@ def cmd_retract(a):
     if why:
         sys.exit(f"{a.id} {why}，无法撤回；原信留在 {path}。"
                  f"要更正就另发一封修正信，不要假装这封没发过")
-    dst_dir = HOME / a.to / "archived" / time.strftime("%Y%m%d-%H%M%S")
-    dst = dst_dir / path.name
-    if dst.exists():
-        sys.exit(f"归档里已有同名文件，未撤回（{dst}）；请人工处理")
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    path.replace(dst)
+    # 和投递方原子地争同一把认领：认领是 O_EXCL 的，所以要么我们赢、要么投递方赢，
+    # 不存在「我们查完还没动，投递方就来认领并唤醒」的中间态。
+    if not claim_letter(a.to, path):
+        sys.exit(f"{a.id} 投递进行中（认领已被投递方抢到），无法撤回；原信留在 {path}。"
+                 f"要更正就另发一封修正信，不要假装这封没发过")
+    try:
+        # 认领已经握在手里，所以这一次只看台账（skip_claim）：不然会把自己刚拿的认领当成别人
+        why = retract_refused_reason(a.to, path, method, skip_claim=True)
+        if why:
+            sys.exit(f"{a.id} {why}，无法撤回；原信留在 {path}。")
+        dst_dir = HOME / a.to / "archived" / time.strftime("%Y%m%d-%H%M%S")
+        dst = dst_dir / path.name
+        if dst.exists():
+            sys.exit(f"归档里已有同名文件，未撤回（{dst}）；请人工处理")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        path.replace(dst)
+    finally:
+        release_claim(a.to, path)   # 原信已经不在 inbox/，投递方下一轮不会再看见它
     log("postman.log", f"撤回 {a.sender} → {a.to} {a.id}：通道 {method} 未接受，原信存档到 {dst}")
     print(f"已撤回 {a.id}")
     print(f"原信原样存档到 {dst}（正文未改，没有写任何通知，也没有替你补发修正）")
@@ -2103,8 +2118,10 @@ def cmd_hook(_a):
             new = [p for p in pending(name) if str(p) not in seen]
             if new:
                 if rate_ok(name):
-                    for p in new:
-                        claim_letter(name, p)   # committed to this wake: `retract` must refuse it now
+                    # 只有抢到认领的那些才唤醒：抢不到说明投递方或撤回正在处理这封信，
+                    # 忽略返回值就会变成「认领失败也照样唤醒」，那正是撤回要避免的事。
+                    new = [p for p in new if claim_letter(name, p)]
+                if new:
                     sys.stderr.write(reminder(name, new) + "\n")
                     with seenf.open("a") as f:
                         f.writelines(f"{p}\n" for p in new)
@@ -2236,8 +2253,12 @@ def cmd_postman(_a):
                 group = ([letter] if letter else []) + due
                 names = " ".join(p.name for p in group)
                 sig = f"{name}::" + "|".join(p.name for p in group)
-                for p in group:
-                    claim_letter(name, p)       # committed to this wake: `retract` must refuse it now
+                # 同样只投认领成功的：抢不到的那几封这一轮不动，等下一轮
+                group = [p for p in group if claim_letter(name, p)]
+                if not group:
+                    continue
+                names = " ".join(p.name for p in group)
+                sig = f"{name}::" + "|".join(p.name for p in group)
                 ok = True
                 try:
                     if method == "codex_queue":
