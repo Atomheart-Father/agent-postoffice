@@ -830,11 +830,11 @@ bid_after=$(python3 -c "import json,sys;print(list(json.load(open(sys.argv[1]))[
 # 退修4b：真·硬中断恢复。第一封广播信真的落地之后，抛一个不被普通 Exception 捕获的中断，
 # 从磁盘重新加载模块再跑一轮，目标仍然是 b —— 这样恢复分支一定被走到。
 # mode=inbox 时信留在收件箱；done 是收件人处理过；arch 是用户用 clear 把它归档了。
-alias_crash() {
-python3 - "$PO" "$P2" "$1" <<'PY'
+alias_crash() { # $1=第几封信落地后中断（1=广播 2=交接） $2=那封信最后在 inbox|done|arch
+python3 - "$PO" "$P2" "$1" "$2" <<'PY'
 import importlib.machinery, importlib.util, json, os, re, sys, time
 from pathlib import Path
-po, home, mode = sys.argv[1], Path(sys.argv[2]), sys.argv[3]
+po, home, step, mode = sys.argv[1], Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 os.environ["POSTOFFICE_HOME"] = str(home)
 os.environ["POSTOFFICE_NO_NOTIFY"] = "1"
 os.environ["POSTOFFICE_ALIAS_STABLE"] = "0"
@@ -861,8 +861,8 @@ landed = []
 def boom(to, sender, subject, need, body, extra_headers=()):
     p = real_write(to, sender, subject, need, body, extra_headers=extra_headers)
     landed.append(p)
-    if len(landed) == 1:
-        raise HardStop("模拟硬中断：信已落地，送达状态还没保存")
+    if len(landed) == step:
+        raise HardStop(f"模拟硬中断：第 {step} 封信已落地，对应的状态还没保存")
     return p
 
 m.write_letter = boom
@@ -876,28 +876,32 @@ except Exception as e:                    # 被普通异常抓到就算失败，
 if not crashed:
     print("BAD 没有触发硬中断")
     raise SystemExit(0)
-first = landed[0]
-if not first.exists():
-    print("BAD 中断前那封信并没有真的落地")
+if len(landed) != step or not landed[step - 1].exists():
+    print(f"BAD 中断前第 {step} 封信并没有真的落地（只写了 {len(landed)} 封）")
     raise SystemExit(0)
 st = json.loads((home / "alias_state.json").read_text(encoding="utf-8"))
 ev0 = list(st["aliases"]["pm"]["events"].values())[0]
-if ev0.get("sent") or ev0.get("broadcast") or ev0.get("done"):
-    print("BAD 中断发生得太晚，送达状态已经落盘了")
-    raise SystemExit(0)
+if step == 1:                             # 广播信刚落地：送达名单与编号都还没落盘
+    if ev0.get("sent") or ev0.get("broadcast") or ev0.get("done"):
+        print("BAD 中断发生得太晚，送达状态已经落盘了")
+        raise SystemExit(0)
+else:                                      # 交接信刚落地：广播已完成，但交接 id 还没落盘
+    if not ev0.get("broadcast") or ev0.get("handoff") or ev0.get("done"):
+        print("BAD 交接中断的前置状态不对")
+        raise SystemExit(0)
 
 # --- 把那封信放到 mode 指定的位置（模拟用户归档 / 收件人处理）---
-moved = first
+first = landed[step - 1]
+holder = first.parent.parent.name
 if mode == "done":
-    dst = home / "d1" / "done"
+    dst = home / holder / "done"
 elif mode == "arch":
-    dst = home / "d1" / "archived" / time.strftime("%Y%m%d-%H%M%S")
+    dst = home / holder / "archived" / time.strftime("%Y%m%d-%H%M%S")
 else:
     dst = first.parent
 dst.mkdir(parents=True, exist_ok=True)
 if mode != "inbox":
-    moved = dst / first.name
-    first.replace(moved)
+    first.replace(dst / first.name)
 
 # --- 从磁盘重新加载模块，跑第二轮：目标仍然是 b（a 仍离线）---
 m2 = load()
@@ -906,39 +910,50 @@ st2 = json.loads((home / "alias_state.json").read_text(encoding="utf-8"))
 ev = list(st2["aliases"]["pm"]["events"].values())[0]
 bid = ev.get("broadcast") or ""
 
-def letters_with(box):
+def letters_with(box, needle):
     hits = []
     for sub in ("inbox", "done"):
         d = home / box / sub
         if d.is_dir():
-            hits += [p for p in d.glob("*.md") if f"广播：{bid}" in p.read_text(encoding="utf-8")]
+            hits += [p for p in d.glob("*.md") if needle in p.read_text(encoding="utf-8")]
     a = home / box / "archived"
     if a.is_dir():
-        hits += [p for p in a.rglob("*.md") if f"广播：{bid}" in p.read_text(encoding="utf-8")]
+        hits += [p for p in a.rglob("*.md") if needle in p.read_text(encoding="utf-8")]
     return hits
 
 recs = sorted((home / "broadcasts").glob("*.json"))
-handoffs = list((home / "b" / "inbox").glob("*.md"))
+eid = ev.get("id") or ""
+handoffs = [p for p in letters_with("b", "事由：交接：@pm")]
+tagged = [p for p in handoffs if f"切换事件：{eid}" in p.read_text(encoding="utf-8")]
 problems = []
-if len(letters_with("d1")) != 1:
-    problems.append(f"d1 手里有 {len(letters_with('d1'))} 封该广播的信")
+if len(letters_with("d1", "广播：" + bid)) != 1:
+    problems.append(f"d1 手里有 {len(letters_with('d1', '广播：', bid))} 封该广播的信")
 if len(recs) != 1:
     problems.append(f"广播记录有 {len(recs)} 份")
 if not re.fullmatch(r"B\d{8}-\d{6}_[A-Za-z0-9_.\-]+", bid or ""):
     problems.append(f"广播编号不合格式：{bid!r}")
+if len(handoffs) != 1:
+    problems.append(f"b 手里有 {len(handoffs)} 封交接提醒")
+if len(tagged) != len(handoffs):
+    problems.append(f"只有 {len(tagged)}/{len(handoffs)} 封交接提醒带了可恢复的事件身份")
 if not ev.get("done"):
     problems.append("事件没有走到完成")
-if len(handoffs) != 1:
-    problems.append(f"交接提醒有 {len(handoffs)} 封")
+if not ev.get("handoff"):
+    problems.append("交接 id 没有补记上")
 print("OK" if not problems else "BAD:" + "；".join(problems))
 PY
 }
 for mode in inbox done arch; do
   po17_new "crash_$mode" "$SW_CFG" "$SW_ON"   # a 在线开局：脚本里先记基线，再让 a 下线触发切换
-  r=$(alias_crash "$mode")
-  where="信在${mode}"
+  r=$(alias_crash 1 "$mode")
+  where="广播信在${mode}"
   [ "$r" = "OK" ] && ok "退修4b 硬中断后从磁盘恢复（${where}）不重投、不另建记录、仍补完交接" \
                   || bad "退修4b 硬中断恢复（${where}）：$r"
+  po17_new "hcrash_$mode" "$SW_CFG" "$SW_ON"
+  r=$(alias_crash 2 "$mode")
+  where="交接信在${mode}"
+  [ "$r" = "OK" ] && ok "退修4d 交接信落盘窗口硬中断后不产生第二封（${where}）" \
+                  || bad "退修4d 交接信硬中断恢复（${where}）：$r"
 done
 
 # 退修4c：两个 alias 在同一秒确认切换，广播编号不能撞。
