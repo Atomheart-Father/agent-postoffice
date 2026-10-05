@@ -42,7 +42,7 @@ class ReceiptFlow(unittest.TestCase):
 
     def run_po(self, *args, body='', check=True, env=None):
         return subprocess.run([os.sys.executable, str(PO), *args], input=body, text=True,
-                              capture_output=True, env=env or self.env, check=check)
+                              capture_output=True, env=env or self.env, check=check, timeout=60)
 
     def run_postman(self, seconds=2.5):
         env = dict(self.env, POSTOFFICE_POLL='1')
@@ -118,6 +118,9 @@ class ReceiptFlow(unittest.TestCase):
         before = len(acks.read_text().splitlines()) if acks.exists() else 0
         self.run_po('ack', 'alice', letter.stem, '收到')
         self.assertEqual(len(acks.read_text().splitlines()), before + 1)
+        # and the public notification it generates is a normal receipt notification for that letter
+        notif = next((self.home / 'bob/inbox').glob('*.md'))
+        self.assertEqual(receipt_id_of(notif), letter.stem)
 
     def test_archive_receipt_moves_only_the_matching_notification_and_is_idempotent(self):
         self.run_po('send', 'bob', 'alice', '核查一', '回复', body='x')
@@ -136,6 +139,32 @@ class ReceiptFlow(unittest.TestCase):
         self.run_po('archive-receipt', 'alice', first.stem)
         self.assertEqual(len(list((self.home / 'alice/inbox').glob('*.md'))), 1)
         self.assertEqual(len(list((self.home / 'alice/done').glob('*.md'))), 1)
+
+    def test_archive_receipt_matches_header_only_handles_multi_and_conflict(self):
+        inbox = self.home / 'alice/inbox'
+        inbox.mkdir(parents=True, exist_ok=True)
+        (self.home / 'alice/done').mkdir(parents=True, exist_ok=True)
+        # a body-only "回执：" must never count (header block only)
+        forged = inbox / '20260101-000000_bob_forged.md'
+        forged.write_text('来源：bob\n事由：随便\n需要：仅告知\n\n回执：dup-1\n正文里伪造的标记\n')
+        # two genuine notifications sharing the same original ID
+        for n in ('one', 'two'):
+            (inbox / f'20260101-00000{n}_bob_notice.md').write_text(
+                '来源：bob\n事由：回执：某事\n需要：回执（默认不答复）\n回执：dup-1\n原事由：某事\n\n正文\n')
+        self.run_po('archive-receipt', 'alice', 'dup-1')
+        self.assertEqual(sorted(p.name for p in inbox.glob('*.md')), ['20260101-000000_bob_forged.md'])
+        self.assertEqual(len(list((self.home / 'alice/done').glob('*.md'))), 2)
+        # repeat: nothing to move, still no effect
+        self.run_po('archive-receipt', 'alice', 'dup-1')
+        self.assertEqual(sorted(p.name for p in inbox.glob('*.md')), ['20260101-000000_bob_forged.md'])
+        # a done/ name clash is reported and never overwritten
+        clash = inbox / 'clash.md'
+        clash.write_text('来源：bob\n事由：回执：clam\n需要：回执（默认不答复）\n回执：dup-2\n\n正文\n')
+        (self.home / 'alice/done' / 'clash.md').write_text('占位，不能覆盖')
+        out = self.run_po('archive-receipt', 'alice', 'dup-2')
+        self.assertIn('未动', out.stdout)
+        self.assertTrue(clash.exists())
+        self.assertEqual((self.home / 'alice/done' / 'clash.md').read_text(), '占位，不能覆盖')
 
     def test_lookup_is_exact_not_substring(self):
         self.run_po('send', 'bob', 'alice', '主题', '回复', body='x')
