@@ -5,6 +5,7 @@ Everything runs in a temp dir against the lab `postoffice`; no real mailbox, age
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import time
@@ -12,6 +13,11 @@ import unittest
 
 PO = Path(__file__).resolve().parents[1] / 'postoffice'
 SENTINEL = 'SENTINEL-RECEIPT-BODY-7f3a9c'
+
+
+def query_cmd(box, receipt_id):
+    """Exactly what the reminder prints: the command with POSIX-quoted arguments."""
+    return 'postoffice receipt ' + shlex.quote(box) + ' ' + shlex.quote(receipt_id)
 
 
 class ReceiptFlow(unittest.TestCase):
@@ -66,7 +72,7 @@ class ReceiptFlow(unittest.TestCase):
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn(SENTINEL, result.stderr)
-        self.assertIn('postoffice receipt alice ' + original.stem, result.stderr)
+        self.assertIn(query_cmd('alice', original.stem), result.stderr)
         self.assertIn('默认不答复', result.stderr)
         self.assertIn(str(receipt), result.stderr)
         self.assertIn('归档：mv', result.stderr)
@@ -132,12 +138,12 @@ class ReceiptFlow(unittest.TestCase):
         summary = summaries[0].read_text()
         self.assertNotIn('B-NOTE-1', summary)
         self.assertNotIn('B-NOTE-2', summary)
-        self.assertIn('postoffice receipt alice ' + bid, summary)
+        self.assertIn(query_cmd('alice', bid), summary)
         t = self.as_claude('alice', 'Broadcast Receipt')
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn('B-NOTE-1', result.stderr)
-        self.assertIn('postoffice receipt alice ' + bid, result.stderr)
+        self.assertIn(query_cmd('alice', bid), result.stderr)
         got = self.run_po('receipt', 'alice', bid)
         self.assertIn('B-NOTE-1', got.stdout)
         self.assertIn('B-NOTE-2', got.stdout)
@@ -157,7 +163,7 @@ class ReceiptFlow(unittest.TestCase):
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn(SENTINEL, result.stderr)
-        self.assertIn('postoffice receipt alice old-id-1', result.stderr)
+        self.assertIn(query_cmd('alice', 'old-id-1'), result.stderr)
         self.assertIn('旧事由', result.stderr)
         got = self.run_po('receipt', 'alice', 'old-id-1')
         self.assertIn(SENTINEL, got.stdout)
@@ -197,6 +203,40 @@ class ReceiptFlow(unittest.TestCase):
         self.assertEqual(list((self.home / 'bob/inbox').glob('*.md')), [])
         self.assertEqual(len((self.home / 'acks.jsonl').read_text().splitlines()), 1)
 
+    # --- generated commands survive spaces and shell metacharacters ----------------
+    def test_generated_commands_are_shell_quoted(self):
+        home = Path(self.tmp.name) / 'po home'  # POSTOFFICE_HOME with a space
+        env = dict(os.environ, POSTOFFICE_HOME=str(home), POSTOFFICE_NO_NOTIFY='1')
+
+        def run(*args, body='', check=True):
+            return subprocess.run([os.sys.executable, str(PO), *args], input=body, text=True,
+                                  capture_output=True, env=env, check=check)
+
+        run('init')
+        run('add', 'alice', '--notify')
+        run('add', 'bob', '--notify')
+        subject = "核查（'重要';x）结果"  # parens, single quote and semicolon survive into the id
+        run('send', 'bob', 'alice', subject, '回复', body='请求核查')
+        original = next((home / 'bob/inbox').glob('*.md'))
+        run('ack', 'bob', original.stem, SENTINEL)
+        run('add', 'alice', '--claude', 'Quote Test')
+        t = Path(self.tmp.name) / 'quote.jsonl'
+        t.write_text(json.dumps({'type': 'custom-title', 'customTitle': 'Quote Test'}))
+        res = subprocess.run([os.sys.executable, str(PO), 'hook'],
+                             input=json.dumps({'transcript_path': str(t)}),
+                             text=True, capture_output=True, env=env)
+        self.assertEqual(res.returncode, 2)
+        line = lambda p: next(l[len(p):] for l in res.stderr.splitlines() if l.startswith(p))
+        query, mv = line('查询命令：'), line('归档：')
+        shell_env = dict(env, PATH=str(PO.parent) + os.pathsep + env.get('PATH', ''))
+        got = subprocess.run(['sh', '-c', query], text=True, capture_output=True, env=shell_env)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn(SENTINEL, got.stdout)
+        (home / 'alice/done').mkdir(parents=True, exist_ok=True)
+        subprocess.run(['sh', '-c', mv], check=True, env=shell_env)
+        self.assertEqual(list((home / 'alice/inbox').glob('*.md')), [])
+        self.assertTrue(list((home / 'alice/done').glob('*.md')))
+
     # --- codex queue mock: the third reminder path ---------------------------------
     def test_codex_queue_reminder_has_metadata_only(self):
         cap = Path(self.tmp.name) / 'codex_capture.txt'
@@ -213,7 +253,7 @@ class ReceiptFlow(unittest.TestCase):
         self.run_postman()
         text = cap.read_text()
         self.assertNotIn(SENTINEL, text)
-        self.assertIn('postoffice receipt carol ' + original.stem, text)
+        self.assertIn(query_cmd('carol', original.stem), text)
 
 
 if __name__ == '__main__':

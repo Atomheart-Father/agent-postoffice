@@ -40,7 +40,8 @@ try {
   assert.equal(prompts.length, 1, 'idle: receipt prompt')
   const text = prompts[0].body.parts[0].text
   assert.doesNotMatch(text, new RegExp(SENTINEL), 'receipt body must not be injected')
-  assert.match(text, /postoffice receipt alice original/)
+  assert.match(text, /postoffice receipt 'alice' 'original'/, 'command args are POSIX-quoted')
+  assert.match(text, /归档：mv '/, 'archive command is POSIX-quoted')
   assert.match(text, /原事由：核查结果/)
   assert.match(text, /默认不答复/)
   await scan()

@@ -15,6 +15,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -157,9 +158,9 @@ def reminder(name, files):
             lines.append(f"【联络总站回执｜{name}】来自 {src} 的回执"
                          + (f"，原事由：{subject}" if subject else ""))
             lines.append(f"通知：{f}")
-            lines.append(f"归档：mv {f} {done}/")
+            lines.append(f"归档：mv {shlex.quote(str(f))} {shlex.quote(str(done) + '/')}")
             lines.append(f"查询 ID：{qid}")
-            lines.append(f"查询命令：postoffice receipt {name} {qid}")
+            lines.append(f"查询命令：postoffice receipt {shlex.quote(name)} {shlex.quote(qid)}")
             lines.append(RECEIPT_TAIL)
         else:
             lines.append(f"【联络总站新信｜{name}】" + REMINDER_TAIL.format(home=HOME, done=done))
@@ -493,7 +494,7 @@ def cmd_ack(a):
         if to in boxes(routes) and (HOME / to / "inbox").is_dir():
             prefix = "copy that" if a.wake else "回执"
             body = (f"对应原信：{a.id}\n"
-                    f"回执正文只存在账本，按需查询：postoffice receipt {to} {a.id}")
+                    f"回执正文只存在账本，按需查询：postoffice receipt {shlex.quote(to)} {shlex.quote(a.id)}")
             path = write_letter(to, a.name, f"{prefix}：{subject}", "回执（默认不答复）", body,
                                 extra_headers=[f"回执：{a.id}", f"原事由：{subject}"])
             print(f"已投递回执通知：{path}")
@@ -613,7 +614,8 @@ def summarize_broadcasts(routes):
             if missing:
                 lines.append("未回执：" + "、".join(
                     f"{n}（离线）" if (routes.get(n) and not online(routes[n])) else n for n in missing))
-            lines.append(f"各人回执正文不随通知投递，按需查询：postoffice receipt {rec.get('from')} {rec.get('id')}")
+            lines.append("各人回执正文不随通知投递，按需查询：postoffice receipt "
+                         f"{shlex.quote(rec.get('from', ''))} {shlex.quote(rec.get('id', ''))}")
             path = write_letter(rec.get("from", ""), "postoffice", f"广播汇总：{rec.get('subject', '')}",
                                 "回执（默认不答复）", "\n".join(lines),
                                 extra_headers=[f"回执：{rec.get('id')}", f"原事由：{rec.get('subject', '')}"])
