@@ -85,6 +85,31 @@ The recipient wakes up, reads, does the work, replies, and moves the letter into
 | `postoffice postman` | Run the postman in the foreground (if you don't want it at login) |
 | `postoffice uninstall claude` / `postman` | Remove the hooks / the login item |
 
+## A session setting its own alarm (OpenCode, optional)
+
+Two native tools let a model in an OpenCode session set a one-shot reminder **for that very session**:
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `postoffice_alarm_schedule` | `delay_minutes` (integer, 1–1440) | rings once, that many minutes from now |
+| `postoffice_alarm_cancel` | none | cancels this session's pending alarm |
+
+One sentence is enough: "set a 25-minute alarm to remind me to check the build".
+
+**End the turn as soon as it is set.** An alarm is not a wait: the tool returns immediately and tells the model to end the turn — no sleeping, no polling, no busy-looping. Whatever you lined up keeps running on its own in the background; the post office neither starts it, watches it, nor has any opinion on whether it finished.
+
+When it fires the action is deliberately narrow: the resident postman queues one fixed sentence into **the same physical mailbox** (`你设的闹钟到了，请检查刚才安排的任务。`) and reuses the existing OpenCode idle delivery channel to put that one sentence into the session. A busy session is left alone until it goes idle — no interruption, no nagging. If the route is offline or the session is not loaded the letter simply waits and is delivered at most once after that; neither a postman nor an OpenCode restart loses it or makes it ring twice. **Only the currently bound session is woken**: nothing opens files for you, nothing runs the next step, and nothing claims the experiment is done — that judgement is still yours, or the model's in that session.
+
+Identity is resolved by lookup, never supplied: the tool reads the session ID OpenCode hands it and looks for the single mailbox that both uses the OpenCode plugin channel and is bound to that session. No match, several matches, an offline mailbox, or a session that cannot be confirmed as belonging to this instance all mean refusal with nothing written to disk. The CLI-side scheduler re-checks the record a second time (is the mailbox still registered, does it still use the channel, is `session_id` still the same, does OpenCode actually know this session) and refuses anything that no longer matches. The tools take no recipient, mailbox or free-form body, so a model cannot use them to post into someone else's inbox.
+
+One alarm per session at a time: setting a second one fails with a clear "cancel it first" instead of silently resetting the first. Once it has rung you do not have to clean up — the runtime record retires itself.
+
+- Upper bound 1440 minutes (24 h): this is a "come back and look at this later" reminder, not a calendar. For anything longer, start another conversation instead.
+- Lower bound 1 minute: waiting less than that is not worth it — just keep working.
+- The timers live in `<POSTOFFICE_HOME>/alarms/` as **runtime** data (one 0600 JSON file per session holding only the alarm id, mailbox, session, due time and delivery state). It is not user configuration, has no import UI, and never stores the task text you gave it.
+- **OpenCode only** in this version. Claude and Codex sessions have neither tool, and the post office does not claim to support them.
+- Accuracy: the postman polls every 10 s, so the alarm can be up to about 10 s late; the due time uses the machine's wall clock, and NTP steps do not matter for delays of a minute or more.
+
 ## Groups and logical addresses (optional)
 
 Without `~/agent-postoffice/config.json` none of this exists and everything else behaves exactly as before. Import a config and you get two things:
@@ -140,6 +165,7 @@ If a letter that **needs action** (its `need:` header says reply / review / …)
 | Panel per-letter status and counts (waiting / reminded-to-file / failed), the Chinese/English switch, verbatim escaped user content, confirmation wording covering both statistics | `tests/panel_i18n_test.mjs` (runs the real page script against a DOM stub: default by browser language, manual choice persisted, unusable storage still switchable, switching issues no write call, user content escaped and untranslated; six mutants verified to fail) plus the `tests/smoke.sh` API checks for the three statistics, `.delivered.json` fallbacks and `FAILED_FINAL` |
 | The six regression negatives from the review round: full config validation at use time (wrong version / duplicated member / notify target removed all disable groups and logical addresses together with no change to routes or inboxes), a first sighting with nobody online that still waits out the window before one notice, an alias baseline that is really persisted when the alias is removed, one broadcast record per switch that is not replayed even when the delivered list is lost, an empty or malformed `广播:` header rejected without touching the ledger or the letter, and an archive confirmation listing failed deliveries plus the total | block 14 of the same `tests/smoke.sh` (60 assertions, each case in its own temp post office); eight mutants were tried, one of them swapping the whole event step back to the pre-fix implementation |
 | The two blocking fixes: broadcast ids never collide (two logical addresses confirmed in the same second, with the same and with different notify targets, independent acks per broadcast, no cross-box ack), and resume after a real hard interrupt (the letter left in the inbox, filed into `done/`, and archived by `clear` — each run separately, and again for the handover note's own write-then-save window so it cannot be sent twice) | blocks 4b/4c/4d of the same `tests/smoke.sh` (12 more assertions); the interrupt case loads the real `postoffice` module in-process, lets the letter really land, then raises a `BaseException` (not caught by `except Exception`), reloads the module from disk and runs a second round, asserting the resume branch really executed |
+| Session-set alarms end to end (tool entry, identity resolution, timer, minimal rendering, cancel) | `tests/alarm_test.py` (19) and `tests/alarm_plugin_test.mjs` (29) against a mock OpenCode; ten mutants were tried. **Not run against a real model**: the model has never actually called these tools, and the fixed sentence has not been seen in a real OpenCode turn |
 | Group switches and logical addresses against real provider quotas, and the handover path file | Not verified on a real machine: no real config was imported and no real group was switched (v1.7 is not released yet) |
 | Receipt reminders are short and metadata-only; `postoffice receipt` is exact-ID/read-only and `postoffice archive-receipt` files only the matching notification | `tests/receipt_test.py` (15 checks, incl. legacy notifications, shell-quoted commands and archive idempotence) and `tests/receipt_plugin_test.mjs` |
 | Claude Desktop: idle for minutes, woken by external mail, processes the letter | Observed repeatedly on a real machine |
@@ -177,6 +203,8 @@ In these cases a Claude session can't be woken for a while; letters are never lo
 python3 tests/receipt_test.py                                 # receipt flow: metadata-only reminders (Claude hook and a Codex-queue mock), exact lookup, no cross-box leak, read-only, legacy notifications, broadcast, --wake
 node --experimental-strip-types tests/receipt_plugin_test.mjs # OpenCode plugin (mock client, no model calls)
 node --experimental-strip-types tests/panel_i18n_test.mjs     # panel page: per-letter statistics, Chinese/English switch, verbatim user content
+python3 tests/alarm_test.py                                   # scheduler: fires once, identity re-check, crash window, offline deferral, ledger
+node --experimental-strip-types tests/alarm_plugin_test.mjs    # alarm tools: schedule/cancel, one per session, short rendering, idle delivery, refusals
 ```
 
 None of these touches your real config, mailboxes or ledger, and none calls a model.
