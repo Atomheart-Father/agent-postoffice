@@ -20,6 +20,14 @@ def query_cmd(box, receipt_id):
     return 'postoffice receipt ' + shlex.quote(box) + ' ' + shlex.quote(receipt_id)
 
 
+def receipt_id_of(path):
+    """The `回执：<id>` marker from a notification's header block (the same rule the tools use)."""
+    for line in Path(path).read_text().split('\n\n', 1)[0].splitlines():
+        if line.startswith('回执：'):
+            return line[len('回执：'):]
+    return ''
+
+
 class ReceiptFlow(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -72,22 +80,62 @@ class ReceiptFlow(unittest.TestCase):
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn(SENTINEL, result.stderr)
-        self.assertIn(query_cmd('alice', original.stem), result.stderr)
+        self.assertIn('【联络总站回执', result.stderr)
+        self.assertIn('查询：' + query_cmd('alice', original.stem), result.stderr)
         self.assertIn('默认不答复', result.stderr)
-        self.assertIn(str(receipt), result.stderr)
-        self.assertIn('归档：mv', result.stderr)
+        # receipt reminder: 3 lines, the lookup id appears exactly once, no path/archive/body
+        self.assertEqual(result.stderr.count(original.stem), 1)
+        self.assertNotIn(str(receipt), result.stderr)
+        self.assertNotIn('归档', result.stderr)
         got = self.run_po('receipt', 'alice', original.stem)
         self.assertIn(SENTINEL, got.stdout)
         self.assertIn('来源：bob', got.stdout)
 
-    def test_normal_letter_reminder_keeps_path_and_id(self):
+    def test_normal_letter_reminder_keeps_path_and_header(self):
         self.run_po('send', 'alice', 'bob', '待办事项', '回复', body='请处理')
         letter = next((self.home / 'alice/inbox').glob('*.md'))
         t = self.as_claude('alice', 'Normal Letter')
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertIn('== ' + str(letter), result.stderr)
-        self.assertIn('编号：' + letter.stem, result.stderr)
+        self.assertIn('来源：bob', result.stderr)
+        self.assertIn('事由：待办事项', result.stderr)
+        self.assertIn('需要：回复', result.stderr)
+        # the long fixed policy lives in the skill now, not in the reminder
+        self.assertNotIn('会叫醒对方', result.stderr)
+
+    def test_formal_send_with_receipt_like_subject_is_not_downgraded(self):
+        self.run_po('send', 'alice', 'bob', '回执：正式信标题', '回复', body='正文')
+        letter = next((self.home / 'alice/inbox').glob('*.md'))
+        t = self.as_claude('alice', 'Receipt Title Letter')
+        result = self.hook(t)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('【联络总站新信', result.stderr)
+        self.assertIn('== ' + str(letter), result.stderr)
+        self.assertNotIn('【联络总站回执', result.stderr)
+        # a receipt-shaped subject must not let ack archive it without recording
+        acks = self.home / 'acks.jsonl'
+        before = len(acks.read_text().splitlines()) if acks.exists() else 0
+        self.run_po('ack', 'alice', letter.stem, '收到')
+        self.assertEqual(len(acks.read_text().splitlines()), before + 1)
+
+    def test_archive_receipt_moves_only_the_matching_notification_and_is_idempotent(self):
+        self.run_po('send', 'bob', 'alice', '核查一', '回复', body='x')
+        first = next((self.home / 'bob/inbox').glob('*.md'))
+        self.run_po('ack', 'bob', first.stem, SENTINEL)
+        self.run_po('send', 'bob', 'alice', '核查二', '回复', body='y')
+        second = next((self.home / 'bob/inbox').glob('*.md'))
+        self.run_po('ack', 'bob', second.stem, '另一条')
+        self.assertEqual(len(list((self.home / 'alice/inbox').glob('*.md'))), 2)
+        self.run_po('archive-receipt', 'alice', first.stem)
+        remaining = list((self.home / 'alice/inbox').glob('*.md'))
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(len(list((self.home / 'alice/done').glob('*.md'))), 1)
+        self.assertEqual(receipt_id_of(remaining[0]), second.stem)  # unrelated notification untouched
+        # idempotent: a second run moves nothing
+        self.run_po('archive-receipt', 'alice', first.stem)
+        self.assertEqual(len(list((self.home / 'alice/inbox').glob('*.md'))), 1)
+        self.assertEqual(len(list((self.home / 'alice/done').glob('*.md'))), 1)
 
     def test_lookup_is_exact_not_substring(self):
         self.run_po('send', 'bob', 'alice', '主题', '回复', body='x')
@@ -227,13 +275,14 @@ class ReceiptFlow(unittest.TestCase):
                              text=True, capture_output=True, env=env)
         self.assertEqual(res.returncode, 2)
         line = lambda p: next(l[len(p):] for l in res.stderr.splitlines() if l.startswith(p))
-        query, mv = line('查询命令：'), line('归档：')
+        query = line('查询：')
         shell_env = dict(env, PATH=str(PO.parent) + os.pathsep + env.get('PATH', ''))
         got = subprocess.run(['sh', '-c', query], text=True, capture_output=True, env=shell_env)
         self.assertEqual(got.returncode, 0, got.stderr)
         self.assertIn(SENTINEL, got.stdout)
+        # archive is now a CLI call, not an inlined shell line: it moves only this box's notification
         (home / 'alice/done').mkdir(parents=True, exist_ok=True)
-        subprocess.run(['sh', '-c', mv], check=True, env=shell_env)
+        run('archive-receipt', 'alice', original.stem)
         self.assertEqual(list((home / 'alice/inbox').glob('*.md')), [])
         self.assertTrue(list((home / 'alice/done').glob('*.md')))
 
