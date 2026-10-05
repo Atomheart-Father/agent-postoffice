@@ -26,6 +26,22 @@ const LIVE4 = 'ses_live_alarm_4'
 const OTHER = 'ses_someone_else'
 const DIR_OK = join(root, 'proj')
 
+// The plugin hands the record write to the Python CLI, which re-checks the session against the
+// OpenCode session database. Give it a stand-in database so the check has something to find.
+const dbPath = join(root, 'opencode.db')
+await writeFile(dbPath, '')
+const mkdb = async (sessions) => {
+  const { execFileSync } = await import('node:child_process')
+  const sql = ['create table session (id text, title text, directory text, parent_id text, time_updated integer);']
+  for (const [id, title, dir] of sessions)
+    sql.push(`insert into session values ('${id}','${title}','${dir}',null,0);`)
+  execFileSync('sqlite3', [dbPath, sql.join('')])
+}
+await mkdb([[LIVE, 'live', DIR_OK], [LIVE2, 'live2', DIR_OK], [LIVE3, 'live3', DIR_OK],
+            [LIVE4, 'live4', DIR_OK], [OTHER, 'other', DIR_OK]])
+process.env.OPENCODE_DB = dbPath
+
+
 const logText = async () => readFile(join(root, 'logs/opencode_plugin.log'), 'utf8').catch(() => '')
 const settle = async () => {
   let last = -1, stable = 0
@@ -38,7 +54,7 @@ const settle = async () => {
 const alarmFile = (sid) => join(root, 'alarms', `${sid}.json`)
 const readAlarm = async (sid) => JSON.parse(await readFile(alarmFile(sid), 'utf8'))
 const alarmExists = (sid) => existsSync(alarmFile(sid))
-const alarmFiles = async () => (await readdir(join(root, 'alarms')).catch(() => [])).sort()
+const alarmFiles = async () => (await readdir(join(root, 'alarms')).catch(() => [])).filter((f) => f.endsWith('.json')).sort()
 const inbox = async (box) => (await readdir(join(root, box, 'inbox')).catch(() => [])).sort()
 
 const putLetter = async (box, name, text) => {
@@ -132,7 +148,18 @@ const armLive = async (box = 'lab', sid = LIVE, minutes = 30, fired = true) => {
   return { id: m[1], rec }
 }
 let n = 0
+// Every case starts from a clean runtime ledger. The flock file lives beside the record and is
+// never deleted by design (no ABA), so it is filtered out rather than cleaned.
+const clearAlarms = async () => {
+  for (const f of await alarmFiles()) await rm(join(root, 'alarms', f), { force: true })
+  // Also put every mailbox back online: a case that took one offline must not leak into the next.
+  const rp = join(root, 'routes.json')
+  const r = JSON.parse(await readFile(rp, 'utf8'))
+  for (const k of Object.keys(r)) if (k !== '_') r[k].status = 'online'
+  await writeFile(rp, JSON.stringify(r))
+}
 const t = async (name, fn) => {
+  await clearAlarms()
   try { await fn(); console.log('ok   -', name); n++ } catch (e) { console.log('FAIL -', name, '::', e.message); process.exitCode = 1 }
 }
 
@@ -168,7 +195,7 @@ await t('同一会话重复 schedule 被清楚拒绝，且不动旧闹钟', asyn
   const first = await readAlarm(LIVE)
   const r = await schedule({ delay_minutes: 90 })
   const text = await out(r)
-  assert.ok(/已有一个活动闹钟/.test(text), '要说清已经有闹钟了：' + text)
+  assert.ok(/已经有一个活动闹钟/.test(text), '要说清已经有闹钟了：' + text)
   assert.ok(/cancel/.test(text), '要告诉模型先取消')
   const now = await readAlarm(LIVE)
   assert.equal(now.id, first.id, '不能悄悄重置旧闹钟')
@@ -220,7 +247,7 @@ await t('cancel 复核归属：会话已被改绑到别的信箱时，记录里�
   await saveRoutes()
   const text = await out(await cancel(ctx(LIVE2)))
   assert.ok(/没取消/.test(text), '记录信箱与当前归属不一致必须拒绝：' + text)
-  assert.ok(/不一致/.test(text), '要说清是不一致：' + text)
+  assert.ok(/不是 relocated/.test(text), '要说清是不一致：' + text)
   assert.ok(alarmExists(LIVE2), '不得清掉记录')
   assert.equal((await inbox('lab2')).includes(`${id}.md`), true, '不得动旧信箱的文件')
   assert.equal((await inbox('relocated')).length, 0, '也不得动新信箱')
@@ -290,42 +317,16 @@ await t('两实例并发 schedule：只有一个成功，另一个明确拒绝�
   const no = [a, b].filter((x) => /没设/.test(x))
   assert.equal(ok.length, 1, `恰好一个成功：\nA=${a}\nB=${b}`)
   assert.equal(no.length, 1, `另一个必须明确拒绝：\nA=${a}\nB=${b}`)
-  assert.ok(/另一个进程/.test(no[0]), '拒绝理由要说清是别的进程在改：' + no[0])
+  assert.ok(/已经有一个活动闹钟|另一个进程/.test(no[0]), '拒绝理由要说清为什么：' + no[0])
   const files = (await alarmFiles()).filter((f) => f === `${LIVE}.json`)
   assert.equal(files.length, 1, '只应有一份记录')
   const rec = await readAlarm(LIVE)
   assert.ok(rec.due > 0 && rec.box === 'lab', '记录完整')
   // 顺序执行时第二个必须撞「已有一个闹钟」
   const again = await out(await first.tool.postoffice_alarm_schedule.execute({ delay_minutes: 45 }, ctx(LIVE)))
-  assert.ok(/已有一个活动闹钟/.test(again), '顺序执行时按已有一个处理：' + again)
+  assert.ok(/已经有一个活动闹钟/.test(again), '顺序执行时按已有一个处理：' + again)
   await cancel()
   await second.dispose()   // 第二个实例也有轮询定时器，不清掉进程不会退出
-})
-
-await t('锁被写者遗留时会自愈，不永久卡死也不重置计时', async () => {
-  await cancel()
-  const { rec } = await armLive()
-  const lock = join(root, 'alarms', `${LIVE}.json.lock`)
-  await writeFile(lock, '99999 stale\n')                 // 假装另一个进程崩了，锁留在盘上
-  const old = new Date(Date.now() - 10 * 60 * 1000)      // 但已经过了看门狗窗口
-  await utimes(lock, old, old)
-  const text = await out(await schedule({ delay_minutes: 45 }))
-  assert.ok(/已有一个活动闹钟/.test(text), '陈旧锁不能让记录被重置：' + text)
-  const after = await readAlarm(LIVE)
-  assert.equal(after.due, rec.due, '到期时刻没被改（没有静默重置计时）')
-  assert.equal(existsSync(lock), false, '陈旧锁应被清掉')
-  await cancel()
-})
-
-await t('未过看门狗的锁会让本次调用明确拒绝（而不是静默等待）', async () => {
-  await cancel()
-  const lock = join(root, 'alarms', `${LIVE}.json.lock`)
-  await writeFile(lock, '99999 fresh\n')
-  const text = await out(await schedule({ delay_minutes: 30 }))
-  assert.ok(/没设闹钟/.test(text), '抢不到锁要明确拒绝：' + text)
-  assert.ok(/另一个进程/.test(text), '要说清是别的进程在改：' + text)
-  assert.ok(!alarmExists(LIVE), '拒绝时不落盘')
-  await rm(lock, { force: true })
 })
 
 // ---------------------------------------------------------------- 身份负例

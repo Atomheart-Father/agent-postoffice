@@ -224,6 +224,9 @@ class ReceiptFlow(unittest.TestCase):
         bid = next(p.stem for p in (self.home / 'broadcasts').glob('*.json'))
         self.run_po('ack', 'bob', bid, 'B-NOTE-1')
         self.run_po('ack', 'carol', bid, 'B-NOTE-2')
+        # 认领归首次接受提醒的那个通道所有（见 ef3edd7）：先把 alice 定成 Claude 通道再让
+        # 邮递员跑，否则邮递员会先用默认的 notify 通道把这封汇总信认领掉，钩子就永远叫不醒它。
+        t = self.as_claude('alice', 'Broadcast Receipt')
         self.run_postman()
         summaries = list((self.home / 'alice/inbox').glob('*.md'))
         self.assertEqual(len(summaries), 1, summaries)
@@ -231,7 +234,6 @@ class ReceiptFlow(unittest.TestCase):
         self.assertNotIn('B-NOTE-1', summary)
         self.assertNotIn('B-NOTE-2', summary)
         self.assertIn(query_cmd('alice', bid), summary)
-        t = self.as_claude('alice', 'Broadcast Receipt')
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn('B-NOTE-1', result.stderr)
