@@ -25,7 +25,7 @@ import assert from 'node:assert/strict'
 import {
   mkdtemp, mkdir, writeFile, readFile, readdir, rm, cp, chmod, symlink, realpath, access, lstat,
 } from 'node:fs/promises'
-import { existsSync, constants } from 'node:fs'
+import { existsSync, constants, rmSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -57,7 +57,7 @@ if (!OPENCODE_NM) {
 
 // ---- temp roots ----------------------------------------------------------------------------
 const T = await mkdtemp(join(tmpdir(), 'postoffice-alarm-install-'))
-process.on('exit', () => { try { require('node:fs').rmSync(T, { recursive: true, force: true }) } catch {} })
+process.on('exit', () => { try { rmSync(T, { recursive: true, force: true }) } catch {} })
 
 // A checkout is what an operator has on disk: the single-file CLI next to the plugin source, plus
 // the two trees `postoffice init` and `postoffice install skill` read. `marker` distinguishes two
