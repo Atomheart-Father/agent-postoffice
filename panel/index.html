@@ -65,6 +65,25 @@
                  border: 1px solid var(--line); border-radius: 999px; padding: 1px 10px; cursor: pointer; }
   .gall button:hover { color: var(--ink); border-color: var(--muted); }
   .settle { color: var(--muted); font-size: 12.5px; }
+  .note { color: var(--muted); font-size: 13px; min-height: 1.5em; }
+  .pending div.pend { cursor: pointer; }
+  .pending div.pend:hover { color: var(--accent); }
+  .letter { position: fixed; inset: 0; z-index: 9; background: rgba(0, 0, 0, .35);
+            display: flex; align-items: flex-start; justify-content: center;
+            padding: 56px 16px; overflow: auto; }
+  .letter[hidden] { display: none; }
+  .letter .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+                  padding: 16px 18px; width: 100%; max-width: 640px; }
+  .letter h3 { margin: 0 0 10px; font-size: 16px; }
+  .letter h3 small { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+  .letter .field { margin: 4px 0; overflow-wrap: anywhere; }
+  .letter .field b { color: var(--muted); font-weight: 500; margin-right: 6px; }
+  .letter .body { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0;
+                  border-top: 1px dashed var(--line); padding-top: 10px; }
+  .letter .acts { display: flex; gap: 8px; margin-top: 14px; }
+  .letter .acts button { font: inherit; font-size: 13px; color: inherit; background: none;
+                         border: 1px solid var(--line); border-radius: 999px; padding: 2px 14px; cursor: pointer; }
+  .letter .acts button:hover { border-color: var(--muted); }
   @media (max-width: 520px) { .state { display: none; } }
 </style>
 </head>
@@ -80,6 +99,8 @@
   </header>
   <p class="hint" id="hint"></p>
   <div class="err" id="err"></div>
+  <div class="note" id="letter-status" aria-live="polite"></div>
+  <section class="letter" id="letter" hidden></section>
   <section id="boxes"></section>
   <h2 id="h-groups"></h2>
   <section id="groups"></section>
@@ -126,6 +147,10 @@ const STR = {
     errGroup: "分组开关失败",
     ariaToggle: "{name} {state}，点击切换",
     from: "来自",
+    letterDetail: "信件详情", subject: "事由", need: "需要", body: "正文",
+    fileDone: "处理完成", close: "关闭",
+    errRead: "读取失败", errArchive: "归档失败", doneOk: "已处理",
+    notFound: "未找到", conflict: "冲突",
   },
   en: {
     title: "Post Office",
@@ -157,6 +182,10 @@ const STR = {
     errGroup: "Group switch failed",
     ariaToggle: "{name} {state}, click to switch",
     from: "from",
+    letterDetail: "Letter details", subject: "Subject", need: "Needs", body: "Body",
+    fileDone: "File as done", close: "Close",
+    errRead: "Read failed", errArchive: "Archive failed", doneOk: "Filed",
+    notFound: "Not found", conflict: "Conflict",
   },
 };
 
@@ -193,7 +222,54 @@ function applyLang(next) {
   $("h-log").textContent = t("hLog");
   $("langs").setAttribute("aria-label", t("langLabel"));
   for (const b of $("langs").children) b.setAttribute("aria-pressed", String(b.dataset.lang === lang));
+  closeLetter();                    // 详情是临时视图：换语言不留旧语言的残留
+  $("letter-status").textContent = "";
   return load();
+}
+
+let currentLetter = null;           // 当前详情里那封信的 {box, id}（按钮不带业务数据，以它为准）
+let letterSeq = 0;                  // 请求序号：过期的读取不得改写更新过的视图
+
+async function openLetter(box, id) {
+  const seq = ++letterSeq;
+  $("letter-status").textContent = "";
+  try {
+    const r = await fetch(`/api/letter?box=${encodeURIComponent(box)}&id=${encodeURIComponent(id)}`);
+    if (seq !== letterSeq) return;          // 已有更新的打开/关闭：丢弃本次结果
+    if (!r.ok) {
+      closeLetter();
+      $("letter-status").textContent = r.status === 404 ? t("notFound") : t("errRead");
+      return;
+    }
+    const d = await r.json();
+    if (seq !== letterSeq) return;
+    currentLetter = { box, id };
+    $("letter").innerHTML = `
+      <div class="card">
+        <h3>${esc(t("letterDetail"))}<small>${esc(d.box)}/${esc(d.id)}</small></h3>
+        <div class="field"><b>${esc(t("from"))}</b>${esc(d.sender)}</div>
+        <div class="field"><b>${esc(t("subject"))}</b>${esc(d.subject)}</div>
+        <div class="field"><b>${esc(t("need"))}</b>${esc(d.need)}</div>
+        <div class="field"><b>${esc(t("body"))}</b></div>
+        <div class="body">${esc(d.body)}</div>
+        <div class="acts">
+          <button data-letter-action="done">${esc(t("fileDone"))}</button>
+          <button data-letter-action="close">${esc(t("close"))}</button>
+        </div>
+      </div>`;
+    $("letter").hidden = false;
+  } catch (e) {
+    if (seq !== letterSeq) return;
+    closeLetter();
+    $("letter-status").textContent = t("errRead");
+  }
+}
+
+function closeLetter() {
+  letterSeq++;                      // 作废所有在途读取，避免它们把详情又打开
+  currentLetter = null;
+  $("letter").hidden = true;
+  $("letter").innerHTML = "";
 }
 
 const counts = (c) => fmt("counts", { w: c.waiting, r: c.reminded });
@@ -220,7 +296,7 @@ async function load() {
         ${b.acks && b.acks.length ? `<div class="meta">${esc(t("recentAcks"))}：${b.acks.map((a) =>
           `${esc(a.by)}（${esc(a.note || t("acked"))}）`).join("；")}</div>` : ""}
         ${b.pending.length ? `<div class="pending">${b.pending.map((p) =>
-          `<div>${statusChip(p.status)} <b>${esc(p.subject || p.file)}</b> <span class="meta">${esc(t("from"))} ${esc(p.from)}</span></div>`).join("")}</div>` : ""}
+          `<div class="pend" data-letter="1" data-box="${esc(b.name)}" data-id="${esc(p.file.replace(/\.md$/, ""))}" data-file="${esc(p.file)}">${statusChip(p.status)} <b>${esc(p.subject || p.file)}</b> <span class="meta">${esc(t("from"))} ${esc(p.from)}</span></div>`).join("")}</div>` : ""}
       </div>`; }).join("") : `<p class="hint">${esc(t("emptyBoxes"))}</p>`;
     const groups = st.groups || [];
     $("groups").innerHTML = (st.config_error ? `<p class="hint">${esc(fmt("cfgBad", { e: st.config_error }))}</p>` : "")
@@ -280,12 +356,36 @@ $("boxes").addEventListener("click", async (ev) => {
     return load();
   }
   const tg = ev.target.closest(".toggle");
-  if (!tg) return;
-  const status = tg.dataset.online === "true" ? "offline" : "online";
-  const r = await fetch("/api/status", { method: "POST", headers: { "Content-Type": "application/json" },
-                                         body: JSON.stringify({ name: tg.dataset.name, status }) });
-  if (!r.ok) $("err").textContent = t("errStatus");
-  load();
+  if (tg) {
+    const status = tg.dataset.online === "true" ? "offline" : "online";
+    const r = await fetch("/api/status", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ name: tg.dataset.name, status }) });
+    if (!r.ok) $("err").textContent = t("errStatus");
+    return load();
+  }
+  const row = ev.target.closest("[data-letter]");
+  if (row) await openLetter(row.dataset.box, row.dataset.id);
+});
+
+$("letter").addEventListener("click", async (ev) => {
+  const b = ev.target.closest("[data-letter-action]");
+  if (!b) return;
+  if (b.dataset.letterAction === "close") return closeLetter();
+  if (b.dataset.letterAction !== "done" || !currentLetter) return;
+  const { box, id } = currentLetter;
+  try {
+    const r = await fetch("/api/archive-one", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                body: JSON.stringify({ box, id }) });
+    if (r.ok) {
+      closeLetter();
+      $("letter-status").textContent = t("doneOk");
+      return load();
+    }
+    $("letter-status").textContent = r.status === 409 ? t("conflict")
+      : r.status === 404 ? t("notFound") : t("errArchive");
+  } catch (e) {
+    $("letter-status").textContent = t("errArchive");
+  }
 });
 
 $("groups").addEventListener("click", async (ev) => {

@@ -27,7 +27,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -576,6 +576,69 @@ def presented_add(name, ids):
     if not ids:
         return False
     return presented_update(name, add=ids)
+
+
+def letter_id_ok(lid):
+    """Panel 读信/单封归档的参数校验：只接受本箱 inbox/ 里的裸文件名编号。
+
+    比 bare_presented_id 再严一点：这两个参数直接来自 URL / JSON，连 .md 结尾和 glob
+    字符也一并拒掉，保证它只能落在 <box>/inbox/<id>.md 这一个文件上。
+    """
+    return (bare_presented_id(lid) and not lid.endswith(".md")
+            and not any(c in lid for c in "*?[]"))
+
+
+def box_name_ok(name):
+    """物理信箱名规则与 `postoffice add` 完全一致（字母数字下划线横线，不含点）。
+
+    routes.json 被人手改出 `../victim` 这类键时，面板的读信/归档也必须 fail closed，
+    绝不把新加的“读任意一封信”接口变成读任意一个文件。
+    """
+    return bool(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_\-]+", name))
+
+
+def letter_done_state(box, lid):
+    """单封信 inbox→done 的唯一原语：archive-current 与面板共用，不搞第三套移动协议。
+
+    moved：inbox 有、done 无 → 移动；already：inbox 无、done 有 → 幂等；
+    conflict：两边都有同名 → 一位都不动（同名的未必是同一封，绝不覆盖）；
+    missing：两边都无。只碰 <box>/inbox/<lid>.md 与 <box>/done/<lid>.md 这一对文件。
+    """
+    inbox_p = HOME / box / "inbox" / f"{lid}.md"
+    done_p = HOME / box / "done" / f"{lid}.md"
+    if not inbox_p.is_file():
+        return "already" if done_p.is_file() else "missing"
+    if done_p.exists():
+        return "conflict"
+    done_p.parent.mkdir(parents=True, exist_ok=True)
+    inbox_p.replace(done_p)
+    return "moved"
+
+
+def read_letter_detail(box, lid):
+    """面板读单封信：只读 <box>/inbox/<lid>.md（绝不读 done/ 或 archived/）。
+
+    纯读，一个字节都不写：不碰 presented / .seen / 台账 / 认领，不唤醒。
+    返回 (dict, "") 或 (None, "not_found")；body 是信头块之后的正文去掉最末一个换行。
+    """
+    p = HOME / box / "inbox" / f"{lid}.md"
+    if not p.is_file():
+        return None, "not_found"
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, "not_found"
+    head, _sep, body = raw.partition("\n\n")
+
+    def field_of(key):
+        for line in head.splitlines():
+            if line.startswith(key):
+                return line[len(key):].strip()
+        return ""
+
+    return {"id": lid, "box": box, "sender": letter_sender(p),
+            "subject": field_of("事由："), "need": field_of("需要："),
+            "body": body[:-1] if body.endswith("\n") else body}, ""
 
 
 def find_codex():
@@ -1330,30 +1393,24 @@ def cmd_archive_current(a):
     if err:
         sys.exit(f"{err}；没有动任何信（fail closed）。读不出来时请人工检查或直接删除该文件")
     keep = set(a.keep or [])
-    inbox = HOME / a.box / "inbox"
-    done = HOME / a.box / "done"
     moved, kept, stale, conflicts = [], [], [], []
     for lid in ids:
         if lid in keep:
             kept.append(lid)
             continue
-        p = inbox / f"{lid}.md"
-        if not p.is_file():
-            stale.append(lid)          # already filed, retracted, or never existed
-            continue
-        dst = done / p.name
-        if dst.exists():
+        try:
+            state = letter_done_state(a.box, lid)
+        except OSError as e:
+            sys.exit(f"归档 {lid} 失败（{e}）；已归档的不回滚，剩下的下次再来")
+        if state == "moved":
+            moved.append(lid)
+        elif state == "conflict":
             # Same name already in done/: could be this letter (already filed) or a colliding
             # new one. We cannot tell, so we move nothing and keep the reference — an explicit
             # conflict beats silently losing track of a letter that is still in the inbox.
             conflicts.append(lid)
-            continue
-        try:
-            done.mkdir(parents=True, exist_ok=True)
-            p.replace(dst)
-        except OSError as e:
-            sys.exit(f"归档 {lid} 失败（{e}）；已归档的不回滚，剩下的下次再来")
-        moved.append(lid)
+        else:                              # already / missing: 引用失效（已归档、已撤回、或从未存在）
+            stale.append(lid)
     if moved or stale:
         presented_update(a.box, remove=moved + stale)
     if conflicts:
@@ -3210,22 +3267,63 @@ def cmd_panel(a):
             origin = self.headers.get("Origin")
             return origin in (None, f"http://127.0.0.1:{port}", f"http://localhost:{port}")
 
+        def _letter(self):
+            """GET /api/letter：纯读单封信。只认已登记信箱里的裸编号，只读 inbox/<id>.md。"""
+            from urllib.parse import urlsplit, parse_qs
+            q = parse_qs(urlsplit(self.path).query)
+            box = q["box"][0] if len(q.get("box") or []) == 1 else ""
+            lid = q["id"][0] if len(q.get("id") or []) == 1 else ""
+            if not box or not lid or not letter_id_ok(lid):
+                return 400, {"ok": False, "error": "bad_request"}
+            if not box_name_ok(box) or box not in boxes(load_routes()):
+                return 404, {"ok": False, "error": "not_found"}
+            detail, err = read_letter_detail(box, lid)
+            if err:
+                return 404, {"ok": False, "error": "not_found"}
+            return 200, {"ok": True, **detail}
+
         def do_GET(self):
             if self.path in ("/", "/index.html"):
                 self._send(200, html, "text/html; charset=utf-8")
             elif self.path == "/api/state":
                 self._send(200, json.dumps(panel_state(), ensure_ascii=False).encode())
+            elif self.path.split("?", 1)[0] == "/api/letter":
+                status, payload = self._letter()
+                self._send(status, json.dumps(payload, ensure_ascii=False).encode())
             else:
                 self._send(404, b"{}")
 
         def do_POST(self):
-            if self.path not in ("/api/status", "/api/clear") or not self._local() \
+            if self.path not in ("/api/status", "/api/clear", "/api/archive-one") or not self._local() \
                     or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self._send(403, b'{"ok":false}')
-            message = ""
+            message, status, payload = "", None, None
             try:
                 d = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-                if self.path == "/api/clear":
+                if not isinstance(d, dict):
+                    d = {}                  # 不是对象就当空对象：缺参路径统一处理
+                if self.path == "/api/archive-one":
+                    # 单封「处理完成」：inbox→done；与 clear（整箱收进 archived/）是两回事
+                    box, lid = d.get("box"), d.get("id")
+                    if not isinstance(box, str) or not isinstance(lid, str) or not box or not lid \
+                            or not letter_id_ok(lid):
+                        ok, status, message = False, 400, "bad_request"
+                    elif not box_name_ok(box) or box not in boxes(load_routes()):
+                        ok, status, message = False, 404, "not_found"
+                    else:
+                        try:
+                            state = letter_done_state(box, lid)
+                        except OSError:
+                            state = "failed"
+                        if state in ("moved", "already"):
+                            ok = True
+                            payload = {"ok": True, "state": state}
+                            log("postman.log", f"面板：单封归档 {box}/{lid}（{state}）")
+                        elif state == "conflict":
+                            ok, status, message = False, 409, "conflict"
+                        else:
+                            ok, status, message = False, 404, "not_found"
+                elif self.path == "/api/clear":
                     name = str(d["name"])
                     ok = name in boxes(load_routes())
                     if ok:
@@ -3241,9 +3339,13 @@ def cmd_panel(a):
                         log("postman.log", f"面板：{name} 设为{'在线' if d['status'] == 'online' else '离线'}")
             except (ValueError, KeyError):
                 ok = False
+                if self.path == "/api/archive-one":
+                    status, message = 400, "bad_request"
             except SystemExit as e:        # an unknown group or a missing member: say why, change nothing
                 ok, message = False, str(e)
-            self._send(200 if ok else 400, json.dumps({"ok": ok, "error": message if not ok else ""}).encode())
+            if payload is None:
+                payload = {"ok": ok, "error": message if not ok else ""}
+            self._send(status or (200 if ok else 400), json.dumps(payload).encode())
 
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", port), H)

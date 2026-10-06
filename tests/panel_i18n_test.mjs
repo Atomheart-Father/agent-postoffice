@@ -59,17 +59,19 @@ const STATE = {
 function makeEl(id) {
   return {
     id, textContent: "", innerHTML: "", value: "", dataset: {}, attrs: {}, children: [],
-    handlers: {},
+    handlers: {}, style: {}, hidden: false, className: "",
     setAttribute(k, v) { this.attrs[k] = v; },
     getAttribute(k) { return this.attrs[k]; },
     addEventListener(type, fn) { (this.handlers[type] = this.handlers[type] || []).push(fn); },
+    appendChild(c) { this.children.push(c); return c; },
   };
 }
 
-function makeEnv({ langs = ["en-US"], storage = new Map(), storageThrows = false, fetchFails = false, state = STATE } = {}) {
+function makeEnv({ langs = ["en-US"], storage = new Map(), storageThrows = false, fetchFails = false, state = STATE,
+                   letter = null, archive = null } = {}) {
   const ids = ["title", "home", "hint", "err", "boxes", "groups", "aliases", "switches",
                "broadcasts", "log", "langs", "h-groups", "h-aliases", "h-switches",
-               "h-broadcasts", "h-log"];
+               "h-broadcasts", "h-log", "letter", "letter-status"];
   const els = {};
   for (const id of ids) els[id] = makeEl(id);
   const btn = (l) => ({ dataset: { lang: l }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } });
@@ -83,13 +85,23 @@ function makeEnv({ langs = ["en-US"], storage = new Map(), storageThrows = false
   const confirmations = [];
   const ctx = {
     console,
-    document: { title: "", documentElement: {}, getElementById: (id) => els[id] || null },
-    window: { localStorage },
+    document: {
+      title: "", documentElement: {}, body: makeEl("body"),
+      getElementById: (id) => els[id] || null,
+      addEventListener() {}, createElement: (t) => makeEl(t),
+    },
+    window: { localStorage, addEventListener() {} },
     navigator: { languages: langs, language: langs[0] || "" },
     localStorage,
     fetch: async (url, opts = {}) => {
       calls.push({ url, method: opts.method || "GET", body: opts.body || null });
       if (fetchFails) throw new Error("offline");
+      if (letter && url.startsWith("/api/letter")) {
+        return { ok: letter.status >= 200 && letter.status < 300, status: letter.status, json: async () => letter.json };
+      }
+      if (archive && url.startsWith("/api/archive-one")) {
+        return { ok: archive.status >= 200 && archive.status < 300, status: archive.status, json: async () => archive.json };
+      }
       if ((opts.method || "GET") !== "GET") return { ok: true, status: 200, json: async () => ({}) };
       return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(state)) };
     },
@@ -229,6 +241,41 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
      "英文下连接失败提示");
   const down2 = makeEnv({ langs: ["zh-Hans-CN"], fetchFails: true }); await settle();
   is(down2.els["err"].textContent, "连不上面板服务（postoffice panel 是否还开着？）", "中文下连接失败提示");
+}
+
+// 7) The letter-detail dialog: every new string exists in BOTH languages, and the dialog renders
+//    in the language the page is in while user content (sender/subject/need/body) stays verbatim
+//    and escaped.
+{
+  const zhDialog = ["信件详情", "处理完成", "关闭", "已处理", "未找到", "读取失败", "冲突", "归档失败"];
+  const enDialog = ["Letter details", "File as done", "Close", "Filed", "Not found", "Read failed",
+                    "Conflict", "Archive failed"];
+  for (const s of zhDialog) has(html, s, `面板源码包含中文文案「${s}」`);
+  for (const s of enDialog) has(html, s, `面板源码包含英文文案「${s}」`);
+
+  const DIALOG_LETTER = { ok: true, id: "a", box: 'dev"one', sender: "manager_a",
+                          subject: "第二封待投递", need: "仅告知",
+                          body: "第一行 & <script>alert(1)</script>\n第二行" };
+  const openRow = (e) => e.fire("boxes", "click", {
+    target: { closest: (s) => (s === ".clear" || s === ".toggle" ? null
+      : { dataset: { box: 'dev"one', id: "a", file: "a.md" } }) },
+  });
+
+  const zh = makeEnv({ langs: ["zh-Hans-CN"], letter: { status: 200, json: DIALOG_LETTER } }); await settle();
+  openRow(zh); await settle();
+  has(zh.els["letter"].innerHTML, "信件详情", "中文详情标题渲染");
+  has(zh.els["letter"].innerHTML, "处理完成", "中文处理完成按钮渲染");
+  has(zh.els["letter"].innerHTML, "关闭", "中文关闭按钮渲染");
+  has(zh.els["letter"].innerHTML, "第二封待投递", "中文界面下用户内容原样");
+  hasNot(zh.els["letter"].innerHTML, "<script>alert(1)</script>", "详情正文里的脚本被转义");
+
+  const en = makeEnv({ langs: ["en-US"], letter: { status: 200, json: DIALOG_LETTER } }); await settle();
+  openRow(en); await settle();
+  has(en.els["letter"].innerHTML, "Letter details", "英文详情标题渲染");
+  has(en.els["letter"].innerHTML, "File as done", "英文处理完成按钮渲染");
+  has(en.els["letter"].innerHTML, "Close", "英文关闭按钮渲染");
+  has(en.els["letter"].innerHTML, "第二封待投递", "英文界面下用户内容仍原样");
+  hasNot(en.els["letter"].innerHTML, "信件详情", "英文界面下没有中文详情标题");
 }
 
 console.log(failures ? `FAIL ${failures}` : "PASS");
