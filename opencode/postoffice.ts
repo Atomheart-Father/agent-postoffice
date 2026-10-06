@@ -22,16 +22,15 @@
 // 到期的提示是**常量**：只有与本会话自己的活动闹钟记录 id 完全一致的信才走闹钟通道，
 // 渲染时直接用 ALARM_TEXT，一个字的信件正文都不读；伪造的信头或陈旧记录按普通信路径处理。
 import type { Plugin } from "@opencode-ai/plugin"
-import type { z } from "zod"
+import type { tool as opencodeTool } from "@opencode-ai/plugin/tool"
 import { homedir, platform } from "node:os"
 import { readdir, readFile, writeFile, appendFile, mkdir, open, rm, stat, chmod } from "node:fs/promises"
 import { accessSync, constants, existsSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { fileURLToPath } from "node:url"
 import { realpathSync } from "node:fs"
 import { join } from "node:path"
-import { createRequire } from "node:module"
 
 const ROOT = process.env.POSTOFFICE_HOME || `${homedir()}/agent-postoffice`
 const LEDGER = `${ROOT}/opencode_delivered.jsonl`
@@ -71,7 +70,7 @@ const wallClock = (epochSeconds: number) => {
   }
 }
 
-type Zod = typeof z
+type Zod = typeof opencodeTool.schema
 
 const log = async (msg: string) => {
   try {
@@ -207,37 +206,23 @@ const PO_CLI =
     `${ROOT}/postoffice`,                                  // post office home that ships the script
   ].map(realpathIf).find(runnable) ?? "")
 
-// ---------------------------------------------------------------------- zod 接缝（唯一的）
-// OpenCode's ToolDefinition is ReturnType<typeof tool>, i.e. `args` is a z.ZodRawShape and
-// `@opencode-ai/plugin/tool` re-exports zod as `tool.schema`. So the schema has to be built from
-// that zod — the copy @opencode-ai/plugin itself depends on. No new dependency, no vendored zod.
+// ---------------------------------------------------------------------- zod：只走官方 API
+// OpenCode's ToolDefinition is ReturnType<typeof tool>, so `args` is a z.ZodRawShape and
+// `@opencode-ai/plugin/tool` re-exports zod as `tool.schema`. That is the only thing used here: no
+// direct zod import, no sidecar, no hand-rolled lookup — the bare specifier below is resolved by
+// Node itself, from this file's own directory, exactly as a static `import` would be.
 //
-// How the runtime finds it, in order:
-//   1. Node's own rule, from this file's location. A real install needs no configuration:
-//      plugins/postoffice.ts sits under the very node_modules OpenCode loads plugins with.
-//   2. POSTOFFICE_PLUGIN_MODULES — colon-separated directories that each contain a node_modules
-//      tree holding zod. This is the explicit override, for layouts step 1 cannot see.
-//   3. ~/.config/opencode/node_modules, then ~/.opencode/node_modules.
-const PLUGIN_MODULES = (process.env.POSTOFFICE_PLUGIN_MODULES || "").split(":").filter(Boolean)
-const modulesDirs = () => [
-  ...PLUGIN_MODULES,
-  join(homedir(), ".config/opencode/node_modules"),
-  join(homedir(), ".opencode/node_modules"),
-]
+// In a real install that needs no configuration at all: the plugin is loaded out of
+// $XDG_CONFIG_HOME/opencode/plugins/, i.e. from underneath the very node_modules OpenCode loads
+// plugins with. A bare repo checkout has no node_modules above it, so the import fails there; that
+// is handled by not registering the two alarm tools (see below), never by taking 投信 down too.
 const loadZod = async (): Promise<Zod | null> => {
   try {
-    const m = await import(import.meta.resolve("@opencode-ai/plugin/tool"))
-    if (m?.tool?.schema) return m.tool.schema as Zod
-  } catch {}
-  for (const dir of modulesDirs()) {
-    try {
-      // resolve from dir/.. so Node looks *inside* dir, not inside dir/node_modules
-      const entry = createRequire(join(dir, "..", "__po_resolver__.cjs")).resolve("zod")
-      const m = await import(pathToFileURL(entry).href)
-      if (m?.z) return m.z as Zod
-    } catch {}
+    const m = await import("@opencode-ai/plugin/tool")
+    return m?.tool?.schema ?? null
+  } catch {
+    return null
   }
-  return null
 }
 
 const runCLI = (args: string[], timeout = 20_000): Promise<{ code: number; text: string }> =>
@@ -503,12 +488,14 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
       if (event?.type === "session.idle") void scan("session.idle")
     } catch {}
   }
-  // 框架只认 z.ZodRawShape。拿不到 zod 就不注册这两个工具：投递通道照旧，但模型不会拿到一个
-  // 框架压根无法校验的 args —— 早先那种“注册了但静默不校验”的形态正是要修掉的东西。
+  // args 按官方形态声明：ToolDefinition 就是 tool() 的返回类型，args 是 z.ZodRawShape。
+  // （旧的 JSON-Schema 形态在 v1.18.x 有 legacy 兼容，不会必然注册失败；换成 tool.schema 是为了
+  // 类型与校验都落在同一处，而不是为了绕开注册错误。）
+  // 拿不到 zod 就不注册这两个工具：投递通道照旧，但模型不会拿到一个没有 schema 的 args。
   const zod = await loadZod()
   if (!zod) {
-    const why = `闹钟工具未注册（找不到 zod）：设 POSTOFFICE_PLUGIN_MODULES 指向带 zod 的 node_modules` +
-      `（本机默认看 ${modulesDirs().join("、")}）；投递通道不受影响。`
+    const why = "闹钟工具未注册：这个 OpenCode 运行环境里解析不到 @opencode-ai/plugin，" +
+      "拿不到它的 tool.schema 就没法声明工具参数；请确认 OpenCode 自己的依赖树完整。投递通道不受影响。"
     await log(why)
     notifyHuman(`联络总站：${why.slice(0, 120)}`)
     return { event, dispose: async () => clearInterval(timer) }

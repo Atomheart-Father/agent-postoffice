@@ -2413,12 +2413,43 @@ def opencode_config_dir():
     return Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "opencode"
 
 
+def link_postoffice_cli():
+    """把 ~/.local/bin/postoffice 指回“执行本安装的那份 checkout”。
+
+    装好的插件不在 checkout 里，它在 $XDG_CONFIG_HOME/opencode/plugins/ 下，只能通过这个 symlink
+    找到写闹钟记录的那个 CLI —— CLI 本身单文件 Python 留在 checkout 里。所以谁装了这个插件，谁的
+    CLI 就必须是它，否则插件版本与 CLI 版本会各走各的（改了插件却用着别的 checkout 的 CLI）。
+    在 A checkout 里 install 再到 B 里 install，插件与 symlink 会一起切到 B。
+
+    幂等：已经指着 SELF 就什么都不做。这不是新增状态文件，只是把 install.sh 早就在做的事
+    （ln -sfn）也放进 `postoffice install opencode`，好让单独跑这个子命令也自洽。
+    """
+    link = Path.home() / ".local" / "bin" / "postoffice"
+    want = str(SELF)
+    try:
+        have = os.readlink(link) if link.is_symlink() else ""
+        if have == want:
+            print(f"命令已就位：{link} → {want}")
+            return
+        if link.is_symlink() or link.exists():
+            backup(link)
+            link.unlink()
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(want)
+        print(f"命令已链接：{link} → {want}（插件与 CLI 现在同源于 {REPO}）")
+    except OSError as e:
+        print(f"提示：没能更新 {link}（{e}）。插件已经装好，但要设闹钟还需要 postoffice 可执行："
+              f"让 {link} 指回 {want}，或设 POSTOFFICE_CLI={want}。")
+
+
 def cmd_install_opencode(_a):
     d = opencode_config_dir()
     plug = d / "plugins"
     plug.mkdir(parents=True, exist_ok=True)
     shutil.copy2(REPO / "opencode" / "postoffice.ts", plug / "postoffice.ts")
     print(f"OpenCode 插件已装入 {plug / 'postoffice.ts'}（重启 OpenCode 生效）")
+    # 插件离开了 checkout 就找不回同目录的 CLI 了，所以这一步必须和上面的复制一起做。
+    link_postoffice_cli()
     # let OpenCode agents read/write the mailbox without a permission prompt each time
     for name in ("opencode.json", "opencode.jsonc"):
         cfgf = d / name
