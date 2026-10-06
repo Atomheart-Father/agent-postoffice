@@ -1440,10 +1440,10 @@ def list_alarms():
     return out
 
 
-# 同一会话的闹钟记录同时被插件工具（设/取消）和本邮递员（到期）改，跨进程没有共享内存，
-# 所以每个会话一把 O_EXCL 原子锁：抢不到就说明有人在改，这一轮跳过（不动记录本身）。
-# 看门狗负责崩溃恢复：锁文件超过 ALARM_LOCK_STALE 秒即视为失效并清掉，只删锁不碰记录，
-# 所以既不会永久卡死，也不会悄悄重置计时。插件侧用同名同规则的锁，两边因此互斥。
+# 同一会话的闹钟记录同时被插件工具（转给 alarm-set / alarm-cancel）和本邮递员（到期）改，
+# 跨进程没有共享内存，所以每个会话一把内核 flock 锁：抢不到就说明有人在改，这一轮跳过。
+# 崩溃恢复由内核负责（持有者死了/被 kill/重启，内核放锁），锁文件只建不删不替换 ——
+# 所以不需要看门狗，也不会出现「回收者删掉新锁」或「旧持有者删掉新锁」。
 def alarm_lock_path(path):
     return path.with_suffix(".json.lock")
 
@@ -1526,17 +1526,18 @@ def cmd_alarm_set(a):
     """Set one alarm for one session. The caller is the plugin, which has already resolved which
     mailbox this session owns; the box and session are re-checked against the registry here so a
     stale mapping cannot write a record."""
-    routes = load_routes()
     box, sid, delay = a.box, a.session, int(a.delay)
     if delay < ALARM_MIN or delay > ALARM_MAX:
         sys.exit(f"延迟要在 {ALARM_MIN}–{ALARM_MAX} 分钟之间，收到 {delay}")
     rec = {"box": box, "session": sid}
-    ok, why = verify_alarm_identity(routes, rec)
-    if not ok:
-        sys.exit(why)
     with with_alarm_lock(sid) as fd:
         if fd is None:
             sys.exit("另一个进程正在改这个会话的闹钟，这次没有落下任何记录")
+        # 路由核验必须在锁内：锁外读到的那份 routes 可能在我们等锁这段时间里被改绑或解绑，
+        # 那样就会拿一份过期映射去落记录 —— 而真正要写的就是这条记录。
+        ok, why = verify_alarm_identity(load_routes(), rec)
+        if not ok:
+            sys.exit(why)
         cur = read_alarm(sid)
         if isinstance(cur, dict) and cur.get("state") in ("pending", "lettered"):
             due = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(cur.get("due") or 0)))
@@ -1559,7 +1560,6 @@ def cmd_alarm_set(a):
 
 def cmd_alarm_cancel(a):
     """Cancel this session's alarm. Only ever touches the record bound to this session and box."""
-    routes = load_routes()
     box, sid = a.box, a.session
     rec = read_alarm(sid)
     if not isinstance(rec, dict) or not rec.get("id"):
@@ -1567,14 +1567,17 @@ def cmd_alarm_cancel(a):
         return 0
     if rec.get("session") != sid or rec.get("box") != box:
         sys.exit(f"这条闹钟属于 {rec.get('box')}，不是 {box}；没有动它")
-    offline = bool(routes.get(box, {}).get("status") == "offline")
-    if not offline:
-        ok, why = verify_alarm_identity(routes, rec)
-        if not ok:
-            sys.exit(why)
     with with_alarm_lock(sid) as fd:
         if fd is None:
             sys.exit("另一个进程正在改这个会话的闹钟，这次没有改动")
+        # 路由核验同样在锁内做：等锁期间信箱可能被下线、换通道或改绑给别人，
+        # 锁外读到的那份 routes 不能当作依据。
+        routes = load_routes()
+        offline = bool(routes.get(box, {}).get("status") == "offline")
+        if not offline:
+            ok, why = verify_alarm_identity(routes, rec)
+            if not ok:
+                sys.exit(why)
         cur = read_alarm(sid)
         if not isinstance(cur, dict) or not cur.get("id"):
             print("这个闹钟刚刚已经被取消。")
@@ -1583,7 +1586,10 @@ def cmd_alarm_cancel(a):
             sys.exit(f"这条闹钟属于 {cur.get('box')}，不是 {box}；没有动它")
         aid = cur["id"]
         where = ""
-        if cur.get("state") == "lettered" and cur.get("letter") == aid and alarm_delivered(box, aid):
+        if cur.get("state") == "lettered" and cur.get("letter") == aid and alarm_gave_up(box, aid):
+            where = ("投递失败、无法确认收件方是否收到，因此不能算送达；"
+                     "只清掉运行态记录，那封信仍在信箱里")
+        elif cur.get("state") == "lettered" and cur.get("letter") == aid and alarm_delivered(box, aid):
             where = "已经送达过了"
         elif offline:
             # 信箱当下离线：身份是唯一的，但没人收，所以只清定时器，不碰 inbox 里的提醒
@@ -1638,8 +1644,12 @@ def verify_alarm_identity(routes, rec):
 
 
 def alarm_delivered(box, lid):
-    """Has this alarm's letter already been handed to a session? The ledger is the same source of
-    truth the plugin and the panel use."""
+    """Has this alarm's letter been *accepted* by a session? The ledger is the same source of truth
+    the plugin and the panel use.
+
+    DELIVERED only. FAILED_FINAL means the plugin gave up and whether the recipient ever saw the
+    letter is unknown, so it must never read as delivered -- same rule the retraction path follows.
+    """
     ledger = HOME / "opencode_delivered.jsonl"
     if not ledger.exists():
         return False
@@ -1652,10 +1662,32 @@ def alarm_delivered(box, lid):
             except ValueError:
                 continue
             if (e.get("box") == box and e.get("file") == f"{lid}.md"
-                    and e.get("result") in ("DELIVERED", "FAILED_FINAL")):
+                    and e.get("result") == "DELIVERED"):
                 return True
     except OSError:
         return False
+    return False
+
+
+def alarm_gave_up(box, lid):
+    """Did the plugin give up on this letter? Unknown outcome, so the honest wording is
+    "delivery failed, cannot confirm", never "already delivered"."""
+    ledger = HOME / "opencode_delivered.jsonl"
+    if not ledger.exists():
+        return False
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if (e.get("box") == box and e.get("file") == f"{lid}.md"
+                    and e.get("result") == "FAILED_FINAL"):
+                return True
+    except OSError:
+        pass
     return False
 
 
@@ -1692,12 +1724,18 @@ def handle_alarm(routes, path, rec, now):
         # 不拿它去判定送达——和插件侧的 alarmLetterOwns 同一个口径。
         if rec.get("letter") != aid:
             return
-        if alarm_delivered(box, rec["letter"]):
+        delivered = alarm_delivered(box, rec["letter"])
+        gave_up = not delivered and alarm_gave_up(box, rec["letter"])
+        if delivered or gave_up:
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
-            log("postman.log", f"闹钟 {aid} 已送达，清掉活跃记录 {session}")
+            # 两种情况都意味着这次闹钟不会再响，但只有一种能说「送达了」：
+            # 插件放弃投递时收件方到底看没看到是未知的，如实这么写。
+            log("postman.log",
+                f"闹钟 {aid} 已送达，清掉活跃记录 {session}" if delivered else
+                f"闹钟 {aid} 投递失败到上限、收件方是否收到未知，不再重试，清掉活跃记录 {session}")
         return
     if state == "refused":
         return
@@ -2458,29 +2496,6 @@ def cmd_uninstall_postman(_a):
     print("邮递员自启已移除")
 
 
-def network_home_note():
-    """A plain-language note when the post office sits on a network filesystem, else "".
-
-    Only speaks up when it can actually name a network mount: on a local path it says nothing,
-    so this never cries wolf about a perfectly good local home. flock is what the alarm lock is
-    built on, and its semantics over NFS/SMB are not dependable.
-    """
-    try:
-        out = subprocess.run(["mount"], capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    home = str(HOME.resolve() if HOME.exists() else HOME)
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 3 or parts[2] not in ("nfs", "smbfs", "afpfs", "webdav", "cifs"):
-            continue
-        point = parts[2]
-        if home == point or home.startswith(point.rstrip("/") + "/"):
-            return (f"邮局在网络文件系统上（{point}，{parts[0]}）：闹钟锁用的 flock 在这里不可靠，"
-                    f"这只影响会话自设闹钟的并发安全，不影响收发信。")
-    return ""
-
-
 def cmd_doctor(_a):
     ok = True
 
@@ -2489,8 +2504,8 @@ def cmd_doctor(_a):
         ok = ok and good
         print(("✅ " if good else "❌ ") + text)
 
-    note = network_home_note()
-    print(("⚠️  " + note) if note else f"✅ 邮局在本地文件系统上（{HOME}）：闹钟锁用的 flock 可靠")
+    print(f"ℹ️  邮局目录 {HOME}：会话自设闹钟的并发锁用内核 flock，需要本地文件系统"
+          f"（NFS/SMB 上不可靠，且这一条只是提示，不是检测结论）")
     say(ROUTES.exists(), f"邮局目录 {HOME}")
     s = Path.home() / ".claude" / "settings.json"
     hooked = False
