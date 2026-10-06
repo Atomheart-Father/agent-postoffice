@@ -2175,18 +2175,20 @@ def cmd_hook(_a):
             new = [p for p in pending(name) if str(p) not in seen]
             if new:
                 if rate_ok(name):
-                    # 只有抢到认领的那些才唤醒：抢不到说明投递方或撤回正在处理这封信，
-                    # 忽略返回值就会变成「认领失败也照样唤醒」，那正是撤回要避免的事。
+                    # 只有「限流放行」并且「抢到认领」的那些才唤醒，两个条件缺一不可：
+                    # 抢不到认领说明投递方或撤回正在处理这封信，忽略返回值就会变成
+                    # 「认领失败也照样唤醒」；限流不放行时连认领都不建，否则唤醒与撤回
+                    # 之间就没有互斥，「撤回报成功但已经唤醒」照样会发生。
                     new = [p for p in new if claim_letter(name, p)]
-                if new:
-                    sys.stderr.write(reminder(name, new) + "\n")
-                    with seenf.open("a") as f:
-                        f.writelines(f"{p}\n" for p in new)
-                    rate_mark(name)          # merged receipts: one wake counts once, however many letters
-                    for p in new:
-                        log("claude_hook.log", f"{name} 唤醒 {p.name}")
-                    pidf.unlink(missing_ok=True)
-                    return 2
+                    if new:
+                        sys.stderr.write(reminder(name, new) + "\n")
+                        with seenf.open("a") as f:
+                            f.writelines(f"{p}\n" for p in new)
+                        rate_mark(name)      # merged receipts: one wake counts once, however many letters
+                        for p in new:
+                            log("claude_hook.log", f"{name} 唤醒 {p.name}")
+                        pidf.unlink(missing_ok=True)
+                        return 2
                 if not paused:
                     notify("联络总站：唤醒暂停", f"{name} 10 分钟内来信超过 {RATE_N} 封")
                     log("claude_hook.log", f"{name} 限流暂停")
