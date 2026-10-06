@@ -21,14 +21,16 @@
 // 一封固定短句的信，再复用上面这条 idle 投递通道送达 —— 插件本身不实现计时器。
 // 到期的提示是**常量**：只有与本会话自己的活动闹钟记录 id 完全一致的信才走闹钟通道，
 // 渲染时直接用 ALARM_TEXT，一个字的信件正文都不读；伪造的信头或陈旧记录按普通信路径处理。
-import type { Plugin, ToolDefinition } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode-ai/plugin"
+import type { tool as opencodeTool } from "@opencode-ai/plugin/tool"
 import { homedir, platform } from "node:os"
 import { readdir, readFile, writeFile, appendFile, mkdir, open, rm, stat, chmod } from "node:fs/promises"
-import { existsSync } from "node:fs"
+import { accessSync, constants, existsSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { realpathSync } from "node:fs"
+import { join, dirname } from "node:path"
 
 const ROOT = process.env.POSTOFFICE_HOME || `${homedir()}/agent-postoffice`
 const LEDGER = `${ROOT}/opencode_delivered.jsonl`
@@ -68,10 +70,7 @@ const wallClock = (epochSeconds: number) => {
   }
 }
 
-// OpenCode 接受插件工具的 args 为 Zod 或 JSON Schema 两种形态（后者不做框架侧校验）。
-// 这里用 JSON Schema：这个文件因此保持零运行时依赖，参数边界由下面 execute() 自己再校验一遍。
-const asTool = (t: Omit<ToolDefinition, "args"> & { args: unknown }) =>
-  t as unknown as ToolDefinition
+type Zod = typeof opencodeTool.schema
 
 const log = async (msg: string) => {
   try {
@@ -186,23 +185,90 @@ const readAlarm = async (sessionID: string): Promise<Alarm | null> => {
 // `postoffice alarm-set` / `postoffice alarm-cancel`，由 Python 在 flock 内改记录。
 // 内核在持有者崩溃/被 kill/重启时自动释放，锁文件永不删除或替换，因此不存在 ABA，
 // 「旧持有者删掉新持有者的锁」在结构上不可能发生。
-// The CLI is the only writer of alarm records. Where it lives differs by install: a repo checkout
-// (plugin in opencode/, script one level up) or a post office home with the script inside it.
-const PO_CLI = process.env.POSTOFFICE_CLI
-  || ([new URL("../postoffice", import.meta.url).pathname, `${ROOT}/postoffice`]
-        .find((p) => existsSync(p)) ?? "")
+// The CLI is the only writer of alarm records, and it must come from the same checkout as this
+// plugin. Which handle on it is legitimate depends on which layout this file was loaded from, so
+// the two are told apart instead of trying everything everywhere:
+//
+//   checkout  the plugin sits in <checkout>/opencode/, so ../postoffice *is* that checkout's CLI
+//             and nothing else can be. Candidate order: ../postoffice, then ~/.local/bin.
+//   installed `postoffice install opencode` copies this .ts into one fixed place —
+//             $XDG_CONFIG_HOME/opencode/plugins/postoffice.ts — and points ~/.local/bin/postoffice
+//             back at the checkout it came from. Here ../postoffice is $XDG_CONFIG_HOME/opencode/
+//             postoffice, which is NOT that checkout: anything executable sitting there would win
+//             over the correct symlink. So: ~/.local/bin/postoffice only.
+//
+// The test is the directory the plugin was loaded from, compared against the installer's own
+// destination (opencode_config_dir() on the Python side computes the same thing). That is a fact
+// about where the file is, not a guess about who installed it, and both branches are exercised:
+// tests/alarm_install_test.mjs runs the checkout layout with no symlink in HOME and the installed
+// layout with a same-directory foreign executable that must stay untouched.
+//
+// POSTOFFICE_CLI stays an explicit override/debug switch, first, and is not something an install
+// depends on. Deliberately not a candidate: $POSTOFFICE_HOME/postoffice — the post office home is
+// per-operator state rather than a checkout, so a `postoffice` file there may belong to any
+// checkout, which is exactly how an installed plugin ends up driving a foreign CLI.
+const runnable = (p: string) => {
+  // accessSync returns undefined on success, so it must not be the tail of the && chain —
+  // `find` would read that undefined as falsy and skip a perfectly good candidate.
+  try { return !!p && existsSync(p) && accessSync(p, constants.X_OK) === undefined } catch { return false }
+}
+const realpathIf = (p: string) => { try { return realpathSync(p) } catch { return p } }
+const INSTALLED_PLUGIN_DIR =
+  join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode", "plugins")
+const SELF_DIR = realpathIf(dirname(fileURLToPath(import.meta.url)))
+const inCheckout = SELF_DIR !== realpathIf(INSTALLED_PLUGIN_DIR)
+const PO_CLI =
+  (process.env.POSTOFFICE_CLI || "").trim() ||
+  (inCheckout
+    ? [new URL("../postoffice", import.meta.url).pathname, join(homedir(), ".local/bin/postoffice")]
+    : [join(homedir(), ".local/bin/postoffice")]
+  ).map(realpathIf).find(runnable) || ""
+
+// ---------------------------------------------------------------------- zod：只走官方 API
+// OpenCode's ToolDefinition is ReturnType<typeof tool>, so `args` is a z.ZodRawShape and
+// `@opencode-ai/plugin/tool` re-exports zod as `tool.schema`. That is the only thing used here: no
+// direct zod import, no sidecar, no hand-rolled lookup — the bare specifier below is resolved by
+// Node itself, from this file's own directory, exactly as a static `import` would be.
+//
+// In a real install that needs no configuration at all: the plugin is loaded out of
+// $XDG_CONFIG_HOME/opencode/plugins/, i.e. from underneath the very node_modules OpenCode loads
+// plugins with. A bare repo checkout has no node_modules above it, so the import fails there; that
+// is handled by not registering the two alarm tools (see below), never by taking 投信 down too.
+const loadZod = async (): Promise<Zod | null> => {
+  try {
+    const m = await import("@opencode-ai/plugin/tool")
+    return m?.tool?.schema ?? null
+  } catch {
+    return null
+  }
+}
 
 const runCLI = (args: string[], timeout = 20_000): Promise<{ code: number; text: string }> =>
   new Promise((resolve) => {
-    const child = spawn(PO_CLI, args, {
-      env: { ...process.env, POSTOFFICE_HOME: ROOT, POSTOFFICE_NO_NOTIFY: "1" },
-    })
-    let out = ""
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeout)
-    child.stdout.on("data", (d) => (out += d))
-    child.stderr.on("data", (d) => (out += d))
-    child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, text: String(e) }) })
-    child.on("close", (code) => { clearTimeout(timer); resolve({ code: code ?? -1, text: out.trim() }) })
+    // 找不到可执行文件是一种要如实回答的状态，不是抛给模型的异常：下面 execute() 会把它
+    // 变成一句中文说明。spawn 对空/不可执行的 file 会同步抛，那会让整个工具 reject。
+    if (!PO_CLI) {
+      resolve({ code: -1, text: `找不到 postoffice 可执行文件。这个插件是从${
+        inCheckout ? " checkout" : "安装位置"}加载的，只找过${
+        inCheckout ? " ../postoffice（同 checkout 的脚本）和 ~/.local/bin/postoffice"
+                   : " ~/.local/bin/postoffice（装插件的那份 checkout，`postoffice install opencode` 会把链接指回去）"
+      }，都不可用。修法：重跑那一 checkout 的 postoffice install opencode，或显式设 ` +
+        "POSTOFFICE_CLI=<那份 checkout 里的 postoffice>。" })
+      return
+    }
+    try {
+      const child = spawn(PO_CLI, args, {
+        env: { ...process.env, POSTOFFICE_HOME: ROOT, POSTOFFICE_NO_NOTIFY: "1" },
+      })
+      let out = ""
+      const timer = setTimeout(() => child.kill("SIGKILL"), timeout)
+      child.stdout.on("data", (d) => (out += d))
+      child.stderr.on("data", (d) => (out += d))
+      child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, text: String(e) }) })
+      child.on("close", (code) => { clearTimeout(timer); resolve({ code: code ?? -1, text: out.trim() }) })
+    } catch (e) {
+      resolve({ code: -1, text: String(e) })
+    }
   })
 
 export const PostofficePlugin: Plugin = async ({ client, directory }) => {
@@ -439,26 +505,35 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
   await log(`投递插件上岗（实例 ${directory}）`)
   const timer = setInterval(() => void scan("poll"), POLL_MS)
   void scan("boot")
+  const event = async ({ event }: { event: { type?: string } }) => {
+    try {
+      if (event?.type === "session.idle") void scan("session.idle")
+    } catch {}
+  }
+  // args 按官方形态声明：ToolDefinition 就是 tool() 的返回类型，args 是 z.ZodRawShape。
+  // （旧的 JSON-Schema 形态在 v1.18.x 有 legacy 兼容，不会必然注册失败；换成 tool.schema 是为了
+  // 类型与校验都落在同一处，而不是为了绕开注册错误。）
+  // 拿不到 zod 就不注册这两个工具：投递通道照旧，但模型不会拿到一个没有 schema 的 args。
+  const zod = await loadZod()
+  if (!zod) {
+    const why = "闹钟工具未注册：这个 OpenCode 运行环境里解析不到 @opencode-ai/plugin，" +
+      "拿不到它的 tool.schema 就没法声明工具参数；请确认 OpenCode 自己的依赖树完整。投递通道不受影响。"
+    await log(why)
+    notifyHuman(`联络总站：${why.slice(0, 120)}`)
+    return { event, dispose: async () => clearInterval(timer) }
+  }
   return {
-    event: async ({ event }) => {
-      try {
-        if ((event as { type?: string })?.type === "session.idle") void scan("session.idle")
-      } catch {}
-    },
+    event,
     tool: {
-      postoffice_alarm_schedule: asTool({
+      postoffice_alarm_schedule: {
         description:
           "给**当前这个会话自己**设一个一次性闹钟（单位分钟，1–1440）。等待期间不需要模型参与，" +
           "所以设完就结束本轮：不要 sleep、不要轮询、不要空转；到点邮局会发一条固定短提醒把你叫回来。" +
           "同一会话同时只能有一个闹钟，已经有的话必须先 cancel，不能直接再设一个。" +
           "收件人由本会话自动绑定，不接受也不需要你指定信箱、会话或提醒内容。",
         args: {
-          delay_minutes: {
-            type: "number",
-            description: `从现在起多少分钟后响一次（${ALARM_MIN}–${ALARM_MAX} 分钟的整数）。`,
-            minimum: ALARM_MIN,
-            maximum: ALARM_MAX,
-          },
+          delay_minutes: zod.number().int().min(ALARM_MIN).max(ALARM_MAX)
+            .describe(`从现在起多少分钟后响一次（${ALARM_MIN}–${ALARM_MAX} 分钟的整数）。`),
         },
         async execute(args, ctx) {
           const raw = (args as { delay_minutes?: unknown }).delay_minutes
@@ -487,8 +562,8 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
             `要提前取消就调用 postoffice_alarm_cancel。`
           )
         },
-      }),
-      postoffice_alarm_cancel: asTool({
+      },
+      postoffice_alarm_cancel: {
         description:
           "取消**当前这个会话自己**的活动闹钟（不带任何参数）。没有活动闹钟时会明确告诉你“没有活动闹钟”。" +
           "如果提醒已经到期进了投递队列但还没送达，会把它移进 archived/ 存档，这样取消后不会再响。" +
@@ -506,7 +581,7 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           const tail = who.offline ? "信箱当前离线：只清了定时器，没有需要撤回的提醒。" : ""
           return `已取消本会话的活动闹钟。${tail}\n${r.text}`
         },
-      }),
+      },
     },
     dispose: async () => clearInterval(timer),
   }

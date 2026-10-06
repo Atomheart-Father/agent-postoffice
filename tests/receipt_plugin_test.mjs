@@ -9,6 +9,9 @@ import { join } from 'node:path'
 const root = await mkdtemp(join(tmpdir(), 'postoffice-receipt-plugin-'))
 process.env.POSTOFFICE_HOME = root
 const { PostofficePlugin } = await import('../opencode/postoffice.ts')
+
+// 这个文件只测投递通道，不碰那两个闹钟工具，所以不依赖 zod 接缝（闹钟工具的 args schema 由
+// tests/alarm_install_test.mjs 负责）。找不到 zod 时投递照旧，只是工具不注册。
 const SENTINEL = 'PLUGIN-SENTINEL-BODY-4c1d'
 const LEDGER = join(root, 'opencode_delivered.jsonl')
 process.env.POSTOFFICE_NO_NOTIFY = '1' // 只留日志里的“通知人”记录，测试不弹系统通知
