@@ -313,20 +313,25 @@ await t('cancel 复核归属：信箱已从通讯录删除时拒绝', async () =
   await cancel(ctx(LIVE2))
 })
 
-await t('cancel 在信箱离线时只清自己的定时器，不碰 inbox', async () => {
+await t('cancel 在信箱离线时仍然把那封没人收的提醒收走（只清定时器是不够的）', async () => {
+  // 这条原来断言的是「离线时不许动 inbox 文件」—— 那是 C-1 僵尸提醒的成因：记录被删掉，
+  // 提醒留在 inbox，收信方上线时它会按普通信再响一次，而且再没有任何人归档它。
+  // 现在离线只影响措辞，不影响要不要把那封信从投递队列里收走。
   await cancel()
   const { id } = await armLive('lab2', LIVE2)
   await putLetter('lab2', `${id}.md`, alarmLetter(id))
   state.routes.lab2.status = 'offline'
   await saveRoutes()
+  state.prompts.length = 0
   const text = await out(await cancel(ctx(LIVE2)))
   assert.ok(/已取消/.test(text), '身份唯一时离线也应允许取消自己的定时器：' + text)
   assert.ok(/离线/.test(text), '要说清信箱离线：' + text)
   assert.ok(!alarmExists(LIVE2), '定时器已清')
-  assert.equal((await inbox('lab2')).includes(`${id}.md`), true, '离线时不许动 inbox 文件')
+  assert.deepEqual(await inbox('lab2'), [], '离线时那封没人收的提醒也要被收走')
+  // lab2 的 archived/ 里还留着本节前面几条用例收走的信，所以只查这一封在不在
+  assert.ok((await archived('lab2')).includes(`${id}.md`), '提醒要存档而不是删掉')
   state.routes.lab2.status = 'online'
   await saveRoutes()
-  await rm(join(root, 'lab2', 'inbox', `${id}.md`))
 })
 
 // ---------------------------------------------------------------- 跨进程互斥
