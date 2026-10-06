@@ -247,8 +247,8 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
 //    in the language the page is in while user content (sender/subject/need/body) stays verbatim
 //    and escaped.
 {
-  const zhDialog = ["信件详情", "处理完成", "关闭", "已处理", "未找到", "读取失败", "冲突", "归档失败"];
-  const enDialog = ["Letter details", "File as done", "Close", "Filed", "Not found", "Read failed",
+  const zhDialog = ["信件详情", "仅归档", "关闭", "已归档", "未找到", "读取失败", "冲突", "归档失败"];
+  const enDialog = ["Letter details", "File only", "Close", "Filed", "Not found", "Read failed",
                     "Conflict", "Archive failed"];
   for (const s of zhDialog) has(html, s, `面板源码包含中文文案「${s}」`);
   for (const s of enDialog) has(html, s, `面板源码包含英文文案「${s}」`);
@@ -264,7 +264,7 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
   const zh = makeEnv({ langs: ["zh-Hans-CN"], letter: { status: 200, json: DIALOG_LETTER } }); await settle();
   openRow(zh); await settle();
   has(zh.els["letter"].innerHTML, "信件详情", "中文详情标题渲染");
-  has(zh.els["letter"].innerHTML, "处理完成", "中文处理完成按钮渲染");
+  has(zh.els["letter"].innerHTML, "仅归档", "中文仅归档按钮渲染");
   has(zh.els["letter"].innerHTML, "关闭", "中文关闭按钮渲染");
   has(zh.els["letter"].innerHTML, "第二封待投递", "中文界面下用户内容原样");
   hasNot(zh.els["letter"].innerHTML, "<script>alert(1)</script>", "详情正文里的脚本被转义");
@@ -272,7 +272,7 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
   const en = makeEnv({ langs: ["en-US"], letter: { status: 200, json: DIALOG_LETTER } }); await settle();
   openRow(en); await settle();
   has(en.els["letter"].innerHTML, "Letter details", "英文详情标题渲染");
-  has(en.els["letter"].innerHTML, "File as done", "英文处理完成按钮渲染");
+  has(en.els["letter"].innerHTML, "File only", "英文仅归档按钮渲染");
   has(en.els["letter"].innerHTML, "Close", "英文关闭按钮渲染");
   has(en.els["letter"].innerHTML, "第二封待投递", "英文界面下用户内容仍原样");
   hasNot(en.els["letter"].innerHTML, "信件详情", "英文界面下没有中文详情标题");

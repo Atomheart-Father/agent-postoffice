@@ -1224,19 +1224,39 @@ def _box_mark(name, routes):
     return f"{name}：{'在线' if online(r) else '离线'}"
 
 
-def cmd_send(a):
-    routes = load_routes()
-    to, extra = a.to, []
-    if a.to.startswith("@"):
-        # resolve once, right now: a pending switch never delays or re-routes a new letter
-        target, lines, _spec = resolve_alias(require_config("逻辑地址"), a.to[1:], routes)
-        print(f"解析 {a.to} → {target}")
-        print("\n".join(lines))
-        to, extra = target, [f"逻辑地址：{a.to}"]
+def resolve_send_target(to_arg, routes):
+    """@逻辑地址 → (目标信箱, 解析说明行)；物理信箱名原样返回、没有说明行。
+
+    只在**发信那一刻**解析一次；解析失败按 CLI 既有文案 sys.exit（正文还没读）。
+    """
+    if not to_arg.startswith("@"):
+        return to_arg, []
+    target, lines, _spec = resolve_alias(require_config("逻辑地址"), to_arg[1:], routes)
+    return target, lines
+
+
+def ensure_box_inbox(to):
+    """目标信箱必须已在通讯录里（有 inbox/）；缺失时按 CLI 既有文案拒绝。"""
     if not (HOME / to / "inbox").is_dir():
         sys.exit(f"没有信箱 {to}；`postoffice list` 看通讯录")
+
+
+def send_letter(sender, to, subject, need, body, alias=None):
+    """把一封普通信写进 to 的 inbox：CLI `send` 与面板 /api/send 唯一的写信路径。"""
+    ensure_box_inbox(to)
+    extra = [f"逻辑地址：{alias}"] if alias else []
+    return write_letter(to, sender, subject, clean_need(need), body, extra_headers=extra)
+
+
+def cmd_send(a):
+    routes = load_routes()
+    to, lines = resolve_send_target(a.to, routes)
+    if lines:
+        print(f"解析 {a.to} → {to}")
+        print("\n".join(lines))
+    ensure_box_inbox(to)                 # 先核实目标再读正文：不为打不开的信箱吞掉 stdin
     body = Path(a.file).read_text(encoding="utf-8") if a.file else sys.stdin.read()
-    path = write_letter(to, a.sender, a.subject, clean_need(a.need), body, extra_headers=extra)
+    path = send_letter(a.sender, to, a.subject, a.need, body, alias=a.to if a.to.startswith("@") else None)
     print(f"已投递：{path}")
     print(f"编号：{path.stem}")
     # stable reference for later edit/retract: <recipient>/<message-id>, no global index needed
@@ -1278,43 +1298,55 @@ def resolve_ack_target(name, ref):
     return ref, "letter", letter, letter_sender(letter), field(letter, "事由：").replace("事由：", "", 1)
 
 
-def cmd_ack(a):
-    """Record the receipt and notify the sender; receipt notifications never need another ack."""
-    routes = load_routes()
-    if a.name not in boxes(routes):
-        sys.exit(f"没有信箱 {a.name}；`postoffice list` 看通讯录")
-    bid, kind, letter, to, subject = resolve_ack_target(a.name, a.id)
+def ack_letter(name, ref, note="", wake=False, routes=None):
+    """ack 的唯一核心：记账 + 归档原信 + 通知发件人；CLI `ack` 与面板 /api/ack-one 共用，不许分叉。
+
+    返回 (state, info, lines)：state ∈ {"recorded", "already", "receipt_notice"}；info 带
+    id/kind/to/letter/notified。任何拒绝都按 CLI 既有文案 sys.exit（调用方负责变成报错）。
+    """
+    routes = routes if routes is not None else load_routes()
+    if name not in boxes(routes):
+        sys.exit(f"没有信箱 {name}；`postoffice list` 看通讯录")
+    bid, kind, letter, to, subject = resolve_ack_target(name, ref)
     for e in read_acks():                    # dedup on the normalised id, so mixing the two forms counts once
-        if e.get("by") == a.name and e.get("id") == bid:
-            print(f"已回执过：{bid}（{e.get('time', '')}）")
+        if e.get("by") == name and e.get("id") == bid:
             if letter:
                 to_done(letter)
-            return 0
-    note = a.note or ""
+            return "already", {"id": bid, "kind": kind, "to": to, "letter": letter, "notified": False}, \
+                [f"已回执过：{bid}（{e.get('time', '')}）"]
     if not to:
-        sys.exit(f"这封信没有可识别的发信方，无法记账：{a.id}")
+        sys.exit(f"这封信没有可识别的发信方，无法记账：{ref}")
     if letter and receipt_query_id(letter):
         to_done(letter)
-        print("回执通知已归档，不再产生回执。")
-        return 0
+        return "receipt_notice", {"id": bid, "kind": kind, "to": to, "letter": letter, "notified": False}, \
+            ["回执通知已归档，不再产生回执。"]
     rec = broadcast_record(bid) if kind == "broadcast" else None
-    append_ack({"time": now_str(), "by": a.name, "id": bid, "kind": kind, "note": note, "to": to})
+    append_ack({"time": now_str(), "by": name, "id": bid, "kind": kind, "note": note, "to": to})
     to_done(letter)
+    lines, notified = [], False
     if kind == "broadcast":
         done = sum(1 for e in read_acks() if e.get("id") == bid and e.get("kind") == "broadcast")
-        print(f"已回执：{bid}（广播 {done}/{len(rec.get('to', []))}，不会单独叫醒 {to}）")
+        lines.append(f"已回执：{bid}（广播 {done}/{len(rec.get('to', []))}，不会单独叫醒 {to}）")
     else:
-        print(f"已回执：{bid}（空闲时通知 {to}，默认不答复）")
-    if kind == "letter" or a.wake:
+        lines.append(f"已回执：{bid}（空闲时通知 {to}，默认不答复）")
+    if kind == "letter" or wake:
         if to in boxes(routes) and (HOME / to / "inbox").is_dir():
-            prefix = "copy that" if a.wake else "回执"
+            prefix = "copy that" if wake else "回执"
             body = (f"对应原信：{bid}\n"
                     f"回执正文只存在账本，按需查询：postoffice receipt {shlex.quote(to)} {shlex.quote(bid)}")
-            path = write_letter(to, a.name, f"{prefix}：{subject}", "回执（默认不答复）", body,
+            path = write_letter(to, name, f"{prefix}：{subject}", "回执（默认不答复）", body,
                                 extra_headers=[f"回执：{bid}", f"原事由：{subject}"])
-            print(f"已投递回执通知：{path}")
+            lines.append(f"已投递回执通知：{path}")
+            notified = True
         else:
-            print(f"注意：发信方 {to} 没有登记信箱；回执仅保留在账本。")
+            lines.append(f"注意：发信方 {to} 没有登记信箱；回执仅保留在账本。")
+    return "recorded", {"id": bid, "kind": kind, "to": to, "letter": letter, "notified": notified}, lines
+
+
+def cmd_ack(a):
+    """Record the receipt and notify the sender; receipt notifications never need another ack."""
+    _, _, lines = ack_letter(a.name, a.id, a.note or "", a.wake)
+    print("\n".join(lines))
     return 0
 
 
@@ -3294,10 +3326,11 @@ def cmd_panel(a):
                 self._send(404, b"{}")
 
         def do_POST(self):
-            if self.path not in ("/api/status", "/api/clear", "/api/archive-one") or not self._local() \
+            if self.path not in ("/api/status", "/api/clear", "/api/archive-one", "/api/ack-one", "/api/send") \
+                    or not self._local() \
                     or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self._send(403, b'{"ok":false}')
-            message, status, payload = "", None, None
+            message, status, payload, refused = "", None, None, ""
             try:
                 d = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
                 if not isinstance(d, dict):
@@ -3323,6 +3356,52 @@ def cmd_panel(a):
                             ok, status, message = False, 409, "conflict"
                         else:
                             ok, status, message = False, 404, "not_found"
+                elif self.path == "/api/ack-one":
+                    # 单封回执（后端 seam，本票不上面板 UI）：与 CLI `ack` 共用 ack_letter 核心；
+                    # 重复调用是幂等的，不会产生第二份回执
+                    box, lid, note = d.get("box"), d.get("id"), d.get("note", "")
+                    if not isinstance(note, str):
+                        ok, status, message = False, 400, "bad_request"
+                    elif not isinstance(box, str) or not isinstance(lid, str) or not box or not lid \
+                            or not letter_id_ok(lid):
+                        ok, status, message = False, 400, "bad_request"
+                    elif not box_name_ok(box) or box not in boxes(load_routes()):
+                        ok, status, message = False, 404, "not_found"
+                    else:
+                        try:
+                            state, info, _lines = ack_letter(box, lid, note)
+                            ok = True
+                            payload = {"ok": True, "state": state, "id": info["id"], "to": info["to"]}
+                            log("postman.log", f"面板：单封回执 {box}/{info['id']}（{state}）")
+                        except SystemExit as e:
+                            ok, status, message, refused = False, 400, "refused", str(e)
+                        except OSError:
+                            ok, status, message = False, 500, "failed"
+                elif self.path == "/api/send":
+                    # 发信（后端 seam）：与 CLI `send` 共用 resolve_send_target + send_letter；
+                    # @逻辑地址的 first-online / 全离线拒绝都走同一份核心，面板不自己实现解析
+                    sender, to_arg = d.get("from"), d.get("to")
+                    subject, need, body = d.get("subject"), d.get("need"), d.get("body")
+                    if not all(isinstance(x, str) for x in (sender, to_arg, subject, need, body)) \
+                            or not sender or not to_arg:
+                        ok, status, message = False, 400, "bad_request"
+                    elif not box_name_ok(sender) or sender not in boxes(load_routes()):
+                        ok, status, message = False, 404, "not_found"
+                    elif not to_arg.startswith("@") and not box_name_ok(to_arg):
+                        ok, status, message = False, 404, "not_found"
+                    else:
+                        try:
+                            routes = load_routes()
+                            to, _lines = resolve_send_target(to_arg, routes)
+                            path = send_letter(sender, to, subject, need, body,
+                                               alias=to_arg if to_arg.startswith("@") else None)
+                            ok = True
+                            payload = {"ok": True, "id": path.stem, "ref": f"{to}/{path.stem}"}
+                            log("postman.log", f"面板：发信 {sender} → {to}（{path.stem}）")
+                        except SystemExit as e:
+                            ok, status, message, refused = False, 400, "refused", str(e)
+                        except OSError:
+                            ok, status, message = False, 500, "failed"
                 elif self.path == "/api/clear":
                     name = str(d["name"])
                     ok = name in boxes(load_routes())
@@ -3345,6 +3424,8 @@ def cmd_panel(a):
                 ok, message = False, str(e)
             if payload is None:
                 payload = {"ok": ok, "error": message if not ok else ""}
+                if not ok and refused:
+                    payload["message"] = refused
             self._send(status or (200 if ok else 400), json.dumps(payload).encode())
 
     try:

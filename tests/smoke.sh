@@ -1132,5 +1132,13 @@ if command -v node >/dev/null 2>&1; then
     && ok "v1.6 插件类型检查通过" || bad "v1.6 插件检查"
 fi
 
+# 16) 共享 skill 文案回归（v1.11 gate）：不再教「手动 mv 到 done/」，归档统一走核心
+/usr/bin/python3 - "$(dirname "$PO")/skill/postoffice/SKILL.md" <<'PY' \
+  && ok "v1.11 共享 skill 不再教手动 mv" || bad "v1.11 共享 skill 又出现手动 mv 指导"
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+sys.exit(1 if ("手动 `mv` 到 `done/` 也行" in text or re.search(r"mv[^\n]{0,20}done", text)) else 0)
+PY
+
 rm -rf "$T"
 echo "通过 ${pass}，失败 ${fail}"; [ $fail -eq 0 ]

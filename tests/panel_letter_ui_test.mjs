@@ -12,8 +12,8 @@
 //     full body, with raw HTML escaped.
 //   * its buttons match [data-letter-action="done"] / [data-letter-action="close"]; clicks are
 //     delegated on #letter.
-//   * 处理完成 POSTs /api/archive-one {box, id}; on ok it closes the detail, re-fetches /api/state
-//     and shows 已处理 / Filed somewhere visible (#letter-status or the existing status area).
+//   * 仅归档 POSTs /api/archive-one {box, id}; on ok it closes the detail, re-fetches /api/state
+//     and shows 已归档 / Filed somewhere visible (#letter-status or the existing status area).
 //   * a language switch closes the open detail and never issues a write call.
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -163,7 +163,7 @@ const switchTo = (e, which) => e.fire("langs", "click", {
   hasNot(t, "row-from-A", "详情用的是 GET /api/letter 的内容，不是行内元数据");
 }
 
-// 2) 处理完成: exactly one POST {box, id}, then close + state refresh + 已处理.
+// 2) 仅归档: exactly one POST {box, id}, then close + state refresh + 已归档.
 {
   const e = makeEnv({ langs: ["zh-Hans-CN"] }); await settle();
   openRow(e, "A"); await settle();
@@ -171,9 +171,9 @@ const switchTo = (e, which) => e.fire("langs", "click", {
   const before = stateGets(e);
   act(e, "done"); await settle();
   const ps = posts(e);
-  is(ps.length, 1, "处理完成恰好一次写请求");
+  is(ps.length, 1, "仅归档恰好一次写请求");
   if (ps.length === 1) {
-    is(ps[0].url, "/api/archive-one", "处理完成走 /api/archive-one");
+    is(ps[0].url, "/api/archive-one", "仅归档走 /api/archive-one");
     const body = JSON.parse(ps[0].body);
     is(body.box, "boxz", "归档请求带 box");
     is(body.id, "A", "归档请求带裸 id（不含 .md）");
@@ -181,7 +181,7 @@ const switchTo = (e, which) => e.fire("langs", "click", {
   }
   is(detailText(e).includes("第一行"), false, "成功后详情关闭");
   is(stateGets(e), before + 1, "成功后重新拉取 /api/state");
-  has(visible(e), "已处理", "成功后显示已处理");
+  has(visible(e), "已归档", "成功后显示已归档");
 }
 
 // 3) 关闭 closes without a single write call.
@@ -228,7 +228,7 @@ for (const [status, error, needle] of [[409, "conflict", "冲突"], [404, "not_f
   act(e, "done"); await settle();
   has(visible(e), needle, `归档 ${status} 显示「${needle}」`);
   has(detailText(e), "第一行", `归档 ${status} 失败后详情保持打开`);
-  hasNot(visible(e), "已处理", `归档 ${status} 失败不显示已处理`);
+  hasNot(visible(e), "已归档", `归档 ${status} 失败不显示已归档`);
   is(posts(e).length, 1, `归档 ${status} 失败也只发一次请求`);
 }
 
@@ -238,21 +238,21 @@ for (const [status, error, needle] of [[409, "conflict", "冲突"], [404, "not_f
   openRow(e, "A"); await settle();
   const t = detailText(e);
   has(t, "Letter details", "英文详情标题");
-  has(t, "File as done", "英文处理完成按钮");
+  has(t, "File only", "英文仅归档按钮");
   has(t, "Close", "英文关闭按钮");
   has(t, "主题 &amp;", "英文界面里用户内容仍原样");
   hasNot(t, "信件详情", "英文界面没有中文详情标题");
-  hasNot(t, "已处理", "还没归档就不显示 Filed/已处理");
+  hasNot(t, "已归档", "还没归档就不显示 Filed/已归档");
 }
 
 // 7) Switching language while the detail is open closes it and writes nothing.
 {
   const e = makeEnv({ langs: ["zh-Hans-CN"] }); await settle();
   openRow(e, "A"); await settle();
-  has(detailText(e), "处理完成", "中文详情已打开（切换用例正面对照）");
+  has(detailText(e), "仅归档", "中文详情已打开（切换用例正面对照）");
   switchTo(e, 1); await settle();
   is(posts(e).length, 0, "切换语言不发任何写请求");
-  hasNot(detailText(e), "处理完成", "切换语言后不残留旧语言按钮");
+  hasNot(detailText(e), "仅归档", "切换语言后不残留旧语言按钮");
   hasNot(detailText(e), "信件详情", "切换语言后不残留旧语言标题");
   is(e.els["title"].textContent, "Post Office", "页面已经切到英文");
 }
