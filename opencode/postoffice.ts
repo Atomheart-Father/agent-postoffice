@@ -185,13 +185,18 @@ const readAlarm = async (sessionID: string): Promise<Alarm | null> => {
 // `postoffice alarm-set` / `postoffice alarm-cancel`，由 Python 在 flock 内改记录。
 // 内核在持有者崩溃/被 kill/重启时自动释放，锁文件永不删除或替换，因此不存在 ABA，
 // 「旧持有者删掉新持有者的锁」在结构上不可能发生。
-// The CLI is the only writer of alarm records. Where it lives differs by install: a repo checkout
-// (plugin in opencode/, script one level up) or an installed plugin whose executable was left
-// behind in some checkout and is reachable only through ~/.local/bin/postoffice — which is what
-// install.sh makes, and what `postoffice install opencode` implies (it copies only this .ts into
-// $XDG_CONFIG_HOME/opencode/plugins/ and writes down no executable path). Both candidates used to
-// be tried by path alone, so under the installed layout PO_CLI degraded to "" and spawn("")
-// rejected: the two alarm tools threw instead of answering.
+// The CLI is the only writer of alarm records, and it must come from the same checkout as this
+// plugin. There are exactly two ways that holds:
+//   - repo checkout: the plugin sits in opencode/, the script one level up  → ../postoffice
+//   - installed:     `postoffice install opencode` copies this .ts into
+//                    $XDG_CONFIG_HOME/opencode/plugins/ and points ~/.local/bin/postoffice back at
+//                    that same checkout, so the symlink is the only handle on it
+// POSTOFFICE_CLI stays an explicit override/debug switch, not something an install depends on.
+//
+// Deliberately *not* a candidate: $POSTOFFICE_HOME/postoffice. The post office home is per-operator
+// state, not a checkout, so a `postoffice` file sitting there could belong to any checkout — picking
+// it up is exactly how an installed plugin ends up driving a foreign CLI. Two real candidates that
+// can be proven same-source beat one convenient guess.
 const runnable = (p: string) => {
   // accessSync returns undefined on success, so it must not be the tail of the && chain —
   // `find` would read that undefined as falsy and skip a perfectly good candidate.
@@ -202,8 +207,7 @@ const PO_CLI =
   (process.env.POSTOFFICE_CLI || "").trim() ||
   ([
     new URL("../postoffice", import.meta.url).pathname,     // repo checkout: script one level up
-    join(homedir(), ".local/bin/postoffice"),              // installed: symlink left by install.sh
-    `${ROOT}/postoffice`,                                  // post office home that ships the script
+    join(homedir(), ".local/bin/postoffice"),              // installed: symlink the installer maintains
   ].map(realpathIf).find(runnable) ?? "")
 
 // ---------------------------------------------------------------------- zod：只走官方 API
@@ -230,8 +234,11 @@ const runCLI = (args: string[], timeout = 20_000): Promise<{ code: number; text:
     // 找不到可执行文件是一种要如实回答的状态，不是抛给模型的异常：下面 execute() 会把它
     // 变成一句中文说明。spawn 对空/不可执行的 file 会同步抛，那会让整个工具 reject。
     if (!PO_CLI) {
-      resolve({ code: -1, text: "找不到 postoffice 可执行文件：请设 POSTOFFICE_CLI，" +
-        "或让 ~/.local/bin/postoffice 指回安装了这个插件的那份仓库" })
+      resolve({ code: -1, text: "找不到 postoffice 可执行文件。只找过两条同源路径：本插件同级的 " +
+        "../postoffice（checkout 开发模式），和 ~/.local/bin/postoffice（装好的插件靠它；" +
+        "`postoffice install opencode` 会把它指回装插件的那份 checkout）。两条都不可用。" +
+        "修法：重跑那一 checkout 的 postoffice install opencode，或显式设 " +
+        "POSTOFFICE_CLI=<那份 checkout 里的 postoffice>。" })
       return
     }
     try {
