@@ -1630,10 +1630,22 @@ def cmd_alarm_cancel(a):
                          f"活动记录没有改动，那封信仍在 {holding}。"
                          f"如果这一轮确实响了，请按已响处理，不要再设同一个闹钟。")
             try:
-                # 认领握在手里才复查台账：投递可能正好在抢到之前完成，那时如实说已送达，
-                # 不能一边归档一边说「不会再响」，而它其实已经响过。
-                if holding is not None and alarm_delivered(box, aid):
+                # 认领握在手里再完整重查一遍台账：precheck 与 claim 之间投递方可能刚好写完
+                # 结局，而且三种结局都要重判 —— 只看 DELIVERED 会让「失败到无法确认」和
+                # 「结果未知」落进归档分支，把一封不该说「不会再响」的提醒说成不会再响。
+                if holding is not None and alarm_gave_up(box, aid):
+                    where = ("投递失败、无法确认收件方是否收到，因此不能算送达"
+                             "（抢到认领后复查台账时发现的）；只清掉运行态记录，那封信仍在信箱里")
+                elif holding is not None and alarm_delivered(box, aid):
                     where = "已经送达过了（抢到认领时复查台账发现的）"
+                elif holding is not None and alarm_unknown(box, aid):
+                    sys.exit(f"闹钟 {aid} 的投递结果无法判定、结果未知"
+                             f"（抢到投递认领后复查台账时发现的：这一条既不算送达也不算未送达），"
+                             f"因此没有取消：fail closed，活动记录与那封信都没有改动 —— "
+                             f"记录仍在 {alarm_file(sid)}，提醒仍在 {letter}。"
+                             f"请人工核对这个提醒到底响没响过"
+                             f"（台账 {HOME / 'opencode_delivered.jsonl'}），"
+                             f"确认之后再决定要不要重新设一个闹钟。")
                 else:
                     moved = archive_alarm_letter(box, aid)
                     if moved:

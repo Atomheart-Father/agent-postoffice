@@ -370,6 +370,9 @@ await t('cancel 在信箱离线时仍然把那封没人收的提醒收走（只�
   const text = await out(await cancel(ctx(LIVE2)))
   assert.ok(/已取消/.test(text), '身份唯一时离线也应允许取消自己的定时器：' + text)
   assert.ok(/离线/.test(text), '要说清信箱离线：' + text)
+  assert.ok(!text.includes('只清了定时器'), '最终输出不得再说「只清了定时器」：' + text)
+  assert.ok(!text.includes('没有提醒'), '最终输出不得再说「没有提醒」这类旧话：' + text)
+  assert.ok(/存档|收走/.test(text), '最终输出要如实说明提醒已被收走/归档：' + text)
   assert.ok(!alarmExists(LIVE2), '定时器已清')
   assert.deepEqual(await inbox('lab2'), [], '离线时那封没人收的提醒也要被收走')
   // lab2 的 archived/ 里还留着本节前面几条用例收走的信，所以只查这一封在不在
@@ -751,6 +754,10 @@ await t('offline + lettered 取消：那封提醒被收走，重新上线后也�
   assert.ok(/已取消/.test(text), '身份唯一时离线也应允许取消自己的定时器：' + text)
   assert.ok(!text.includes('没有待送达的提醒'),
     'inbox 里明明有那封提醒，不得说「没有待送达的提醒」：' + text)
+  // 最终给模型看的那段文本也不许再带旧口径：它必须说清提醒已被收走/归档
+  assert.ok(!text.includes('只清了定时器'), '不得再说「只清了定时器」：' + text)
+  assert.ok(!text.includes('没有提醒'), '不得再说「没有提醒」这类旧话：' + text)
+  assert.ok(/存档|收走/.test(text), '最终输出要如实说明提醒已被收走/归档：' + text)
   assert.deepEqual(await inbox('lab5'), [], '离线时那封没人收的提醒也必须被收走')
   assert.deepEqual(await archived('lab5'), [`${id}.md`], '提醒要存档而不是删掉')
   assert.ok(!alarmExists(LIVE5), '活动记录照旧清掉')
