@@ -9,9 +9,6 @@ chmod +x "$PO"
 command -v python3 >/dev/null || { echo "需要 python3"; exit 1; }
 
 "$PO" init
-mkdir -p "$HOME/.local/bin"
-ln -sfn "$PO" "$HOME/.local/bin/postoffice"
-echo "命令已链接：~/.local/bin/postoffice"
 
 if [ -d "$HOME/.claude" ] || command -v claude >/dev/null; then
   "$PO" install claude
@@ -19,8 +16,15 @@ else
   echo "未发现 Claude Code，跳过钩子（装好后运行：postoffice install claude）"
 fi
 if [ -d "$HOME/.config/opencode" ] || command -v opencode >/dev/null || [ -d /Applications/OpenCode.app ]; then
+  # 这里不要自己 ln。链接归 `postoffice install opencode` 管，它在同一个事务里先换链接、再复制
+  # 插件，复制失败会把链接撤回。install.sh 若在这儿提前 ln，一旦后面的插件复制失败，就会留下
+  # link=本 checkout + plugin=上一份 checkout 的错配 —— 正是 install opencode 内部那套事务要防的。
   "$PO" install opencode
 else
+  # 没有 OpenCode 就没有插件复制这一步，也就不存在事务问题：PATH 便利链接照旧直接建。
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$PO" "$HOME/.local/bin/postoffice"
+  echo "命令已链接：$HOME/.local/bin/postoffice"
   echo "未发现 OpenCode，跳过插件（装好后运行：postoffice install opencode）"
 fi
 "$PO" install skill

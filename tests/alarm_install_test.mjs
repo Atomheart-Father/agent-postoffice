@@ -106,7 +106,7 @@ const newSession = (name) => {
   dbRows.push(`insert into session values ('${id}','${name}','${DIRS[name]}',null,0);`)
   return id
 }
-for (const name of ['instA', 'instB', 'dev', 'nocli', 'nozod', 'foreign', 'sibling']) newSession(name)
+for (const name of ['instA', 'instB', 'dev', 'nocli', 'nozod', 'foreign', 'sibling', 'sw']) newSession(name)
 await writeFile(DB, '')
 execFileSync('sqlite3', [DB, dbRows.join('')])
 
@@ -121,10 +121,20 @@ const register = async (name, poHome) => {
   return box
 }
 
-const runInstall = (checkout, home) =>
-  execFileSync(join(checkout, 'install.sh'), ['--no-postman'],
-    { env: { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, '.config') },
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+const runInstallRaw = (checkout, home) => {
+  try {
+    return { rc: 0, out: execFileSync(join(checkout, 'install.sh'), ['--no-postman'],
+      { env: { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, '.config') },
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }
+  } catch (e) {
+    return { rc: e.status ?? -1, out: `${e.stdout ?? ''}${e.stderr ?? ''}` }
+  }
+}
+const runInstall = (checkout, home) => {
+  const r = runInstallRaw(checkout, home)
+  if (r.rc !== 0) throw new Error(`install.sh 失败（rc=${r.rc}）：${r.out}`)
+  return r.out
+}
 
 // Load one plugin copy under one layout. ROOT, PO_CLI and the schema are all frozen when the module
 // is evaluated, so every layout needs its own copy of the file and its own env at import time.
@@ -499,6 +509,54 @@ await t('③ 负例：故障排除后重跑 B，插件与链接一起切到 B', 
     '这次应当真的装成 B')
   assert.equal(await realpath(cliLink(homePair)), await realpath(join(coPairB, 'postoffice')),
     '链接也应当一起切到 B')
+})
+
+// =============================================================== ③ (negative) install.sh must not switch early
+// The whole point of the transaction inside `postoffice install opencode` is that a failed plugin copy
+// leaves the link where it was. Running the installer end to end is what proves nothing above it
+// gets there first: install.sh used to do its own `ln -sfn` before calling the subcommand, which
+// moved the link to B up front, so B failing to copy left link=B next to plugin=A — the transaction
+// could not undo a switch that happened before it started.
+//
+// The failure is injected at the copy step, uid-independently: checkout B's
+// opencode/postoffice.ts is made a directory. shutil.copy2 opens the source for reading, and
+// reading a directory fails with EISDIR for every user, root included — unlike a permission bit.
+// A's installed plugin file is never touched by the injection, so "plugin is still A" stays a real
+// assertion rather than a tautology.
+const homeSw = await mkHome('sw')
+const swA = await mkCheckout('swA', 'MARKER-SW-A')
+const swB = await mkCheckout('swB', 'MARKER-SW-B')
+const swBPlugin = join(swB, 'opencode/postoffice.ts')
+const swBSource = await readFile(swBPlugin)          // keep B's real plugin to restore later
+
+runInstall(swA, homeSw)
+await t('③ 前置：A 用 install.sh 装好，plugin 与 link 都是 A', async () => {
+  assert.ok((await readFile(installedAt(homeSw), 'utf8')).includes('MARKER-SW-A'), 'plugin=A')
+  assert.equal(await realpath(cliLink(homeSw)), await realpath(join(swA, 'postoffice')), 'link=A')
+})
+
+await rm(swBPlugin, { recursive: true, force: true })
+await mkdir(join(swBPlugin, 'blocker'), { recursive: true })     // a directory where a file must be
+const swFail = runInstallRaw(swB, homeSw)
+
+await t('③ 负例：B 的 install.sh 插件复制失败时，plugin 与 link 都还是 A（不错配）', async () => {
+  assert.notEqual(swFail.rc, 0, `install.sh 必须非零退出，实际 rc=${swFail.rc}：${swFail.out}`)
+  assert.doesNotMatch(swFail.out, /安装完成/, `失败时不许打出成功收尾：${swFail.out}`)
+  const pluginText = await readFile(installedAt(homeSw), 'utf8')
+  assert.ok(pluginText.includes('MARKER-SW-A'), '插件必须还是 A 那份')
+  assert.ok(!pluginText.includes('MARKER-SW-B'), '绝不能把 B 的插件留在这儿')
+  assert.equal(await realpath(cliLink(homeSw)), await realpath(join(swA, 'postoffice')),
+    '链接必须还指着 A —— 提前切换正是这条要防的')
+  assert.deepEqual((await readdir(join(homeSw, '.local/bin'))).sort(), ['postoffice'],
+    '不该留下半截的临时链接')
+})
+
+await t('③ 负例：排除故障后重跑 B 的 install.sh，plugin 与 link 一起切到 B', async () => {
+  await rm(swBPlugin, { recursive: true, force: true })
+  await writeFile(swBPlugin, swBSource)                          // B 恢复正常
+  runInstall(swB, homeSw)
+  assert.ok((await readFile(installedAt(homeSw), 'utf8')).includes('MARKER-SW-B'), 'plugin=B')
+  assert.equal(await realpath(cliLink(homeSw)), await realpath(join(swB, 'postoffice')), 'link=B')
 })
 
 await disposeAll()
