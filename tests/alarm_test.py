@@ -478,6 +478,64 @@ class AlarmScheduler(unittest.TestCase):
         self.run_postman()
         self.assertIsNone(self.read_alarm(), '投递失败到上限也算这次闹钟结束')
 
+    def alarm_cli(self, *args):
+        return subprocess.run([sys.executable, str(PO), *args], capture_output=True, text=True,
+                              env=self.env, timeout=60)
+
+    def test_cancel_of_a_failed_delivery_does_not_say_delivered(self):
+        """FAILED_FINAL 是失败且收件状态不确定，取消时不得说「已经送达过了」。"""
+        rec = self.put_alarm()
+        self.run_postman()
+        self.mark_delivered(result='FAILED_FINAL')
+        r = self.alarm_cli('alarm-cancel', '--box', 'lab', '--session', 'ses_live')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('无法确认收件方是否收到', r.stdout)
+        self.assertNotIn('已经送达过了', r.stdout)
+        self.assertIsNone(self.read_alarm(), '记录仍要清掉')
+
+    def test_cancel_of_a_delivered_alarm_says_delivered(self):
+        """对照组：真送达时仍然说已送达。"""
+        rec = self.put_alarm()
+        self.run_postman()
+        self.mark_delivered(result='DELIVERED')
+        r = self.alarm_cli('alarm-cancel', '--box', 'lab', '--session', 'ses_live')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('已经送达过了', r.stdout)
+
+    def test_alarm_set_refuses_when_the_route_changed_while_waiting(self):
+        """锁内重核路由：等到锁的这段时间里信箱被改绑，就不能落记录。"""
+        rec = {'box': 'lab', 'session': 'ses_live'}
+        routes = json.loads((self.home / 'routes.json').read_text())
+        routes['lab']['session_id'] = 'ses_someone_else'
+        (self.home / 'routes.json').write_text(json.dumps(routes))
+        r = self.alarm_cli('alarm-set', '--box', 'lab', '--session', 'ses_live', '--delay', '10')
+        self.assertNotEqual(r.returncode, 0, '改绑之后必须拒绝')
+        self.assertIn('绑的是别的会话', r.stderr)
+        self.assertIsNone(self.read_alarm(), '不得留下任何记录')
+
+    def test_alarm_cancel_refuses_when_the_route_changed_while_waiting(self):
+        """同样地：改绑之后 cancel 不得动别人的记录。"""
+        self.put_alarm()
+        routes = json.loads((self.home / 'routes.json').read_text())
+        routes['lab']['session_id'] = 'ses_someone_else'
+        (self.home / 'routes.json').write_text(json.dumps(routes))
+        r = self.alarm_cli('alarm-cancel', '--box', 'lab', '--session', 'ses_live')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('绑的是别的会话', r.stderr)
+        self.assertIsNotNone(self.read_alarm(), '记录必须留着')
+        self.assertEqual(len(self.inbox()), 0, '不得动信箱里的任何文件')
+
+    def test_alarm_cancel_still_works_for_a_box_that_went_offline(self):
+        """对照组：信箱只是离线（身份仍唯一）时 cancel 仍允许，只清定时器不碰 inbox。"""
+        rec = self.put_alarm()
+        routes = json.loads((self.home / 'routes.json').read_text())
+        routes['lab']['status'] = 'offline'
+        (self.home / 'routes.json').write_text(json.dumps(routes))
+        r = self.alarm_cli('alarm-cancel', '--box', 'lab', '--session', 'ses_live')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('离线', r.stdout)
+        self.assertIsNone(self.read_alarm())
+
     def test_undelivered_alarm_stays(self):
         self.put_alarm()
         self.run_postman()
