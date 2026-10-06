@@ -106,7 +106,7 @@ const newSession = (name) => {
   dbRows.push(`insert into session values ('${id}','${name}','${DIRS[name]}',null,0);`)
   return id
 }
-for (const name of ['instA', 'instB', 'dev', 'nocli', 'nozod', 'foreign']) newSession(name)
+for (const name of ['instA', 'instB', 'dev', 'nocli', 'nozod', 'foreign', 'sibling']) newSession(name)
 await writeFile(DB, '')
 execFileSync('sqlite3', [DB, dbRows.join('')])
 
@@ -366,7 +366,10 @@ await t('⑦ 负例：邮局目录里那份外来 CLI 不会被调用，只得�
   assert.doesNotMatch(text, /STUB-FOREIGN-CHECKOUT-CLI/, `不能出现外来 CLI 的自报身份：${text}`)
   assert.match(text, /没设闹钟/, `应当是工具自己的话：${text}`)
   assert.match(text, /可执行文件/, `要指出可执行文件找不到：${text}`)
-  assert.match(text, /只找过两条同源路径/, `要说清只找过哪两条：${text}`)
+  // 从安装位置加载时只该找 ~/.local/bin/postoffice —— 同级那份不是安装 checkout
+  assert.match(text, /从安装位置加载/, `要说清自己是在哪种布局下找的：${text}`)
+  assert.match(text, /只找过 ~\/\.local\/bin\/postoffice/, `要说清只找过哪条：${text}`)
+  assert.doesNotMatch(text, /\.\.\/postoffice/, `安装位置不该提同级那份：${text}`)
   assert.match(text, /POSTOFFICE_CLI/, `要给出可操作的出路：${text}`)
   assert.deepEqual(await mForeign.records(), [], '不该有任何记录')
   // and the plugin is still alive: delivery works
@@ -403,18 +406,99 @@ try {
 
 await t('① 链接更新不了时 install opencode 非零退出，且不说“装好了”', async () => {
   assert.notEqual(failRc, 0, `链接失败必须以非零退出，实际 rc=${failRc}，输出：${failOut}`)
-  assert.match(failOut, /CLI 链接没有更新成同源/, `诊断要说清链接没跟上：${failOut}`)
-  assert.match(failOut, /本次安装不算成功/, `诊断要明说这次不算成功：${failOut}`)
+  assert.match(failOut, /没有安装/, `诊断要明说这次没装：${failOut}`)
+  assert.match(failOut, /CLI 链接没能更新成同源/, `诊断要说清链接没跟上：${failOut}`)
+  assert.match(failOut, /插件一个字节都没动/, `诊断要明说插件没被动过：${failOut}`)
   assert.match(failOut, /POSTOFFICE_CLI=/, `诊断要给出路：${failOut}`)
   assert.doesNotMatch(failOut, /已装入/, `不许出现宣称安装成功的措辞：${failOut}`)
   assert.doesNotMatch(failOut, /重启 OpenCode 生效/, `不许出现宣称安装成功的措辞：${failOut}`)
-  // state left behind: the plugin file did get copied, the link path is still the squatter. The
-  // operator has to be the one to resolve it, and the non-zero exit is what tells them.
-  assert.equal(await readFile(installedAt(homeFail), 'utf8'), await PLUGIN_TEXT(failCheckout),
-    '插件文件确实已复制')
+  // Nothing landed: the link is fixed before the plugin is touched, so a link failure leaves the
+  // install untouched rather than half-applied.
+  await assert.rejects(() => access(installedAt(homeFail)), '插件不该被复制进来')
   const linkStat = await lstat(join(homeFail, '.local/bin/postoffice'))
   assert.ok(linkStat.isDirectory(),
     `链接路径仍应是那个占位目录，实际是 ${linkStat.isSymbolicLink() ? 'symlink' : '别的东西'}`)
+  assert.deepEqual((await readdir(join(homeFail, '.local/bin'))).sort(), ['postoffice'],
+    '不该留下半截的临时链接')
+})
+
+// =============================================================== ② (negative) the adjacent decoy
+// Same category as ②, and the decoy is the one that actually sits next to an installed plugin:
+// $XDG_CONFIG_HOME/opencode/postoffice — one level above plugins/, exactly where `../postoffice`
+// points from the installed copy. The correct ~/.local/bin/postoffice symlink is also in place and
+// does work. So whichever candidate is picked is visible: the symlink's CLI announces itself and
+// then delegates to the real CLI (so the alarm is really written), while the decoy only announces
+// itself and does nothing.
+const homeSibling = await mkHome('sibling')
+const installedSibling = installedAt(homeSibling)
+await mkdir(dirname(installedSibling), { recursive: true })
+await cp(join(REPO, 'opencode/postoffice.ts'), installedSibling)
+const coSibling = await mkCheckout('sibling', null)
+await mkdir(join(homeSibling, '.local/bin'), { recursive: true })
+const markerSibling = join(T, 'SIBLING-STUB-CALLED')
+const markerSymlink = join(T, 'SYMLINK-CLI-CALLED')
+const decoySibling = join(homeSibling, '.config/opencode/postoffice')
+await writeFile(decoySibling, `#!/bin/sh\ntouch "${markerSibling}"\necho "STUB-ADJACENT-DECOY-CLI $*"\nexit 0\n`)
+await chmod(decoySibling, 0o755)
+// ~/.local/bin/postoffice: the correct handle, made self-identifying, and it delegates to the real
+// CLI of that checkout so the alarm really lands when (and only when) this path is taken.
+const symlinkCli = join(T, 'symlink-cli.sh')
+await writeFile(symlinkCli, `#!/bin/sh\ntouch "${markerSymlink}"\nexec "${join(coSibling, 'postoffice')}" "$@"\n`)
+await chmod(symlinkCli, 0o755)
+await symlink(symlinkCli, cliLink(homeSibling))
+const poHomeSibling = join(homeSibling, 'agent-postoffice')
+const boxSibling = await register('sibling', poHomeSibling)
+await mkdir(join(DIRS.sibling, '.opencode'), { recursive: true })
+const mSibling = await mount(installedSibling, { name: 'sibling', home: homeSibling, poHome: poHomeSibling })
+
+await t('② 负例：安装位置同级那份外来可执行文件不会被调用，用的是同源 symlink', async () => {
+  const text = mSibling.out(await mSibling.plugin.tool.postoffice_alarm_schedule.execute({ delay_minutes: 30 }, mSibling.ctx()))
+  assert.ok(!existsSync(markerSibling), '同级那份外来可执行文件绝不能被调用（桩一旦被跑就会留下这个文件）')
+  assert.ok(existsSync(markerSymlink), '应当走 ~/.local/bin/postoffice 这条同源 symlink')
+  assert.doesNotMatch(text, /STUB-ADJACENT-DECOY-CLI/, `不能出现同级桩的自报身份：${text}`)
+  assert.match(text, /已设/, `应当真的设成功（symlink 那条链是真 CLI）：${text}`)
+  assert.equal((await mSibling.records()).length, 1, '记录应当由 symlink 指向的 CLI 落盘')
+})
+
+// =============================================================== ③ (negative) a failed switch
+// A is installed and matched (plugin A + link A). Now B tries to install and its link update fails.
+// Either outcome is acceptable as long as it is not a mismatch; this asserts the one this
+// implementation aims for — nothing moved, so A's pair is still A's pair.
+const homePair = await mkHome('pair')
+const coPairA = await mkCheckout('pairA', 'MARKER-PAIR-A')
+const coPairB = await mkCheckout('pairB', 'MARKER-PAIR-B')
+const envFor = (home) => ({
+  ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), POSTOFFICE_NO_NOTIFY: '1',
+})
+const runSub = (checkout, home) =>
+  execFileSync(join(checkout, 'postoffice'), ['install', 'opencode'],
+    { env: envFor(home), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+
+runSub(coPairA, homePair)
+const binDir = join(homePair, '.local/bin')
+await chmod(binDir, 0o555)                       // B's link cannot be created: EACCES, A's link survives
+let pairRc = 0, pairOut = ''
+try { runSub(coPairB, homePair) } catch (e) { pairRc = e.status ?? -1; pairOut = `${e.stdout ?? ''}${e.stderr ?? ''}` }
+await chmod(binDir, 0o755)                       // restore so the recovery step can run
+
+await t('③ 负例：换 checkout 时链接失败，A 的配对原封不动（插件=A、link=A），不是错配', async () => {
+  assert.notEqual(pairRc, 0, `B 的安装必须失败，实际 rc=${pairRc}，输出：${pairOut}`)
+  assert.match(pairOut, /没有安装/, `诊断要明说没装：${pairOut}`)
+  assert.doesNotMatch(pairOut, /已装入/, `不许宣称成功：${pairOut}`)
+  // the invariant: plugin content and link target are still A's, together
+  const pluginText = await readFile(installedAt(homePair), 'utf8')
+  assert.equal(pluginText, await PLUGIN_TEXT(coPairA), '插件必须还是 A 那份，不能是 B 的')
+  assert.ok(!pluginText.includes('MARKER-PAIR-B'), '绝不能把 B 的插件留在这儿')
+  assert.equal(await realpath(cliLink(homePair)), await realpath(join(coPairA, 'postoffice')),
+    '链接必须还指着 A，不能是 B')
+})
+
+await t('③ 负例：故障排除后重跑 B，插件与链接一起切到 B', async () => {
+  runSub(coPairB, homePair)
+  assert.equal(await readFile(installedAt(homePair), 'utf8'), await PLUGIN_TEXT(coPairB),
+    '这次应当真的装成 B')
+  assert.equal(await realpath(cliLink(homePair)), await realpath(join(coPairB, 'postoffice')),
+    '链接也应当一起切到 B')
 })
 
 await disposeAll()

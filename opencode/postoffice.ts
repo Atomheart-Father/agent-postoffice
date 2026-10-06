@@ -30,7 +30,7 @@ import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { realpathSync } from "node:fs"
-import { join } from "node:path"
+import { join, dirname } from "node:path"
 
 const ROOT = process.env.POSTOFFICE_HOME || `${homedir()}/agent-postoffice`
 const LEDGER = `${ROOT}/opencode_delivered.jsonl`
@@ -186,29 +186,43 @@ const readAlarm = async (sessionID: string): Promise<Alarm | null> => {
 // 内核在持有者崩溃/被 kill/重启时自动释放，锁文件永不删除或替换，因此不存在 ABA，
 // 「旧持有者删掉新持有者的锁」在结构上不可能发生。
 // The CLI is the only writer of alarm records, and it must come from the same checkout as this
-// plugin. There are exactly two ways that holds:
-//   - repo checkout: the plugin sits in opencode/, the script one level up  → ../postoffice
-//   - installed:     `postoffice install opencode` copies this .ts into
-//                    $XDG_CONFIG_HOME/opencode/plugins/ and points ~/.local/bin/postoffice back at
-//                    that same checkout, so the symlink is the only handle on it
-// POSTOFFICE_CLI stays an explicit override/debug switch, not something an install depends on.
+// plugin. Which handle on it is legitimate depends on which layout this file was loaded from, so
+// the two are told apart instead of trying everything everywhere:
 //
-// Deliberately *not* a candidate: $POSTOFFICE_HOME/postoffice. The post office home is per-operator
-// state, not a checkout, so a `postoffice` file sitting there could belong to any checkout — picking
-// it up is exactly how an installed plugin ends up driving a foreign CLI. Two real candidates that
-// can be proven same-source beat one convenient guess.
+//   checkout  the plugin sits in <checkout>/opencode/, so ../postoffice *is* that checkout's CLI
+//             and nothing else can be. Candidate order: ../postoffice, then ~/.local/bin.
+//   installed `postoffice install opencode` copies this .ts into one fixed place —
+//             $XDG_CONFIG_HOME/opencode/plugins/postoffice.ts — and points ~/.local/bin/postoffice
+//             back at the checkout it came from. Here ../postoffice is $XDG_CONFIG_HOME/opencode/
+//             postoffice, which is NOT that checkout: anything executable sitting there would win
+//             over the correct symlink. So: ~/.local/bin/postoffice only.
+//
+// The test is the directory the plugin was loaded from, compared against the installer's own
+// destination (opencode_config_dir() on the Python side computes the same thing). That is a fact
+// about where the file is, not a guess about who installed it, and both branches are exercised:
+// tests/alarm_install_test.mjs runs the checkout layout with no symlink in HOME and the installed
+// layout with a same-directory foreign executable that must stay untouched.
+//
+// POSTOFFICE_CLI stays an explicit override/debug switch, first, and is not something an install
+// depends on. Deliberately not a candidate: $POSTOFFICE_HOME/postoffice — the post office home is
+// per-operator state rather than a checkout, so a `postoffice` file there may belong to any
+// checkout, which is exactly how an installed plugin ends up driving a foreign CLI.
 const runnable = (p: string) => {
   // accessSync returns undefined on success, so it must not be the tail of the && chain —
   // `find` would read that undefined as falsy and skip a perfectly good candidate.
   try { return !!p && existsSync(p) && accessSync(p, constants.X_OK) === undefined } catch { return false }
 }
 const realpathIf = (p: string) => { try { return realpathSync(p) } catch { return p } }
+const INSTALLED_PLUGIN_DIR =
+  join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode", "plugins")
+const SELF_DIR = realpathIf(dirname(fileURLToPath(import.meta.url)))
+const inCheckout = SELF_DIR !== realpathIf(INSTALLED_PLUGIN_DIR)
 const PO_CLI =
   (process.env.POSTOFFICE_CLI || "").trim() ||
-  ([
-    new URL("../postoffice", import.meta.url).pathname,     // repo checkout: script one level up
-    join(homedir(), ".local/bin/postoffice"),              // installed: symlink the installer maintains
-  ].map(realpathIf).find(runnable) ?? "")
+  (inCheckout
+    ? [new URL("../postoffice", import.meta.url).pathname, join(homedir(), ".local/bin/postoffice")]
+    : [join(homedir(), ".local/bin/postoffice")]
+  ).map(realpathIf).find(runnable) || ""
 
 // ---------------------------------------------------------------------- zod：只走官方 API
 // OpenCode's ToolDefinition is ReturnType<typeof tool>, so `args` is a z.ZodRawShape and
@@ -234,10 +248,11 @@ const runCLI = (args: string[], timeout = 20_000): Promise<{ code: number; text:
     // 找不到可执行文件是一种要如实回答的状态，不是抛给模型的异常：下面 execute() 会把它
     // 变成一句中文说明。spawn 对空/不可执行的 file 会同步抛，那会让整个工具 reject。
     if (!PO_CLI) {
-      resolve({ code: -1, text: "找不到 postoffice 可执行文件。只找过两条同源路径：本插件同级的 " +
-        "../postoffice（checkout 开发模式），和 ~/.local/bin/postoffice（装好的插件靠它；" +
-        "`postoffice install opencode` 会把它指回装插件的那份 checkout）。两条都不可用。" +
-        "修法：重跑那一 checkout 的 postoffice install opencode，或显式设 " +
+      resolve({ code: -1, text: `找不到 postoffice 可执行文件。这个插件是从${
+        inCheckout ? " checkout" : "安装位置"}加载的，只找过${
+        inCheckout ? " ../postoffice（同 checkout 的脚本）和 ~/.local/bin/postoffice"
+                   : " ~/.local/bin/postoffice（装插件的那份 checkout，`postoffice install opencode` 会把链接指回去）"
+      }，都不可用。修法：重跑那一 checkout 的 postoffice install opencode，或显式设 ` +
         "POSTOFFICE_CLI=<那份 checkout 里的 postoffice>。" })
       return
     }
