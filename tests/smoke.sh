@@ -349,8 +349,10 @@ rm -f "$T/merge_cap" "$POSTOFFICE_HOME/logs/notify.log"
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 7; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 [ "$(grep -c "另有 3 条回执" "$T/merge_cap")" = "1" ] && ok "v1.6 回执合并成一条" || bad "v1.6 合并"
 [ "$(grep -c "查询：postoffice receipt mergebox " "$T/merge_cap")" = "3" ] && ok "v1.6 合并块含各条查询 ID" || bad "v1.6 合并块 ID"
-[ "$(grep -c "【联络总站新信" "$T/merge_cap")" = "3" ] && ok "v1.6 正式信各自先送" || bad "v1.6 正式信"
-fm=$(grep -n "另有 3 条回执" "$T/merge_cap" | cut -d: -f1); lf=$(grep -n "【联络总站新信" "$T/merge_cap" | tail -1 | cut -d: -f1)
+[ "$(grep -c "【联络总站｜3 封新信】" "$T/merge_cap")" = "1" ] && ok "v1.10 三封正式信合成一批一次唤醒" || bad "v1.10 批量正式信"
+[ "$(grep -c "^[0-9]\+\. mergebox/" "$T/merge_cap")" = "3" ] && ok "v1.10 批量逐封给稳定引用" || bad "v1.10 批量引用"
+[ "$(grep -c "【联络总站新信" "$T/merge_cap")" = "0" ] && ok "v1.10 多封时不再用单封形态" || bad "v1.10 单封形态残留"
+fm=$(grep -n "另有 3 条回执" "$T/merge_cap" | cut -d: -f1); lf=$(grep -n "【联络总站｜3 封新信】" "$T/merge_cap" | tail -1 | cut -d: -f1)
 [ -n "$fm" ] && [ -n "$lf" ] && [ "$fm" -gt "$lf" ] && ok "v1.6 正式信排在合并回执之前" || bad "v1.6 顺序 fm=$fm lf=$lf"
 [ "$(grep -o "mergebox" "$POSTOFFICE_HOME/.delivered.json" | wc -l | tr -d ' ')" = "6" ] && ok "v1.6 每个 ID 都记入账本" || bad "v1.6 账本"
 grep -q "投递暂停" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null && bad "v1.6 合并后仍限流" || ok "v1.6 合并后不触发限流"

@@ -27,7 +27,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -39,6 +39,7 @@ RATE_N, RATE_WIN = 6, 600   # at most 6 wakes per mailbox per 10 minutes
 GRACE = int(os.environ.get("POSTOFFICE_GRACE", 1200))  # hook/plugin mailbox not woken within 20 min → tell the human
 CONSUME_ALERT = int(os.environ.get("POSTOFFICE_CONSUME_ALERT", 1800))  # reminded but still in inbox after 30 min → tell the human
 RECEIPT_WAIT = int(os.environ.get("POSTOFFICE_RECEIPT_WAIT", 600))  # a merged receipt block waits at most 10 min before riding along
+MAX_FORMAL_BATCH = 20       # at most this many ordinary letters per single wake; the rest go next round
 HOOK_TIMEOUT = 7 * 24 * 3600  # explicit timeout for the async Claude hook (seconds)
 ALIAS_STABLE = int(os.environ.get("POSTOFFICE_ALIAS_STABLE", 60))  # a new alias target must hold this long before a switch is announced
 SWITCH_LOG = "alias_switch.log"
@@ -296,13 +297,25 @@ def merged_receipts(name, receipts):
 def reminder(name, files):
     """Metadata-only wake text: formal letters first, then receipts merged into one trailing block.
 
-    A single receipt with no formal letter keeps the compact 3-line shape; anything else merges.
-    Receipt bodies are never injected — call `postoffice receipt` when the body is actually needed.
+    One formal letter keeps the original single-letter shape. Two or more are presented as one
+    batch: the shared header and the shared rule are written once, and each letter gets one line
+    with its stable reference, source, subject and path — no repeated boilerplate. Batch
+    membership is exactly the set the caller already claimed; a letter that lost its claim never
+    reaches this function. A single receipt with no formal letter keeps the compact 3-line shape;
+    anything else merges. Receipt bodies are never injected.
     """
     formal, receipts = mail_split(files)
     parts = []
-    for f in formal:
-        parts += [f"【联络总站新信｜{name}】", f"== {f}", header(f), LETTER_TAIL]
+    if len(formal) >= 2:
+        parts.append(f"【联络总站｜{len(formal)} 封新信】")
+        for i, f in enumerate(formal, start=1):
+            src = letter_sender(f) or "?"
+            subj = header_field(f, "事由：") or "（无）"
+            parts.append(f"{i}. {name}/{f.stem}  来源：{src}  事由：{subj}  {f}")
+        parts.append("按各信“需要”字段处理；回信/回执/归档规则见 postoffice skill。")
+    else:
+        for f in formal:
+            parts += [f"【联络总站新信｜{name}】", f"== {f}", header(f), LETTER_TAIL]
     if len(receipts) == 1 and not formal:
         parts.append(single_receipt_block(name, receipts[0]))
     elif receipts:
@@ -472,6 +485,97 @@ def to_done(path):
     dst.parent.mkdir(parents=True, exist_ok=True)
     path.replace(dst)
     return dst
+
+
+def presented_path(name):
+    return HOME / name / ".presented.json"
+
+
+def bare_presented_id(x):
+    """A presented id may only ever name <box>/inbox/<id>.md: a bare file name, no path parts.
+
+    Anything else means the file was hand-edited or corrupted, and archive-current must fail
+    closed instead of resolving `..` or an absolute id into somebody else's letter.
+    """
+    return (isinstance(x, str) and bool(x) and "/" not in x and "\\" not in x
+            and "\0" not in x and not x.startswith(".")
+            and Path(x).name == x)
+
+
+def read_presented(name):
+    """This box's presented set as (bare ids, error). A missing file is an empty set, not an error.
+
+    "Presented" means the wake that carried the letter was actually accepted by this box's
+    channel. It is only an archive hint: delivery truth stays in .seen / the plugin ledger /
+    .woken.json / the claims, and archive-current never touches anything outside this set.
+    """
+    p = presented_path(name)
+    if not p.exists():
+        return [], ""
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return [], f"{p} 读不出来（{e}）"
+    if not isinstance(data, list):
+        return [], f"{p} 不是 id 数组"
+    bad = next((x for x in data if not bare_presented_id(x)), None)
+    if bad is not None:
+        return [], f"{p} 里有不是裸编号的条目（{bad!r}）；只接受本箱的信件编号"
+    return list(data), ""
+
+
+def presented_update(name, add=(), remove=()):
+    """Union `add`, drop `remove`, atomically rewrite. Best effort: a lost update is safe.
+
+    The common path is: a channel accepted a wake → union the ids in; archive-current → drop the
+    ones it filed. A per-box O_EXCL lock keeps concurrent read-modify-writes from losing each
+    other; if the lock cannot be had we still write (last writer wins). Losing an add only means
+    the letter will not be auto-archived (it stays in inbox, visible); losing a remove only leaves
+    a stale id that a later run cleans up. Neither direction loses or re-delivers mail.
+    """
+    d = HOME / name
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    lock = d / ".presented.lock"
+    fd = None
+    try:
+        for _ in range(40):                      # ~2s, then write anyway
+            try:
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                break
+            except FileExistsError:
+                time.sleep(0.05)
+        ids, err = read_presented(name)
+        if err:
+            log("postman.log", f"presented 更新跳过：{err}")
+            return False
+        merged = [x for x in ids if x not in remove]
+        for x in add:
+            if bare_presented_id(x) and x not in merged:
+                merged.append(x)
+        tmp = d / f".presented.json.tmp-{os.getpid()}"
+        tmp.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(presented_path(name))
+        return True
+    except OSError as e:
+        log("postman.log", f"presented 更新失败（不影响投递）：{e}")
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+
+
+def presented_add(name, ids):
+    ids = [i for i in ids if i]
+    if not ids:
+        return False
+    return presented_update(name, add=ids)
 
 
 def find_codex():
@@ -1072,6 +1176,8 @@ def cmd_send(a):
     path = write_letter(to, a.sender, a.subject, clean_need(a.need), body, extra_headers=extra)
     print(f"已投递：{path}")
     print(f"编号：{path.stem}")
+    # stable reference for later edit/retract: <recipient>/<message-id>, no global index needed
+    print(f"引用：{to}/{path.stem}")
     r = boxes(routes).get(to, {})
     if r and not online(r):
         print(f"注意：{to} 目前离线，信会留在信箱，等它上线再提醒。")
@@ -1208,6 +1314,57 @@ def cmd_archive_receipt(a):
     return 0
 
 
+def cmd_archive_current(a):
+    """File exactly the letters this box was already shown, and nothing else.
+
+    The presented set is written by the channel that accepted the wake; this command never scans
+    inbox/ and never guesses, so a letter that arrived after the last wake is left alone.
+    `--keep` leaves the named ids in the inbox and in the presented set. Ids whose letter is gone
+    (already filed, retracted, or never there) are just dropped. A corrupt set fails closed:
+    nothing is moved and the file is left as it is.
+    """
+    routes = boxes(load_routes())
+    if a.box not in routes:
+        sys.exit(f"没有信箱 {a.box}；`postoffice list` 看通讯录")
+    ids, err = read_presented(a.box)
+    if err:
+        sys.exit(f"{err}；没有动任何信（fail closed）。读不出来时请人工检查或直接删除该文件")
+    keep = set(a.keep or [])
+    inbox = HOME / a.box / "inbox"
+    done = HOME / a.box / "done"
+    moved, kept, stale, conflicts = [], [], [], []
+    for lid in ids:
+        if lid in keep:
+            kept.append(lid)
+            continue
+        p = inbox / f"{lid}.md"
+        if not p.is_file():
+            stale.append(lid)          # already filed, retracted, or never existed
+            continue
+        dst = done / p.name
+        if dst.exists():
+            # Same name already in done/: could be this letter (already filed) or a colliding
+            # new one. We cannot tell, so we move nothing and keep the reference — an explicit
+            # conflict beats silently losing track of a letter that is still in the inbox.
+            conflicts.append(lid)
+            continue
+        try:
+            done.mkdir(parents=True, exist_ok=True)
+            p.replace(dst)
+        except OSError as e:
+            sys.exit(f"归档 {lid} 失败（{e}）；已归档的不回滚，剩下的下次再来")
+        moved.append(lid)
+    if moved or stale:
+        presented_update(a.box, remove=moved + stale)
+    if conflicts:
+        print(f"已归档 {len(moved)} 封已展示过的信到 done/；保留 {len(kept)} 封；清理 {len(stale)} 个失效引用")
+        sys.exit(f"done/ 里已有同名文件，没动也没清 presented：{'、'.join(conflicts)}；"
+                 f"请人工核对后处理，剩下的下次再来")
+    if not moved and not stale and not kept:
+        print("没有待归档的已展示消息")
+    return 0
+
+
 def retract_refused_reason(name, path, method, skip_claim=False):
     """Why this letter can no longer be pulled back, or "" when the channel has not taken it yet.
 
@@ -1244,6 +1401,109 @@ def retract_refused_reason(name, path, method, skip_claim=False):
     return f"无法核实该通道（{method}）是否已接受，fail closed 不撤回"
 
 
+def refusal_for_methods(name, path, methods, skip_claim=False):
+    """Judge every wake channel this box could use; any refusal (or an unknown channel) wins.
+
+    A box normally has exactly one method, but routes can be edited by hand. Judging only
+    methods[0] would let a letter that a second channel already accepted look untouched.
+    """
+    for m in methods or []:
+        why = retract_refused_reason(name, path, m, skip_claim=skip_claim)
+        if why:
+            return why
+    if not methods:
+        return "无法核实该通道（没有配置）是否已接受，fail closed 不撤回"
+    return ""
+
+
+def mutation_refusal(lid, why, path):
+    return (f"{lid} {why}：无法撤回也改不了；原信留在 {path}。"
+            f"要更正就另发一封修正信（投递状态以收件方通道为准），不要假装这封没发过")
+
+
+def parse_message_ref(ref):
+    """<recipient>/<message-id> and nothing else: no bare ids, paths, globs or .md suffix."""
+    if ref.count("/") != 1:
+        sys.exit(f"引用必须写成 <收件信箱>/<信件编号>，不接受路径或通配符：{ref!r}")
+    to, lid = ref.split("/", 1)
+    if not to or not lid:
+        sys.exit(f"引用必须写成 <收件信箱>/<信件编号>：{ref!r}")
+    if any(c in lid for c in "/\\*?[]") or lid.startswith(".") or lid.endswith(".md"):
+        sys.exit(f"信件编号要精确、不带 .md 后缀，也不是路径：{lid!r}")
+    return to, lid
+
+
+def rewrite_letter(path, subject=None, need=None, body=None):
+    """Replace the editable fields in place: same file name, envelope identity untouched.
+
+    Only 事由/需要/正文 may change. Every other header line (来源 and any extra marker) is kept
+    verbatim and in order, so the letter keeps its identity and its channel classification.
+    Temporary file + os.replace, so a reader never sees a half-written letter.
+    """
+    text = path.read_text(encoding="utf-8")
+    head, _sep, rest = text.partition("\n\n")
+    out = []
+    for line in head.split("\n"):
+        if subject is not None and line.startswith("事由："):
+            out.append(f"事由：{subject}")
+        elif need is not None and line.startswith("需要："):
+            out.append(f"需要：{need}")
+        else:
+            out.append(line)
+    new_body = rest if body is None else body
+    if new_body and not new_body.endswith("\n"):
+        new_body += "\n"
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp.write_text("\n".join(out) + "\n\n" + new_body, encoding="utf-8")
+    tmp.replace(path)
+
+
+def cmd_edit(a):
+    """Update one ordinary letter in place while its recipient channel has not accepted it.
+
+    Same arbitration as `retract`: the shared per-letter claim decides who wins between a mutation
+    and every delivery entry, and after winning it the delivery records are checked again (with
+    skip_claim, so we do not read our own claim as a competitor's). Only subject/need/body change;
+    the id, file name, source, recipient and every system marker stay. Fails closed whenever the
+    letter is already on its way.
+    """
+    routes = boxes(load_routes())
+    if a.box not in routes:
+        sys.exit(f"没有信箱 {a.box}（发信方）；`postoffice list` 看通讯录")
+    if a.subject is None and a.need is None and a.body is None:
+        sys.exit("至少要改一个字段：--subject / --need / --body")
+    to, lid = parse_message_ref(a.ref)
+    if to not in routes:
+        sys.exit(f"没有信箱 {to}（收件方）；`postoffice list` 看通讯录")
+    path = HOME / to / "inbox" / f"{lid}.md"
+    if not path.is_file():
+        sys.exit(f"{to} 的 inbox/ 里没有编号为 {lid} 的信；只能改仍在收件方 inbox/ 里的普通信")
+    derived = [k for k in ("回执：", "广播：", "闹钟：", "切换事件：") if header_field_present(path, k)]
+    if derived or letter_sender(path) == "postoffice":
+        sys.exit(f"{lid} 不是普通直发信（信头含 {'、'.join(derived) or '系统来信'}），只能改普通 send 的信")
+    if letter_sender(path) != a.box:
+        sys.exit(f"信 {lid} 的来源是 {letter_sender(path) or '（读不出来）'}，不是你指定的 {a.box}；不改别人的信")
+    methods = routes[to].get("methods", ["notify"])
+    why = refusal_for_methods(to, path, methods)
+    if why:
+        sys.exit(mutation_refusal(lid, why, path))
+    if not claim_letter(to, path):
+        sys.exit(mutation_refusal(lid, "投递进行中（认领已被投递方抢到）", path))
+    try:
+        why = refusal_for_methods(to, path, methods, skip_claim=True)
+        if why:
+            sys.exit(mutation_refusal(lid, why, path))
+        rewrite_letter(path, subject=a.subject,
+                       need=None if a.need is None else clean_need(a.need), body=a.body)
+    finally:
+        release_claim(to, path)
+    log("postman.log", f"更新 {a.box} → {to} {lid}：通道 {','.join(methods)} 未接受，原地改成新版本")
+    print(f"已更新 {lid}（{a.box} → {to}）")
+    print("收件方尚未收到旧版本；编号、文件名、来源、收件人都没变，只会看到新版")
+    print("还想改就再 edit 一次；想收回就 retract；已经投递的只能另发一封修正信")
+    return 0
+
+
 def cmd_retract(a):
     """Pull back one ordinary letter that its recipient's channel has not accepted yet.
 
@@ -1275,21 +1535,20 @@ def cmd_retract(a):
     sender = letter_sender(path)
     if sender != a.sender:
         sys.exit(f"信 {a.id} 的来源是 {sender or '（读不出来）'}，不是你指定的 {a.sender}；不撤回别人的信")
-    method = routes[a.to].get("methods", ["notify"])[0]
-    why = retract_refused_reason(a.to, path, method)
+    methods = routes[a.to].get("methods", ["notify"])
+    method = methods[0]
+    why = refusal_for_methods(a.to, path, methods)
     if why:
-        sys.exit(f"{a.id} {why}，无法撤回；原信留在 {path}。"
-                 f"要更正就另发一封修正信，不要假装这封没发过")
+        sys.exit(mutation_refusal(a.id, why, path))
     # 和投递方原子地争同一把认领：认领是 O_EXCL 的，所以要么我们赢、要么投递方赢，
     # 不存在「我们查完还没动，投递方就来认领并唤醒」的中间态。
     if not claim_letter(a.to, path):
-        sys.exit(f"{a.id} 投递进行中（认领已被投递方抢到），无法撤回；原信留在 {path}。"
-                 f"要更正就另发一封修正信，不要假装这封没发过")
+        sys.exit(mutation_refusal(a.id, "投递进行中（认领已被投递方抢到）", path))
     try:
         # 认领已经握在手里，所以这一次只看台账（skip_claim）：不然会把自己刚拿的认领当成别人
-        why = retract_refused_reason(a.to, path, method, skip_claim=True)
+        why = refusal_for_methods(a.to, path, methods, skip_claim=True)
         if why:
-            sys.exit(f"{a.id} {why}，无法撤回；原信留在 {path}。")
+            sys.exit(mutation_refusal(a.id, why, path))
         dst_dir = HOME / a.to / "archived" / time.strftime("%Y%m%d-%H%M%S")
         dst = dst_dir / path.name
         if dst.exists():
@@ -1302,7 +1561,7 @@ def cmd_retract(a):
     print(f"已撤回 {a.id}")
     print(f"原信原样存档到 {dst}（正文未改，没有写任何通知，也没有替你补发修正）")
     print(f"核实依据：{a.to} 走 {method} 通道，投递认领为空、该通道的送达记录里没有这封信")
-    print("收件方没有被提醒过。如果对方已从别的途径得知内容，要不要另发修正由你决定")
+    print("收件方没有被提醒过，也不会再因这封信被唤醒。如果对方已从别的途径得知内容，要不要另发修正由你决定")
     return 0
 
 
@@ -2269,6 +2528,11 @@ def cmd_hook(_a):
                         sys.stderr.write(reminder(name, new) + "\n")
                         with seenf.open("a") as f:
                             f.writelines(f"{p}\n" for p in new)
+                        try:
+                            # only now is the wake actually accepted: this is the presented set
+                            presented_add(name, [p.stem for p in new])
+                        except Exception as e:
+                            log("claude_hook.log", f"{name} presented 记录失败（不影响唤醒）：{e}")
                         rate_mark(name)      # merged receipts: one wake counts once, however many letters
                         for p in new:
                             log("claude_hook.log", f"{name} 唤醒 {p.name}")
@@ -2376,16 +2640,21 @@ def cmd_postman(_a):
                             continue
                         mark(key)
                     continue
-                # codex_queue / notify: formal letters go out one at a time, receipts merge into one trailing block
+                # codex_queue / notify: one batch of ordinary letters (≤ MAX_FORMAL_BATCH) per wake,
+                # receipts merge into one trailing block; an alarm letter keeps its own single round
                 leftovers = [p for p in pending(name) if str(p) not in delivered]
                 formal, receipts = mail_split(leftovers)
-                if not formal and not receipts:
-                    continue
-                letter = formal[0] if formal else None
-                # with a letter: only receipts that have waited long enough ride along; without one: all of them
-                due = list(receipts) if letter is None \
-                    else [p for p in receipts if time.time() - p.stat().st_mtime > RECEIPT_WAIT]
-                if letter is None and not due:
+                ordinary = [p for p in formal if not field(p, "闹钟：")]
+                alarms = [p for p in formal if field(p, "闹钟：")]
+                if ordinary:
+                    # with letters: only receipts that have waited long enough ride along
+                    candidates = ordinary[:MAX_FORMAL_BATCH] \
+                        + [p for p in receipts if time.time() - p.stat().st_mtime > RECEIPT_WAIT]
+                elif alarms:
+                    candidates = [alarms[0]]      # the alarm reminder stays a lone round, no receipts
+                else:
+                    candidates = list(receipts)   # no letters: receipts go on their own
+                if not candidates:
                     continue
                 if not rate_ok(name):
                     if name not in throttled:
@@ -2394,11 +2663,8 @@ def cmd_postman(_a):
                         throttled.add(name)
                     continue
                 throttled.discard(name)
-                group = ([letter] if letter else []) + due
-                names = " ".join(p.name for p in group)
-                sig = f"{name}::" + "|".join(p.name for p in group)
                 # 同样只投认领成功的：抢不到的那几封这一轮不动，等下一轮
-                group = [p for p in group if claim_letter(name, p)]
+                group = [p for p in candidates if claim_letter(name, p)]
                 if not group:
                     continue
                 names = " ".join(p.name for p in group)
@@ -2413,8 +2679,10 @@ def cmd_postman(_a):
                         log("postman.log", f"codex_queue {name} {names} rc={res.returncode} "
                                            f"{res.stdout.strip()[:200]} {res.stderr.strip()[:200]}")
                     else:
+                        first = group[0]
                         notify(f"联络总站：给 {name} 的新信",
-                               (field(letter, "事由") or letter.name) if letter else f"{len(due)} 条回执")
+                               f"{len(group)} 条回执" if receipt_query_id(first)
+                               else (field(first, "事由") or first.name))
                         log("postman.log", f"notify {name} {names}")
                 except Exception as e:
                     ok = False
@@ -2432,6 +2700,12 @@ def cmd_postman(_a):
                 rate_mark(name)                  # one wake for the whole batch (a merged receipt block counts once)
                 for p in group:
                     mark(str(p), reminded=(method == "codex_queue"))
+                if method == "codex_queue":
+                    try:
+                        # accepted by the channel: these are the letters the session was shown
+                        presented_add(name, [p.stem for p in group])
+                    except Exception as e:
+                        log("postman.log", f"{name} presented 记录失败（不影响投递）：{e}")
         except Exception as e:
             log("postman.log", f"邮递员本轮异常（已忽略，继续）：{e}")
         time.sleep(POLL)
@@ -3073,6 +3347,18 @@ def main():
     p.add_argument("to", help="收件信箱")
     p.add_argument("id", metavar="信件编号", help="完整编号（文件名去掉 .md）；不接受路径、通配符或前缀")
     p.set_defaults(fn=cmd_retract)
+    p = sp.add_parser("edit", help="原地改一封还没被收件方通道接受的普通信（只改事由/需要/正文；编号、来源、收件人不变）")
+    p.add_argument("--box", required=True, metavar="发信信箱", help="必须与信件信头的来源一致")
+    p.add_argument("ref", metavar="收件信箱/信件编号", help="稳定引用，例如 worker/20260101-000000_boss_hi")
+    p.add_argument("--subject", help="新事由")
+    p.add_argument("--need", help="新的「需要」")
+    p.add_argument("--body", help="新正文（字面文本）")
+    p.set_defaults(fn=cmd_edit)
+    p = sp.add_parser("archive-current", help="归档本箱「已经展示过但还没归档」的信到 done/（只处理 presented 集合，不扫 inbox）")
+    p.add_argument("--box", required=True, help="本会话自己的信箱")
+    p.add_argument("--keep", action="append", default=[], metavar="信件编号",
+                   help="这些还留在 inbox（也不从 presented 里删）；可重复")
+    p.set_defaults(fn=cmd_archive_current)
     p = sp.add_parser("alarm-set", help="给一个 OpenCode 会话设一次性闹钟（由插件工具调用；在内核锁内改记录）")
     p.add_argument("--box", required=True, help="该会话绑定的信箱")
     p.add_argument("--session", required=True, help="OpenCode 会话 ID")
