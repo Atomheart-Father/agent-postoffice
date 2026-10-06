@@ -305,7 +305,9 @@ await t('cancel 在信箱离线时只清自己的定时器，不碰 inbox', asyn
 })
 
 // ---------------------------------------------------------------- 跨进程互斥
-// 同一会话的记录会被两个 OpenCode 实例和邮递员同时改，所以每个会话一把 O_EXCL 锁。
+// 同一会话的记录会被两个 OpenCode 实例和邮递员同时改，所以每个会话一把锁。
+// 这把锁已经换成内核 flock，而且**只有 Python 侧拿**：记录由 `postoffice alarm-set` /
+// `alarm-cancel` 在锁内写，插件只负责解析出「这个会话属于哪个信箱」再调命令。
 await t('两实例并发 schedule：只有一个成功，另一个明确拒绝且不落盘', async () => {
   await cancel()
   const second = await PostofficePlugin({ client, directory: DIR_OK })

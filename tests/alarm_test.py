@@ -536,6 +536,120 @@ class AlarmScheduler(unittest.TestCase):
         self.assertIn('离线', r.stdout)
         self.assertIsNone(self.read_alarm())
 
+        # --- 真正的锁等待：命令必须是在排队期间路由才被改的 -----------------------
+    # 前两条负例只是「先改路由再跑命令」，锁外核验的旧实现同样会拒绝，所以它们证明不了
+    # 「核验搬进锁内」这件事。这里让子进程真握住同一把 <session>.json.lock，命令确实
+    # 排在 flock 上，等它进入等待之后才改路由，再放锁。
+    def hold_alarm_lock(self):
+        """Child that takes the same per-session flock and holds it until `stop` appears."""
+        holder = subprocess.Popen(
+            [sys.executable, '-c',
+             "import importlib.machinery, importlib.util, sys, os, time\n"
+             "loader=importlib.machinery.SourceFileLoader('po', sys.argv[1])\n"
+             "spec=importlib.util.spec_from_loader('po', loader)\n"
+             "m=importlib.util.module_from_spec(spec); loader.exec_module(m)\n"
+             "fd=m.take_alarm_lock(m.alarm_file(sys.argv[2]))\n"
+             "open(sys.argv[3], 'w').write('held')\n"
+             "while not os.path.exists(sys.argv[4]): time.sleep(0.02)",
+             str(PO), 'ses_live', str(self.home / 'holding'), str(self.home / 'stop')],
+            env=dict(os.environ, POSTOFFICE_HOME=str(self.home)))
+        self.addCleanup(holder.kill)
+        for _ in range(400):
+            if (self.home / 'holding').exists():
+                break
+            time.sleep(0.05)
+        else:
+            self.fail('持锁子进程没能在限定时间内拿到锁')
+        self.assertIsNone(take_lock(self.alarm_path()), '锁确实被那个子进程握着')
+        return holder
+
+    def release_alarm_lock(self, holder):
+        (self.home / 'stop').write_text('go')
+        holder.wait(20)
+        for _ in range(400):
+            fd = take_lock(self.alarm_path())
+            if fd is not None:
+                release_lock(fd)
+                return
+            time.sleep(0.05)
+        self.fail('放锁后仍拿不到锁')
+
+    def set_route(self, **changes):
+        p = self.home / 'routes.json'
+        r = json.loads(p.read_text())
+        r['lab'].update(changes)
+        p.write_text(json.dumps(r, ensure_ascii=False))
+
+    def test_alarm_set_refuses_when_the_route_is_rebound_while_it_waits(self):
+        holder = self.hold_alarm_lock()
+        cmd = subprocess.Popen([sys.executable, str(PO), 'alarm-set', '--box', 'lab',
+                                '--session', 'ses_live', '--delay', '10'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               env=self.env)
+        self.addCleanup(cmd.kill)
+        time.sleep(1.0)                      # 让它真的排在 flock 上
+        self.assertIsNone(cmd.poll(), '命令应当在等锁而不是已经退出')
+        self.set_route(session_id='ses_someone_else')      # 等锁期间改绑
+        self.release_alarm_lock(holder)
+        _, err = cmd.communicate(timeout=30)
+        self.assertNotEqual(cmd.returncode, 0)
+        self.assertIn('绑的是别的会话', err)
+        self.assertIsNone(self.read_alarm(), '拒绝时不得留下任何记录')
+
+    def test_alarm_set_still_works_when_the_route_is_unchanged_while_it_waits(self):
+        """对照组：锁被握着、但路由没变时，命令等到锁之后应当成功。"""
+        holder = self.hold_alarm_lock()
+        cmd = subprocess.Popen([sys.executable, str(PO), 'alarm-set', '--box', 'lab',
+                                '--session', 'ses_live', '--delay', '10'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               env=self.env)
+        self.addCleanup(cmd.kill)
+        time.sleep(1.0)
+        self.assertIsNone(cmd.poll(), '命令应当在等锁')
+        self.release_alarm_lock(holder)
+        out, err = cmd.communicate(timeout=30)
+        self.assertEqual(cmd.returncode, 0, err)
+        self.assertIn('已设闹钟', out)
+        self.assertIsNotNone(self.read_alarm(), '成功时必须落下记录')
+
+    def test_alarm_cancel_refuses_when_the_route_is_rebound_while_it_waits(self):
+        self.put_alarm()
+        holder = self.hold_alarm_lock()
+        cmd = subprocess.Popen([sys.executable, str(PO), 'alarm-cancel', '--box', 'lab',
+                                '--session', 'ses_live'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               env=self.env)
+        self.addCleanup(cmd.kill)
+        time.sleep(1.0)
+        self.assertIsNone(cmd.poll(), '命令应当在等锁')
+        self.set_route(session_id='ses_someone_else')      # 等锁期间改绑
+        self.release_alarm_lock(holder)
+        _, err = cmd.communicate(timeout=30)
+        self.assertNotEqual(cmd.returncode, 0)
+        self.assertIn('绑的是别的会话', err)
+        self.assertIsNotNone(self.read_alarm(), '拒绝时记录必须留着')
+        self.assertEqual(self.inbox(), [], '拒绝时不得动信箱里的任何文件')
+
+    def test_alarm_cancel_refuses_a_rebound_session_even_while_the_box_is_offline(self):
+        """离线不是身份豁免：信箱标着 offline，但 session 已改绑给别人时不得取消。"""
+        self.put_alarm()
+        self.set_route(status='offline', session_id='ses_someone_else')
+        r = self.alarm_cli('alarm-cancel', '--box', 'lab', '--session', 'ses_live')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('绑的是别的会话', r.stderr)
+        self.assertIsNotNone(self.read_alarm(), '记录必须留着')
+        self.assertEqual(self.inbox(), [], '不得动信箱里的任何文件')
+
+    def test_alarm_cancel_refuses_a_disabled_channel_even_while_the_box_is_offline(self):
+        """同上，但失效的是 methods：信箱不再走插件通道时也不许按旧归属取消。"""
+        self.put_alarm()
+        self.set_route(status='offline', methods=['notify'])
+        r = self.alarm_cli('alarm-cancel', '--box', 'lab', '--session', 'ses_live')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('不再由 OpenCode 插件投递', r.stderr)
+        self.assertIsNotNone(self.read_alarm())
+        self.assertEqual(self.inbox(), [])
+
     def test_undelivered_alarm_stays(self):
         self.put_alarm()
         self.run_postman()

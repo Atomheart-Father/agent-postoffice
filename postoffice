@@ -1572,12 +1572,17 @@ def cmd_alarm_cancel(a):
             sys.exit("另一个进程正在改这个会话的闹钟，这次没有改动")
         # 路由核验同样在锁内做：等锁期间信箱可能被下线、换通道或改绑给别人，
         # 锁外读到的那份 routes 不能当作依据。
+        #
+        # 身份核验无条件执行，**离线不构成豁免**：信箱离线只是「现在没人收」，而
+        # 「这个信箱是不是还归这个会话」是另一回事。旧实现在这里跳过整段核验，于是
+        # routes 标着 offline、但 methods 已被移除或 session_id 已改绑给别人时，
+        # CLI 仍会按调用方给的 box/session 去清记录、归档提醒——那正好是越权路径。
+        # offline 只影响下面「要不要动 inbox」这一步，不影响能不能操作这条记录。
         routes = load_routes()
         offline = bool(routes.get(box, {}).get("status") == "offline")
-        if not offline:
-            ok, why = verify_alarm_identity(routes, rec)
-            if not ok:
-                sys.exit(why)
+        ok, why = verify_alarm_identity(routes, rec)
+        if not ok:
+            sys.exit(why)
         cur = read_alarm(sid)
         if not isinstance(cur, dict) or not cur.get("id"):
             print("这个闹钟刚刚已经被取消。")
