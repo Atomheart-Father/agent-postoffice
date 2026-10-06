@@ -110,6 +110,17 @@ await mkdir(join(root, 'alarms'), { recursive: true })
 await saveRoutes()
 
 const plugin = await PostofficePlugin({ client, directory: DIR_OK })
+
+// 前置条件（不是用例）：本插件把闹钟工具的 args 交给 OpenCode 官方 tool.schema，也就是
+// @opencode-ai/plugin 自己依赖的那份 zod。仓库树里没有 node_modules，所以走的是这条接缝：
+//   POSTOFFICE_PLUGIN_MODULES=<含 zod 的 node_modules>，未设时依次找
+//   ~/.config/opencode/node_modules 与 ~/.opencode/node_modules（本机命中前者，zod 4.1.8）。
+// 找不到时插件不会注册那两个闹钟工具（投递通道照旧工作），所以这里先说清楚，别让人当成用例失败。
+if (!plugin?.tool) {
+  console.error(`FAIL - 找不到 zod，两个闹钟工具未注册（投递通道不受影响）。` +
+    `请设 POSTOFFICE_PLUGIN_MODULES 指向带 zod 的 node_modules 目录后重跑。`)
+  process.exit(1)
+}
 const first = plugin
 const ctx = (sessionID = LIVE) => ({
   sessionID, messageID: 'msg_1', agent: 'build', directory: DIR_OK,
