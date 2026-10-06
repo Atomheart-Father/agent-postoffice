@@ -836,29 +836,37 @@ class AlarmScheduler(unittest.TestCase):
                                  f'第 {i} 轮 cancel 赢时不得留下认领：{self.claims(box)}')
             self.assertIn('CLAIM', dout, '投递方子进程应当报告自己有没有抢到认领：' + dout)
 
-    # C-3 (6) 台账 fail closed：未知结果既不当送达、也不当未送达
+    # C-3 (6) 台账 fail closed：未知结果既不当送达、也不当未送达，而且整条拒绝
     def test_an_unknown_ledger_result_is_not_read_as_undelivered(self):
-        """result=FAILED_UNKNOWN 这类「既不算送达也不算未送达」的行，cancel 必须 fail closed。
+        """result=FAILED_UNKNOWN 必须整条拒绝：记录原地不动、信原地不动、非零退出。
 
-        旧实现只认 DELIVERED（送达）和 FAILED_FINAL（放弃），其它一律落到「还没送达」那支，
-        于是把这封信存档并说「不会再响」—— 那是把未知当成了未送达。
+        上一轮这里只把措辞改成「因此不能保证取消」，随后照样走 alarm_file(sid).unlink()
+        并返回 0 —— 那不是 fail closed：台账说结果未知时，唯一诚实的动作是什么都不做，
+        并且把「没有取消」「哪里都没改」说出来，让调用方（插件工具 → 模型）能转述。
         """
         self.put_alarm()
         self.run_postman()
+        before = self.read_alarm()
+        lid = before['letter']
         self.mark_delivered(result='FAILED_UNKNOWN')
         r = self.cancel_cli()
         said = r.stdout + r.stderr
-        self.assertNotIn('不会再响', said,
-                         '投递结果未知时不得声称不会再响：' + said)
-        self.assertNotIn('已经送达过了', said, '未知也不等于送达：' + said)
-        self.assertRegex(said, r'未知|不确定|无法确认|不能保证|无法保证',
-                         '未知结果必须如实说出来：' + said)
+        self.assertNotEqual(r.returncode, 0, '结果未知时必须非零退出：' + said)
+        self.assertNotIn('已取消闹钟', said, '不得以成功前缀开头：' + said)
+        self.assertRegex(said, r'未知|无法判定|没有取消',
+                         '必须明说结果未知、没有取消：' + said)
+        self.assertRegex(said, r'都没有改动|原样',
+                         '必须明说活动记录与那封信都没有改动：' + said)
+        self.assertEqual(self.read_alarm(), before, '活动记录必须原地保留、内容一个字节不变')
+        self.assertEqual(self.inbox(), [lid + '.md'], '那封提醒必须原地留在 inbox')
+        self.assertEqual(self.archived(), [], '不得归档、不得移走那封提醒')
+        self.assertEqual(self.claims(), [], '拒绝路径不得留下认领')
 
     def test_failed_retryable_still_counts_as_not_delivered(self):
         """对照组，必须保持不变：FAILED_RETRYABLE 是「已知没送到、还会重试」，所以收得走。
 
-        这条现在就是绿的，它的作用是把 fail closed 的边界钉住 —— 不能把「已知未送达」也一起
-        改成不敢收，否则用户永远撤不回一个还在重试队列里的提醒。
+        它和上面那条成对使用：fail closed 只针对**认不出来**的结果值。已知未送达不能一起改成
+        不敢收，否则用户永远撤不回一个还在重试队列里的提醒。
         """
         self.put_alarm()
         self.run_postman()

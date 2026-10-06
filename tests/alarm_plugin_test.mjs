@@ -759,14 +759,22 @@ await t('cancel 赢下认领之后：提醒真的出了队列，投递不得再�
   assert.deepEqual(await claims('lab7'), [], '也不得留下残留认领')
 })
 
-await t('台账里出现未知结果（FAILED_UNKNOWN）时不得当成「还没送达」', async () => {
+await t('台账里出现未知结果（FAILED_UNKNOWN）时整条拒绝：不动记录、不动信、如实说没取消', async () => {
+  // 模型这一侧看到的必须是「没取消」，不是一句换了措辞的成功：CLI 非零退出 → 工具返回
+  // 「没取消：…」，同时记录与那封信原地不动，用户可以核对之后再来一次。
   const { id } = await armLive('lab6', LIVE6, 30, true)
   await putLetter('lab6', `${id}.md`, alarmLetter(id))
+  const before = await readAlarm(LIVE6)
   await ledgerRow('lab6', `${id}.md`, 'FAILED_UNKNOWN')       // 既不算送达也不算未送达
   const text = await out(await cancel(ctx(LIVE6)))
-  assert.ok(!text.includes('不会再响'), '投递结果未知时不得声称不会再响：' + text)
-  assert.ok(!text.includes('已经送达过了'), '未知也不等于送达：' + text)
-  assert.ok(/未知|不确定|无法确认|不能保证|无法保证/.test(text), '未知结果必须如实说出来：' + text)
+  assert.ok(/没取消/.test(text), '非零退出时工具必须说「没取消」：' + text)
+  assert.ok(!text.includes('已取消本会话的活动闹钟'), '不得报告成功：' + text)
+  assert.ok(/未知|无法判定|没有取消/.test(text), '未知结果必须如实说出来：' + text)
+  assert.ok(/都没有改动|原样/.test(text), '必须明说活动记录与那封信都没有改动：' + text)
+  assert.deepEqual(await readAlarm(LIVE6), before, '活动记录必须原地保留、内容不变')
+  assert.ok((await inbox('lab6')).includes(`${id}.md`), '那封提醒必须原地留在 inbox')
+  assert.ok(!(await archived('lab6')).includes(`${id}.md`), '不得归档、不得移走那封提醒')
+  assert.deepEqual(await claims('lab6'), [], '拒绝路径不得留下认领')
   await rm(join(root, 'lab6', 'inbox', `${id}.md`), { force: true })
 })
 

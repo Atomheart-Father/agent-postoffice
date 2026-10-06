@@ -1611,10 +1611,16 @@ def cmd_alarm_cancel(a):
         elif cur.get("state") == "lettered" and cur.get("letter") == aid and alarm_delivered(box, aid):
             where = "已经送达过了"
         elif cur.get("state") == "lettered" and cur.get("letter") == aid and alarm_unknown(box, aid):
-            # fail closed：认不出来的台账结果既不是送达、也不是「还没送达」。这时唯一诚实的
-            # 说法是「不知道」，而把信移走等于替一个未知结果宣布「不会再响」。
-            where = ("投递结果无法判定（台账里这一条既不算送达也不算未送达），因此不能保证取消；"
-                     "只清掉运行态记录，那封信仍在信箱里")
+            # fail closed = 整条拒绝，不是换个措辞。台账里这一条既不是送达也不是未送达，于是
+            # 「这封提醒还值不值得从队列里收走」这个问题没有答案：收了可能把已经响过的
+            # 悄悄咽下去，不收则可能让一个用户以为已经不响的提醒继续排队。所以什么都不动，
+            # 非零退出，把「没有取消」和「哪里都没改」说出来 —— 记录留着，下次还能重来，
+            # 信留着，插件的投递路径也不受影响。
+            sys.exit(f"闹钟 {aid} 的投递结果无法判定、结果未知（台账里这一条既不算送达也不算未送达），"
+                     f"因此没有取消：fail closed，活动记录与那封信都没有改动 —— "
+                     f"记录仍在 {alarm_file(sid)}，提醒仍在 {HOME / box / 'inbox' / f'{aid}.md'}。"
+                     f"请人工核对这个提醒到底响没响过（台账 {HOME / 'opencode_delivered.jsonl'}、"
+                     f"认领 {claims_dir(box) / f'{aid}.md'}），确认之后再决定要不要重新设一个闹钟。")
         else:
             letter = HOME / box / "inbox" / f"{aid}.md"
             holding = letter if letter.exists() else None
