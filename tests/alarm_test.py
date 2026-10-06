@@ -877,6 +877,93 @@ class AlarmScheduler(unittest.TestCase):
         self.assertEqual(self.archived(), ['A20260101-000000_lab.md'])
         self.assertIsNone(self.read_alarm())
 
+    # --- precheck 与 claim 之间的窗口：台账变了也必须完整重判 --------------------
+    # cancel 先在锁内读一次台账（precheck），再去抢认领；这中间投递方可能刚好写完结局。
+    # 窗口用受控停靠造出来：子进程 import 单文件后把 claim_letter 包一层，先落下 `paused`
+    # 文件、等测试放行，再调用真正的 claim_letter。停在哪一步由测试决定、由文件交接驱动，
+    # 与调度/概率无关，重复多少次结果都一样。
+    def cancel_with_claim_paused(self, mutate):
+        paused, resume = self.home / 'paused', self.home / 'resume'
+        code = (
+            "import importlib.machinery, importlib.util, sys, os, time\n"
+            "loader=importlib.machinery.SourceFileLoader('po', sys.argv[1])\n"
+            "spec=importlib.util.spec_from_loader('po', loader)\n"
+            "mod=importlib.util.module_from_spec(spec); loader.exec_module(mod)\n"
+            "real=mod.claim_letter\n"
+            "def paused(box, path):\n"
+            "    open(os.environ['PO_PAUSED'], 'w').write('at-claim')\n"
+            "    while not os.path.exists(os.environ['PO_RESUME']): time.sleep(0.02)\n"
+            "    return real(box, path)\n"
+            "mod.claim_letter=paused\n"
+            "sys.argv=[sys.argv[0], 'alarm-cancel', '--box', 'lab', '--session', 'ses_live']\n"
+            "sys.exit(mod.main())\n")
+        cmd = subprocess.Popen(
+            [sys.executable, '-c', code, str(PO)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=dict(self.env, PO_PAUSED=str(paused), PO_RESUME=str(resume)))
+        self.addCleanup(cmd.kill)
+        for _ in range(600):
+            if paused.exists():
+                break
+            if cmd.poll() is not None:
+                out, err = cmd.communicate()
+                self.fail(f'取消进程没停在 claim 之前就退出了（rc={cmd.returncode}）：{out}{err}')
+            time.sleep(0.05)
+        else:
+            self.fail('取消进程没有停在 claim 之前（超时）')
+        mutate()                       # 就在这一刻改台账：precheck 已经读过，claim 还没发生
+        resume.write_text('go')
+        out, err = cmd.communicate(timeout=60)
+        return subprocess.CompletedProcess(cmd.args, cmd.returncode, out, err)
+
+    def test_delivered_written_between_precheck_and_claim_is_still_read_as_delivered(self):
+        """窗口里出现的 DELIVERED 必须认出来：不归档，只说已送达。"""
+        self.put_alarm()
+        self.run_postman()
+        lid = self.read_alarm()['letter']
+        r = self.cancel_with_claim_paused(lambda: self.mark_delivered(result='DELIVERED'))
+        said = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, said)
+        self.assertIn('已经送达过了', said, '抢到认领后复查到 DELIVERED 要如实说：' + said)
+        self.assertNotIn('不会再响', said, '已送达的提醒不能归档、也就不能说不会再响：' + said)
+        self.assertEqual(self.inbox(), [lid + '.md'], '已送达的提醒原地不动')
+        self.assertEqual(self.archived(), [], '不归档')
+        self.assertEqual(self.claims(), [], '认领要放回去')
+        self.assertIsNone(self.read_alarm(), '记录照旧清掉')
+
+    def test_unknown_written_between_precheck_and_claim_fails_closed(self):
+        """窗口里出现的未知结果必须 fail closed：不删记录、不动信、非零退出。"""
+        self.put_alarm()
+        self.run_postman()
+        before = self.read_alarm()
+        lid = before['letter']
+        r = self.cancel_with_claim_paused(lambda: self.mark_delivered(result='FAILED_UNKNOWN'))
+        said = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, '结果未知时必须非零退出：' + said)
+        self.assertNotIn('已取消闹钟', said, '不得以成功前缀开头：' + said)
+        self.assertRegex(said, r'未知|无法判定|没有取消', '必须明说结果未知、没有取消：' + said)
+        self.assertRegex(said, r'都没有改动|原样', '必须明说哪里都没动：' + said)
+        self.assertEqual(self.read_alarm(), before, '活动记录必须原地保留、内容不变')
+        self.assertEqual(self.inbox(), [lid + '.md'], '那封提醒必须原地留在 inbox')
+        self.assertEqual(self.archived(), [], '不得归档、不得移走那封提醒')
+        self.assertEqual(self.claims(), [], '拒绝路径也必须把刚抢到的认领放回去')
+
+    def test_failed_final_written_between_precheck_and_claim_keeps_the_letter(self):
+        """窗口里出现的 FAILED_FINAL 按既定语义处理：信留 inbox、如实说无法确认。"""
+        self.put_alarm()
+        self.run_postman()
+        lid = self.read_alarm()['letter']
+        r = self.cancel_with_claim_paused(lambda: self.mark_delivered(result='FAILED_FINAL'))
+        said = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, 'FAILED_FINAL 的既定语义是清记录、正常退出：' + said)
+        self.assertIn('无法确认收件方是否收到', said, '失败不等于送达，文案要诚实：' + said)
+        self.assertNotIn('已经送达过了', said, '失败不等于送达：' + said)
+        self.assertNotIn('不会再响', said, '没归档就不该说不会再响：' + said)
+        self.assertEqual(self.inbox(), [lid + '.md'], '既定语义：那封信仍在信箱里')
+        self.assertEqual(self.archived(), [], '不归档')
+        self.assertEqual(self.claims(), [], '认领要放回去')
+        self.assertIsNone(self.read_alarm(), '记录照旧清掉')
+
 
 if __name__ == '__main__':
     unittest.main()
