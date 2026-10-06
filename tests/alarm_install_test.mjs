@@ -23,9 +23,9 @@
 // @opencode-ai/plugin. Nothing outside the temp dirs is written.
 import assert from 'node:assert/strict'
 import {
-  mkdtemp, mkdir, writeFile, readFile, readdir, rm, cp, chmod, symlink, realpath, access,
+  mkdtemp, mkdir, writeFile, readFile, readdir, rm, cp, chmod, symlink, realpath, access, lstat,
 } from 'node:fs/promises'
-import { constants } from 'node:fs'
+import { existsSync, constants } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -106,7 +106,7 @@ const newSession = (name) => {
   dbRows.push(`insert into session values ('${id}','${name}','${DIRS[name]}',null,0);`)
   return id
 }
-for (const name of ['instA', 'instB', 'dev', 'nocli', 'nozod']) newSession(name)
+for (const name of ['instA', 'instB', 'dev', 'nocli', 'nozod', 'foreign']) newSession(name)
 await writeFile(DB, '')
 execFileSync('sqlite3', [DB, dbRows.join('')])
 
@@ -337,6 +337,84 @@ await t('⑦ 找不到 CLI 时返回可读的诊断，而不是抛异常，也�
   await mNoCli.plugin.event({ event: { type: 'session.idle' } })
   await mNoCli.settle(1)
   assert.equal(mNoCli.prompts.length, 1, 'CLI 缺席不该影响投信')
+})
+
+// =============================================================== ⑦ (negative) a foreign CLI
+// Same as ⑦, except something *is* sitting where a careless resolver would look: a `postoffice`
+// under the post office home. The post office home is per-operator state rather than a checkout, so
+// that file could be any checkout's, and using it is exactly the "plugin and CLI from different
+// checkouts" this must never do. The stub announces itself and leaves a marker, so "it was not
+// called" is an observation rather than an inference from the absence of a record.
+const homeForeign = await mkHome('foreign')
+const installedForeign = installedAt(homeForeign)
+await mkdir(dirname(installedForeign), { recursive: true })
+await cp(join(REPO, 'opencode/postoffice.ts'), installedForeign)
+const poHomeForeign = join(homeForeign, 'agent-postoffice')
+const boxForeign = await register('foreign', poHomeForeign)
+await mkdir(join(DIRS.foreign, '.opencode'), { recursive: true })
+const markerForeign = join(poHomeForeign, 'FOREIGN-CLI-WAS-CALLED')
+const stubForeign = join(poHomeForeign, 'postoffice')
+// exit 0 on purpose: were this stub called, the tool would report a *successful* alarm and leave no
+// error text at all, which is precisely the failure this negative case is about.
+await writeFile(stubForeign, `#!/bin/sh\ntouch "${markerForeign}"\necho "STUB-FOREIGN-CHECKOUT-CLI $*"\nexit 0\n`)
+await chmod(stubForeign, 0o755)
+const mForeign = await mount(installedForeign, { name: 'foreign', home: homeForeign, poHome: poHomeForeign })
+
+await t('⑦ 负例：邮局目录里那份外来 CLI 不会被调用，只得到可诊断的报错', async () => {
+  const text = mForeign.out(await mForeign.plugin.tool.postoffice_alarm_schedule.execute({ delay_minutes: 30 }, mForeign.ctx()))
+  assert.ok(!existsSync(markerForeign), '外来 checkout 的 CLI 绝不能被调用（桩一旦被跑就会留下这个文件）')
+  assert.doesNotMatch(text, /STUB-FOREIGN-CHECKOUT-CLI/, `不能出现外来 CLI 的自报身份：${text}`)
+  assert.match(text, /没设闹钟/, `应当是工具自己的话：${text}`)
+  assert.match(text, /可执行文件/, `要指出可执行文件找不到：${text}`)
+  assert.match(text, /只找过两条同源路径/, `要说清只找过哪两条：${text}`)
+  assert.match(text, /POSTOFFICE_CLI/, `要给出可操作的出路：${text}`)
+  assert.deepEqual(await mForeign.records(), [], '不该有任何记录')
+  // and the plugin is still alive: delivery works
+  const letter = '20260101-000003_foreign.md'
+  await writeFile(join(poHomeForeign, boxForeign, 'inbox', letter), '来源：boss\n事由：试投\n需要：仅告知\n\n正文\n')
+  await mForeign.plugin.event({ event: { type: 'session.idle' } })
+  await mForeign.settle(1)
+  assert.equal(mForeign.prompts.length, 1, '外来 CLI 没被调用也不该影响投信')
+})
+
+// =============================================================== ① (fail-closed) link failure
+// `postoffice install opencode` promises the plugin and the CLI come from the same checkout. When it
+// cannot keep that promise the command must fail: reporting success would leave a plugin wired to a
+// foreign CLI and nothing would ever notice. Reproducible injection: ~/.local/bin/postoffice is
+// occupied by a directory, so the link cannot be created (and does not depend on file permissions,
+// so it fails the same way for any user).
+const homeFail = await mkHome('fail')
+const failCheckout = join(T, 'fail', 'checkout')
+await mkdir(join(failCheckout, 'opencode'), { recursive: true })
+await cp(REAL_CLI, join(failCheckout, 'postoffice'))
+await chmod(join(failCheckout, 'postoffice'), 0o755)
+await cp(join(REPO, 'opencode/postoffice.ts'), join(failCheckout, 'opencode/postoffice.ts'))
+await mkdir(join(homeFail, '.local/bin/postoffice'), { recursive: true })   // squatting the link path
+
+let failRc = 0, failOut = ''
+try {
+  failOut = execFileSync(join(failCheckout, 'postoffice'), ['install', 'opencode'],
+    { env: { ...process.env, HOME: homeFail, XDG_CONFIG_HOME: join(homeFail, '.config') },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+} catch (e) {
+  failRc = e.status ?? -1
+  failOut = `${e.stdout ?? ''}${e.stderr ?? ''}`
+}
+
+await t('① 链接更新不了时 install opencode 非零退出，且不说“装好了”', async () => {
+  assert.notEqual(failRc, 0, `链接失败必须以非零退出，实际 rc=${failRc}，输出：${failOut}`)
+  assert.match(failOut, /CLI 链接没有更新成同源/, `诊断要说清链接没跟上：${failOut}`)
+  assert.match(failOut, /本次安装不算成功/, `诊断要明说这次不算成功：${failOut}`)
+  assert.match(failOut, /POSTOFFICE_CLI=/, `诊断要给出路：${failOut}`)
+  assert.doesNotMatch(failOut, /已装入/, `不许出现宣称安装成功的措辞：${failOut}`)
+  assert.doesNotMatch(failOut, /重启 OpenCode 生效/, `不许出现宣称安装成功的措辞：${failOut}`)
+  // state left behind: the plugin file did get copied, the link path is still the squatter. The
+  // operator has to be the one to resolve it, and the non-zero exit is what tells them.
+  assert.equal(await readFile(installedAt(homeFail), 'utf8'), await PLUGIN_TEXT(failCheckout),
+    '插件文件确实已复制')
+  const linkStat = await lstat(join(homeFail, '.local/bin/postoffice'))
+  assert.ok(linkStat.isDirectory(),
+    `链接路径仍应是那个占位目录，实际是 ${linkStat.isSymbolicLink() ? 'symlink' : '别的东西'}`)
 })
 
 await disposeAll()
