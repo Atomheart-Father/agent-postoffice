@@ -9,7 +9,7 @@
 //
 // Everything runs in a temp POSTOFFICE_HOME with a mocked OpenCode client.
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rename, rm, chmod, utimes } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rename, rm, chmod, utimes, appendFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,6 +23,9 @@ const LIVE = 'ses_live_alarm'
 const LIVE2 = 'ses_live_alarm_2'
 const LIVE3 = 'ses_live_alarm_3'
 const LIVE4 = 'ses_live_alarm_4'
+const LIVE5 = 'ses_live_alarm_5'
+const LIVE6 = 'ses_live_alarm_6'
+const LIVE7 = 'ses_live_alarm_7'
 const OTHER = 'ses_someone_else'
 const DIR_OK = join(root, 'proj')
 
@@ -38,7 +41,8 @@ const mkdb = async (sessions) => {
   execFileSync('sqlite3', [dbPath, sql.join('')])
 }
 await mkdb([[LIVE, 'live', DIR_OK], [LIVE2, 'live2', DIR_OK], [LIVE3, 'live3', DIR_OK],
-            [LIVE4, 'live4', DIR_OK], [OTHER, 'other', DIR_OK]])
+            [LIVE4, 'live4', DIR_OK], [LIVE5, 'live5', DIR_OK], [LIVE6, 'live6', DIR_OK],
+            [LIVE7, 'live7', DIR_OK], [OTHER, 'other', DIR_OK]])
 process.env.OPENCODE_DB = dbPath
 
 
@@ -56,6 +60,17 @@ const readAlarm = async (sid) => JSON.parse(await readFile(alarmFile(sid), 'utf8
 const alarmExists = (sid) => existsSync(alarmFile(sid))
 const alarmFiles = async () => (await readdir(join(root, 'alarms')).catch(() => [])).filter((f) => f.endsWith('.json')).sort()
 const inbox = async (box) => (await readdir(join(root, box, 'inbox')).catch(() => [])).sort()
+const claims = async (box) => (await readdir(join(root, box, '.claims')).catch(() => [])).sort()
+const ledgerRow = async (box, file, result) =>
+  appendFile(join(root, 'opencode_delivered.jsonl'),
+    JSON.stringify({ time: new Date().toISOString(), box, file, session: 'x', result }) + '\n')
+// 存档目录是按时间戳再分一层的，所以这里真的走一遍目录树
+const archived = async (box, dir = join(root, box, 'archived')) => {
+  const out = []
+  for (const e of await readdir(dir, { withFileTypes: true }).catch(() => []))
+    out.push(...(e.isDirectory() ? await archived(box, join(dir, e.name)) : [e.name]))
+  return out.filter((f) => f.endsWith('.md')).sort()
+}
 
 const putLetter = async (box, name, text) => {
   await mkdir(join(root, box, 'inbox'), { recursive: true })
@@ -76,11 +91,18 @@ const state = {
     lab3: { methods: ['opencode_plugin'], session_id: LIVE3, status: 'online' },
     // lettered 缺字段的用例专用：再一个独立信箱，避开前面的限流窗口
     lab4: { methods: ['opencode_plugin'], session_id: LIVE4, status: 'online' },
+    // 取消 vs 投递并发用例专用：每条用例一个独立信箱，各自一份限流窗口与 .claims
+    lab5: { methods: ['opencode_plugin'], session_id: LIVE5, status: 'online' },
+    lab6: { methods: ['opencode_plugin'], session_id: LIVE6, status: 'online' },
+    lab7: { methods: ['opencode_plugin'], session_id: LIVE7, status: 'online' },
   },
   busy: new Set(),
   prompts: [],
   failNext: false,
-  sessionDirs: { [LIVE]: DIR_OK, [LIVE2]: DIR_OK, [LIVE3]: DIR_OK, [LIVE4]: DIR_OK, [OTHER]: DIR_OK, ses_notify_only: DIR_OK },
+  sessionDirs: {
+    [LIVE]: DIR_OK, [LIVE2]: DIR_OK, [LIVE3]: DIR_OK, [LIVE4]: DIR_OK, [LIVE5]: DIR_OK,
+    [LIVE6]: DIR_OK, [LIVE7]: DIR_OK, [OTHER]: DIR_OK, ses_notify_only: DIR_OK,
+  },
   getFails: false,
 }
 const saveRoutes = async () => writeFile(join(root, 'routes.json'), JSON.stringify(state.routes))
@@ -105,6 +127,9 @@ const client = {
 }
 await mkdir(join(root, 'lab/inbox'), { recursive: true })
 await mkdir(join(root, 'lab2/inbox'), { recursive: true })
+await mkdir(join(root, 'lab5/inbox'), { recursive: true })
+await mkdir(join(root, 'lab6/inbox'), { recursive: true })
+await mkdir(join(root, 'lab7/inbox'), { recursive: true })
 await mkdir(join(root, 'other/inbox'), { recursive: true })
 await mkdir(join(root, 'alarms'), { recursive: true })
 await saveRoutes()
@@ -288,20 +313,25 @@ await t('cancel 复核归属：信箱已从通讯录删除时拒绝', async () =
   await cancel(ctx(LIVE2))
 })
 
-await t('cancel 在信箱离线时只清自己的定时器，不碰 inbox', async () => {
+await t('cancel 在信箱离线时仍然把那封没人收的提醒收走（只清定时器是不够的）', async () => {
+  // 这条原来断言的是「离线时不许动 inbox 文件」—— 那是 C-1 僵尸提醒的成因：记录被删掉，
+  // 提醒留在 inbox，收信方上线时它会按普通信再响一次，而且再没有任何人归档它。
+  // 现在离线只影响措辞，不影响要不要把那封信从投递队列里收走。
   await cancel()
   const { id } = await armLive('lab2', LIVE2)
   await putLetter('lab2', `${id}.md`, alarmLetter(id))
   state.routes.lab2.status = 'offline'
   await saveRoutes()
+  state.prompts.length = 0
   const text = await out(await cancel(ctx(LIVE2)))
   assert.ok(/已取消/.test(text), '身份唯一时离线也应允许取消自己的定时器：' + text)
   assert.ok(/离线/.test(text), '要说清信箱离线：' + text)
   assert.ok(!alarmExists(LIVE2), '定时器已清')
-  assert.equal((await inbox('lab2')).includes(`${id}.md`), true, '离线时不许动 inbox 文件')
+  assert.deepEqual(await inbox('lab2'), [], '离线时那封没人收的提醒也要被收走')
+  // lab2 的 archived/ 里还留着本节前面几条用例收走的信，所以只查这一封在不在
+  assert.ok((await archived('lab2')).includes(`${id}.md`), '提醒要存档而不是删掉')
   state.routes.lab2.status = 'online'
   await saveRoutes()
-  await rm(join(root, 'lab2', 'inbox', `${id}.md`))
 })
 
 // ---------------------------------------------------------------- 跨进程互斥
@@ -662,6 +692,90 @@ await t('记录已是 lettered 但缺少 letter 字段时不走短通道', async
   assert.equal(state.prompts.length, 1, '一封都该投')
   assert.ok(!state.prompts[0].body.parts[0].text.includes(FIXED), '缺 letter 字段就该按普通正式信渲染')
   await cancel()
+})
+
+// ---------------------------------------------------------------- 取消 vs 投递的并发语义
+// 到期写成信（state=lettered）之后，取消必须同时负责：把那封还没人收的提醒从投递队列里收走、
+// 清掉活动记录、并且如实说明到底能不能保证不再响。下面四条每条一个独立信箱（限流窗口独立）。
+await t('offline + lettered 取消：那封提醒被收走，重新上线后也不会再响', async () => {
+  const { id } = await armLive('lab5', LIVE5, 30, true)
+  await putLetter('lab5', `${id}.md`, alarmLetter(id))       // 邮递员已到期，提醒在 inbox
+  state.routes.lab5.status = 'offline'                       // 之后信箱才下线
+  await saveRoutes()
+  state.prompts.length = 0
+  const text = await out(await cancel(ctx(LIVE5)))
+  assert.ok(/已取消/.test(text), '身份唯一时离线也应允许取消自己的定时器：' + text)
+  assert.ok(!text.includes('没有待送达的提醒'),
+    'inbox 里明明有那封提醒，不得说「没有待送达的提醒」：' + text)
+  assert.deepEqual(await inbox('lab5'), [], '离线时那封没人收的提醒也必须被收走')
+  assert.deepEqual(await archived('lab5'), [`${id}.md`], '提醒要存档而不是删掉')
+  assert.ok(!alarmExists(LIVE5), '活动记录照旧清掉')
+  // 上线之后再扫一轮：那封提醒既不该以闹钟短通道响，也不该退化成普通信再响一次
+  state.routes.lab5.status = 'online'
+  await saveRoutes()
+  await plugin.event({ event: { type: 'session.idle' } })
+  await settle()
+  assert.equal(state.prompts.filter((p) => p.path.id === LIVE5).length, 0,
+    '取消过的提醒在重新上线后也不得再响一次')
+})
+
+await t('投递方已经拿着认领时取消：不得声称保证成功', async () => {
+  const { id } = await armLive('lab6', LIVE6, 30, true)
+  await putLetter('lab6', `${id}.md`, alarmLetter(id))
+  // 投递插件抢到认领之后、promptAsync 之前的样子
+  await mkdir(join(root, 'lab6', '.claims'), { recursive: true })
+  await writeFile(join(root, 'lab6', '.claims', `${id}.md`), '4242\n')
+  state.prompts.length = 0
+  const text = await out(await cancel(ctx(LIVE6)))
+  assert.ok(/无法保证|不能保证|已进入投递|投递进行中|没取消/.test(text),
+    '认领已被投递方抢到时必须明说无法保证取消：' + text)
+  assert.ok(!text.includes('不会再响'),
+    '提醒已经在投递流程里时不得声称「不会再响」：' + text)
+  await plugin.event({ event: { type: 'session.idle' } })
+  await settle()
+  assert.equal(state.prompts.filter((p) => p.path.id === LIVE6).length, 0,
+    '这一轮投递已经被 cancel 挡掉，不该再唤醒')
+  await rm(join(root, 'lab6', '.claims', `${id}.md`), { force: true })
+  await rm(join(root, 'lab6', 'inbox', `${id}.md`), { force: true })
+})
+
+await t('cancel 赢下认领之后：提醒真的出了队列，投递不得再唤醒、也不得留认领', async () => {
+  // 「投递方拿着删除前那份路径来认领」这半个窗口插件侧造不出来（它每轮都重新列 inbox），
+  // 所以那半个窗口在 tests/alarm_test.py 里用同一个 claim_letter 原语直接测。
+  // 这里测的是端到端那一半：cancel 成功之后提醒确实不在队列里了，一轮 idle 扫描不该唤醒
+  // 任何人，而且 cancel 自己抢的认领必须放回去 —— 否则这把认领会把以后的投递全挡住。
+  const { id } = await armLive('lab7', LIVE7, 30, true)
+  const stale = join(root, 'lab7', 'inbox', `${id}.md`)      // 投递方先列出了待投清单
+  await putLetter('lab7', `${id}.md`, alarmLetter(id))
+  assert.ok(existsSync(stale))
+  state.prompts.length = 0
+  const text = await out(await cancel(ctx(LIVE7)))
+  assert.ok(/不会再响/.test(text), 'cancel 成功时该说不会再响：' + text)
+  assert.deepEqual(await claims('lab7'), [], 'cancel 不得把自己的认领留在信箱里')
+  await plugin.event({ event: { type: 'session.idle' } })
+  await settle()
+  assert.equal(state.prompts.filter((p) => p.path.id === LIVE7).length, 0,
+    'cancel 赢之后不得再响')
+  assert.deepEqual(await claims('lab7'), [], '也不得留下残留认领')
+})
+
+await t('台账里出现未知结果（FAILED_UNKNOWN）时整条拒绝：不动记录、不动信、如实说没取消', async () => {
+  // 模型这一侧看到的必须是「没取消」，不是一句换了措辞的成功：CLI 非零退出 → 工具返回
+  // 「没取消：…」，同时记录与那封信原地不动，用户可以核对之后再来一次。
+  const { id } = await armLive('lab6', LIVE6, 30, true)
+  await putLetter('lab6', `${id}.md`, alarmLetter(id))
+  const before = await readAlarm(LIVE6)
+  await ledgerRow('lab6', `${id}.md`, 'FAILED_UNKNOWN')       // 既不算送达也不算未送达
+  const text = await out(await cancel(ctx(LIVE6)))
+  assert.ok(/没取消/.test(text), '非零退出时工具必须说「没取消」：' + text)
+  assert.ok(!text.includes('已取消本会话的活动闹钟'), '不得报告成功：' + text)
+  assert.ok(/未知|无法判定|没有取消/.test(text), '未知结果必须如实说出来：' + text)
+  assert.ok(/都没有改动|原样/.test(text), '必须明说活动记录与那封信都没有改动：' + text)
+  assert.deepEqual(await readAlarm(LIVE6), before, '活动记录必须原地保留、内容不变')
+  assert.ok((await inbox('lab6')).includes(`${id}.md`), '那封提醒必须原地留在 inbox')
+  assert.ok(!(await archived('lab6')).includes(`${id}.md`), '不得归档、不得移走那封提醒')
+  assert.deepEqual(await claims('lab6'), [], '拒绝路径不得留下认领')
+  await rm(join(root, 'lab6', 'inbox', `${id}.md`), { force: true })
 })
 
 await plugin.dispose()
