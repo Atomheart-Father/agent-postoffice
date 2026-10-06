@@ -9,15 +9,50 @@
 //
 // Everything runs in a temp POSTOFFICE_HOME with a mocked OpenCode client.
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rename, rm, chmod, utimes, appendFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rename, rm, chmod, utimes, appendFile, cp, symlink, access } from 'node:fs/promises'
+import { existsSync, constants } from 'node:fs'
+import { tmpdir, homedir } from 'node:os'
+import { join, dirname, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
+const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const root = await mkdtemp(join(tmpdir(), 'postoffice-alarm-plugin-'))
 process.env.POSTOFFICE_HOME = root
 process.env.POSTOFFICE_NO_NOTIFY = '1'
-const { PostofficePlugin } = await import('../opencode/postoffice.ts')
+
+// The plugin declares its alarm-tool args with the official `@opencode-ai/plugin` tool.schema, and
+// Node resolves that specifier from the plugin file's own directory. This repo tree has no
+// node_modules above it, so the plugin is staged into a checkout-shaped copy under this suite's own
+// temp dir — the CLI one level up (so `../postoffice` still finds it, unchanged) and one OpenCode
+// dependency tree above that. PRECONDITION: $OPENCODE_NODE_MODULES, else ~/.config/opencode/
+// node_modules, else ~/.opencode/node_modules; exits with what it tried if none has zod +
+// @opencode-ai/plugin. Nothing outside the temp dir is written.
+const nmCandidates = [
+  process.env.OPENCODE_NODE_MODULES,
+  join(homedir(), '.config/opencode/node_modules'),
+  join(homedir(), '.opencode/node_modules'),
+].filter(Boolean)
+let OPENCODE_NM = null
+for (const c of nmCandidates) {
+  try {
+    await access(join(c, 'zod/package.json'), constants.R_OK)
+    await access(join(c, '@opencode-ai/plugin/package.json'), constants.R_OK)
+    OPENCODE_NM = c
+    break
+  } catch {}
+}
+if (!OPENCODE_NM) {
+  console.error(`FAIL - 找不到带 zod 与 @opencode-ai/plugin 的 node_modules，试过：\n  ${nmCandidates.join('\n  ')}\n` +
+                `  用 OPENCODE_NODE_MODULES=<path> 指定。`)
+  process.exit(1)
+}
+const staged = join(root, 'checkout')
+await mkdir(join(staged, 'opencode'), { recursive: true })
+await cp(join(REPO, 'opencode/postoffice.ts'), join(staged, 'opencode/postoffice.ts'))
+await cp(join(REPO, 'postoffice'), join(staged, 'postoffice'))
+await chmod(join(staged, 'postoffice'), 0o755)
+await symlink(OPENCODE_NM, join(staged, 'node_modules'))
+const { PostofficePlugin } = await import(pathToFileURL(join(staged, 'opencode/postoffice.ts')).href)
 const FIXED = '你设的闹钟到了，请检查刚才安排的任务。'
 const LIVE = 'ses_live_alarm'
 const LIVE2 = 'ses_live_alarm_2'
@@ -135,6 +170,15 @@ await mkdir(join(root, 'alarms'), { recursive: true })
 await saveRoutes()
 
 const plugin = await PostofficePlugin({ client, directory: DIR_OK })
+
+// 前置条件（不是用例）：闹钟工具的 args 用官方 tool.schema 声明，所以插件必须从一棵有
+// @opencode-ai/plugin 的依赖树上方加载 —— 上面的 staged 布局就是为这件事准备的。拿不到时插件
+// 不注册这两个工具（投递通道照旧），所以这里先说清楚，别让人当成用例失败。
+if (!plugin?.tool) {
+  console.error(`FAIL - 闹钟工具未注册：这个加载位置解析不到 @opencode-ai/plugin。` +
+    `请用 OPENCODE_NODE_MODULES 指向一棵带 zod 与 @opencode-ai/plugin 的 node_modules 后重跑。`)
+  process.exit(1)
+}
 const first = plugin
 const ctx = (sessionID = LIVE) => ({
   sessionID, messageID: 'msg_1', agent: 'build', directory: DIR_OK,
