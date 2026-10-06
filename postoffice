@@ -100,17 +100,33 @@ def claims_dir(name):
 def claim_letter(name, path):
     """Mark a letter as claimed for delivery, in the same directory and by the same rule the OpenCode
     plugin already uses. Every delivery entry takes one before it commits to waking somebody, so
-    `postoffice retract` can refuse a letter that is on its way out. False when somebody holds it."""
+    `postoffice retract` can refuse a letter that is on its way out. False when somebody holds it.
+
+    Taking the claim is not enough: the caller usually got here from a directory listing taken
+    earlier, and a retraction may have archived the letter in between. Without the re-check below
+    the delivery side would happily put a claim on a letter that no longer exists and then wake
+    somebody about it -- "retraction reported success, delivery accepted it afterwards". So after
+    winning the claim we confirm the letter is still in inbox/, and if it is not we drop the claim
+    we just made and report failure.
+    """
     d = claims_dir(name)
     d.mkdir(parents=True, exist_ok=True)
+    claim = d / path.name
     try:
-        fd = os.open(str(d / path.name), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        fd = os.open(str(claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         return False
     try:
         os.write(fd, f"{os.getpid()}\n".encode())
     finally:
         os.close(fd)
+    if not path.exists():
+        # retracted between the listing and now: undo our own claim rather than leave a stale one
+        try:
+            claim.unlink()
+        except OSError:
+            pass
+        return False
     return True
 
 
@@ -2442,6 +2458,29 @@ def cmd_uninstall_postman(_a):
     print("邮递员自启已移除")
 
 
+def network_home_note():
+    """A plain-language note when the post office sits on a network filesystem, else "".
+
+    Only speaks up when it can actually name a network mount: on a local path it says nothing,
+    so this never cries wolf about a perfectly good local home. flock is what the alarm lock is
+    built on, and its semantics over NFS/SMB are not dependable.
+    """
+    try:
+        out = subprocess.run(["mount"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    home = str(HOME.resolve() if HOME.exists() else HOME)
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] not in ("nfs", "smbfs", "afpfs", "webdav", "cifs"):
+            continue
+        point = parts[2]
+        if home == point or home.startswith(point.rstrip("/") + "/"):
+            return (f"邮局在网络文件系统上（{point}，{parts[0]}）：闹钟锁用的 flock 在这里不可靠，"
+                    f"这只影响会话自设闹钟的并发安全，不影响收发信。")
+    return ""
+
+
 def cmd_doctor(_a):
     ok = True
 
@@ -2450,6 +2489,8 @@ def cmd_doctor(_a):
         ok = ok and good
         print(("✅ " if good else "❌ ") + text)
 
+    note = network_home_note()
+    print(("⚠️  " + note) if note else f"✅ 邮局在本地文件系统上（{HOME}）：闹钟锁用的 flock 可靠")
     say(ROUTES.exists(), f"邮局目录 {HOME}")
     s = Path.home() / ".claude" / "settings.json"
     hooked = False

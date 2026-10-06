@@ -93,6 +93,25 @@ class Retract(unittest.TestCase):
         r[box].update(extra)
         p.write_text(json.dumps(r, ensure_ascii=False))
 
+    def route_set_claude(self, home, box, title):
+        p = home / "routes.json"
+        r = json.loads(p.read_text())
+        r[box]["claude_title"] = title
+        p.write_text(json.dumps(r, ensure_ascii=False))
+
+    def claim_stale_path(self, box, path):
+        """Ask the real claim primitive for a letter that has already been archived."""
+        code = ("import importlib.machinery, importlib.util, sys\n"
+                "loader=importlib.machinery.SourceFileLoader('po', sys.argv[1])\n"
+                "spec=importlib.util.spec_from_loader('po', loader)\n"
+                "m=importlib.util.module_from_spec(spec); loader.exec_module(m)\n"
+                "print('CLAIM', m.claim_letter(sys.argv[2], __import__('pathlib').Path(sys.argv[3])))")
+        r = subprocess.run([sys.executable, "-c", code, str(PO), box, str(path)],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, POSTOFFICE_HOME=str(self.home)))
+        self.assertIn("CLAIM False", r.stdout, f"认领已归档的信必须失败：{r.stdout}{r.stderr}")
+        return r
+
     def fake_codex(self):
         """假 codex CLI：把被调用的次数写进 capture 文件（投递到底有没有发生）。"""
         cap = self.home / "codex.calls"
@@ -391,8 +410,44 @@ class Retract(unittest.TestCase):
         claims = self.home / "worker" / ".claims"
         self.assertFalse(claims.exists() and (claims / f"{lid}.md").exists(),
                         "失败路径也必须放掉认领")
-        # 放掉之后投递方就能正常拿到它（真跑一次钩子验证）
-        self.assertEqual(hook(self.home, self.title_transcript("抽样的标题")) if False else 2, 2)
+        # 放掉之后投递方就能正常拿到它：真跑一次钩子，它应该被叫醒（rc=2）
+        self.set_methods("worker", "claude_hook")
+        self.route_set_claude(self.home, "worker", "worker 的标题")
+        rc = hook(self.home, self.title_transcript("worker 的标题"))
+        self.assertEqual(rc, 2, "认领还回去之后这封信必须还能被正常投递")
+
+    def test_a_pending_scan_cannot_claim_after_a_retraction(self):
+        """投递方先列出待投 → 撤回方归档并放掉认领 → 投递方再拿那个旧路径来认领。
+
+        这是评审指出的 stale-scan 竞态：认领必须自己确认信还在 inbox/，否则「撤回报成功、
+        投递之后仍被叫醒」就会发生。这里钩子与邮递员各来一次，都不许唤醒、都不许留认领。
+        """
+        for method in ("claude_hook", "codex_queue"):
+            with self.subTest(method=method):
+                self.setUp()
+                self.set_methods("worker", method,
+                                 **({"codex_cli": str(self.fake_codex()), "thread_id": "th-y"}
+                                    if method == "codex_queue" else {}))
+                self.route_set_claude(self.home, "worker", "worker 的标题")
+                lid = self.send("worker")
+                inbox_path = self.home / "worker" / "inbox" / f"{lid}.md"   # 先列出待投
+                self.assertTrue(inbox_path.exists())
+                self.assertEqual(run_po("retract", "boss", "worker", lid, home=self.home).returncode, 0)
+                self.assertFalse(inbox_path.exists(), "撤回后原信应已归档")
+                self.claim_stale_path("worker", inbox_path)                   # 投递方拿着旧路径来认领
+                self.assertFalse((self.home / "worker" / ".claims" / f"{lid}.md").exists(),
+                                 "认领到已归档的信时必须放掉自己刚建的认领")
+                if method == "claude_hook":
+                    hook(self.home, self.title_transcript("worker 的标题"))
+                else:
+                    postman(self.home)
+                seen = self.home / "worker" / ".seen"
+                self.assertFalse(seen.exists() and lid in seen.read_text(), "不得写 .seen")
+                wf = self.home / ".woken.json"
+                self.assertFalse(wf.exists() and lid in wf.read_text(), "不得进投递台账")
+                self.assertFalse((self.home / "worker" / ".claims" / f"{lid}.md").exists(),
+                                 "不得留下残留认领")
+                self.assertEqual(self.captured(), [], "不得真的调用投递通道")
 
     def test_retract_and_delivery_never_both_win(self):
         """两边真的同时起跑：不强制先后，只断言那条不变量。
