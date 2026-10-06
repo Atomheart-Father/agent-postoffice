@@ -138,25 +138,28 @@ class HookRateClaim(unittest.TestCase):
         p = self.start_hook(**extra)
         return self.wait_hook(p, self.hooks[-1][1], wait=wait)
 
-    def park_on_rate_decision(self, spent=6):
+    def park_on_rate_decision(self, records=6):
         """把钩子真进程停在「已经列出待投、还没决定要不要唤醒」的那个点上。
 
         `.wake_times` 换成 FIFO：`rate_ok()` 里的 `f.read_text()` 会一直等写端，于是钩子
         停在 postoffice:2177，既没抢认领也没写 `.seen` —— 正是「投递方手里已经有一份待投
-        清单」的状态。撤回方此时跑完整流程（真进程、真抢认领、真归档），之后我们再把 6 条
-        限流记录喂进去，钩子就带着「撤回已经完成」的现场去做唤醒决策。
+        清单」的状态。`records=6` 是「限流已经用满」那一组用例的夹具；`records=0` 则一个
+        限流记录都不预填，`feed_rate(fifo, 0)` 之后 `rate_ok()` 放行，用来单独验认领仲裁。
 
         用例全程额外持有 FIFO 的读端，所以喂数据不必等钩子来读，钩子之后的 `rate_mark()`
-        打开 FIFO 追加也不会卡住 —— 今天这个缺陷会一路顺畅地走到 `return 2`。
+        打开 FIFO 追加也不会卡住。
         """
         fifo = self.home / BOX / ".wake_times"
-        self.spend_wakes(spent)
+        if records:
+            self.spend_wakes(records)
         parked = fifo.with_suffix(".fifo")
         os.mkfifo(parked)
-        fifo.unlink()
+        if fifo.exists():
+            fifo.unlink()
         parked.rename(fifo)
         keeper = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)   # 读者常驻：喂数据不必等它读
         self.addCleanup(os.close, keeper)
+        self.park_keeper, self.park_fifo = keeper, fifo
         p = self.start_hook()
         deadline = time.time() + 10
         while time.time() < deadline and not (self.home / BOX / ".watch_alive").exists():
@@ -170,13 +173,158 @@ class HookRateClaim(unittest.TestCase):
         """把限流记录喂进 FIFO，让钩子从 rate_ok 里醒过来继续做唤醒决策。
 
         写完必须关掉写端：read_text() 读到 EOF 才返回，光喂不关，钩子会一直等在限流判断里。
+        `spent=0` 表示喂一份空记录：钩子读到 EOF、记录为空，`rate_ok()` 放行。
         """
         now = time.time()
         fd = os.open(str(fifo), os.O_WRONLY)
         try:
-            os.write(fd, "".join(f"{now - i}\n" for i in range(spent)).encode())
+            if spent:
+                os.write(fd, "".join(f"{now - i}\n" for i in range(spent)).encode())
         finally:
             os.close(fd)
+
+    def unpark_rate_file(self):
+        """把夹具用的 `.wake_times` FIFO 换回普通文件，内容就是钩子真的写进去的限流记录。
+
+        FIFO 只是停靠用的机关：留着它的话，之后任何一次读它都会等一个永远不来的写端。
+        常驻的读者 fd 让这里能把钩子写进管道的内容原样取出来，不会丢也不会编。
+        """
+        data = b""
+        while True:
+            chunk = os.read(self.park_keeper, 65536)
+            if not chunk:
+                break
+            data += chunk
+        real = self.park_fifo.with_suffix(".real")
+        real.write_bytes(data)
+        os.replace(real, self.park_fifo)
+        return data
+
+    def retract(self, lid):
+        """跑真正的 `postoffice retract` CLI（不用任何包装），交回 (退出码, stderr)。"""
+        env = env_for(self.home)
+        p = subprocess.Popen([sys.executable, PO, "retract", "boss", BOX, lid],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                             text=True, env=env)
+        err = p.communicate(timeout=90)[1]
+        return p.returncode, err
+
+    # -- 认领仲裁（限流放行，不靠限流挡人）----------------------------------
+    def test_a_live_race_lets_only_one_side_win_the_claim(self):
+        """限流放行时，钩子与撤回真进程同时抢同一封信的认领：只能有一个赢家。
+
+        这里一个限流记录都不预填（`.wake_times` 压根不存在），所以钩子一定会走到
+        `claim_letter`：两边在同一个 O_EXCL 认领文件上真实竞争。两种起跑顺序交替，避免
+        固定的先后偏差；每轮 inbox 里只有这一封信，所以「钩子 rc=2」与「这封信被交付」
+        是同一件事，不存在用别的信把赢家说过去的可能。逐轮断言互斥并留下各自的证据。
+        """
+        self.assertFalse((self.home / BOX / ".wake_times").exists(), "前置：一个限流记录都不许预填")
+        wins = {"retract": 0, "hook": 0}
+        for i in range(16):
+            self.assertEqual(len(list((self.home / BOX / "inbox").glob("*.md"))), 0,
+                             f"第 {i} 轮开始前 inbox 必须是空的：上一轮的信已由会话收走")
+            lid = self.send(subject=f"竞态信{i}")
+            self.assertEqual(len(list((self.home / BOX / "inbox").glob("*.md"))), 1, "本轮 inbox 只应有这一封信")
+            cmd_hook = [sys.executable, PO, "hook"]
+            cmd_retract = [sys.executable, PO, "retract", "boss", BOX, lid]
+            if i % 2 == 0:
+                h = self.start_hook()
+                r = subprocess.Popen(cmd_retract, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.PIPE, text=True, env=env_for(self.home))
+                rerr = r.communicate(timeout=90)[1]
+                rrc = r.returncode
+            else:
+                r = subprocess.Popen(cmd_retract, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.PIPE, text=True, env=env_for(self.home))
+                h = self.start_hook()
+                rerr = r.communicate(timeout=90)[1]
+                rrc = r.returncode
+            hrc, herr = self.wait_hook(h, self.hooks[-1][1], wait=6)
+            path = str(self.letter(lid))
+            retract_ok = rrc == 0
+            delivered = path in herr or path in self.seen()      # 这封信真的到了会话手里
+            self.assertFalse(retract_ok and (hrc == 2 or delivered),
+                             f"第 {i} 轮两边都赢了：撤回 rc={rrc}（{rerr.strip()[:120]}），"
+                             f"钩子 rc={hrc}，交付={delivered}")
+            if retract_ok:                                    # 撤回赢：认领归它，信进归档
+                wins["retract"] += 1
+                self.assertNotEqual(hrc, 2, f"第 {i} 轮撤回赢了，钩子不得唤醒")
+                self.assertFalse(delivered, f"第 {i} 轮撤回来了，就不许再交付给会话")
+                self.assertFalse(self.letter(lid).exists(), f"第 {i} 轮撤回来了，原信应已离开发件箱")
+                self.assertEqual(len(list((self.home / BOX / "archived").rglob(f"{lid}.md"))), 1,
+                                 f"第 {i} 轮撤回来了，归档里必须有它")
+                self.assertNotIn(f"{lid}.md", self.claims(), f"第 {i} 轮撤回放掉了自己的认领")
+                self.assertNotIn(path, self.seen(), f"第 {i} 轮撤回来了，不许写 .seen")
+            else:                                             # 钩子赢：认领归它，撤回必须被拒
+                wins["hook"] += 1
+                self.assertEqual(hrc, 2, f"第 {i} 轮撤回没赢，钩子就必须已经唤醒：{rerr.strip()[:120]}")
+                self.assertTrue(delivered, f"第 {i} 轮钩子赢了，这封信必须真的进了唤醒负载")
+                self.assertIn("无法撤回", rerr, f"第 {i} 轮钩子已经唤醒，撤回必须被明确拒绝")
+                self.assertTrue(self.letter(lid).exists(), f"第 {i} 轮信必须仍在 inbox/")
+                self.assertIn(path, self.seen(), f"第 {i} 轮唤醒过就必须写 .seen")
+                self.assertIn(f"{lid}.md", self.claims(), f"第 {i} 轮认领必须在钩子名下")
+            leftover = self.letter(lid)
+            if leftover.exists():                 # 会话把被唤醒的那封收进 done/，下一轮从干净 inbox 起跑
+                os.replace(leftover, self.home / BOX / "done" / leftover.name)
+        self.assertGreater(wins["retract"], 0, "撤回一次都没赢过：竞态没真的跑起来")
+        # 限流从头到尾放行的证据：每一次真唤醒恰好记一次限流，没有任何一轮是被限流挡下的
+        self.assertEqual(len(self.wake_times()), wins["hook"],
+                         "限流计数必须恰好等于真唤醒次数 —— 说明限流没有挡过任何一轮")
+
+    def test_the_retraction_winning_the_claim_means_no_wake(self):
+        """限流放行：撤回抢到认领 → 钩子随后抢不到认领 → 不唤醒、不写 .seen、不留认领。"""
+        lid = self.send()
+        p, fifo = self.park_on_rate_decision(records=0)       # 一个限流记录都不预填
+        rrc, rerr = self.retract(lid)                          # 撤回在钩子排队等认领的时候赢
+        self.assertEqual(rrc, 0, rerr)
+        self.feed_rate(fifo, 0)                                # 放行：rate_ok() 读到空记录 → True
+        hrc, herr = self.wait_hook(p, self.hooks[-1][1], wait=10)
+        self.assertNotEqual(hrc, 2, "认领被撤回拿走了，钩子不得唤醒")
+        self.assertNotIn(str(self.letter(lid)), herr, "撤回来了就不许出现在唤醒负载里")
+        self.assertNotIn(str(self.letter(lid)), self.seen(), "撤回来了就不许写 .seen")
+        self.assertNotIn(f"{lid}.md", self.claims(), "撤回放掉了认领，钩子不该再留一个")
+        self.assertEqual(len(list((self.home / BOX / "archived").rglob(f"{lid}.md"))), 1, "原信应已归档")
+        self.unpark_rate_file()      # FIFO 只是停靠机关，换回普通文件才能读
+        self.assertEqual(self.wake_times(), [], "没唤醒就不该记限流（也说明限流确实放行了）")
+
+    def test_the_hook_winning_the_claim_refuses_the_retraction(self):
+        """限流放行：钩子抢到认领、唤醒还没落地 → 此刻真撤回必须被拒（投递进行中）。
+
+        停靠点选在「认领已拿到、正在渲染唤醒负载」：认领是对整份待投清单做的（postoffice:2180），
+        所以 inbox 里多一封名字排在最前的 FIFO 信就能把钩子卡在 reminder() 里，让「认领在钩子
+        名下但还没唤醒」这个瞬间可以被观测，也可以往里插一个真的撤回进程。
+        """
+        lid = self.send()
+        self.assertFalse((self.home / BOX / ".wake_times").exists(), "前置：一个限流记录都不许预填")
+        park = self.home / BOX / "inbox" / "0000-park.md"
+        os.mkfifo(park)
+        self.addCleanup(park.unlink, True)
+        reader = os.open(str(park), os.O_RDONLY | os.O_NONBLOCK)     # 读者常驻，钩子的 open 不会失败
+        writer = os.open(str(park), os.O_WRONLY)                    # 写端先占住，等下关掉它放行
+        self.addCleanup(reader and os.close, reader)
+        h = self.start_hook()
+        claim = self.home / BOX / ".claims" / f"{lid}.md"
+        deadline = time.time() + 15
+        while time.time() < deadline and not claim.exists():
+            self.assertIsNone(h.poll(), "钩子不该在下台之前就退出")
+            time.sleep(0.02)
+        self.assertTrue(claim.exists(), "钩子没有拿到认领，夹具没搭起来")
+        rrc, rerr = self.retract(lid)                               # 认领在钩子名下时插入真撤回
+        self.assertNotEqual(rrc, 0, "钩子已经拿到认领，撤回必须被拒")
+        self.assertIn("投递进行中", rerr)
+        self.assertTrue(self.letter(lid).exists(), "被拒之后原信必须留在 inbox/")
+        self.assertNotIn(str(self.letter(lid)), self.seen(), "唤醒还没落地，.seen 不该有它")
+        # 放行钩子的渲染：把 FIFO 换成真信（后续按路径重读时就不再是 FIFO），再关掉写端给 EOF
+        real = self.home / BOX / "inbox" / "0000-park.real.md"
+        real.write_text(f"收件人：{BOX}\n发件人：boss\n事由：夹具信\n需要：仅告知\n")
+        os.replace(real, park)
+        os.close(writer)
+        hrc, herr = self.wait_hook(h, self.hooks[-1][1], wait=15)
+        self.assertEqual(hrc, 2, f"限流放行时钩子应当照常唤醒，实际退出码 {hrc}")
+        # 夹具那封 FIFO 信也是真的被投递了，所以唤醒负载里有两封；但认领必须两封都在钩子名下
+        self.assertIn(str(self.letter(lid)), self.seen(), "唤醒落地才写 .seen")
+        self.assertEqual(sorted(self.claims()), sorted([f"{lid}.md", park.name]),
+                         "认领必须留在钩子名下")
 
     # -- 1) 第 7 次唤醒必须被挡住 -----------------------------------------
     def test_the_seventh_wake_is_blocked(self):
