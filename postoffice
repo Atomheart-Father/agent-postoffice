@@ -2413,39 +2413,63 @@ def opencode_config_dir():
     return Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "opencode"
 
 
+def cli_link_path():
+    return Path.home() / ".local" / "bin" / "postoffice"
+
+
 def link_postoffice_cli():
-    """把 ~/.local/bin/postoffice 指回“执行本安装的那份 checkout”，成功与否如实返回。
+    """把 ~/.local/bin/postoffice 换成指向“执行本安装的那份 checkout”，成功与否如实返回。
 
     装好的插件不在 checkout 里，它在 $XDG_CONFIG_HOME/opencode/plugins/ 下，只能通过这个 symlink
     找到写闹钟记录的那个 CLI —— CLI 本身单文件 Python 留在 checkout 里。所以谁装了这个插件，谁的
-    CLI 就必须是它，否则插件版本与 CLI 版本会各走各的（改了插件却用着别的 checkout 的 CLI）。
-    在 A checkout 里 install 再到 B 里 install，插件与 symlink 会一起切到 B。
+    CLI 就必须是它，否则插件版本与 CLI 版本会各走各的。在 A checkout 里 install 再到 B 里 install，
+    插件与 symlink 会一起切到 B。
 
-    返回 (是否成功, 细节)。失败必须让整条 install 以非零结束：插件与 CLI 同源是这次安装的一部分，
-    做不到就不算装好了 —— 否则会安静地留下一个“用别家 CLI 的插件”。
+    返回 (是否成功, 细节, 旧目标或 None)。**这个函数先换链接、不碰插件**，所以它失败时磁盘上
+    一位都没动过：旧插件还配旧链接，仍是自洽的一对。这条顺序是硬要求 —— 先覆盖插件再试着改链接的
+    写法，链接一失败就会把新插件留在旧 checkout 的链接上，正好制造出要避免的错配。
 
-    幂等：已经指着 SELF 就什么都不做。这不是新增状态文件，只是把 install.sh 早就在做的事
+    幂等：已经指着 SELF 就不做任何改动。这不是新增状态文件，只是把 install.sh 早就在做的事
     （ln -sfn）也放进 `postoffice install opencode`，好让单独跑这个子命令也自洽。
-    新链接先写在临时名上再 rename 换过去，所以失败时旧链接原封不动，不会出现“链接没了”。
+    新链接先写在临时名上再 rename 换过去，换的动作是原子的：失败时旧链接原封不动。
     """
-    link = Path.home() / ".local" / "bin" / "postoffice"
+    link = cli_link_path()
     want = str(SELF)
     try:
         have = os.readlink(link) if link.is_symlink() else ""
         if have == want:
-            return True, f"{link} 已经指向 {want}"
+            return True, f"{link} 已经指向 {want}", have
         if link.is_dir() and not link.is_symlink():
-            return False, f"{link} 已经是一个目录，换不动"
+            return False, f"{link} 已经是一个目录，换不动", have or None
         link.parent.mkdir(parents=True, exist_ok=True)
         tmp = link.with_name(link.name + f".tmp-{os.getpid()}")
         tmp.unlink(missing_ok=True)
         tmp.symlink_to(want)
         if link.is_symlink() or link.exists():
             backup(link)
-        os.replace(tmp, link)     # 换链接是原子的：失败时旧链接还在
+        os.replace(tmp, link)          # 从这一行起链接已指向本 checkout
     except OSError as e:
-        return False, f"{link} 没能指向 {want}（{e}）"
-    return True, f"{link} → {want}"
+        return False, f"{link} 没能指向 {want}（{e}）", None
+    return True, f"{link} → {want}", have or None
+
+
+def restore_cli_link(prev):
+    """把链接放回安装前的指向；之前没有链接就把它撤掉。
+
+    只在“链接已经换过去、但插件没复制成功”时用：那一刻链接是新 checkout 的、插件还是旧的，
+    必须撤掉新链接才能回到配对状态，否则这次安装就留下了一个错配。
+    """
+    link = cli_link_path()
+    try:
+        if prev is None:
+            link.unlink(missing_ok=True)
+            return
+        tmp = link.with_name(link.name + f".rollback-{os.getpid()}")
+        tmp.unlink(missing_ok=True)
+        tmp.symlink_to(prev)
+        os.replace(tmp, link)
+    except OSError as e:
+        print(f"⚠️  回滚 {link} 到 {prev} 失败（{e}）。请手工把它指回安装前的那份 CLI。")
 
 
 def cmd_install_opencode(_a):
@@ -2453,20 +2477,26 @@ def cmd_install_opencode(_a):
     plug = d / "plugins"
     plug.mkdir(parents=True, exist_ok=True)
     dst = plug / "postoffice.ts"
-    # 先复制插件、再对齐 CLI：复制失败时旧插件与旧链接原封不动（仍是一对自洽的）；反过来先改
-    # 链接，一旦复制失败，活着的插件就被悄悄换成了别家 checkout 的 CLI，比前者更难收拾。
-    # 链接用临时名 + rename 换，所以它失败时旧链接也还在，不会出现链接消失的中间态。
-    shutil.copy2(REPO / "opencode" / "postoffice.ts", dst)
-    linked, detail = link_postoffice_cli()
-    if linked:
-        print(f"OpenCode 插件已装入 {dst}（重启 OpenCode 生效）")
-        print(f"CLI 已就位：{detail}（插件与 CLI 同源于 {REPO}）")
-    else:
-        # 到这里插件文件已经落地，但 CLI 没跟上同源 —— 一句话都不许说“装好了”。
-        print(f"❌ 插件文件已复制到 {dst}，但 CLI 链接没有更新成同源的一份：{detail}")
-        print(f"   此刻这个插件会通过别的 checkout 的 CLI 干活，所以**本次安装不算成功**。")
-        print(f"   修法：让 {Path.home() / '.local' / 'bin' / 'postoffice'} 指向 {SELF}，"
-              f"或设 POSTOFFICE_CLI={SELF}，再重跑一次本命令。")
+    # 先把链接对齐，再覆盖插件（顺序是硬要求，见 link_postoffice_cli 的说明）：链接这一步失败时
+    # 磁盘一位都没动，装好的那份插件仍配它自己的链接；插件复制失败时把链接撤回，同样不留错配。
+    linked, detail, prev = link_postoffice_cli()
+    if not linked:
+        print(f"❌ 没有安装：CLI 链接没能更新成同源的一份，所以插件一个字节都没动（{dst} 保持原样）。")
+        print(f"   原因：{detail}")
+        print(f"   此刻磁盘上的插件与它原本的链接仍是一对，只是这次装的是 {REPO} 这份，没装成。")
+        print(f"   修法：让 {cli_link_path()} 指向 {SELF}，或设 POSTOFFICE_CLI={SELF}，再重跑一次本命令。")
+        sys.exit(1)
+    try:
+        tmp = dst.with_name(dst.name + f".tmp-{os.getpid()}")
+        shutil.copy2(REPO / "opencode" / "postoffice.ts", tmp)   # 先写临时名，失败就不会截断已装的插件
+        os.replace(tmp, dst)
+    except OSError as e:
+        restore_cli_link(prev)
+        print(f"❌ 没有安装：插件没能复制到 {dst}（{e}）。")
+        print(f"   CLI 链接已撤回到安装前的那一份，所以插件与链接仍然同源。")
+        sys.exit(1)
+    print(f"OpenCode 插件已装入 {dst}（重启 OpenCode 生效）")
+    print(f"CLI 已就位：{detail}（插件与 CLI 同源于 {REPO}）")
     # let OpenCode agents read/write the mailbox without a permission prompt each time
     for name in ("opencode.json", "opencode.jsonc"):
         cfgf = d / name
@@ -2494,9 +2524,6 @@ def cmd_install_opencode(_a):
         perm["external_directory"] = ext
         cfgf.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"已允许 OpenCode 读写 {HOME}（{cfgf}" + (f"，备份 {bk}）" if bk else "）"))
-    # 同源没做到就不是装好了：哪怕插件文件和权限都落了地，也必须以非零退出，不能让人以为成功。
-    if not linked:
-        sys.exit(1)
 
 
 def cmd_install_skill(_a):
