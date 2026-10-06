@@ -301,7 +301,7 @@ export const PostofficePlugin: Plugin = async ({ client, directory }) => {
 // 反查“这个会话自己的物理信箱”：唯一匹配 + 走插件通道 + 属于本实例目录。
 // 任何一条不成立都拒绝 —— 宁可没有闹钟，也不能把提醒投到别人的信箱去。
 // 路由离线单独标出来：离线时身份仍然是唯一的，只是当下没人收 —— 取消自己的定时器
-// 可以照常做（不碰任何信箱文件），设新闹钟则拒绝。
+// 可以照常做（连同那封还没人收的提醒一起收走），设新闹钟则拒绝。
 const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: string; offline?: boolean }> => {
     let routes: Record<string, Route> = {}
     try {
@@ -566,7 +566,9 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
       postoffice_alarm_cancel: {
         description:
           "取消**当前这个会话自己**的活动闹钟（不带任何参数）。没有活动闹钟时会明确告诉你“没有活动闹钟”。" +
-          "如果提醒已经到期进了投递队列但还没送达，会把它移进 archived/ 存档，这样取消后不会再响。" +
+          "如果提醒已经到期进了投递队列、但还没被投递方认领，会把它移进 archived/ 存档，" +
+          "这样取消后不会再响；如果提醒已经进入投递流程（认领已被投递方抢到），则**无法保证取消**，" +
+          "这时会明确告诉你，并且不改动活动记录与那封信。" +
           "本会话当前的信箱归属核不上（或已改绑给别人）时会拒绝，不会去动任何信箱的文件。",
         args: {},
         async execute(_args, ctx) {
@@ -574,12 +576,12 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           if (!who.box)
             return `没取消：${who.why}。归属核不上时邮局不会去动任何信箱的文件，` +
               `请先让本会话在通讯录里对应唯一信箱（postoffice add … / doctor 看绑定），再试一次。`
-          // 同上：取消也由 Python 在锁内做，包括「还没送达就把提醒存档」那一步
+          // 同上：取消也由 Python 在锁内做，包括「与投递方争同一把认领、把还没送出的提醒
+          // 存档」那一步；CLI 的文案已经如实覆盖离线与「投递已在路上」两种结局。
           const r = await runCLI(["alarm-cancel", "--box", who.box, "--session", ctx.sessionID])
           await log(`ALARM CANCEL ${ctx.sessionID} rc=${r.code}`)
           if (r.code !== 0) return `没取消：${r.text}`
-          const tail = who.offline ? "信箱当前离线：只清了定时器，没有需要撤回的提醒。" : ""
-          return `已取消本会话的活动闹钟。${tail}\n${r.text}`
+          return `已取消本会话的活动闹钟。\n${r.text}`
         },
       },
     },
