@@ -491,7 +491,9 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
       postoffice_alarm_cancel: asTool({
         description:
           "取消**当前这个会话自己**的活动闹钟（不带任何参数）。没有活动闹钟时会明确告诉你“没有活动闹钟”。" +
-          "如果提醒已经到期进了投递队列但还没送达，会把它移进 archived/ 存档，这样取消后不会再响。" +
+          "如果提醒已经到期进了投递队列、但还没被投递方认领，会把它移进 archived/ 存档，" +
+          "这样取消后不会再响；如果提醒已经进入投递流程（认领已被投递方抢到），则**无法保证取消**，" +
+          "这时会明确告诉你，并且不改动活动记录与那封信。" +
           "本会话当前的信箱归属核不上（或已改绑给别人）时会拒绝，不会去动任何信箱的文件。",
         args: {},
         async execute(_args, ctx) {
