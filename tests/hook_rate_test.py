@@ -263,6 +263,26 @@ class HookRateClaim(unittest.TestCase):
         self.assertEqual(self.seen(), [], "撤回来了就不许写 .seen")
         self.assertEqual(self.claims(), [], "撤回放掉了自己的认领，钩子不该再留一个")
 
+    # -- 对照：限流没满时，正常唤醒路径一个字节都不许变 ----------------------
+    def test_a_wake_under_the_rate_limit_still_works(self):
+        """对照组：限流空着（`.wake_times` 压根不存在）时，钩子照常唤醒。
+
+        钉住修复不许碰到的那一面：退出码 2、唤醒负载里既有路径也有正文开头、`.seen` 照写、
+        限流计数照记一次、认领照建（唤醒过的那封信必须有归属，撤回才拒得掉）。
+        """
+        lid = self.send()
+        self.assertFalse((self.home / BOX / ".wake_times").exists(), "前置：限流计数是空的")
+        rc, err = self.run_hook()
+        self.assertEqual(rc, 2, f"限流没满时必须照常唤醒，实际退出码 {rc}")
+        head = (self.letter(lid)).read_text().splitlines()[:1]
+        self.assertIn(f"【联络总站新信｜{BOX}】", err, "唤醒负载的形状不许变")
+        self.assertIn(str(self.letter(lid)), err, "唤醒负载必须给出信件路径")
+        self.assertIn(head[0], err, "唤醒负载必须带信件开头")
+        self.assertIn("按信件“需要”字段处理", err, "结尾那句不许变")
+        self.assertEqual(self.seen(), [str(self.letter(lid))], "唤醒了就必须写 .seen")
+        self.assertEqual(len(self.wake_times()), 1, "一次唤醒只记一次限流")
+        self.assertEqual(self.claims(), [f"{lid}.md"], "唤醒过的那封信必须有认领归属")
+
     # -- 6) 钩子先拿到认领 → 撤回明确被拒 ----------------------------------
     def test_a_claude_wake_blocks_the_retraction_and_keeps_the_claim(self):
         """限流满着的那一轮不许唤醒、不许留认领；限流解除后钩子唤醒 → 认领在钩子名下 → 撤回被拒。"""
