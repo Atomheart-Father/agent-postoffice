@@ -214,13 +214,14 @@ class HookRateClaim(unittest.TestCase):
         """限流放行时，钩子与撤回真进程同时抢同一封信的认领：只能有一个赢家。
 
         这里一个限流记录都不预填（`.wake_times` 压根不存在），所以钩子一定会走到
-        `claim_letter`：两边在同一个 O_EXCL 认领文件上真实竞争。两种起跑顺序交替，避免
-        固定的先后偏差；每轮 inbox 里只有这一封信，所以「钩子 rc=2」与「这封信被交付」
+        `claim_letter`：两边在同一个 O_EXCL 认领文件上真实竞争。20 轮够把两种赢家都逼出来
+        （钩子到认领点之前要读的档案比撤回多，天然吃亏，所以轮数留够）。两种起跑顺序交替，
+        避免固定的先后偏差；每轮 inbox 里只有这一封信，所以「钩子 rc=2」与「这封信被交付」
         是同一件事，不存在用别的信把赢家说过去的可能。逐轮断言互斥并留下各自的证据。
         """
         self.assertFalse((self.home / BOX / ".wake_times").exists(), "前置：一个限流记录都不许预填")
         wins = {"retract": 0, "hook": 0}
-        for i in range(16):
+        for i in range(20):
             self.assertEqual(len(list((self.home / BOX / "inbox").glob("*.md"))), 0,
                              f"第 {i} 轮开始前 inbox 必须是空的：上一轮的信已由会话收走")
             lid = self.send(subject=f"竞态信{i}")
@@ -239,7 +240,7 @@ class HookRateClaim(unittest.TestCase):
                 h = self.start_hook()
                 rerr = r.communicate(timeout=90)[1]
                 rrc = r.returncode
-            hrc, herr = self.wait_hook(h, self.hooks[-1][1], wait=6)
+            hrc, herr = self.wait_hook(h, self.hooks[-1][1], wait=5)
             path = str(self.letter(lid))
             retract_ok = rrc == 0
             delivered = path in herr or path in self.seen()      # 这封信真的到了会话手里
@@ -267,6 +268,7 @@ class HookRateClaim(unittest.TestCase):
             if leftover.exists():                 # 会话把被唤醒的那封收进 done/，下一轮从干净 inbox 起跑
                 os.replace(leftover, self.home / BOX / "done" / leftover.name)
         self.assertGreater(wins["retract"], 0, "撤回一次都没赢过：竞态没真的跑起来")
+        self.assertGreater(wins["hook"], 0, "钩子一次都没赢过：竞态没真的跑起来（两种赢家都必须出现）")
         # 限流从头到尾放行的证据：每一次真唤醒恰好记一次限流，没有任何一轮是被限流挡下的
         self.assertEqual(len(self.wake_times()), wins["hook"],
                          "限流计数必须恰好等于真唤醒次数 —— 说明限流没有挡过任何一轮")
@@ -369,36 +371,14 @@ class HookRateClaim(unittest.TestCase):
         self.assertEqual(rc2, 2, "限流解除后这封信必须还能被正常投出去")
         self.assertEqual(self.seen(), [str(self.letter(lid))])
 
-    # -- 4) 唤醒与撤回真并发：只允许一个结果 -------------------------------
-    def test_a_wake_and_a_retraction_never_both_win(self):
-        """两边真的同时起跑：不强制先后，只断言那条不变量。
+    # -- 4) 限流已满的一轮里，被撤回的信既不会被唤醒也不会写 .seen ---------------
+    def test_a_rate_blocked_hook_leaves_a_retracted_letter_alone(self):
+        """限流已满（预填 6 条）时钩子被停在限流判断上，此时撤回完成。
 
-        钩子被停在限流判断上（手里已有一份待投清单），撤回方跑真正的 CLI。绝不允许
-        「撤回报成功」与「钩子把那封信交给会话」同时发生。
+        这一轮赢的是限流、不是认领，所以它只钉限流那一侧的行为：被限流挡下的那一轮，
+        不许因为撤回刚刚归档过那封信就去唤醒、更不许把它写进 `.seen`。
+        认领仲裁由上面那三条（限流放行）用例负责。
         """
-        lid = self.send()
-        p, fifo = self.park_on_rate_decision()
-        r = run_po("retract", "boss", BOX, lid, home=self.home)     # 与停住的钩子并发
-        self.feed_rate(fifo)
-        rc, err = self.wait_hook(p, self.hooks[-1][1], wait=10)
-        retract_ok = r.returncode == 0
-        woke = str(self.letter(lid)) in err
-        self.assertFalse(retract_ok and woke,
-                         f"撤回与唤醒不能同时成立：撤回 rc={r.returncode}，钩子 rc={rc}，"
-                         f"唤醒负载里含这封信={woke}")
-        # 信只有一个下落：在 inbox 里，或者在 archived 里
-        in_inbox = self.letter(lid).exists()
-        archived = [p for p in (self.home / BOX / "archived").rglob(f"{lid}.md")]
-        self.assertNotEqual(in_inbox, bool(archived), "信既没留在 inbox 也没进 archived：丢件了")
-        if retract_ok:
-            self.assertNotIn(str(self.letter(lid)), err, "撤回来了就不许再交给会话")
-            self.assertNotIn(str(self.letter(lid)), self.seen(), "撤回来了就不许写 .seen")
-        else:
-            self.assertIn("无法撤回", r.stderr)
-
-    # -- 5) 撤回先拿到认领 → 钩子不唤醒 ------------------------------------
-    def test_retraction_that_wins_the_claim_means_no_wake(self):
-        """撤回在钩子做决策之前完成 → 钩子不得唤醒，也不得把那封信写进 .seen。"""
         lid = self.send()
         p, fifo = self.park_on_rate_decision()
         r = run_po("retract", "boss", BOX, lid, home=self.home)
@@ -406,10 +386,13 @@ class HookRateClaim(unittest.TestCase):
         self.assertFalse(self.letter(lid).exists(), "撤回后原信应已归档")
         self.feed_rate(fifo)
         rc, err = self.wait_hook(p, self.hooks[-1][1], wait=10)
-        self.assertNotEqual(rc, 2, "撤回已经完成，钩子不得唤醒")
+        self.assertNotEqual(rc, 2, "限流已满的一轮不许唤醒")
         self.assertNotIn(str(self.letter(lid)), err, "撤回来了就不许出现在唤醒负载里")
         self.assertEqual(self.seen(), [], "撤回来了就不许写 .seen")
-        self.assertEqual(self.claims(), [], "撤回放掉了自己的认领，钩子不该再留一个")
+        self.assertEqual(self.claims(), [], "撤回放掉了认领，钩子不该再留一个")
+        self.unpark_rate_file()
+        # 夹具的 6 条记录是被 rate_ok 读掉的那 6 条；钩子没唤醒，所以一个字节都不该再添
+        self.assertEqual(self.wake_times(), [], "没唤醒就不该再记一次限流")
 
     # -- 对照：限流没满时，正常唤醒路径一个字节都不许变 ----------------------
     def test_a_wake_under_the_rate_limit_still_works(self):
