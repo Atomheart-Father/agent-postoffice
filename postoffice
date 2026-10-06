@@ -1559,7 +1559,20 @@ def cmd_alarm_set(a):
 
 
 def cmd_alarm_cancel(a):
-    """Cancel this session's alarm. Only ever touches the record bound to this session and box."""
+    """Cancel this session's alarm. Only ever touches the record bound to this session and box.
+
+    A fired alarm is a letter sitting in the recipient's inbox, so cancelling is two things: stop
+    the timer *and* take that letter back out of the delivery queue. Leaving it there is the bug
+    this shape exists to prevent: the record is gone, so nothing files that letter any more, and
+    once the mailbox is back online the plugin delivers it as an ordinary letter — a reminder the
+    user already cancelled, arriving with no alarm record behind it.
+
+    Taking it back means contending for the same per-letter claim (`<box>/.claims/<letter>.md`,
+    O_EXCL) the OpenCode plugin takes before it wakes anybody, so cancel and delivery can never
+    both win. If the plugin already holds it the wake-up is already on its way and no amount of
+    moving files can take it back, so cancel says exactly that and exits non-zero rather than
+    promising a silence it cannot keep.
+    """
     box, sid = a.box, a.session
     rec = read_alarm(sid)
     if not isinstance(rec, dict) or not rec.get("id"):
@@ -1577,7 +1590,8 @@ def cmd_alarm_cancel(a):
         # 「这个信箱是不是还归这个会话」是另一回事。旧实现在这里跳过整段核验，于是
         # routes 标着 offline、但 methods 已被移除或 session_id 已改绑给别人时，
         # CLI 仍会按调用方给的 box/session 去清记录、归档提醒——那正好是越权路径。
-        # offline 只影响下面「要不要动 inbox」这一步，不影响能不能操作这条记录。
+        # offline 只影响下面那句话怎么措辞，不影响能不能操作这条记录、更不影响要不要
+        # 把那封没人收的提醒收走：离线时它同样躺在 inbox 里，上线后同样会被投出去。
         routes = load_routes()
         offline = bool(routes.get(box, {}).get("status") == "offline")
         ok, why = verify_alarm_identity(routes, rec)
@@ -1596,15 +1610,44 @@ def cmd_alarm_cancel(a):
                      "只清掉运行态记录，那封信仍在信箱里")
         elif cur.get("state") == "lettered" and cur.get("letter") == aid and alarm_delivered(box, aid):
             where = "已经送达过了"
-        elif offline:
-            # 信箱当下离线：身份是唯一的，但没人收，所以只清定时器，不碰 inbox 里的提醒
-            where = "信箱当前离线，没有待送达的提醒需要撤回；只清掉这个会话的定时器。"
+        elif cur.get("state") == "lettered" and cur.get("letter") == aid and alarm_unknown(box, aid):
+            # fail closed = 整条拒绝，不是换个措辞。台账里这一条既不是送达也不是未送达，于是
+            # 「这封提醒还值不值得从队列里收走」这个问题没有答案：收了可能把已经响过的
+            # 悄悄咽下去，不收则可能让一个用户以为已经不响的提醒继续排队。所以什么都不动，
+            # 非零退出，把「没有取消」和「哪里都没改」说出来 —— 记录留着，下次还能重来，
+            # 信留着，插件的投递路径也不受影响。
+            sys.exit(f"闹钟 {aid} 的投递结果无法判定、结果未知（台账里这一条既不算送达也不算未送达），"
+                     f"因此没有取消：fail closed，活动记录与那封信都没有改动 —— "
+                     f"记录仍在 {alarm_file(sid)}，提醒仍在 {HOME / box / 'inbox' / f'{aid}.md'}。"
+                     f"请人工核对这个提醒到底响没响过（台账 {HOME / 'opencode_delivered.jsonl'}、"
+                     f"认领 {claims_dir(box) / f'{aid}.md'}），确认之后再决定要不要重新设一个闹钟。")
         else:
-            moved = archive_alarm_letter(box, aid)
-            if moved:
-                where = f"提醒已投递但还没送达，原信存档到 {moved}，不会再响"
-            else:
-                where = "定时器已清掉，信箱里没有待响的提醒"
+            letter = HOME / box / "inbox" / f"{aid}.md"
+            holding = letter if letter.exists() else None
+            if holding is not None and not claim_letter(box, holding):
+                # 投递方赢了：唤醒已经在路上，把文件移走也追不回来，所以不假装成功。
+                sys.exit(f"闹钟 {aid} 的提醒已进入投递流程（投递认领已被投递方抢到），无法保证取消；"
+                         f"活动记录没有改动，那封信仍在 {holding}。"
+                         f"如果这一轮确实响了，请按已响处理，不要再设同一个闹钟。")
+            try:
+                # 认领握在手里才复查台账：投递可能正好在抢到之前完成，那时如实说已送达，
+                # 不能一边归档一边说「不会再响」，而它其实已经响过。
+                if holding is not None and alarm_delivered(box, aid):
+                    where = "已经送达过了（抢到认领时复查台账发现的）"
+                else:
+                    moved = archive_alarm_letter(box, aid)
+                    if moved:
+                        where = f"提醒已投递但还没送达，原信存档到 {moved}，不会再响"
+                        if offline:
+                            where += "（信箱当前离线：提醒已收走，上线后不会补送）"
+                    else:
+                        where = "定时器已清掉，信箱里没有待响的提醒"
+                        if offline:
+                            where += "（信箱当前离线：没有人在收）"
+            finally:
+                # 成功、失败、异常都放：留着这把认领会把以后的投递全挡在门外。
+                if holding is not None:
+                    release_claim(box, holding)
         try:
             alarm_file(sid).unlink()
         except FileNotFoundError:
@@ -1693,6 +1736,36 @@ def alarm_gave_up(box, lid):
                 return True
     except OSError:
         pass
+    return False
+
+
+LEDGER_RESULTS = ("DELIVERED", "FAILED_RETRYABLE", "FAILED_FINAL")
+
+
+def alarm_unknown(box, lid):
+    """Is there a ledger row for this letter whose result we have no rule for?
+
+    Such a row is neither proof of delivery nor proof of non-delivery, and the only honest reading
+    of "unknown" is unknown: fail closed. Treating it as DELIVERED would claim a wake-up nobody can
+    confirm; treating it as "not delivered yet" would let cancel archive the letter and promise it
+    will not ring, which is the same false promise as claiming success on an in-flight delivery.
+    """
+    ledger = HOME / "opencode_delivered.jsonl"
+    if not ledger.exists():
+        return False
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if (e.get("box") == box and e.get("file") == f"{lid}.md"
+                    and e.get("result") not in LEDGER_RESULTS):
+                return True
+    except OSError:
+        return False
     return False
 
 

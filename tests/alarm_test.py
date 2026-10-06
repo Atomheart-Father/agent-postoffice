@@ -674,6 +674,209 @@ class AlarmScheduler(unittest.TestCase):
                      encoding='utf-8')
         return p
 
+    # --- 取消 vs 投递：完整并发语义 -------------------------------------------
+    # 到期写成信（state=lettered）之后，取消必须同时负责三件事：把那封还没人收的提醒从
+    # 投递队列里收走、清掉活动记录、并且**如实**说明到底能不能保证不再响。
+    # 这一节的每一条都是先复现后落成用例的；本阶段只写测试，不改实现。
+    def cancel_cli(self, box='lab', session='ses_live'):
+        return subprocess.run([sys.executable, str(PO), 'alarm-cancel', '--box', box,
+                               '--session', session], capture_output=True, text=True,
+                              env=self.env, timeout=60)
+
+    def add_box(self, name, status='online'):
+        """A mailbox of its own: one rate-limit window and one .claims dir per case."""
+        self.run_po('add', name, '--notify')
+        p = self.home / 'routes.json'
+        r = json.loads(p.read_text())
+        r[name].update(methods=['opencode_plugin'], session_id='ses_live', status=status)
+        p.write_text(json.dumps(r, ensure_ascii=False))
+        self.routes = r
+        return name
+
+    def archived(self, box='lab'):
+        return sorted(p.name for p in (self.home / box / 'archived').rglob('*.md'))
+
+    def claims(self, box='lab'):
+        d = self.home / box / '.claims'
+        return sorted(p.name for p in d.glob('*')) if d.is_dir() else []
+
+    def delivery_side(self, box, lid, marker):
+        """A child that does exactly what the plugin does per letter: take the shared claim, and
+        only if it won, "prompt" (the marker) — then keep the claim, like a delivery that is on its
+        way. The ledger row is deliberately NOT written: that is the race window we care about
+        (claim held, wake-up in flight, nothing recorded yet)."""
+        code = ("import importlib.machinery, importlib.util, sys\n"
+                "loader=importlib.machinery.SourceFileLoader('po', sys.argv[1])\n"
+                "spec=importlib.util.spec_from_loader('po', loader)\n"
+                "mod=importlib.util.module_from_spec(spec); loader.exec_module(mod)\n"
+                "p=mod.HOME/sys.argv[2]/'inbox'/sys.argv[3]\n"
+                "won=mod.claim_letter(sys.argv[2], p)\n"
+                "print('CLAIM', won, flush=True)\n"
+                "if won:\n"
+                "    open(sys.argv[4], 'a').write('prompted')\n")
+        return subprocess.Popen([sys.executable, '-c', code, PO, box, lid + '.md', str(marker)],
+                                stdout=subprocess.PIPE, text=True,
+                                env=dict(os.environ, POSTOFFICE_HOME=str(self.home)))
+
+    # C-3 (1) offline + lettered：提醒必须被收走
+    def test_cancel_files_the_reminder_even_while_the_box_is_offline(self):
+        """信已经落进 inbox（lettered）之后信箱才下线，cancel 仍必须把那封提醒收走。
+
+        旧实现只清掉活动记录就返回，还顺手说一句「没有待送达的提醒需要撤回」——而 inbox 里
+        明明就躺着那封没人收的提醒。记录没了之后没有任何人再管它：收信方上线时它会按普通信
+        投递（还会展开信头和路径），并且永远不会被归档，cancel 也再也够不着它。
+        """
+        self.put_alarm()
+        self.run_postman()                              # 到期 → lettered，提醒进了 inbox
+        self.set_route(status='offline')               # 之后才下线
+        r = self.cancel_cli()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('没有待送达的提醒', r.stdout,
+                         'inbox 里明明有那封提醒，不得说「没有待送达的提醒」：' + r.stdout)
+        self.assertEqual(self.inbox(), [], '离线时那封没人收的提醒也必须被收走')
+        self.assertEqual(self.archived(), ['A20260101-000000_lab.md'],
+                         '提醒要存档而不是删掉：' + str(self.archived()))
+        self.assertIsNone(self.read_alarm(), '活动记录照旧清掉')
+
+    # C-3 (3) 投递方拿着认领：cancel 不得声称保证成功
+    def test_cancel_does_not_guarantee_while_the_delivery_side_holds_the_claim(self):
+        """插件已经抢到 .claims/<letter>.md（马上要 promptAsync）时，取消无法保证成功。
+
+        认领是投递方和撤回方共用的那把锁（postoffice retract 就靠它判胜负）。cancel 从来没碰
+        过它，所以现在会照旧把信从 inbox 移走并回一句「不会再响」——而那一轮唤醒照样发生。
+        """
+        self.put_alarm()
+        self.run_postman()
+        lid = self.read_alarm()['letter']
+        (self.home / 'lab' / '.claims').mkdir(parents=True, exist_ok=True)
+        (self.home / 'lab' / '.claims' / f'{lid}.md').write_text('4242\n')
+        r = self.cancel_cli()
+        said = r.stdout + r.stderr
+        self.assertRegex(said, r'无法保证|不能保证|已进入投递|投递进行中',
+                         '认领已被投递方抢到时必须明说无法保证取消：' + said)
+        self.assertNotIn('不会再响', said,
+                         '投递已经在路上时不得声称「不会再响」：' + said)
+
+    # C-3 (4) cancel 赢：投递方拿着旧路径来认领必须失败，且不留残留认领
+    def test_cancel_wins_so_a_stale_delivery_claim_cannot_wake_anybody(self):
+        """对照组：cancel 成功之后，投递方拿着删除前那份路径来认领必须失败。
+
+        这是「cancel 赢 → 不会再响」那一半的护栏。现在它靠的是投递侧 claim_letter 自己的
+        stat 复查（认领之后确认信还在 inbox），所以这条今天就是绿的：改坏任一边都会红。
+        """
+        self.put_alarm()
+        self.run_postman()
+        lid = self.read_alarm()['letter']
+        stale = self.home / 'lab' / 'inbox' / f'{lid}.md'
+        self.assertTrue(stale.exists())
+        self.assertEqual(self.cancel_cli().returncode, 0)
+        self.assertEqual(self.claims(), [], 'cancel 不得留下自己的认领')
+        p = subprocess.run(
+            [sys.executable, '-c',
+             "import importlib.machinery, importlib.util, sys\n"
+             "loader=importlib.machinery.SourceFileLoader('po', sys.argv[1])\n"
+             "spec=importlib.util.spec_from_loader('po', loader)\n"
+             "mod=importlib.util.module_from_spec(spec); loader.exec_module(mod)\n"
+             "print('CLAIM', mod.claim_letter('lab', mod.HOME/'lab'/'inbox'/sys.argv[2]))",
+             PO, f'{lid}.md'], capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, POSTOFFICE_HOME=str(self.home)))
+        self.assertIn('CLAIM False', p.stdout, '投递方拿着旧路径不得再拿到认领：' + p.stdout)
+        self.assertEqual(self.claims(), [], '也不得留下残留认领')
+
+    # C-3 (5) 真进程多轮 race：cancel 与投递只能有一个赢
+    def test_cancel_and_delivery_never_both_win(self):
+        """两边真的同时起跑，只断言那条不变量：绝不允许「投递已经唤醒 + cancel 声称不会再响」。
+
+        投递方在子进程里用与插件同一个 claim_letter 原语抢认领，抢到就写一个 marker 当作
+        「已经 prompt 了」；取消方跑真正的 CLI。两边抢的是同一个 .claims 文件，所以每一轮
+        必然有一方赢 —— 断言的是「谁赢谁说了算」，不规定哪一方赢。偶数轮让投递方先起跑 0.2s、
+        奇数轮让 cancel 先起跑 0.2s，两个方向都要被真实走到。注意在当前实现下**每一轮都是
+        投递赢**：cancel 根本不参与抢认领，先起跑也没用，那正是这条用例要抓的根因。
+        """
+        for i in range(6):
+            box = self.add_box(f'racelab{i}')
+            self.put_alarm(box=box)
+            self.run_postman()                      # 那条闹钟到期，提醒进这个信箱
+            rec = self.read_alarm()
+            self.assertEqual(rec['box'], box)
+            lid = rec['letter']
+            marker = self.home / f'prompted{i}'
+
+            def start_cancel():
+                return subprocess.Popen(
+                    [sys.executable, str(PO), 'alarm-cancel', '--box', box,
+                     '--session', 'ses_live'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env)
+
+            if i % 2 == 0:                          # 投递方先起跑，晚到的 cancel 该抢不到认领
+                delivery = self.delivery_side(box, lid, marker)
+                self.addCleanup(delivery.kill)
+                time.sleep(0.2)
+                cancel = start_cancel()
+            else:                                   # cancel 先起跑，晚到的投递方该抢不到
+                cancel = start_cancel()
+                time.sleep(0.2)
+                delivery = self.delivery_side(box, lid, marker)
+                self.addCleanup(delivery.kill)
+            self.addCleanup(cancel.kill)
+            dout, _ = delivery.communicate(timeout=60)
+            cout, cerr = cancel.communicate(timeout=60)
+            said = (cout or '') + (cerr or '')
+            if marker.exists():                    # 投递赢：它已经 prompt 了
+                self.assertNotIn('不会再响', said,
+                                 f'第 {i} 轮投递已经抢到认领并唤醒，cancel 不得说不会再响：{said}')
+                self.assertRegex(said, r'无法保证|不能保证|已进入投递|投递进行中',
+                                 f'第 {i} 轮投递赢时必须明说无法保证取消：{said}')
+            else:                                  # cancel 赢：提醒必须被收走，且不留认领
+                self.assertEqual(cancel.returncode, 0, f'第 {i} 轮：{said}')
+                self.assertIn('不会再响', said, f'第 {i} 轮 cancel 赢时该说不会再响：{said}')
+                self.assertEqual(sorted(p.name for p in (self.home / box / 'inbox').glob('*.md')),
+                                 [], f'第 {i} 轮 cancel 赢时提醒必须被收走：{said}')
+                self.assertEqual(self.claims(box), [],
+                                 f'第 {i} 轮 cancel 赢时不得留下认领：{self.claims(box)}')
+            self.assertIn('CLAIM', dout, '投递方子进程应当报告自己有没有抢到认领：' + dout)
+
+    # C-3 (6) 台账 fail closed：未知结果既不当送达、也不当未送达，而且整条拒绝
+    def test_an_unknown_ledger_result_is_not_read_as_undelivered(self):
+        """result=FAILED_UNKNOWN 必须整条拒绝：记录原地不动、信原地不动、非零退出。
+
+        上一轮这里只把措辞改成「因此不能保证取消」，随后照样走 alarm_file(sid).unlink()
+        并返回 0 —— 那不是 fail closed：台账说结果未知时，唯一诚实的动作是什么都不做，
+        并且把「没有取消」「哪里都没改」说出来，让调用方（插件工具 → 模型）能转述。
+        """
+        self.put_alarm()
+        self.run_postman()
+        before = self.read_alarm()
+        lid = before['letter']
+        self.mark_delivered(result='FAILED_UNKNOWN')
+        r = self.cancel_cli()
+        said = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0, '结果未知时必须非零退出：' + said)
+        self.assertNotIn('已取消闹钟', said, '不得以成功前缀开头：' + said)
+        self.assertRegex(said, r'未知|无法判定|没有取消',
+                         '必须明说结果未知、没有取消：' + said)
+        self.assertRegex(said, r'都没有改动|原样',
+                         '必须明说活动记录与那封信都没有改动：' + said)
+        self.assertEqual(self.read_alarm(), before, '活动记录必须原地保留、内容一个字节不变')
+        self.assertEqual(self.inbox(), [lid + '.md'], '那封提醒必须原地留在 inbox')
+        self.assertEqual(self.archived(), [], '不得归档、不得移走那封提醒')
+        self.assertEqual(self.claims(), [], '拒绝路径不得留下认领')
+
+    def test_failed_retryable_still_counts_as_not_delivered(self):
+        """对照组，必须保持不变：FAILED_RETRYABLE 是「已知没送到、还会重试」，所以收得走。
+
+        它和上面那条成对使用：fail closed 只针对**认不出来**的结果值。已知未送达不能一起改成
+        不敢收，否则用户永远撤不回一个还在重试队列里的提醒。
+        """
+        self.put_alarm()
+        self.run_postman()
+        self.mark_delivered(result='FAILED_RETRYABLE')
+        r = self.cancel_cli()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.inbox(), [], '已知未送达的提醒应当被收走：' + r.stdout)
+        self.assertEqual(self.archived(), ['A20260101-000000_lab.md'])
+        self.assertIsNone(self.read_alarm())
+
 
 if __name__ == '__main__':
     unittest.main()
