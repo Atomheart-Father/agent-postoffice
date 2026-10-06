@@ -114,6 +114,8 @@ One alarm per session at a time: setting a second one fails with a clear "cancel
 
 The lock lives on the post office side and it is a kernel `flock`: one `<alarms>/<session>.json.lock` per session, held across set, cancel and firing, and the lock file is created once and never removed — so neither "a reaper deletes somebody else's fresh lock" nor "a holder that was paused for a long time comes back and deletes the new one" can happen, and a holder that is killed or whose machine reboots releases it by itself. Only Python writes records (Node has no flock API); the plugin's job is to work out which mailbox the session belongs to. This needs `POSTOFFICE_HOME` on a **local filesystem** — flock over NFS is not reliable.
 
+Old/new side by side: the lock path is `<alarms>/<session>.json.lock`, and the **old version used the same path plus `.gate` / `.reap` files with mtime leases**. On upgrade those files are simply left there; the new version neither reads nor deletes them, so nothing needs cleaning. But **an old and a new version running against the same `POSTOFFICE_HOME` do not exclude each other** (the old one guards `.gate`, the new one flocks the same `.lock`, two protocols minding their own business), so stop the old postman before starting the new one in the upgrade window, and the same in reverse.
+
 ## Groups and logical addresses (optional)
 
 Without `~/agent-postoffice/config.json` none of this exists and everything else behaves exactly as before. Import a config and you get two things:
