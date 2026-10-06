@@ -12,11 +12,15 @@
 //   恢复规则由人决定：删掉 <信箱>/.claims/<文件名> 才允许再投一次，或把信挪进 done 收账
 // - 不改模型/工具/权限，不新建会话，不批准权限请求
 //
-// 另外提供两个原生工具，让模型给**当前会话自己**设/取消一次性闹钟：
+// 另外提供四个原生工具，模型只能操作**当前会话自己**的信箱：
 //   postoffice_alarm_schedule(delay_minutes) —— 只收一个分钟数，没有收件人/信箱/正文参数
 //   postoffice_alarm_cancel()               —— 不收任何参数
+//   postoffice_message_edit(message_ref, content) —— 原地改（或 content=null 撤回）自己发出、
+//                                                   还没被对方通道接受的普通信；规矩同 CLI 的 edit/retract
+//   postoffice_archive_current(keep_unarchived)   —— 归档本会话已展示过、还没归档的信（presented 集合）
 // 身份只来自框架给的 ToolContext.sessionID，再唯一映射到已登记且启用插件的信箱；
 // 无映射、多个映射、信箱离线、身份核不上时一律拒绝，模型无法指定别的信箱或会话。
+// 改信/归档的真正改动都由 CLI 在既有的认领与锁下完成，插件自己不动信。
 // 闹钟记录落在 <HOME>/alarms/<session>.json（运行态账本，0600），由常驻邮递员到期时写成
 // 一封固定短句的信，再复用上面这条 idle 投递通道送达 —— 插件本身不实现计时器。
 // 到期的提示是**常量**：只有与本会话自己的活动闹钟记录 id 完全一致的信才走闹钟通道，
@@ -24,7 +28,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import type { tool as opencodeTool } from "@opencode-ai/plugin/tool"
 import { homedir, platform } from "node:os"
-import { readdir, readFile, writeFile, appendFile, mkdir, open, rm, stat, chmod } from "node:fs/promises"
+import { readdir, readFile, writeFile, appendFile, mkdir, open, rm, stat, chmod, rename } from "node:fs/promises"
 import { accessSync, constants, existsSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
@@ -40,6 +44,7 @@ const POLL_MS = 10_000
 const RATE_N = 6
 const RATE_WIN_MS = 600_000
 const MAX_ATTEMPTS = 2
+const MAX_FORMAL_BATCH = 20   // ordinary letters per single wake; the rest go out next round
 const RECEIPT_WAIT_MS = Number(process.env.POSTOFFICE_RECEIPT_WAIT || 600) * 1000
 const ALARM_MIN = 1
 const ALARM_MAX = 1440
@@ -142,6 +147,43 @@ const receiptSubject = (fieldOf: (k: string) => string) =>
 
 // POSIX single-quote a value for a shell command shown to the model (paths/ids may hold spaces, ();')
 const shq = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'"
+
+// A batch line must show the letter as it stands *after* the claim: a concurrent edit can
+// rewrite it in the window between the scan snapshot and the claim. Python's reminder()
+// re-reads after claiming too, so both sides deliver the version the claim froze.
+const letterHead = async (box: string, file: string) => {
+  try {
+    const raw = await readFile(`${ROOT}/${box}/inbox/${file}`, "utf8")
+    const head = raw.split("\n\n", 1)[0].split("\n")
+    const fieldOf = (k: string) => {
+      const l = head.find((x) => x.startsWith(k))
+      return l ? l.slice(k.length).trim() : ""
+    }
+    return { src: fieldOf("来源：").split("（")[0].trim(), subj: fieldOf("事由：") }
+  } catch {
+    return { src: "", subj: "" }
+  }
+}
+
+// presented set: which ids this box was actually shown. Only written after the channel accepted
+// the wake, union-only, atomic rewrite. It is an archive hint, not a second delivery truth —
+// delivery truth stays in the ledger / .seen / .woken.json / the claims.
+const presentedPath = (box: string) => `${ROOT}/${box}/.presented.json`
+const presentedAdd = async (box: string, ids: string[]) => {
+  const clean = ids.filter(Boolean)
+  if (!clean.length) return
+  const p = presentedPath(box)
+  let cur: string[] = []
+  try {
+    const v = JSON.parse(await readFile(p, "utf8"))
+    if (Array.isArray(v)) cur = v.filter((x): x is string => typeof x === "string")
+  } catch {}
+  const merged = cur.slice()
+  for (const id of clean) if (!merged.includes(id)) merged.push(id)
+  const tmp = `${p}.tmp-${process.pid}`
+  await writeFile(tmp, JSON.stringify(merged), "utf8")
+  await rename(tmp, p)
+}
 
 // ---------------------------------------------------------------- 闹钟记录
 // 一个会话一个文件：设/取消/到期清理都只碰自己那一个，两个写者（插件工具 / 邮递员）
@@ -368,7 +410,8 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
         // 读开头块分出正式信、闹钟提醒与回执通知；正文永不注入
         type Item = { file: string; src: string; subj: string; id: string; mtime: number }
         type Formal = Item & { alarm?: boolean }
-        const formal: Formal[] = []
+        const formal: Formal[] = []   // ordinary letters: batchable
+        const alarms: Formal[] = []   // this session's own alarm reminders: never batched
         const receipts: Item[] = []
         for (const file of todo) {
           const key = `${box}::${file}`
@@ -392,26 +435,26 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           if (id) receipts.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: receiptSubject(fieldOf), id, mtime })
           else if (alarmId && ownAlarm && ownAlarm.id === alarmId && file === `${alarmId}.md`) {
             // 闹钟提醒：只渲染那句固定常量，正文一个字节都不读、不注入
-            formal.push({ file, src: "postoffice", subj: "闹钟", id: alarmId, mtime, alarm: true })
-          } else formal.push({ file, src: "", subj: "", id: "", mtime })
+            alarms.push({ file, src: "postoffice", subj: "闹钟", id: alarmId, mtime, alarm: true })
+          } else formal.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: fieldOf("事由："), id: "", mtime })
         }
-        // 有正式信：先送一封；没有正式信：把回执合并成一条。
-        // 回执超过 10 分钟就随下一次投递带上，绝不被正式信永远挤掉。
-        const picked: Formal | null = formal.length ? formal[0] : null
-        const letter = picked === null ? null : picked.file
-        const due = letter === null
-          ? receipts
-          : receipts.filter((r) => Date.now() - r.mtime > RECEIPT_WAIT_MS)
-        if (!letter && !due.length) continue
+        // 一批普通正式信（≤ MAX_FORMAL_BATCH）优先；没有普通信时，本会话自己的闹钟提醒独占一轮；
+        // 再没有才轮到回执。抢不到认领的那几封这一轮不投，但不会挡住后面的信（跳过继续收集）。
+        const quota = formal.slice(0, MAX_FORMAL_BATCH)
+        const alarmRound = quota.length === 0 && alarms.length > 0
+        const due = quota.length
+          ? receipts.filter((r) => Date.now() - r.mtime > RECEIPT_WAIT_MS)
+          : (alarmRound ? [] : receipts)
+        const group: { file: string; isReceipt: boolean }[] = (quota.length
+          ? quota.map((f) => ({ file: f.file, isReceipt: false }))
+          : alarmRound ? [{ file: alarms[0].file, isReceipt: false }] : [])
+          .concat(due.map((r) => ({ file: r.file, isReceipt: true })))
+        if (!group.length) continue
         const now = Date.now()
         const win = (recent.get(box) ?? []).filter((t) => now - t < RATE_WIN_MS)
         if (win.length >= RATE_N) continue
         // 每次投递前都认领：失败时已释放认领，所以重试照样能拿到；
         // 抢不到说明别的实例正在投这封，跳过（否则多实例会各投一次）
-        // 闹钟提醒独占一轮：不捎带回执块，保持“极短一条”的形态；回执不会被饿死（有 RECEIPT_WAIT 兜底）
-        const group: { file: string; isReceipt: boolean }[] =
-          (letter ? [{ file: letter, isReceipt: false }] : [])
-            .concat(picked && picked.alarm ? [] : due.map((r) => ({ file: r.file, isReceipt: true })))
         const claimed: { file: string; isReceipt: boolean }[] = []
         for (const g of group) {
           if (!(await claim(box, g.file))) continue
@@ -422,7 +465,7 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
         const claimedReceipts = claimed.filter((g) => g.isReceipt)
           .map((g) => receipts.find((r) => r.file === g.file)!).filter(Boolean)
         let text: string
-        const alarmFormal = claimedFormal.length === 1 && formal.find((f) => f.file === claimedFormal[0])?.alarm
+        const alarmFormal = claimedFormal.length === 1 && alarms.some((f) => f.file === claimedFormal[0])
         if (alarmFormal) {
           // 固定短句：常量，不来自信件
           text = `⏰ ${ALARM_TEXT}`
@@ -432,9 +475,22 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
                  `查询：postoffice receipt ${shq(box)} ${shq(r.id)}\n默认不答复`
         } else {
           const parts: string[] = []
-          for (const f of claimedFormal) {
-            parts.push(`【联络总站新信｜${box}】\n== ${ROOT}/${box}/inbox/${f}\n${await head3(`${ROOT}/${box}/inbox/${f}`)}\n` +
-              `按信件“需要”字段处理；回信/回执/归档规则见 postoffice skill。`)
+          if (claimedFormal.length >= 2) {
+            // 多封：公共 header 与规则各只写一次，每封一行（稳定引用 + 来源 + 事由 + 路径）
+            parts.push(`【联络总站｜${claimedFormal.length} 封新信】`)
+            let i = 1
+            for (const f of claimedFormal) {
+              const m = await letterHead(box, f)
+              parts.push(`${i}. ${box}/${f.replace(/\.md$/, "")}  来源：${m.src || "?"}  ` +
+                `事由：${m.subj || "（无）"}  ${ROOT}/${box}/inbox/${f}`)
+              i++
+            }
+            parts.push(`按各信“需要”字段处理；回信/回执/归档规则见 postoffice skill。`)
+          } else {
+            for (const f of claimedFormal) {
+              parts.push(`【联络总站新信｜${box}】\n== ${ROOT}/${box}/inbox/${f}\n${await head3(`${ROOT}/${box}/inbox/${f}`)}\n` +
+                `按信件“需要”字段处理；回信/回执/归档规则见 postoffice skill。`)
+            }
           }
           if (claimedReceipts.length) {
             parts.push(`另有 ${claimedReceipts.length} 条回执（默认不答复，需要时按 ID 查询）：\n` +
@@ -465,6 +521,12 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
         // prompt 已被接受：算一次唤醒（限流照旧），此后本地记账出错也不能当成“没投”
         win.push(now)
         recent.set(box, win)
+        try {
+          // 只有这时候才算「展示过」：后面 archive_current 只动这一集合
+          await presentedAdd(box, claimed.map((g) => g.file.replace(/\.md$/, "")))
+        } catch (e) {
+          await log(`presented 记录失败（不影响投递，信仍留在 inbox）${box}/${files2}: ${e}`)
+        }
         try {
           for (const g of claimed) {
             await appendFile(LEDGER, JSON.stringify({ time: new Date().toISOString(), box, file: g.file, session: sessionID, result: "DELIVERED", attempt: tries.get(g.file) }) + "\n")
@@ -582,6 +644,70 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           await log(`ALARM CANCEL ${ctx.sessionID} rc=${r.code}`)
           if (r.code !== 0) return `没取消：${r.text}`
           return `已取消本会话的活动闹钟。\n${r.text}`
+        },
+      },
+      postoffice_message_edit: {
+        description:
+          "改一封**你自己发的、还没被收件方通道接受**的普通信：content 给 subject/need/body 里至少一个 → 原地更新，" +
+          "编号、文件名、来源、收件人都不变，收件方只会看到新版；content 给 null → 撤回这封信（原样进 archived/，" +
+          "收件方不会再因这封信被唤醒）。message_ref 写成 <收件信箱>/<信件编号>（send 会打印「引用：」）。" +
+          "只对普通直发信有效：回执/广播/交接/闹钟等派生通知不能改；已经进入投递的会明确拒绝，" +
+          "这时请另发一封更正消息，不要把已经送出的内容当成没送过。",
+        args: {
+          message_ref: zod.string().describe("<收件信箱>/<信件编号>，例如 worker/20260101-000000_boss_hi"),
+          content: zod.object({
+            subject: zod.string().optional().describe("新事由"),
+            need: zod.string().optional().describe("新的「需要」"),
+            body: zod.string().optional().describe("新正文（字面文本）"),
+          }).nullable().describe("要改成的内容（至少一个字段）；null 表示撤回这封信"),
+        },
+        async execute(args, ctx) {
+          const a = args as { message_ref?: unknown; content?: unknown }
+          const ref = typeof a.message_ref === "string" ? a.message_ref.trim() : ""
+          if (!ref) return "没改：message_ref 必须是 <收件信箱>/<信件编号>。"
+          const who = await resolveOwnBox(ctx.sessionID)
+          if (!who.box) {
+            return `没改：${who.why}。邮局不会替身份不确定的会话改信，请先让本会话在通讯录里对应唯一信箱。`
+          }
+          if (a.content === null) {
+            const m = ref.split("/")
+            if (m.length !== 2 || !m[0] || !m[1]) return "没撤回：message_ref 必须写成 <收件信箱>/<信件编号>。"
+            const r = await runCLI(["retract", who.box, m[0], m[1]])
+            return r.text || "（撤回没有输出）"
+          }
+          if (typeof a.content !== "object" || Array.isArray(a.content)) {
+            return "没改：content 要是一个对象（subject/need/body 至少一个），撤回请传 null。"
+          }
+          const c = a.content as { subject?: unknown; need?: unknown; body?: unknown }
+          const argv = ["edit", "--box", who.box, ref]
+          if (typeof c.subject === "string") argv.push("--subject", c.subject)
+          if (typeof c.need === "string") argv.push("--need", c.need)
+          if (typeof c.body === "string") argv.push("--body", c.body)
+          if (argv.length === 4) return "没改：content 里至少要有一个字符串字段（subject / need / body）。"
+          const r = await runCLI(argv)
+          return r.text || "（更新没有输出）"
+        },
+      },
+      postoffice_archive_current: {
+        description:
+          "把**本会话当前已经展示过、但还没归档**的消息一键归档到 done/（不读正文、不发信、不叫醒）。" +
+          "只处理本会话实际看过的那些消息：之后新到的信不会被碰。keep_unarchived 里列出的编号留在 inbox，" +
+          "当作还没完成的事项继续保留。不要在 shell 里自己 mv 信箱文件；工作完成后用这个工具收尾。",
+        args: {
+          keep_unarchived: zod.array(zod.string()).optional()
+            .describe("这些信件编号继续留在 inbox（也不从已展示集合里删）；其余已展示过的归档"),
+        },
+        async execute(args, ctx) {
+          const raw = (args as { keep_unarchived?: unknown }).keep_unarchived
+          const keep = Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : []
+          const who = await resolveOwnBox(ctx.sessionID)
+          if (!who.box) {
+            return `没归档：${who.why}。邮局只归档本会话自己信箱里已展示过的消息。`
+          }
+          const argv = ["archive-current", "--box", who.box]
+          for (const k of keep) argv.push("--keep", k)
+          const r = await runCLI(argv)
+          return r.text || "（归档没有输出）"
         },
       },
     },
