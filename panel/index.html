@@ -213,8 +213,10 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
 .seg button:hover{color:var(--ink)}
 .seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
 .cerr{color:var(--bad);font-family:var(--mono);font-size:11px;min-height:1em;margin:4px 0}
-/* 收件人下拉：纯本地建议列表（名单来自 /api/state，不是第二份路由真相） */
-.sug{margin-top:4px;border:1px solid var(--rule);background:var(--panel2);max-height:216px;overflow:auto}
+/* 收件人下拉：纯本地建议列表（名单来自 /api/state，不是第二份路由真相）。
+   悬浮定位：不撑高弹窗——否则鼠标按下后弹窗重心变化、抬起时命中祖先元素，被外点收起误判。 */
+.to-wrap{position:relative}
+.sug{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:6;border:1px solid var(--rule);background:var(--panel2);max-height:216px;overflow:auto}
 .sug[hidden]{display:none}
 .sug button{display:flex;justify-content:space-between;gap:8px;width:100%;text-align:left;border:0;border-bottom:1px solid var(--rule2);padding:9px 10px;font-family:var(--mono);font-size:12px;min-height:44px}
 .sug button:last-child{border-bottom:0}
@@ -314,7 +316,7 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
     <div class="frow"><label>FROM</label>
       <div class="fixed"><span id="compose-from"></span><span class="mono dim" style="font-size:9px" id="compose-fromnote"></span></div></div>
     <div class="frow"><label for="compose-to" id="compose-to-label"></label>
-      <div>
+      <div class="to-wrap">
         <div class="seg" role="group" id="compose-seg">
           <button type="button" id="seg-mbox" aria-pressed="true"></button>
           <button type="button" id="seg-alias" aria-pressed="false"></button>
@@ -869,6 +871,8 @@ function hideSug() {
 }
 on("compose-to", "input", renderSug);
 on("compose-to", "focus", renderSug);
+// 焦点已在输入框时再点一下也要有下拉（focus 不会再触发）
+on("compose-to", "click", renderSug);
 on("compose-to", "keydown", (e) => {
   // Escape 只收下拉：拦住冒泡，别把写信弹窗一起关了
   if (e && e.key === "Escape" && $("compose-sug") && !$("compose-sug").hidden) {
