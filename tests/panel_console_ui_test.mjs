@@ -77,6 +77,12 @@ function makeEl(id) {
   return {
     id, textContent: "", innerHTML: "", value: "", dataset: {}, attrs: {}, children: [],
     handlers: {}, style: {}, hidden: false, className: "",
+    classList: {
+      _s: new Set(),
+      add(c) { this._s.add(c); }, remove(c) { this._s.delete(c); },
+      contains(c) { return this._s.has(c); },
+      toggle(c, on) { if (on === undefined) on = !this._s.has(c); if (on) this._s.add(c); else this._s.delete(c); return on; },
+    },
     setAttribute(k, v) { this.attrs[k] = v; },
     getAttribute(k) { return this.attrs[k]; },
     removeAttribute(k) { delete this.attrs[k]; },
@@ -88,7 +94,7 @@ function makeEl(id) {
 
 function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200, json: LETTER },
                    ack = null, send = { status: 200, json: { ok: true, id: "S1", ref: "lead/S1" } },
-                   archive = { status: 200, json: { ok: true, state: "moved" } }, hash = "" } = {}) {
+                   archive = { status: 200, json: { ok: true, state: "moved" } }, hash = "", width = undefined } = {}) {
   const ids = ["title", "home", "hint", "err", "boxes", "groups", "aliases", "switches",
                "broadcasts", "log", "langs", "h-groups", "h-aliases", "h-switches",
                "h-broadcasts", "h-log", "letter", "letter-status",
@@ -115,7 +121,7 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
       getElementById: (id) => els[id] || null,
       addEventListener() {}, createElement: (t) => makeEl(t),
     },
-    window: { localStorage, addEventListener() {}, location: { hash } },
+    window: { localStorage, addEventListener() {}, location: { hash }, ...(width !== undefined ? { innerWidth: width } : {}) },
     navigator: { languages: langs, language: langs[0] || "" },
     localStorage,
     fetch: async (url, opts = {}) => {
@@ -476,6 +482,40 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   is(s2.ctx.window.location.hash, "", "非法深链 hash 被清（不每 5s 重刷）");
   const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
   is(/\.toggle\s*,\s*\.clear\s*\{[^}]*min-height:\s*44px/.test(css), true, ".toggle/.clear 有 ≥44px 规则");
+}
+
+// ============ 13) 工作台可关闭：桌面收起右轨、手机首屏不开、点节点/徽章重开 ============
+{
+  const closeIt = (env) => env.fire("boxes", "click", { target: { closest: (s) => (s === "[data-ins-close]" ? { dataset: {} } : null) } });
+  const e = makeEnv(); await settle();
+  has(e.els["boxes"].innerHTML, 'class="inspector', "桌面默认打开工作台");
+  is(e.ctx.document.body.classList.contains("with-ins"), true, "桌面默认让出右轨");
+  closeIt(e); await settle();
+  hasNot(e.els["boxes"].innerHTML, 'class="inspector', "关闭后工作台不渲染");
+  is(e.ctx.document.body.classList.contains("with-ins"), false, "关闭后收起右轨");
+  has(e.els["boxes"].innerHTML, 'data-box="director"', "组织视图仍在");
+  await e.ctx.load(); await settle();
+  hasNot(e.els["boxes"].innerHTML, 'class="inspector', "关闭后轮询不得把它带回来");
+  nodeClick("lead")(e); await settle();
+  has(e.els["boxes"].innerHTML, 'class="inspector', "点节点重新打开");
+  has(e.els["boxes"].innerHTML, "lead-who", "显示点击的信箱");
+  await e.ctx.load(); await settle();
+  has(e.els["boxes"].innerHTML, 'class="inspector', "点节点后轮询保持打开（insOpen 已置位）");
+  closeIt(e); await settle();
+  e.fire("op-shortcut", "click", { target: {} }); await settle();
+  has(e.els["boxes"].innerHTML, 'class="inspector', "右上 OPERATOR 徽章重开工作台");
+  has(e.els["boxes"].innerHTML, "director-who", "回到老板工作台");
+  await e.ctx.load(); await settle();
+  has(e.els["boxes"].innerHTML, 'class="inspector', "徽章重开后轮询保持打开");
+  const m = makeEnv({ width: 390 }); await settle();
+  hasNot(m.els["boxes"].innerHTML, 'class="inspector', "手机首屏不开工作台（组织视图优先）");
+  is(m.ctx.document.body.classList.contains("with-ins"), false, "手机不让出右轨");
+  nodeClick("lead")(m); await settle();
+  has(m.els["boxes"].innerHTML, 'class="inspector', "手机点节点才打开");
+  await m.ctx.load(); await settle();
+  has(m.els["boxes"].innerHTML, 'class="inspector', "手机打开后轮询保持");
+  closeIt(m); await settle();
+  hasNot(m.els["boxes"].innerHTML, 'class="inspector', "手机关闭回到组织视图");
 }
 
 console.log(failures ? `FAIL ${failures}` : "PASS");
