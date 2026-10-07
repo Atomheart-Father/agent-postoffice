@@ -560,7 +560,8 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   is(open(), false, "打开写信时下拉默认收起");
   e.fire("compose-to", "focus", {}); await settle();
   is(open(), true, "聚焦即出下拉");
-  is((sug().match(/<button/g) || []).length, 8, "空查询最多 8 条");
+  is((sug().match(/<button/g) || []).length, ACME_BOXES.length + 1, "空查询列出全部信箱+逻辑地址（不截断）");
+  has(sug(), "ware", "列表尾部的信箱也在（不再被 8 条截断）");
   has(sug(), "director", "下拉含物理信箱");
   is(e.els["compose-to"].getAttribute("aria-expanded"), "true", "aria-expanded 同步");
   e.els["compose-to"].value = "res";
@@ -593,6 +594,15 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   is(posts(e, "/api/send").length, 1, "点选后照常发送一次");
   e.fire("btn-compose", "click", { target: {} }); await settle();
   is(open(), false, "重开写信下拉收起");
+  // v1.12.4：从某信箱工作台点「写信」→ 收件人默认就是它；下拉点开即可见（截断已移除）
+  nodeClick("scribe")(e); await settle();
+  e.fire("boxes", "click", { target: { closest: (s) => (s === "[data-compose]" ? {} : null) } }); await settle();
+  is(e.els["compose-to"].value, "scribe", "工作台写信预填当前信箱");
+  e.fire("compose-to", "click", { target: {} }); await settle();
+  has(sug(), "scribe", "下拉含预填信箱");
+  e.fire("compose-sug", "click", { target: { closest: (s) => (s === "button[data-v]" ? { dataset: { v: "ware" } } : null) } });
+  await settle();
+  is(e.els["compose-to"].value, "ware", "预填仍可改选别的信箱");
 }
 
 // ============ 16) 收件人下拉：点输入框保持、点外面才收起（真实浏览器事件序列回归） ============
