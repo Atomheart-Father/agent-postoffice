@@ -340,6 +340,40 @@ class SlackAlert(unittest.TestCase):
         self.assertEqual(len(self.slack_requests()), 1, "告警本身要发过一次")
         self.assertTrue(self.letter_path("chief", lid).is_file(), "信照常留在 inbox")
 
+    def test_hanging_webhook_does_not_stall_the_next_box(self):
+        """webhook 永不应答时，后面的信箱必须照常入账——钉住的是超时「值」。
+
+        routes 顺序 chief 在前：chief 的告警挂起（客户端 3 秒超时放弃）之后，
+        helper 的入账必须仍在 6.5 秒红线内完成。若实现把 timeout 放大（如 30s），
+        helper 会被顶过红线，本用例变红。
+        """
+        lid2 = self.send("helper", "coder", "隔壁信箱照常")
+        self.srv.mode = "sleep"
+        self.srv.sleep_secs = 30.0            # 本轮内永不应答
+        p = subprocess.Popen([sys.executable, PO, "postman"],
+                             env=env_for(self.home, POSTOFFICE_SLACK_WEBHOOK=self.webhook_url),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        marked = False
+        try:
+            deadline = time.time() + 6.5
+            while time.time() < deadline:
+                if str(self.letter_path("helper", lid2)) in self.delivered():
+                    marked = True
+                    break
+                if p.poll() is not None:
+                    break
+                time.sleep(0.1)
+        finally:
+            p.terminate()
+            try:
+                p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        self.assertTrue(marked, "挂起的 webhook 不得把下一个信箱的入账拖过 6.5s（timeout 必须是秒级）")
+        self.assertIn(str(self.letter_path("helper", lid2)), self.delivered())
+        self.assertTrue(self.letter_path("helper", lid2).is_file(), "信照常留在 inbox")
+
 
 if __name__ == "__main__":
     try:

@@ -399,5 +399,60 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   is(e.els["letter"].hidden, true, "无副作用");
 }
 
+// ============ 10) UNASSIGNED: routes 已注册但未进组织的信箱不得被静默隐藏 ============
+{
+  const st = JSON.parse(JSON.stringify(ACME));
+  st.boxes.push(mkBox("stray", "notify", true, 1));
+  const e = makeEnv({ state: st }); await settle();
+  const b = e.els["boxes"].innerHTML;
+  has(b, "未分配", "UNASSIGNED 区域出现");
+  has(b, 'data-box="stray"', "未分配信箱仍渲染为可点节点");
+  is((b.match(/data-box="stray"/g) || []).length, 1, "不能 duplicate render（恰好一次）");
+  e.fire("tab-hk", "click", { target: {} }); await settle();
+  has(e.els["racks"].innerHTML, "stray", "Harness 仍按真实 method 出现");
+  const st2 = JSON.parse(JSON.stringify(st));
+  st2.panel.organization.children.push({ mailbox: "stray", label: "Stray" });
+  const e2 = makeEnv({ state: st2 }); await settle();
+  hasNot(e2.els["boxes"].innerHTML, "未分配", "全部入编后 UNASSIGNED 区域消失");
+  is((e2.els["boxes"].innerHTML.match(/data-box="stray"/g) || []).length, 1, "正式位置恰好一次");
+  const n0 = e2.calls.length;
+  await e2.ctx.load(); await settle();
+  const added = e2.calls.slice(n0);
+  is(added.filter((c) => c.method !== "GET" || !c.url.startsWith("/api/state")).length, 0,
+     "render 轮询零写请求（routes/config 不被改）");
+}
+
+// ============ 11) Harness 组控制：member-set 恰好相等才显示（部分重叠不算） ============
+{
+  const st = JSON.parse(JSON.stringify(ACME));
+  st.groups.push({ name: "part", members: ["scribe", "research-b"], online: 1, total: 2,
+    counts: { waiting: 0, reminded: 0, failed: 0 } });
+  const e = makeEnv({ state: st }); await settle();
+  e.fire("tab-hk", "click", { target: {} }); await settle();
+  const r = e.els["racks"].innerHTML;
+  hasNot(r, 'data-group="part"', "部分重叠组不得显示组控制");
+  has(r, "@ocode", "恰好相等的组仍显示");
+}
+
+// ============ 12) 深链生命周期 + 工作台控件可见性 ============
+{
+  const e = makeEnv({ hash: "#/mail/director/L1" }); await settle();
+  is(e.els["letter"].hidden, false, "深链打开");
+  e.fire("letter", "click", { target: { closest: (s) => (s === "[data-letter-action]" ? { dataset: { letterAction: "close" } } : null) } });
+  await settle();
+  is(e.els["letter"].hidden, true, "关闭");
+  is(e.ctx.window.location.hash, "", "关闭时清掉 hash");
+  await e.ctx.load(); await settle();
+  is(e.els["letter"].hidden, true, "轮询后不得重开");
+  const s1 = makeEnv({ hash: "#/mail/lead" }); await settle();
+  has(s1.els["boxes"].innerHTML, "lead-who", "#/mail/<box> 打开 inspector");
+  is(s1.els["letter-status"].textContent.includes("深链"), false, "单段深链不报错");
+  const s2 = makeEnv({ hash: "#/mail/nobody..x" }); await settle();
+  has(s2.els["letter-status"].textContent, "深链", "非法深链提示");
+  is(s2.ctx.window.location.hash, "", "非法深链 hash 被清（不每 5s 重刷）");
+  const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+  is(/\.toggle\s*,\s*\.clear\s*\{[^}]*min-height:\s*44px/.test(css), true, ".toggle/.clear 有 ≥44px 规则");
+}
+
 console.log(failures ? `FAIL ${failures}` : "PASS");
 process.exit(failures ? 1 : 0);

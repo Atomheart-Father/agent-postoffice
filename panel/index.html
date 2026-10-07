@@ -219,6 +219,14 @@ table.hk td:first-child{width:34px;color:var(--rule2);font-family:var(--mono);fo
   .rail .brand .sub,.rail .home{display:none}
 }
 @media (prefers-reduced-motion:reduce){.letter,.drawer,.opstrip .arrow{transition:none}}
+
+/* 工作台主控件：在线/离线开关与「归档全部」必须看得见、摸得着（≤v1.11 既有类名，重写时不许丢样式） */
+.toggle,.clear{border:1px solid var(--rule2);background:none;color:var(--ink);font-family:var(--mono);font-size:11px;letter-spacing:.08em;min-height:44px;padding:0 14px;cursor:pointer}
+.toggle.on{border-color:var(--ok);color:var(--ok)}
+.toggle:hover,.clear:hover{border-color:var(--ink)}
+/* 编外信箱：presentation-only 兜底区，样式刻意轻 */
+.unassigned{margin-top:34px}
+.unassigned .k{display:block;margin-bottom:10px}
 </style>
 </head>
 <body>
@@ -347,6 +355,7 @@ const STR = {
     groupReject: "收件人不能是分组，请选具体信箱或 @逻辑地址。",
     operatorBad: "操作员信箱不可用：写信/回复/回执已停用。",
     noOrg: "未配置组织视图（config.json 可选 panel 段）。下面是全部信箱。",
+    unassigned: "未分配",
     panelBad: "组织配置有问题，只影响本视图：",
     deepLinkBad: "深链无效。",
     fromLabel: "FROM", toLabel: "收件人", send: "发送", cancel: "取消",
@@ -401,6 +410,7 @@ const STR = {
     groupReject: "The recipient cannot be a group — pick a mailbox or an @logical address.",
     operatorBad: "Operator mailbox unusable: compose, reply and ack are disabled.",
     noOrg: "No organization configured (optional \"panel\" section in config.json). All mailboxes:",
+    unassigned: "UNASSIGNED",
     panelBad: "Organization config has problems (this view only):",
     deepLinkBad: "Invalid deep link.",
     fromLabel: "FROM", toLabel: "To", send: "Send", cancel: "Cancel",
@@ -509,6 +519,21 @@ function orgHTML() {
     return `<div class="orgnote">${esc(t("noOrg"))}</div>${flatGrid()}`;
   }
   const root = p.organization;
+  // 编内集合：树上出现过的 physical mailbox（服务端已保证全树唯一，这里只为求差集）
+  const assigned = new Set();
+  const walkAssigned = (n) => {
+    if (!n || typeof n !== "object") return;
+    if (n.mailbox) assigned.add(n.mailbox);
+    (n.members || []).forEach((m) => assigned.add(m));
+    (n.children || []).forEach(walkAssigned);
+  };
+  walkAssigned(root);
+  // 已注册但未编入组织的信箱：presentation-only 兜底展示，绝不为它猜部门、改配置
+  const unassignedBoxes = (STATE?.boxes || []).filter((b) => !assigned.has(b.name));
+  const unassigned = unassignedBoxes.length ? `
+    <section class="unassigned"><div class="k">${esc(t("unassigned"))}</div>
+      <div class="peers">${unassignedBoxes.map((b) => nodeBtn(b.name)).join("")}</div>
+    </section>` : "";
   const rootBox = root.mailbox ? boxOf(root.mailbox) : null;
   const isOp = root.mailbox && root.mailbox === operatorName();
   const strip = rootBox ? `
@@ -535,7 +560,7 @@ function orgHTML() {
       <div class="dn"><b>${esc(d.label || "")}</b><span class="chno"><span class="tick"></span>CH-${String(i + 1).padStart(2, "0")}</span></div>
       ${treeBlock({ members: d.members, children: d.children })}
     </section>`).join("")}</div>` : "";
-  return strip + `<div class="vjoin"></div>` + t1 + cols;
+  return strip + `<div class="vjoin"></div>` + t1 + cols + unassigned;
 }
 
 function flatGrid() {
@@ -722,6 +747,17 @@ function closeLetter() {
   el.innerHTML = "";
   setClass(el, "open", false);
   const bg = $("sheet-bg"); setClass(bg, "open", false);
+  // 不在这里清 hash：初始化 applyLang 也会走 closeLetter，会把还没消费的深链抹掉。
+  // 深链只被 handleDeepLink 消费一次（打开/报错时即刻清），关掉后轮询自然不会再拉起。
+}
+
+function clearHash() {
+  try {
+    if (!readHash()) return;
+    if (typeof history !== "undefined" && history.replaceState) {
+      history.replaceState(null, "", location.pathname + location.search);
+    } else if (window.location) window.location.hash = "";
+  } catch {}
 }
 
 /* ---------- compose / reply ---------- */
@@ -751,7 +787,8 @@ function openCompose(mode) {
   if (composeMode === "reply" && currentLetter) {
     const box = boxOf(currentLetter.box);
     const row = ((box?.pending) || []).find((p) => p.file.replace(/\.md$/, "") === currentLetter.id);
-    $("compose-to").value = row?.from || "";
+    // 回复对象用信件详情里的规范 sender（列表行的 from 是 ≤30 字的显示截断，不是地址）
+    $("compose-to").value = currentLetter.sender || row?.from || "";
     const s = row?.subject || "";
     $("compose-subject").value = /^re:/i.test(s) ? s : `Re: ${s}`;
   }
@@ -803,7 +840,7 @@ async function sendCompose() {
         const lr = await fetch(`/api/letter?box=${encodeURIComponent(box)}&id=${encodeURIComponent(id)}`);
         if (seq === letterSeq && lr.ok) {
           const d = await lr.json();
-          currentLetter = { box, id };
+    currentLetter = { box, id, sender: d.sender || "" };
           const el = $("letter");
           el.innerHTML = `<div class="card">${letterHTML(d)}</div>`;
           el.hidden = false; setClass(el, "open", true);
@@ -1089,12 +1126,28 @@ function readHash() {
 function handleDeepLink() {
   const h = readHash();
   if (!h) return;
-  const m = h.match(/^#\/mail\/([^/]+)\/([^/]+)$/);
-  if (!m) { setTxt("letter-status", t("deepLinkBad")); return; }
-  const box = decodeURIComponent(m[1]), id = decodeURIComponent(m[2]);
-  if (!/^mailto:/.test(box) && !/^[A-Za-z0-9_\-]+$/.test(box)) { setTxt("letter-status", t("deepLinkBad")); return; }
-  if (!/^[^.\/][^/]*$/.test(id) || /\.md$/.test(id)) { setTxt("letter-status", t("deepLinkBad")); return; }
-  openLetter(box, id);
+  clearHash();                      // 深链只消费一次：打开/报错后都清掉，轮询不得重放
+  const two = h.match(/^#\/mail\/([^/]+)\/([^/]+)$/);
+  if (two) {
+    const box = decodeURIComponent(two[1]), id = decodeURIComponent(two[2]);
+    if (/^[A-Za-z0-9_\-]+$/.test(box) && /^[^.\/][^/]*$/.test(id) && !/\.md$/.test(id)) {
+      openLetter(box, id);
+      return;
+    }
+    setTxt("letter-status", t("deepLinkBad"));
+    return;
+  }
+  const one = h.match(/^#\/mail\/([^/]+)$/);
+  if (one) {
+    const box = decodeURIComponent(one[1]);
+    if (/^[A-Za-z0-9_\-]+$/.test(box) && boxOf(box)) {
+      insBox = box;                 // 单段深链：直达该信箱的工作台
+      const b = $("boxes");
+      if (b && view === "org") b.innerHTML = orgHTML() + inspectorHTML();
+      return;
+    }
+  }
+  setTxt("letter-status", t("deepLinkBad"));
 }
 try { window.addEventListener && window.addEventListener("hashchange", handleDeepLink); } catch {}
 
