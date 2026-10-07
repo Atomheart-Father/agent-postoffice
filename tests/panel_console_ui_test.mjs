@@ -49,7 +49,8 @@ const mkBox = (name, method, online, waiting = 0) => ({
 });
 const ACME_BOXES = [
   { ...mkBox("director", "notify", true, 2), pending: [
-    { file: "L1.md", status: "waiting", subject: "部署 & 计划", from: "lead" } ] },
+        // from 是服务端 ≤30 字截断的显示串，可以 ≠ 规范 sender：回复预填必须用 sender，不能落到显示串
+        { file: "L1.md", status: "waiting", subject: "部署 & 计划", from: "lead-display-trunc" } ] },
   mkBox("scribe", "opencode_plugin", true, 1),
   mkBox("research-a", "opencode_plugin", true),
   mkBox("research-b", "claude_hook", false),
@@ -125,7 +126,10 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
         const spec = Array.isArray(letter) ? (letter.shift() || { status: 200, json: {} }) : letter;
         return reply(spec.status, spec.json);
       }
-      if (method === "POST" && url.startsWith("/api/archive-one")) return reply(archive.status, archive.json);
+      if (method === "POST" && url.startsWith("/api/archive-one")) {
+        if (archive.throw) throw new Error("network down");
+        return reply(archive.status, archive.json);
+      }
       if (method === "POST" && url.startsWith("/api/ack-one")) {
         return reply(ack ? ack.status : 200, ack ? ack.json : { ok: true, state: "recorded", id: "L1", to: "lead" });
       }
@@ -320,6 +324,18 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   is(posts(h, "/api/send").length, 0, "重试归档不再 send");
   is(posts(h, "/api/ack-one").length, 0, "重试归档绝不 ack-one");
   is(posts(h, "/api/archive-one").length, 1, "重试归档只发 archive-one");
+  // 5e. send ok + 归档请求在网络层抛错（非 4xx/5xx）→ 同样是「回复已出门」：只重试归档，绝无二次 send
+  const hNet = makeEnv({ archive: { throw: true } }); await settle();
+  rowClick(hNet); await settle();
+  letterAct("reply")(hNet); await settle();
+  hNet.els["compose-body"].value = "x";
+  hNet.calls.length = 0;
+  hNet.fire("compose-send", "click", { target: {} }); await settle();
+  is(posts(hNet, "/api/send").length, 1, "网络抛错：send 恰好一次");
+  is(posts(hNet, "/api/archive-one").length, 1, "网络抛错：归档尝试一次");
+  has(hNet.els["letter-status"].textContent, "回复已经发送，原信归档失败", "网络抛错也进部分失败横幅");
+  has(detail(hNet), "重试归档", "网络抛错只提供重试归档");
+  hasNot(detail(hNet), "回复（发送回复并归档）", "网络抛错不再提供再次回复");
 }
 
 // ============ 6) Ack / File only / pure read ============
@@ -447,6 +463,14 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   const s1 = makeEnv({ hash: "#/mail/lead" }); await settle();
   has(s1.els["boxes"].innerHTML, "lead-who", "#/mail/<box> 打开 inspector");
   is(s1.els["letter-status"].textContent.includes("深链"), false, "单段深链不报错");
+  // 单段深链在 HARNESS 页也要能落到工作台（自动切回组织视图）
+  const s3 = makeEnv(); await settle();
+  s3.fire("tab-hk", "click", { target: {} }); await settle();
+  is(s3.els["view-hk"].hidden, false, "先切到 HARNESS 页");
+  s3.ctx.window.location.hash = "#/mail/lead";
+  await s3.ctx.load(); await settle();
+  has(s3.els["boxes"].innerHTML, "lead-who", "HARNESS 页收到单段深链切回工作台");
+  is(s3.els["view-hk"].hidden, true, "视图已切回组织");
   const s2 = makeEnv({ hash: "#/mail/nobody..x" }); await settle();
   has(s2.els["letter-status"].textContent, "深链", "非法深链提示");
   is(s2.ctx.window.location.hash, "", "非法深链 hash 被清（不每 5s 重刷）");
