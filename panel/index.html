@@ -1,109 +1,264 @@
-<!doctype html>
-<html lang="zh">
+<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>联络总站</title>
 <style>
-  :root {
-    --bg: #f6f5f1; --card: #ffffff; --ink: #1d1d1b; --muted: #77756e; --line: #e4e1d8;
-    --on: #2f7d4f; --off: #b04a3a; --chip: #efede6; --accent: #1d1d1b; --warn: #8a6d1f;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #161615; --card: #1f1f1d; --ink: #ecebe6; --muted: #9a988f; --line: #2e2e2b;
-            --on: #5fbf85; --off: #e07a68; --chip: #2a2a27; --accent: #ecebe6; --warn: #d7b45a; }
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-         font: 15px/1.5 -apple-system, "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif; }
-  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
-  header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-  h1 { font-size: 22px; margin: 0; letter-spacing: .02em; }
-  .home { color: var(--muted); font-size: 13px; font-family: ui-monospace, Menlo, monospace; }
-  .langs { display: flex; gap: 6px; }
-  .langs button { font: inherit; font-size: 12px; color: var(--muted); background: none;
-                  border: 1px solid var(--line); border-radius: 999px; padding: 1px 10px; cursor: pointer; }
-  .langs button[aria-pressed="true"] { color: var(--ink); border-color: var(--muted); }
-  .hint { color: var(--muted); font-size: 13px; margin: 6px 0 20px; }
-  .box { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-         padding: 14px 16px; margin-bottom: 10px; display: grid;
-         grid-template-columns: 1fr auto; gap: 4px 16px; align-items: center; }
-  .box.offline { opacity: .72; }
-  .name { font-weight: 600; font-size: 16px; }
-  .name small { font-weight: 400; color: var(--muted); margin-left: 8px; font-size: 13px; }
-  .meta { color: var(--muted); font-size: 13px; grid-column: 1; overflow-wrap: anywhere; }
-  .chip { display: inline-block; background: var(--chip); border-radius: 999px; padding: 0 8px;
-          font-size: 12px; margin-right: 6px; color: var(--ink); }
-  .chip.bad { color: var(--off); }
-  .chip.mid { color: var(--warn); }
-  .pending { grid-column: 1 / -1; margin-top: 6px; font-size: 13px; }
-  .pending div { padding: 3px 0; border-top: 1px dashed var(--line); }
-  .pending b { font-weight: 500; }
-  .meter { display: inline-block; width: 120px; height: 6px; border-radius: 3px; background: var(--chip);
-           vertical-align: middle; margin-left: 8px; overflow: hidden; }
-  .meter i { display: block; height: 100%; background: var(--on); }
-  .toggle { grid-row: 1 / span 2; grid-column: 2; display: flex; align-items: center; gap: 10px;
-            cursor: pointer; user-select: none; border: 0; background: none; color: inherit; font: inherit; padding: 4px; }
-  .track { width: 46px; height: 26px; border-radius: 13px; background: var(--off); position: relative; transition: background .15s; }
-  .track::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px;
-                  border-radius: 50%; background: #fff; transition: transform .15s; }
-  .on .track { background: var(--on); }
-  .on .track::after { transform: translateX(20px); }
-  .state { width: 3em; text-align: right; font-size: 14px; }
-  .toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
-  h2 { font-size: 15px; margin: 28px 0 8px; }
-  .log { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px 14px;
-         font: 12.5px/1.6 ui-monospace, Menlo, monospace; max-height: 340px; overflow: auto; }
-  .log div { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .log span { color: var(--muted); }
-  .clear { margin-left: 10px; font: inherit; font-size: 12px; color: var(--off); background: none;
-           border: 1px solid var(--off); border-radius: 999px; padding: 0 10px; cursor: pointer; }
-  .err { color: var(--off); font-size: 13px; min-height: 1.5em; }
-  .gname { font-weight: 600; }
-  .gall { display: flex; gap: 6px; grid-row: 1 / span 2; grid-column: 2; }
-  .gall button { font: inherit; font-size: 12px; color: var(--muted); background: none;
-                 border: 1px solid var(--line); border-radius: 999px; padding: 1px 10px; cursor: pointer; }
-  .gall button:hover { color: var(--ink); border-color: var(--muted); }
-  .settle { color: var(--muted); font-size: 12.5px; }
-  .note { color: var(--muted); font-size: 13px; min-height: 1.5em; }
-  .pending div.pend { cursor: pointer; }
-  .pending div.pend:hover { color: var(--accent); }
-  .letter { position: fixed; inset: 0; z-index: 9; background: rgba(0, 0, 0, .35);
-            display: flex; align-items: flex-start; justify-content: center;
-            padding: 56px 16px; overflow: auto; }
-  .letter[hidden] { display: none; }
-  .letter .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-                  padding: 16px 18px; width: 100%; max-width: 640px; }
-  .letter h3 { margin: 0 0 10px; font-size: 16px; }
-  .letter h3 small { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
-  .letter .field { margin: 4px 0; overflow-wrap: anywhere; }
-  .letter .field b { color: var(--muted); font-weight: 500; margin-right: 6px; }
-  .letter .body { white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0;
-                  border-top: 1px dashed var(--line); padding-top: 10px; }
-  .letter .acts { display: flex; gap: 8px; margin-top: 14px; }
-  .letter .acts button { font: inherit; font-size: 13px; color: inherit; background: none;
-                         border: 1px solid var(--line); border-radius: 999px; padding: 2px 14px; cursor: pointer; }
-  .letter .acts button:hover { border-color: var(--muted); }
-  @media (max-width: 520px) { .state { display: none; } }
+:root{
+  --sans:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --bg:#e6e4de; --panel:#efede7; --panel2:#f6f4ee;
+  --ink:#1d1c18; --ink2:#6d6a62; --rule:#45423a; --rule2:#cfccc2;
+  --accent:#ff4d00; --ok:#2e8b57; --off:#98948b; --warn:#b8860b; --bad:#b3362b;
+  --radius:2px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+.mono{font-family:var(--mono)}
+.dim{color:var(--ink2)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---------- top rail ---------- */
+header.rail{display:flex;align-items:stretch;border-bottom:1px solid var(--rule);background:var(--bg);position:sticky;top:0;z-index:20}
+.rail .brand{padding:8px 20px;border-right:1px solid var(--rule)}
+.rail .brand b{font-size:16px;letter-spacing:.16em;font-weight:800;display:block;line-height:1.15}
+.rail .brand .sub{font-family:var(--mono);font-size:9px;letter-spacing:.3em;color:var(--ink2)}
+.rail .home{display:block;font-family:var(--mono);font-size:9px;color:var(--ink2);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+nav.tabs{display:flex;align-items:stretch}
+nav.tabs button{padding:0 26px;font-family:var(--mono);font-size:11px;letter-spacing:.2em;color:var(--ink2);border-right:1px solid var(--rule2);position:relative;min-height:44px}
+nav.tabs button[aria-selected="true"]{color:var(--ink)}
+nav.tabs button[aria-selected="true"]::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:3px;background:var(--accent)}
+.rail .spacer{flex:1}
+.rail .aux{display:flex;align-items:center;gap:4px;padding:0 12px}
+.act{font-family:var(--mono);font-size:11px;letter-spacing:.16em;color:var(--ink2);padding:8px 10px;min-height:44px}
+.act:hover{color:var(--ink)}
+.compose-btn{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--ink);background:var(--ink);color:var(--bg);padding:8px 16px;font-family:var(--mono);font-size:11px;letter-spacing:.14em;border-radius:var(--radius);min-height:32px}
+.compose-btn:hover{background:#000}
+.compose-btn[disabled]{opacity:.45;cursor:not-allowed}
+.langs{display:inline-flex;gap:2px;margin:0 8px}
+.langs button{font-family:var(--mono);font-size:10px;padding:6px 8px;color:var(--ink2);min-height:32px}
+.langs button[aria-pressed="true"]{color:var(--ink);border-bottom:2px solid var(--accent)}
+.op-btn{display:flex;align-items:center;gap:10px;padding:0 16px;border-left:1px solid var(--rule);min-height:44px;text-align:left}
+.op-btn:hover{background:var(--panel2)}
+.op-btn .lbl{display:flex;flex-direction:column;line-height:1.3}
+.op-btn .lbl b{font-family:var(--mono);font-size:10px;letter-spacing:.14em;font-weight:700}
+.op-btn .lbl span{font-family:var(--mono);font-size:9px;letter-spacing:.12em;color:var(--ink2)}
+.counter{font-family:var(--mono);font-size:9px;letter-spacing:.08em;border:1px solid var(--rule);padding:1px 5px;color:var(--ink);border-radius:var(--radius)}
+.counter.hot{border-color:var(--accent);color:var(--accent)}
+
+/* status: LED + text, never color-only */
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--off);flex:none}
+.dot.on{background:var(--ok)} .dot.warn{background:var(--warn)}
+.st{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--ink2)}
+.st.on{color:var(--ok)} .st.off{color:var(--off)} .st.warn{color:var(--warn)}
+.chip{font-family:var(--mono);font-size:9px;letter-spacing:.12em;border:1px solid var(--rule2);color:var(--ink2);padding:1px 6px;border-radius:var(--radius)}
+.chip.bad{border-color:var(--bad);color:var(--bad)}
+.chip.mid{border-color:var(--warn);color:var(--warn)}
+
+main{max-width:1280px;margin:0 auto;padding:18px 26px 120px}
+.hint{font-family:var(--mono);font-size:10px;color:var(--ink2);letter-spacing:.04em;margin-bottom:10px}
+.err{color:var(--bad);font-family:var(--mono);font-size:11px;min-height:1em;margin-bottom:6px}
+.note{font-family:var(--mono);font-size:11px;color:var(--accent);min-height:1em;margin-bottom:6px}
+.crumb{font-family:var(--mono);font-size:10px;letter-spacing:.24em;color:var(--ink2);display:flex;justify-content:space-between;margin-bottom:14px}
+
+/* ---------- TX-6 micrographics ---------- */
+.chno{font-family:var(--mono);font-size:10px;letter-spacing:.18em;color:var(--ink2)}
+.tick{display:inline-block;width:14px;height:5px;border-bottom:1px solid var(--rule2);border-left:1px solid var(--rule2);margin:0 4px 1px 0}
+.sigbars{display:inline-flex;gap:2px;align-items:flex-end;height:8px}
+.sigbars i{width:2px;background:var(--rule2)} .sigbars i:nth-child(1){height:3px}.sigbars i:nth-child(2){height:5px}.sigbars i:nth-child(3){height:8px}
+.sigbars.on i{background:var(--ok)}
+
+/* ---------- Operator Strip ---------- */
+.opstrip{display:flex;align-items:center;gap:18px;width:100%;text-align:left;border:0;border-bottom:2px solid var(--rule);padding:14px 6px 12px;min-height:44px}
+.opstrip:hover{background:var(--panel2)}
+.opstrip .nm{font-size:38px;font-weight:800;letter-spacing:-.01em;line-height:1}
+.opstrip .sub{display:flex;flex-direction:column;gap:3px}
+.opstrip .sub .k{font-family:var(--mono);font-size:9px;letter-spacing:.26em;color:var(--ink2)}
+.opstrip .inbox{margin-left:auto;display:flex;align-items:center;gap:12px;font-family:var(--mono);font-size:10px;letter-spacing:.18em;color:var(--ink2)}
+.opstrip .inbox .counter{font-size:11px;padding:2px 7px}
+.opstrip .inbox .arrow{font-size:16px;color:var(--ink);transition:transform .15s ease}
+.opstrip:hover .arrow{transform:translateX(4px)}
+
+/* thin hierarchy connectors */
+.vjoin{position:relative;height:22px}
+.vjoin::before{content:"";position:absolute;left:50%;top:0;width:1px;height:100%;background:var(--rule2)}
+.vjoin.wide::before{left:25%;right:25%;width:auto;height:1px;top:0}
+.vjoin.wide::after{content:"";position:absolute;left:50%;top:0;width:1px;height:100%;background:var(--rule2)}
+
+/* ---------- mailbox node ---------- */
+.node{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;border:0;border-top:1px solid var(--rule);padding:8px 2px 7px;min-height:44px;text-align:left;width:100%}
+.node:hover{background:var(--panel2)}
+.node .l1{display:flex;align-items:baseline;gap:10px}
+.node .nm{font-weight:700;font-size:14px}
+.node .idchip{font-family:var(--mono);font-size:9px;color:var(--ink2)}
+.node .l2{display:flex;align-items:center;gap:10px;margin-top:3px;flex-wrap:wrap}
+.node.dead .nm{color:var(--ink2)}
+
+/* ---------- ORG layout ---------- */
+.t1row{display:flex;align-items:center;gap:16px;padding:2px 6px;margin:4px 0 8px}
+.t1row .k{font-family:var(--mono);font-size:9px;letter-spacing:.24em;color:var(--ink2)}
+.t1row .t1node{max-width:300px;min-width:230px}
+.t1row .hair{flex:1;border-top:1px solid var(--rule2)}
+.cols{display:grid;grid-template-columns:repeat(3,1fr);gap:0 34px;margin-top:6px}
+.dept{border-left:1px solid var(--rule2);padding:14px 0 8px 20px;min-height:200px}
+.dept:first-child{border-left:none;padding-left:0}
+.dept .no{font-size:52px;font-weight:800;line-height:.9;letter-spacing:-.03em}
+.dept .dn{display:flex;align-items:baseline;justify-content:space-between;margin:6px 0 4px}
+.dept .dn b{font-family:var(--mono);font-size:11px;letter-spacing:.26em;font-weight:700}
+.peers{display:flex;flex-direction:column;margin-top:8px}
+.kids{display:flex;gap:0 18px}
+.kid{flex:1;position:relative}
+.kid::before{content:"";position:absolute;top:0;left:0;width:1px;height:22px;background:var(--rule2)}
+.kid.single::before{left:50%}
+.split{position:relative;height:1px;background:var(--rule2)}
+.split.s2{margin-left:25%;margin-right:25%}
+.orgnote{border:1px solid var(--rule2);background:var(--panel);border-radius:var(--radius);padding:14px 16px;font-family:var(--mono);font-size:11px;color:var(--ink2);margin-bottom:16px}
+.flatgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px 26px}
+
+/* ---------- HARNESS ---------- */
+.rackhead{display:flex;align-items:baseline;gap:14px;padding:12px 0 6px}
+.rackhead b{font-family:var(--mono);font-size:12px;letter-spacing:.24em}
+.rackhead .gctl{margin-left:auto;display:flex;gap:8px;align-items:center}
+.rackhead .hint2{font-family:var(--mono);font-size:9px;color:var(--ink2)}
+.gbtn{font-family:var(--mono);font-size:9px;letter-spacing:.14em;border:1px solid var(--rule);padding:4px 9px;border-radius:var(--radius);min-height:26px}
+.gbtn:hover{background:var(--ink);color:var(--bg)}
+table.hk{width:100%;border-collapse:collapse;border-top:2px solid var(--rule);margin-bottom:8px}
+table.hk th{font-family:var(--mono);font-size:9px;letter-spacing:.2em;color:var(--ink2);text-align:left;font-weight:400;padding:6px 10px;border-bottom:1px solid var(--rule)}
+table.hk td{padding:6px 10px;border-bottom:1px solid var(--rule2)}
+table.hk td:first-child{width:34px;color:var(--rule2);font-family:var(--mono);font-size:10px}
+.chname{display:flex;align-items:center;gap:10px}
+.chname .id{font-family:var(--mono);font-size:9px;color:var(--ink2)}
+.onoff{font-family:var(--mono);font-size:9px;letter-spacing:.14em;border:1px solid var(--rule2);color:var(--ink2);padding:4px 10px;border-radius:var(--radius);min-width:44px;min-height:26px}
+.onoff:hover{border-color:var(--ink);color:var(--ink)}
+
+/* ---------- inspector ---------- */
+.inspector{position:fixed;top:0;right:0;bottom:0;width:370px;background:var(--panel);border-left:1px solid var(--rule);z-index:40;overflow:auto;padding:16px 18px 40px}
+.inspector .k{font-family:var(--mono);font-size:9px;letter-spacing:.22em;color:var(--ink2)}
+.inspector h3{font-size:24px;font-weight:800;margin:2px 0 2px}
+.inspector .sec{font-family:var(--mono);font-size:9px;letter-spacing:.22em;color:var(--ink2);border-bottom:1px solid var(--rule);padding-bottom:4px;margin:18px 0 4px;display:flex;justify-content:space-between}
+.pl{display:flex;align-items:flex-start;gap:10px;width:100%;text-align:left;border:0;border-bottom:1px solid var(--rule2);padding:9px 2px;min-height:44px}
+.pl:hover{background:var(--panel2)}
+.pl .who{font-weight:700;width:88px;flex:none;overflow:hidden;text-overflow:ellipsis}
+.pl .meta{flex:1;min-width:0}
+.pl .sj{font-size:12px;font-weight:600}
+.pl .nd{font-family:var(--mono);font-size:9px;letter-spacing:.1em;color:var(--ink2);margin-top:2px}
+.pl .tm{font-family:var(--mono);font-size:9px;color:var(--ink2);flex:none}
+.inspector .kv{display:grid;grid-template-columns:92px 1fr;gap:5px 10px;font-size:12px;margin-top:6px}
+.inspector .kv .k{padding-top:2px}
+.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.btn{border:1px solid var(--ink);padding:8px 12px;font-family:var(--mono);font-size:10px;letter-spacing:.12em;border-radius:var(--radius);background:var(--panel2);min-height:32px}
+.btn.primary{background:var(--ink);color:var(--bg)}
+.btn.accent{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.ghost{border-color:var(--rule2);color:var(--ink2)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.metaline{font-family:var(--mono);font-size:9px;color:var(--ink2);letter-spacing:.08em;margin-top:6px}
+
+/* ---------- letter overlay ---------- */
+.sheet-bg{position:fixed;inset:0;background:rgba(29,28,24,.28);z-index:30;display:none}
+.sheet-bg.open{display:block}
+.letter{position:fixed;top:0;right:0;bottom:0;width:400px;max-width:100vw;background:var(--panel);border-left:1px solid var(--rule);z-index:41;overflow:auto;padding:16px 18px 40px;transform:translateX(103%);transition:transform .16s ease}
+.letter[hidden]{display:none}
+.letter.open{transform:none}
+.corr{font-family:var(--mono);font-size:9px;letter-spacing:.22em;color:var(--ink2);display:flex;justify-content:space-between;border-bottom:1px solid var(--rule);padding-bottom:6px}
+.corr h2{font-size:11px;letter-spacing:.22em;color:var(--ink)}
+.letter .kv{display:grid;grid-template-columns:92px 1fr;gap:6px 10px;font-size:12px;margin-top:12px}
+.letter .kv .k{font-family:var(--mono);font-size:9px;letter-spacing:.22em;color:var(--ink2);padding-top:2px}
+.letter .body{white-space:pre-wrap;border:1px solid var(--rule2);background:var(--panel2);border-radius:var(--radius);padding:10px;font-size:12px;margin:10px 0}
+.letter .acts{flex-direction:column;align-items:stretch;gap:8px}
+.letter .fine{font-family:var(--mono);font-size:9px;color:var(--ink2);margin-top:10px;line-height:1.7}
+
+/* ---------- activity drawer ---------- */
+.drawer{position:fixed;top:0;left:0;bottom:0;width:430px;max-width:92vw;background:var(--panel);border-right:1px solid var(--rule);z-index:40;transform:translateX(-103%);transition:transform .16s ease;overflow:auto;padding:16px 18px 40px}
+.drawer.open{transform:none}
+.drawer h2{font-family:var(--mono);font-size:10px;letter-spacing:.22em;color:var(--ink2);border-bottom:1px solid var(--rule);padding-bottom:4px;margin:18px 0 6px;font-weight:400}
+.drawer .row{display:flex;gap:10px;align-items:baseline;padding:6px 0;border-bottom:1px dashed var(--rule2);font-size:12px}
+.drawer .row .t{font-family:var(--mono);font-size:10px;color:var(--ink2);flex:none}
+.drawer .log div{padding:4px 0;border-bottom:1px dashed var(--rule2);font-family:var(--mono);font-size:11px}
+.drawer .log span{color:var(--ink2);margin-right:8px}
+.meter{display:inline-block;width:90px;height:4px;border:1px solid var(--rule2);border-radius:var(--radius);vertical-align:middle}
+.meter i{display:block;height:100%;background:var(--ok)}
+
+/* ---------- groups (configured) ---------- */
+#groups .box,#broadcasts .box{border-top:1px solid var(--rule);padding:9px 2px}
+#groups .gname,#broadcasts .name{font-weight:700;font-size:14px}
+#groups .gname small,#broadcasts .name small{font-family:var(--mono);font-size:9px;color:var(--ink2);margin-left:10px;letter-spacing:.08em}
+#groups .gall{display:flex;gap:8px;margin:6px 0}
+#groups .meta,#broadcasts .meta{font-family:var(--mono);font-size:9px;color:var(--ink2);display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:4px}
+#aliases .box{border-top:1px solid var(--rule);padding:9px 2px}
+#aliases .gname{font-weight:700;font-size:14px}
+#aliases .gname small{font-family:var(--mono);font-size:9px;color:var(--ink2);margin-left:10px}
+#aliases .meta{font-family:var(--mono);font-size:9px;color:var(--ink2);display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+#aliases .settle{font-family:var(--mono);font-size:9px;color:var(--warn);margin-top:4px}
+.hintp{font-family:var(--mono);font-size:10px;color:var(--ink2);padding:8px 2px}
+
+/* ---------- compose modal ---------- */
+.modal{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:50;background:rgba(29,28,24,.32)}
+.modal[hidden]{display:none}
+.modal .card{width:560px;max-width:94vw;background:var(--panel);border:1px solid var(--ink);border-radius:var(--radius);padding:18px}
+.modal h3{font-size:16px;font-weight:800;margin-bottom:12px}
+.frow{display:grid;grid-template-columns:120px 1fr;gap:10px;align-items:center;margin-bottom:10px}
+.frow label{font-family:var(--mono);font-size:9px;letter-spacing:.18em;color:var(--ink2)}
+.frow .fixed{border:1px solid var(--rule2);border-radius:var(--radius);padding:8px 10px;background:var(--panel2);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.frow input,.frow textarea{border:1px solid var(--rule2);border-radius:var(--radius);padding:8px 10px;background:var(--panel2);font:inherit;width:100%}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:var(--radius);overflow:hidden;margin-bottom:6px}
+.seg button{font-family:var(--mono);font-size:9px;letter-spacing:.12em;padding:5px 10px;color:var(--ink2);min-height:26px}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
+.cerr{color:var(--bad);font-family:var(--mono);font-size:10px;min-height:1em;margin:4px 0}
+.close-x{float:right;font-family:var(--mono);font-size:12px;color:var(--ink2);padding:4px 8px;min-height:28px}
+.close-x:hover{color:var(--ink)}
+
+@media (max-width:900px){
+  main{padding:12px 12px 120px}
+  .cols{grid-template-columns:1fr}
+  .dept{border-left:none;padding-left:0;min-height:0;border-top:1px solid var(--rule);margin-top:12px}
+  .dept:first-child{border-top:none;margin-top:0}
+  .inspector,.letter{width:100vw;border-left:none}
+  .opstrip .nm{font-size:26px}
+  .rail .brand .sub,.rail .home{display:none}
+}
+@media (prefers-reduced-motion:reduce){.letter,.drawer,.opstrip .arrow{transition:none}}
 </style>
 </head>
 <body>
-<main>
-  <header>
-    <h1 id="title">联络总站</h1>
+
+<header class="rail">
+  <div class="brand">
+    <b id="title">联络总站</b>
+    <span class="sub">POST OFFICE</span>
     <span class="home" id="home"></span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button type="button" id="tab-org" role="tab" aria-selected="true"></button>
+    <button type="button" id="tab-hk" role="tab" aria-selected="false"></button>
+  </nav>
+  <div class="spacer"></div>
+  <div class="aux">
+    <button type="button" class="act" id="btn-activity"></button>
+    <button type="button" class="compose-btn" id="btn-compose"></button>
     <span class="langs" id="langs" role="group">
       <button type="button" data-lang="zh">中文</button>
       <button type="button" data-lang="en">English</button>
     </span>
-  </header>
+  </div>
+  <button type="button" class="op-btn" id="op-shortcut"></button>
+</header>
+
+<main>
   <p class="hint" id="hint"></p>
   <div class="err" id="err"></div>
   <div class="note" id="letter-status" aria-live="polite"></div>
-  <section class="letter" id="letter" hidden></section>
   <section id="boxes"></section>
-  <h2 id="h-groups"></h2>
-  <section id="groups"></section>
+  <section id="view-hk" hidden>
+    <div id="racks"></div>
+    <h2 id="h-groups"></h2>
+    <section id="groups"></section>
+  </section>
+</main>
+
+<aside class="drawer" id="drawer" aria-label="ACTIVITY">
+  <button type="button" class="close-x" id="drawer-x">✕</button>
   <h2 id="h-aliases"></h2>
   <section id="aliases"></section>
   <h2 id="h-switches"></h2>
@@ -112,7 +267,37 @@
   <section id="broadcasts"></section>
   <h2 id="h-log"></h2>
   <div class="log" id="log"></div>
-</main>
+</aside>
+
+<div class="sheet-bg" id="sheet-bg"></div>
+<section class="letter" id="letter" hidden></section>
+
+<div class="modal" id="compose" hidden role="dialog" aria-modal="true">
+  <div class="card">
+    <button type="button" class="close-x" id="compose-x">✕</button>
+    <h3 id="compose-title"></h3>
+    <div class="frow"><label for="compose-from">FROM</label>
+      <div class="fixed"><span id="compose-from"></span><span class="mono dim" style="font-size:9px" id="compose-fromnote"></span></div></div>
+    <div class="frow"><label for="compose-to" id="compose-to-label"></label>
+      <div>
+        <div class="seg" role="group" id="compose-seg">
+          <button type="button" id="seg-mbox" aria-pressed="true"></button>
+          <button type="button" id="seg-alias" aria-pressed="false"></button>
+        </div>
+        <input id="compose-to" autocomplete="off">
+      </div>
+    </div>
+    <div class="frow"><label for="compose-subject" id="c-sj"></label><input id="compose-subject" autocomplete="off"></div>
+    <div class="frow"><label for="compose-need" id="c-nd"></label><input id="compose-need" autocomplete="off"></div>
+    <div class="frow" style="align-items:start"><label for="compose-body" id="c-bd" style="padding-top:8px"></label><textarea id="compose-body" rows="5"></textarea></div>
+    <div class="cerr" id="compose-err"></div>
+    <div class="acts" style="justify-content:flex-end">
+      <button type="button" class="btn ghost" id="compose-cancel"></button>
+      <button type="button" class="btn primary" id="compose-send"></button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -151,6 +336,25 @@ const STR = {
     fileDone: "仅归档", close: "关闭",
     errRead: "读取失败", errArchive: "归档失败", doneOk: "已归档",
     notFound: "未找到", conflict: "冲突",
+    orgTab: "组织", hkTab: "设备", activity: "活动",
+    composeNew: "＋ 写信", inbox: "收件箱", humanOperator: "HUMAN OPERATOR",
+    t1Direct: "直属", waitingForYou: "等待你处理", techInfo: "技术信息",
+    writeMail: "写信", reply: "回复", replySendFile: "回复（发送回复并归档）",
+    ackFile: "收到并归档", retryArchive: "重试归档",
+    replySentArchiveFail: "回复已经发送，原信归档失败。",
+    ackedOk: "已回执并归档", alreadyAck: "已处理过", receiptNotice: "回执通知已归档",
+    sentOk: "已发送", refLabel: "引用", idLabel: "编号",
+    groupReject: "收件人不能是分组，请选具体信箱或 @逻辑地址。",
+    operatorBad: "操作员信箱不可用：写信/回复/回执已停用。",
+    noOrg: "未配置组织视图（config.json 可选 panel 段）。下面是全部信箱。",
+    panelBad: "组织配置有问题，只影响本视图：",
+    deepLinkBad: "深链无效。",
+    fromLabel: "FROM", toLabel: "收件人", send: "发送", cancel: "取消",
+    segMailbox: "MAILBOX", segAlias: "LOGICAL ADDRESS",
+    needDefault: "仅告知",
+    noGroupMatch: "无匹配分组，仅可单独开关。",
+    configuredGroups: "已配置分组",
+    harnessOn: "ON", harnessOff: "OFF", harnessMixed: "MIXED",
   },
   en: {
     title: "Post Office",
@@ -186,6 +390,25 @@ const STR = {
     fileDone: "File only", close: "Close",
     errRead: "Read failed", errArchive: "Archive failed", doneOk: "Filed",
     notFound: "Not found", conflict: "Conflict",
+    orgTab: "ORGANIZATION", hkTab: "HARNESS", activity: "ACTIVITY",
+    composeNew: "＋ Compose", inbox: "INBOX", humanOperator: "HUMAN OPERATOR",
+    t1Direct: "DIRECT", waitingForYou: "WAITING FOR YOU", techInfo: "TECHNICAL",
+    writeMail: "Compose", reply: "Reply", replySendFile: "Reply (send reply & file)",
+    ackFile: "Acknowledge & file", retryArchive: "Retry filing",
+    replySentArchiveFail: "Reply was sent, but filing the original failed.",
+    ackedOk: "Acknowledged & filed", alreadyAck: "Already handled", receiptNotice: "Receipt notice filed",
+    sentOk: "Sent", refLabel: "Ref", idLabel: "ID",
+    groupReject: "The recipient cannot be a group — pick a mailbox or an @logical address.",
+    operatorBad: "Operator mailbox unusable: compose, reply and ack are disabled.",
+    noOrg: "No organization configured (optional \"panel\" section in config.json). All mailboxes:",
+    panelBad: "Organization config has problems (this view only):",
+    deepLinkBad: "Invalid deep link.",
+    fromLabel: "FROM", toLabel: "To", send: "Send", cancel: "Cancel",
+    segMailbox: "MAILBOX", segAlias: "LOGICAL ADDRESS",
+    needDefault: "仅告知",
+    noGroupMatch: "No matching config group — individual switches only.",
+    configuredGroups: "CONFIGURED GROUPS",
+    harnessOn: "ON", harnessOff: "OFF", harnessMixed: "MIXED",
   },
 };
 
@@ -208,27 +431,262 @@ const browserLang = () => {
 };
 lang = store.get() || (browserLang().toLowerCase().startsWith("zh") ? "zh" : "en");
 
-function applyLang(next) {
-  lang = next === "zh" ? "zh" : "en";
-  store.set(lang);              // display only: never a status / clear / ack call, never a wake-up
-  document.documentElement.lang = lang === "zh" ? "zh" : "en";
-  document.title = t("title");
-  $("title").textContent = t("title");
-  $("hint").textContent = t("hint");
-  $("h-groups").textContent = t("hGroups");
-  $("h-aliases").textContent = t("hAliases");
-  $("h-switches").textContent = t("hSwitches");
-  $("h-broadcasts").textContent = t("hBroadcasts");
-  $("h-log").textContent = t("hLog");
-  $("langs").setAttribute("aria-label", t("langLabel"));
-  for (const b of $("langs").children) b.setAttribute("aria-pressed", String(b.dataset.lang === lang));
-  closeLetter();                    // 详情是临时视图：换语言不留旧语言的残留
-  $("letter-status").textContent = "";
-  return load();
+// null-safe listeners: the page also runs under minimal DOM stubs in tests
+const setClass = (el, cls, on) => { try { if (!el || !el.classList) return; if (on) el.classList.add(cls); else el.classList.remove(cls); } catch {} };
+const on = (id, ev, fn) => { const el = $(id); if (el) el.addEventListener(ev, fn); };
+const setTxt = (id, s) => { const el = $(id); if (el) el.textContent = s; };
+
+let STATE = null;                 // latest /api/state
+let view = "org";                 // org | hk
+let insBox = null;                // mailbox shown in the inspector
+let composeMode = "new";          // new | reply
+let replyOf = null;               // {box,id} when composing a reply
+let sending = false;              // compose double-click guard
+const replySent = new Set();      // "<box>/<id>" replies already sent this page session
+
+const boxesByName = () => { const m = {}; for (const b of (STATE?.boxes || [])) m[b.name] = b; return m; };
+const panelInfo = () => (STATE && STATE.panel) || { ok: false, label: "", operator: "", organization: null, error: "" };
+const operatorName = () => { const p = panelInfo(); return p.ok ? p.operator : ""; };
+const operatorValid = () => { const op = operatorName(); return !!op && !!(STATE?.boxes || []).some((b) => b.name === op); };
+const boxOf = (name) => boxesByName()[name] || null;
+const waitingOf = (name) => (boxOf(name)?.counts.waiting) || 0;
+
+const stHTML = (online) => online
+  ? `<span class="st on"><span class="dot on"></span>${esc(t("online"))}</span>`
+  : `<span class="st off"><span class="dot"></span>${esc(t("offline"))}</span>`;
+const counts = (c) => fmt("counts", { w: c.waiting, r: c.reminded });
+const statusChip = (s) => `<span class="chip ${s === "failed" ? "bad" : s === "reminded" ? "mid" : ""}">${
+  s === "waiting" ? t("waiting") : s === "reminded" ? t("reminded") : t("failed")}</span>`;
+const counterHTML = (n, hot) => n > 0 ? `<span class="counter ${hot ? "hot" : ""}">${n}</span>` : "";
+
+/* ---------- ORGANIZATION view (generic; rendered from panel.organization + live boxes) ---------- */
+
+const nodeBtn = (name, extraClass = "") => {
+  const b = boxOf(name);
+  if (!b) return "";
+  const label = orgLabel(name) || b.name;
+  return `<button type="button" class="node ${extraClass} ${b.online ? "" : "dead"}" data-box="${esc(name)}"
+    aria-label="${esc(label)}">
+    <span class="l1"><span class="nm">${esc(label)}</span><span class="idchip">${esc(b.name)}</span>${counterHTML(b.counts.waiting, true)}</span>
+    <span class="l2">${stHTML(b.online)}<span class="chip">${esc(b.app)}</span></span>
+  </button>`;
+};
+let orgLabels = {};
+const orgLabel = (name) => orgLabels[name] || "";
+
+// one tree block: mailbox node or peer pair, then thin connectors down to the children
+function treeBlock(node) {
+  if (node.members) {
+    const peers = node.members.map((m) => nodeBtn(m)).join("");
+    return `<div class="peers">${peers}</div>${childrenBlock(node.children)}`;
+  }
+  const inner = nodeBtn(node.mailbox);
+  return inner + childrenBlock(node.children);
 }
+function childrenBlock(children) {
+  const kids = children || [];
+  if (!kids.length) return "";
+  if (kids.length === 1) return `<div class="vjoin"></div><div class="kid single">${treeBlock(kids[0])}</div>`;
+  return `<div class="vjoin wide"></div><div class="split s2"></div>
+    <div class="kids">${kids.map((k) => `<div class="kid">${treeBlock(k)}</div>`).join("")}</div>`;
+}
+
+function orgHTML() {
+  const p = panelInfo();
+  orgLabels = {};
+  const collect = (n) => {
+    if (!n || typeof n !== "object") return;
+    if (n.label && n.mailbox) orgLabels[n.mailbox] = n.label;
+    if (n.label && n.members) n.members.forEach((m) => { if (!orgLabels[m]) orgLabels[m] = n.label; });
+    (n.children || []).forEach(collect);
+  };
+  if (p.ok && p.organization) collect(p.organization);
+
+  if (!p.ok && p.error) {
+    return `<div class="orgnote">${esc(t("panelBad"))} ${esc(p.error)}</div>${flatGrid()}`;
+  }
+  if (!p.organization) {
+    return `<div class="orgnote">${esc(t("noOrg"))}</div>${flatGrid()}`;
+  }
+  const root = p.organization;
+  const rootBox = root.mailbox ? boxOf(root.mailbox) : null;
+  const isOp = root.mailbox && root.mailbox === operatorName();
+  const strip = rootBox ? `
+    <button type="button" class="opstrip" data-box="${esc(root.mailbox)}"
+      aria-label="${esc(rootBox.name)} ${t("inbox")} ${rootBox.counts.waiting}">
+      <span class="nm">${esc(root.label || rootBox.name)}</span>
+      <span class="sub">
+        ${isOp ? `<span class="k">${esc(t("humanOperator"))}</span>` : ""}
+        ${stHTML(rootBox.online)}
+      </span>
+      <span class="inbox">${esc(t("inbox"))} ${counterHTML(rootBox.counts.waiting, true)} <span class="arrow">⟶</span></span>
+    </button>` : "";
+  const kids = root.children || [];
+  const standalones = kids.filter((k) => k.mailbox && !k.members);
+  const depts = kids.filter((k) => k.members);
+  const t1 = standalones.length ? `
+    <div class="t1row"><span class="k">${esc(t("t1Direct"))}</span>
+      ${standalones.map((s) => `<div class="t1node">${treeBlock(s)}</div>`).join("")}
+      <span class="hair"></span>
+    </div>` : "";
+  const cols = depts.length ? `<div class="cols">${depts.map((d, i) => `
+    <section class="dept">
+      <div class="no">${String(i + 1).padStart(2, "0")}</div>
+      <div class="dn"><b>${esc(d.label || "")}</b><span class="chno"><span class="tick"></span>CH-${String(i + 1).padStart(2, "0")}</span></div>
+      ${treeBlock({ members: d.members, children: d.children })}
+    </section>`).join("")}</div>` : "";
+  return strip + `<div class="vjoin"></div>` + t1 + cols;
+}
+
+function flatGrid() {
+  const boxes = STATE?.boxes || [];
+  if (!boxes.length) return `<p class="hintp">${esc(t("emptyBoxes"))}</p>`;
+  return `<div class="flatgrid">${boxes.map((b) => nodeBtn(b.name)).join("")}</div>`;
+}
+
+/* ---------- inspector (operator workbench / mailbox card) ---------- */
+
+function pickDefaultInspector() {
+  if (insBox && boxOf(insBox)) return;
+  const op = operatorName();
+  insBox = (op && boxOf(op)) ? op : ((STATE?.boxes || [])[0] || {}).name || null;
+}
+
+function inspectorHTML() {
+  pickDefaultInspector();
+  const b = insBox ? boxOf(insBox) : null;
+  if (!b) return "";
+  const c = b.counts || { waiting: 0, reminded: 0, failed: 0 };
+  const isOp = b.name === operatorName() && operatorValid();
+  const head = isOp ? `
+    <div class="k">${esc(t("humanOperator"))}</div><h3>${esc(b.name)}</h3>
+    <div style="margin:4px 0">${stHTML(b.online)} <span class="chip">${esc(b.app)}</span></div>
+    <div class="sec"><span>${esc(t("waitingForYou"))}</span><span>${c.waiting}</span></div>` : `
+    <div class="k">${esc(t("techInfo"))}</div><h3>${esc(b.name)}</h3>
+    <div style="margin:4px 0">${stHTML(b.online)} <span class="chip">${esc(b.app)}</span></div>
+    <div class="sec"><span>${esc(t("waiting"))}</span><span>${c.waiting}</span></div>`;
+  const pending = (b.pending || []).map((p) => `
+    <button type="button" class="pl" data-letter="1" data-box="${esc(b.name)}"
+      data-id="${esc(p.file.replace(/\.md$/, ""))}" data-file="${esc(p.file)}">
+      <span class="who">${esc(p.from)}</span>
+      <span class="meta"><span class="sj">${esc(p.subject || p.file)}</span>
+        <span class="nd">${statusChip(p.status)}</span></span>
+      <span class="tm">${p.mtime ? new Date(p.mtime * 1000).toTimeString().slice(0, 5) : ""}</span>
+    </button>`).join("") || `<p class="hintp">${esc(t("doneOk"))} · 0</p>`;
+  const acks = (b.acks && b.acks.length)
+    ? `<div class="sec"><span>${esc(t("recentAcks"))}</span><span></span></div>
+       ${b.acks.map((a) => `<div class="metaline">${esc(a.by)}（${esc(a.note || t("acked"))}）</div>`).join("")}` : "";
+  const meta = `
+    <div class="sec"><span>${esc(t("techInfo"))}</span><span></span></div>
+    <div class="kv">
+      <span class="k">WHO</span><span>${esc(b.who || "—")}</span>
+      <span class="k">APP</span><span>${esc(b.app)}</span>
+      <span class="k">METHOD</span><span class="mono" style="font-size:10px">${esc(b.method || "—")}</span>
+      <span class="k">IDENTITY</span><span class="mono" style="font-size:10px">${esc(b.ident || "—")}</span>
+      <span class="k">STATUS</span><span>${counts(c)}${c.failed ? ` · <span class="chip bad">${esc(fmt("failedLine", { n: c.failed }))}</span>` : ""}</span>
+    </div>`;
+  const opNote = !operatorValid() ? `<div class="cerr">${esc(t("operatorBad"))}</div>` : "";
+  return `<aside class="inspector open" id="ins" aria-label="${esc(b.name)}">
+    ${head}
+    ${pending}
+    ${acks}
+    ${meta}
+    ${opNote}
+    <div class="acts">
+      <button type="button" class="btn accent" data-compose="1" ${operatorValid() ? "" : "disabled"}>${esc(t("writeMail"))}</button>
+      <button type="button" class="toggle ${b.online ? "on" : ""}" data-name="${esc(b.name)}" data-online="${b.online}"
+        aria-label="${esc(fmt("ariaToggle", { name: b.name, state: b.online ? t("online") : t("offline") }))}">
+        ${b.online ? esc(t("offline")) : esc(t("online"))}</button>
+      ${b.pending.length ? `<button type="button" class="clear" data-clear="${esc(b.name)}" data-w="${c.waiting}" data-r="${c.reminded}" data-f="${c.failed}" data-n="${b.pending.length}">${esc(t("archiveAll"))}</button>` : ""}
+    </div>
+  </aside>`;
+}
+
+/* ---------- HARNESS view (grouped by the real route method) ---------- */
+
+function harnessHTML() {
+  const boxes = STATE?.boxes || [];
+  const byMethod = new Map();
+  for (const b of boxes) { const m = b.method || "notify"; if (!byMethod.has(m)) byMethod.set(m, []); byMethod.get(m).push(b); }
+  const groups = STATE?.groups || [];
+  const sameSet = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+  let ch = 0;
+  const racks = [...byMethod.entries()].map(([method, members]) => {
+    ch += 1;
+    const on = members.filter((b) => b.online).length;
+    const state = on === members.length ? ["on", t("harnessOn")] : on === 0 ? ["off", t("harnessOff")] : ["warn", t("harnessMixed")];
+    const names = members.map((b) => b.name);
+    const match = groups.find((g) => sameSet(g.members || [], names));
+    const ctl = match
+      ? `<button type="button" class="gbtn" data-group="${esc(match.name)}" data-status="${on === members.length ? "offline" : "online"}">${on === members.length ? esc(t("groupNone")) : esc(t("groupAll"))}</button>
+         <span class="hint2">@${esc(match.name)}</span>`
+      : `<span class="hint2">${esc(t("noGroupMatch"))}</span>`;
+    const rows = members.map((b, i) => `
+      <tr>
+        <td>${String(i + 1).padStart(2, "0")}</td>
+        <td><span class="chname"><span class="dot ${b.online ? "on" : ""}"></span>${esc(b.name)} <span class="id">${esc(b.who || "")}</span></span></td>
+        <td>${stHTML(b.online)}</td>
+        <td class="mono">${b.counts.waiting || "—"}</td>
+        <td><button type="button" class="toggle onoff" data-name="${esc(b.name)}" data-online="${b.online}"
+          aria-label="${esc(fmt("ariaToggle", { name: b.name, state: b.online ? t("online") : t("offline") }))}">${b.online ? "OFF" : "ON"}</button></td>
+      </tr>`).join("");
+    return `
+      <div class="rackhead"><span class="chno">${String(ch).padStart(2, "0")}</span><b>${esc(members[0].app)}</b>
+        <span class="st ${state[0]}"><span class="dot ${state[0] === "on" ? "on" : state[0] === "warn" ? "warn" : ""}"></span>${esc(state[1])}</span>
+        <span class="sigbars ${on === members.length ? "on" : ""}"><i></i><i></i><i></i></span>
+        <span class="gctl">${ctl}</span>
+      </div>
+      <table class="hk">
+        <tr><th></th><th>MAILBOX</th><th>STATUS</th><th>WAITING</th><th></th></tr>
+        ${rows}
+      </table>`;
+  }).join("");
+  return racks || `<p class="hintp">${esc(t("emptyBoxes"))}</p>`;
+}
+
+/* ---------- top-right operator shortcut ---------- */
+
+function opBadgeHTML() {
+  const op = operatorName();
+  const b = op ? boxOf(op) : null;
+  if (!b) return `<span class="lbl"><b>—</b><span></span></span>`;
+  return `<span class="dot ${b.online ? "on" : ""}"></span>
+    <span class="lbl"><b>OPERATOR · ${esc(b.name)}</b><span>${esc(t("inbox"))}</span></span>
+    ${counterHTML(b.counts.waiting, true)}`;
+}
+
+/* ---------- letter overlay ---------- */
 
 let currentLetter = null;           // 当前详情里那封信的 {box, id}（按钮不带业务数据，以它为准）
 let letterSeq = 0;                  // 请求序号：过期的读取不得改写更新过的视图
+
+const letterIndex = () => String((letterSeq % 9999) + 1).padStart(4, "0");
+
+function letterHTML(d) {
+  const opOK = operatorValid();
+  const sent = replySent.has(`${d.box}/${d.id}`);
+  const note = !opOK
+    ? `<div class="cerr">${esc(t("operatorBad"))}</div>` : "";
+  return `
+    <button type="button" class="close-x" data-letter-action="close">✕ ${esc(t("close"))}</button>
+    <div class="corr"><h2>${esc(panelInfo().label || "POST OFFICE")}</h2><span>INTERNAL CORRESPONDENCE · ${letterIndex()}</span></div>
+    <div class="k" style="margin-top:8px">${esc(t("letterDetail"))}</div>
+    <div class="kv">
+      <span class="k">FROM</span><span style="font-weight:700">${esc(d.sender)}</span>
+      <span class="k">${esc(t("subject"))}</span><span style="font-weight:600">${esc(d.subject)}</span>
+      <span class="k">${esc(t("need"))}</span><span style="color:var(--accent);font-weight:600">${esc(d.need)}</span>
+    </div>
+    <div class="body">${esc(d.body)}</div>
+    ${note}
+    <div class="acts">
+      ${sent
+        ? `<button type="button" class="btn accent" data-letter-action="retry">${esc(t("retryArchive"))}</button>`
+        : `<button type="button" class="btn accent" data-letter-action="reply" ${opOK ? "" : "disabled"}>${esc(t("replySendFile"))}</button>`}
+      <button type="button" class="btn primary" data-letter-action="ack" ${opOK ? "" : "disabled"}>${esc(t("ackFile"))}</button>
+      <button type="button" class="btn ghost" data-letter-action="done">${esc(t("fileDone"))}</button>
+    </div>
+    <p class="fine">${esc(t("need"))} = reply → 1 send, no extra ack. ${esc(t("fileDone"))} → archived/, no receipt.</p>`;
+}
 
 async function openLetter(box, id) {
   const seq = ++letterSeq;
@@ -244,20 +702,11 @@ async function openLetter(box, id) {
     const d = await r.json();
     if (seq !== letterSeq) return;
     currentLetter = { box, id };
-    $("letter").innerHTML = `
-      <div class="card">
-        <h3>${esc(t("letterDetail"))}<small>${esc(d.box)}/${esc(d.id)}</small></h3>
-        <div class="field"><b>${esc(t("from"))}</b>${esc(d.sender)}</div>
-        <div class="field"><b>${esc(t("subject"))}</b>${esc(d.subject)}</div>
-        <div class="field"><b>${esc(t("need"))}</b>${esc(d.need)}</div>
-        <div class="field"><b>${esc(t("body"))}</b></div>
-        <div class="body">${esc(d.body)}</div>
-        <div class="acts">
-          <button data-letter-action="done">${esc(t("fileDone"))}</button>
-          <button data-letter-action="close">${esc(t("close"))}</button>
-        </div>
-      </div>`;
-    $("letter").hidden = false;
+    const el = $("letter");
+    el.innerHTML = `<div class="card">${letterHTML(d)}</div>`;
+    el.hidden = false;
+    setClass(el, "open", true);
+    const bg = $("sheet-bg"); setClass(bg, "open", true);
   } catch (e) {
     if (seq !== letterSeq) return;
     closeLetter();
@@ -268,52 +717,192 @@ async function openLetter(box, id) {
 function closeLetter() {
   letterSeq++;                      // 作废所有在途读取，避免它们把详情又打开
   currentLetter = null;
-  $("letter").hidden = true;
-  $("letter").innerHTML = "";
+  const el = $("letter");
+  el.hidden = true;
+  el.innerHTML = "";
+  setClass(el, "open", false);
+  const bg = $("sheet-bg"); setClass(bg, "open", false);
 }
 
-const counts = (c) => fmt("counts", { w: c.waiting, r: c.reminded });
-const statusChip = (s) => `<span class="chip ${s === "failed" ? "bad" : s === "reminded" ? "mid" : ""}">${
-  s === "waiting" ? t("waiting") : s === "reminded" ? t("reminded") : t("failed")}</span>`;
+/* ---------- compose / reply ---------- */
+
+function openCompose(mode) {
+  const m = $("compose"); if (!m) return;
+  composeMode = mode || "new";
+  replyOf = composeMode === "reply" ? currentLetter : null;
+  const op = operatorName();
+  $("compose-err").textContent = "";
+  setTxt("compose-from", op || "—");
+  setTxt("compose-fromnote", t("humanOperator"));
+  setTxt("compose-title", composeMode === "reply" ? t("reply") : t("writeMail"));
+  setTxt("compose-to-label", t("toLabel"));
+  setTxt("c-sj", t("subject"));
+  setTxt("c-nd", t("need"));
+  setTxt("c-bd", t("body"));
+  setTxt("compose-send", t("send"));
+  setTxt("compose-cancel", t("cancel"));
+  setTxt("seg-mbox", t("segMailbox"));
+  setTxt("seg-alias", t("segAlias"));
+  setSeg("mailbox");
+  $("compose-to").value = "";
+  $("compose-subject").value = "";
+  $("compose-need").value = composeMode === "reply" ? t("needDefault") : "";
+  $("compose-body").value = "";
+  if (composeMode === "reply" && currentLetter) {
+    const box = boxOf(currentLetter.box);
+    const row = ((box?.pending) || []).find((p) => p.file.replace(/\.md$/, "") === currentLetter.id);
+    $("compose-to").value = row?.from || "";
+    const s = row?.subject || "";
+    $("compose-subject").value = /^re:/i.test(s) ? s : `Re: ${s}`;
+  }
+  $("compose-err").textContent = operatorValid() ? "" : t("operatorBad");
+  $("compose-send").disabled = !operatorValid();
+  m.hidden = false;
+}
+function closeCompose() { const m = $("compose"); if (m) m.hidden = true; replyOf = null; }
+function setSeg(which) {
+  const a = $("seg-mbox"), b = $("seg-alias");
+  if (a) a.setAttribute("aria-pressed", String(which === "mailbox"));
+  if (b) b.setAttribute("aria-pressed", String(which === "alias"));
+}
+
+async function sendCompose() {
+  if (sending) return;                       // 双击只发一次
+  const errEl = $("compose-err");
+  errEl.textContent = "";
+  if (!operatorValid()) { errEl.textContent = t("operatorBad"); return; }
+  const to = ($("compose-to").value || "").trim();
+  const subject = $("compose-subject").value;
+  const need = $("compose-need").value;
+  const body = $("compose-body").value;
+  if (!to.startsWith("@") && (STATE?.groups || []).some((g) => g.name === to)) {
+    errEl.textContent = t("groupReject");
+    return;
+  }
+  sending = true;
+  $("compose-send").disabled = true;
+  try {
+    const r = await fetch("/api/send", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from: operatorName(), to, subject, need, body }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { errEl.textContent = j.message || t("errStatus"); return; }
+    if (composeMode === "reply" && replyOf && currentLetter
+        && currentLetter.box === replyOf.box && currentLetter.id === replyOf.id) {
+      // 礼仪：需要回复的信，正式回复就是答复 —— 只归档原信，绝不 ack
+      const { box, id } = replyOf;
+      replySent.add(`${box}/${id}`);
+      const a = await fetch("/api/archive-one", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ box, id }) });
+      closeCompose();
+      if (a.ok) {
+        closeLetter();
+        $("letter-status").textContent = t("doneOk");
+      } else {
+        // 回复已经出门：只允许重试归档，绝不再发一次回复
+        const seq = ++letterSeq;
+        const lr = await fetch(`/api/letter?box=${encodeURIComponent(box)}&id=${encodeURIComponent(id)}`);
+        if (seq === letterSeq && lr.ok) {
+          const d = await lr.json();
+          currentLetter = { box, id };
+          const el = $("letter");
+          el.innerHTML = `<div class="card">${letterHTML(d)}</div>`;
+          el.hidden = false; setClass(el, "open", true);
+          const bg = $("sheet-bg"); setClass(bg, "open", true);
+        }
+        $("letter-status").textContent = t("replySentArchiveFail");
+      }
+      return load();
+    }
+    closeCompose();
+    $("letter-status").textContent = `${t("sentOk")} · ${t("idLabel")} ${j.id || "—"} · ${t("refLabel")} ${j.ref || "—"}`;
+    return load();
+  } catch (e) {
+    errEl.textContent = t("errOffline");
+  } finally {
+    sending = false;
+    const btn = $("compose-send"); if (btn) btn.disabled = !operatorValid();
+  }
+}
+
+/* ---------- i18n apply ---------- */
+
+function applyLang(next) {
+  lang = next === "zh" ? "zh" : "en";
+  store.set(lang);              // display only: never a status / clear / ack call, never a wake-up
+  try { document.documentElement.lang = lang === "zh" ? "zh" : "en"; } catch {}
+  try { document.title = t("title"); } catch {}
+  setTxt("title", t("title"));
+  setTxt("hint", t("hint"));
+  setTxt("h-groups", t("hGroups"));
+  setTxt("h-aliases", t("hAliases"));
+  setTxt("h-switches", t("hSwitches"));
+  setTxt("h-broadcasts", t("hBroadcasts"));
+  setTxt("h-log", t("hLog"));
+  setTxt("tab-org", t("orgTab"));
+  setTxt("tab-hk", t("hkTab"));
+  setTxt("btn-activity", t("activity"));
+  setTxt("btn-compose", t("composeNew"));
+  setTxt("drawer-x", "✕ " + t("close"));
+  setTxt("compose-title", t("writeMail"));
+  setTxt("compose-to-label", t("toLabel"));
+  setTxt("c-sj", t("subject"));
+  setTxt("c-nd", t("need"));
+  setTxt("c-bd", t("body"));
+  setTxt("compose-send", t("send"));
+  setTxt("compose-cancel", t("cancel"));
+  setTxt("seg-mbox", t("segMailbox"));
+  setTxt("seg-alias", t("segAlias"));
+  const langs = $("langs");
+  if (langs) {
+    langs.setAttribute("aria-label", t("langLabel"));
+    for (const b of langs.children) b.setAttribute("aria-pressed", String(b.dataset.lang === lang));
+  }
+  closeLetter();                    // 详情是临时视图：换语言不留旧语言的残留
+  setTxt("letter-status", "");
+  return load();
+}
+
+/* ---------- data render ---------- */
 
 async function load() {
   try {
     const st = await (await fetch("/api/state")).json();
-    $("err").textContent = "";
-    $("home").textContent = st.home;
-    $("boxes").innerHTML = st.boxes.length ? st.boxes.map((b) => {
-      const c = b.counts || { waiting: 0, reminded: 0, failed: 0 };
-      return `
-      <div class="box ${b.online ? "" : "offline"}">
-        <div class="name">${esc(b.name)}<small>${esc(b.who)}</small></div>
-        <button class="toggle ${b.online ? "on" : ""}" data-name="${esc(b.name)}" data-online="${b.online}"
-                aria-label="${esc(fmt("ariaToggle", { name: b.name, state: b.online ? t("online") : t("offline") }))}">
-          <span class="state">${b.online ? t("online") : t("offline")}</span><span class="track"></span>
-        </button>
-        <div class="meta"><span class="chip">${esc(b.app)}</span>${esc(b.ident)}
-          · ${esc(counts(c))}${c.failed ? ` · <span class="chip bad">${esc(fmt("failedLine", { n: c.failed }))}</span>` : ""}
-          ${b.pending.length ? `<button class="clear" data-clear="${esc(b.name)}" data-w="${c.waiting}" data-r="${c.reminded}" data-f="${c.failed}" data-n="${b.pending.length}">${esc(t("archiveAll"))}</button>` : ""}</div>
-        ${b.acks && b.acks.length ? `<div class="meta">${esc(t("recentAcks"))}：${b.acks.map((a) =>
-          `${esc(a.by)}（${esc(a.note || t("acked"))}）`).join("；")}</div>` : ""}
-        ${b.pending.length ? `<div class="pending">${b.pending.map((p) =>
-          `<div class="pend" data-letter="1" data-box="${esc(b.name)}" data-id="${esc(p.file.replace(/\.md$/, ""))}" data-file="${esc(p.file)}">${statusChip(p.status)} <b>${esc(p.subject || p.file)}</b> <span class="meta">${esc(t("from"))} ${esc(p.from)}</span></div>`).join("")}</div>` : ""}
-      </div>`; }).join("") : `<p class="hint">${esc(t("emptyBoxes"))}</p>`;
+    STATE = st;
+    setTxt("err", "");
+    setTxt("home", st.home);
+    // 主视图：组织（含 inspector）+ 设备
+    const boxesEl = $("boxes");
+    if (boxesEl) boxesEl.innerHTML = (view === "org")
+      ? orgHTML() + inspectorHTML()
+      : `<p class="hintp">${esc(t("emptyBoxes"))}</p>`;
+    const hkEl = $("view-hk");
+    if (hkEl) {
+      hkEl.hidden = view !== "hk";
+      const racks = $("racks");
+      if (racks) racks.innerHTML = view === "hk" ? harnessHTML() : "";
+    }
+    const opEl = $("op-shortcut");
+    if (opEl) opEl.innerHTML = opBadgeHTML();
+    // 已配置分组（Harness 视图下半区）
     const groups = st.groups || [];
-    $("groups").innerHTML = (st.config_error ? `<p class="hint">${esc(fmt("cfgBad", { e: st.config_error }))}</p>` : "")
-      + (groups.length ? groups.map((g) => {
+    const groupsEl = $("groups");
+    if (groupsEl) groupsEl.innerHTML = (st.config_error ? `<p class="hintp">${esc(fmt("cfgBad", { e: st.config_error }))}</p>` : "")
+      + (groups.length ? `<div class="rackhead"><b>${esc(t("configuredGroups"))}</b></div>` + groups.map((g) => {
         const c = g.counts || { waiting: 0, reminded: 0, failed: 0 };
         return `
       <div class="box">
         <div class="gname">@${esc(g.name)}<small>${esc(fmt("groupOn", { o: g.online, n: g.total }))}</small></div>
         <div class="gall">
-          <button data-group="${esc(g.name)}" data-status="online">${esc(t("groupAll"))}</button>
-          <button data-group="${esc(g.name)}" data-status="offline">${esc(t("groupNone"))}</button>
+          <button type="button" data-group="${esc(g.name)}" data-status="online">${esc(t("groupAll"))}</button>
+          <button type="button" data-group="${esc(g.name)}" data-status="offline">${esc(t("groupNone"))}</button>
         </div>
         <div class="meta">${g.members.map((m) => `<span class="chip">${esc(m)}</span>`).join("") || esc(t("groupEmpty"))}
           ${g.members.length ? ` · ${esc(fmt("groupMail", { w: c.waiting, r: c.reminded }))}` : ""}</div>
-      </div>`; }).join("") : `<p class="hint">${esc(t("noGroups"))}</p>`);
+      </div>`; }).join("") : `<p class="hintp">${esc(t("noGroups"))}</p>`);
+    // ACTIVITY 抽屉
     const al = st.aliases || [];
-    $("aliases").innerHTML = al.length ? al.map((a) => {
+    const aliasesEl = $("aliases");
+    if (aliasesEl) aliasesEl.innerHTML = al.length ? al.map((a) => {
       if (a.error) {
         return `<div class="box"><div class="gname">@${esc(a.name)}<small>${esc(t("aliasBad"))}</small></div>
           <div class="meta">${esc(a.error)}</div></div>`;
@@ -325,54 +914,97 @@ async function load() {
           `<span class="chip">${esc(c.name)}${c.known ? "" : `（${esc(t("notRegistered"))}）`}${c.known ? (c.online ? ` ${esc(t("online"))}` : ` ${esc(t("offline"))}`) : ""}</span>`).join("")}
           ${a.notify && a.notify.length ? `<span class="chip">${esc(fmt("aliasNotify", { n: a.notify.map(esc).join("、") }))}</span>` : ""}</div>
         ${a.pending ? `<div class="settle">${esc(fmt("aliasPending", { a: a.confirmed || t("aliasNone"), b: a.pending || t("aliasNone"), s: a.pending_in }))}</div>` : ""}
-      </div>`; }).join("") : `<p class="hint">${esc(t("noAliases"))}</p>`;
+      </div>`; }).join("") : `<p class="hintp">${esc(t("noAliases"))}</p>`;
     const sw = st.switches || [];
-    $("switches").innerHTML = sw.length ? sw.map((s) => `<div>${esc(s.text)}</div>`).join("")
+    const switchesEl = $("switches");
+    if (switchesEl) switchesEl.innerHTML = sw.length ? sw.map((s) => `<div>${esc(s.text)}</div>`).join("")
       : `<span>${esc(t("emptySwitches"))}</span>`;   // raw log lines stay in the original wording
     const bcs = st.broadcasts || [];
-    $("broadcasts").innerHTML = bcs.length ? bcs.map((b) => `
+    const bcsEl = $("broadcasts");
+    if (bcsEl) bcsEl.innerHTML = bcs.length ? bcs.map((b) => `
       <div class="box">
         <div class="name">${esc(b.subject)}<small>${esc(t("from"))} ${esc(b.from)}</small></div>
         <div class="state">${b.acked}/${b.total}</div>
         <div class="meta"><span class="chip">${esc(b.error ? t("bErr") : b.summarized ? t("bDone") : t("bOpen"))}</span>${esc(b.id)} · ${esc(t("bDeadline"))} ${esc(b.deadline)}
           <span class="meter"><i style="width:${b.total ? Math.round(b.acked * 100 / b.total) : 0}%"></i></span></div>
-      </div>`).join("") : `<p class="hint">${esc(t("emptyBroadcasts"))}</p>`;
-    $("log").innerHTML = st.log.map((l) => `<div><span>${esc(l.t.slice(5))} ${esc(l.src)}</span> ${esc(l.msg)}</div>`).join("")
+      </div>`).join("") : `<p class="hintp">${esc(t("emptyBroadcasts"))}</p>`;
+    const logEl = $("log");
+    if (logEl) logEl.innerHTML = st.log.map((l) => `<div><span>${esc(l.t.slice(5))} ${esc(l.src)}</span> ${esc(l.msg)}</div>`).join("")
       || `<span>${esc(t("emptyLog"))}</span>`;       // raw log lines stay in the original wording
+    handleDeepLink();
   } catch (e) {
-    $("err").textContent = t("errOffline");
+    setTxt("err", t("errOffline"));
   }
 }
 
-$("boxes").addEventListener("click", async (ev) => {
-  const c = ev.target.closest(".clear");
+/* ---------- delegated actions ---------- */
+
+// shared by the org view (#boxes) and the harness racks (#racks)
+async function mainClick(ev) {
+  const t0 = ev.target;
+  const c = t0.closest(".clear");
   if (c) {
     const msg = fmt("clearConfirm", { box: c.dataset.clear, w: c.dataset.w, r: c.dataset.r,
                                       f: c.dataset.f || "0", n: c.dataset.n || "0" });
     if (!confirm(msg)) return;
     const r = await fetch("/api/clear", { method: "POST", headers: { "Content-Type": "application/json" },
                                           body: JSON.stringify({ name: c.dataset.clear }) });
-    if (!r.ok) $("err").textContent = t("errClear");
+    if (!r.ok) setTxt("err", t("errClear"));
     return load();
   }
-  const tg = ev.target.closest(".toggle");
+  const tg = t0.closest(".toggle");
   if (tg) {
     const status = tg.dataset.online === "true" ? "offline" : "online";
     const r = await fetch("/api/status", { method: "POST", headers: { "Content-Type": "application/json" },
                                            body: JSON.stringify({ name: tg.dataset.name, status }) });
-    if (!r.ok) $("err").textContent = t("errStatus");
+    if (!r.ok) setTxt("err", t("errStatus"));
     return load();
   }
-  const row = ev.target.closest("[data-letter]");
-  if (row) await openLetter(row.dataset.box, row.dataset.id);
-});
+  const row = t0.closest("[data-letter]");
+  if (row) return openLetter(row.dataset.box, row.dataset.id);
+  const cm = t0.closest("[data-compose]");
+  if (cm) return openCompose("new");
+  const gb = t0.closest("button[data-group]");
+  if (gb) {
+    const r = await fetch("/api/status", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group: gb.dataset.group, status: gb.dataset.status }) });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      setTxt("err", j.error || t("errGroup"));
+    }
+    return load();
+  }
+  const nd = t0.closest("[data-box]");       // open the mailbox inspector (org nodes / strips)
+  if (nd) { insBox = nd.dataset.box; const b = $("boxes"); if (b && view === "org") b.innerHTML = orgHTML() + inspectorHTML(); }
+}
+on("boxes", "click", mainClick);
+on("racks", "click", mainClick);
 
-$("letter").addEventListener("click", async (ev) => {
+on("letter", "click", async (ev) => {
   const b = ev.target.closest("[data-letter-action]");
-  if (!b) return;
-  if (b.dataset.letterAction === "close") return closeLetter();
-  if (b.dataset.letterAction !== "done" || !currentLetter) return;
+  if (!b || b.disabled) return;
+  const action = b.dataset.letterAction;
+  if (action === "close") return closeLetter();
+  if (!currentLetter) return;
   const { box, id } = currentLetter;
+  if (action === "reply") return openCompose("reply");
+  if (action === "retry") return retryArchiveOnly(box, id);
+  if (action === "ack") {
+    try {
+      const r = await fetch("/api/ack-one", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ box, id }) });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok) {
+        closeLetter();
+        $("letter-status").textContent = j.state === "already" ? t("alreadyAck")
+          : j.state === "receipt_notice" ? t("receiptNotice") : t("ackedOk");
+        return load();
+      }
+      $("letter-status").textContent = j.message || (r.status === 404 ? t("notFound") : t("errArchive"));
+    } catch (e) { $("letter-status").textContent = t("errArchive"); }
+    return;
+  }
+  if (action !== "done") return;
   try {
     const r = await fetch("/api/archive-one", { method: "POST", headers: { "Content-Type": "application/json" },
                                                 body: JSON.stringify({ box, id }) });
@@ -388,22 +1020,83 @@ $("letter").addEventListener("click", async (ev) => {
   }
 });
 
-$("groups").addEventListener("click", async (ev) => {
+// partial failure: the reply is already out — retry filing ONLY, never send again
+async function retryArchiveOnly(box, id) {
+  try {
+    const r = await fetch("/api/archive-one", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ box, id }) });
+    if (r.ok) {
+      closeLetter();
+      $("letter-status").textContent = t("doneOk");
+      return load();
+    }
+    $("letter-status").textContent = r.status === 409 ? t("conflict") : r.status === 404 ? t("notFound") : t("errArchive");
+  } catch (e) { $("letter-status").textContent = t("errArchive"); }
+}
+
+on("groups", "click", async (ev) => {
   const b = ev.target.closest("button[data-group]");
   if (!b) return;
   const r = await fetch("/api/status", { method: "POST", headers: { "Content-Type": "application/json" },
                                          body: JSON.stringify({ group: b.dataset.group, status: b.dataset.status }) });
   if (!r.ok) {
     const e = await r.json().catch(() => ({}));
-    $("err").textContent = e.error || t("errGroup");
+    setTxt("err", e.error || t("errGroup"));
   }
   load();
 });
 
-$("langs").addEventListener("click", (ev) => {
+on("langs", "click", (ev) => {
   const b = ev.target.closest("button[data-lang]");
   if (b) applyLang(b.dataset.lang);   // display only
 });
+
+/* ---------- tabs / drawer / compose chrome ---------- */
+
+function setView(v) {
+  view = v;
+  const o = $("tab-org"), h = $("tab-hk");
+  if (o) o.setAttribute("aria-selected", String(v === "org"));
+  if (h) h.setAttribute("aria-selected", String(v === "hk"));
+  load();
+}
+on("tab-org", "click", () => setView("org"));
+on("tab-hk", "click", () => setView("hk"));
+on("btn-activity", "click", () => { const d = $("drawer"); setClass(d, "open", true); });
+on("drawer-x", "click", () => { const d = $("drawer"); setClass(d, "open", false); });
+on("btn-compose", "click", () => openCompose("new"));
+on("compose-x", "click", closeCompose);
+on("compose-cancel", "click", closeCompose);
+on("compose-send", "click", sendCompose);
+on("op-shortcut", "click", () => {
+  const op = operatorName();
+  if (op && boxOf(op)) {
+    insBox = op;
+    setView("org");
+    const b = $("boxes");
+    if (b) b.innerHTML = orgHTML() + inspectorHTML();
+  }
+});
+on("seg-mbox", "click", () => setSeg("mailbox"));
+on("seg-alias", "click", () => setSeg("alias"));
+on("sheet-bg", "click", closeLetter);
+
+/* ---------- deep link #/mail/<box>/<id> ---------- */
+
+function readHash() {
+  try { return (window.location && window.location.hash) || ""; } catch { return ""; }
+}
+function handleDeepLink() {
+  const h = readHash();
+  if (!h) return;
+  const m = h.match(/^#\/mail\/([^/]+)\/([^/]+)$/);
+  if (!m) { setTxt("letter-status", t("deepLinkBad")); return; }
+  const box = decodeURIComponent(m[1]), id = decodeURIComponent(m[2]);
+  if (!/^mailto:/.test(box) && !/^[A-Za-z0-9_\-]+$/.test(box)) { setTxt("letter-status", t("deepLinkBad")); return; }
+  if (!/^[^.\/][^/]*$/.test(id) || /\.md$/.test(id)) { setTxt("letter-status", t("deepLinkBad")); return; }
+  openLetter(box, id);
+}
+try { window.addEventListener && window.addEventListener("hashchange", handleDeepLink); } catch {}
 
 applyLang(lang);
 setInterval(load, 5000);

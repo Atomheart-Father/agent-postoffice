@@ -27,7 +27,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -45,6 +45,8 @@ ALIAS_STABLE = int(os.environ.get("POSTOFFICE_ALIAS_STABLE", 60))  # a new alias
 SWITCH_LOG = "alias_switch.log"
 CONFIG = HOME / "config.json"        # groups + logical addresses (v1.7); absent = feature off
 ALIAS_STATE = HOME / "alias_state.json"  # switch de-duplication only, never a second source of online truth
+PANEL_BASE_URL = os.environ.get("POSTOFFICE_PANEL_BASE_URL", "").strip().rstrip("/")  # 面板对外地址；空 = 关
+SLACK_WEBHOOK = os.environ.get("POSTOFFICE_SLACK_WEBHOOK", "")  # 人操作员信箱的对外告警；空 = 关
 NAME_RE = re.compile(r"[A-Za-z0-9_.\-]+")  # group / alias names: no paths, spaces, globs
 
 METHODS = {
@@ -910,6 +912,118 @@ def config_errors(cfg, routes):
         if not isinstance(spec["handoff"], str):
             errs.append(f"alias {name} 的 handoff 必须是字符串路径")
     return errs
+
+
+def panel_errors(cfg, routes):
+    """Every reason the optional "panel" presentation section is unusable, as human lines.
+
+    Presentation truth only: it shares nothing with config_errors, so a broken panel never
+    disables groups/aliases and routing errors never hide a valid panel. The one shared case is
+    a whole-file JSON error, which by nature blanks both sides.
+    """
+    panel = cfg.get("panel") if isinstance(cfg, dict) else None
+    if not isinstance(panel, dict):
+        return ["panel 必须是对象"]
+    errs = []
+    extra = sorted(set(panel) - {"label", "operator", "organization"})
+    if extra:
+        errs.append(f"panel 有不支持的字段：{'、'.join(extra)}（只有 label / operator / organization）")
+    for k in ("label", "operator", "organization"):
+        if k not in panel:
+            errs.append(f"panel 缺 {k}")
+    if not isinstance(panel.get("label"), str):
+        errs.append("panel 的 label 必须是字符串")
+    known = boxes(routes)
+    alias_names = set(cfg["aliases"]) if isinstance(cfg.get("aliases"), dict) else set()
+    if not isinstance(panel.get("operator"), str) or panel["operator"] not in known:
+        errs.append(f"panel 的 operator 必须是已登记信箱（现在读到 {panel.get('operator')!r}）")
+
+    seen = []
+
+    def name_error(where, value):
+        """One mailbox reference: must be a registered physical mailbox, never a logical alias."""
+        if not isinstance(value, str):
+            errs.append(f"{where} 必须是信箱名字符串")
+        elif value in alias_names:
+            errs.append(f"{where} 是逻辑地址 {value}：面板树里只能填物理信箱")
+        elif value not in known:
+            errs.append(f"{where} 指向未登记信箱 {value}")
+        else:
+            seen.append(value)
+
+    def node_errors(node, where):
+        if not isinstance(node, dict):
+            errs.append(f"{where} 必须是对象")
+            return
+        extra = sorted(set(node) - {"mailbox", "members", "label", "children"})
+        if extra:
+            errs.append(f"{where} 有不支持的字段：{'、'.join(extra)}")
+        has_box, has_members = "mailbox" in node, "members" in node
+        if has_box and has_members:
+            errs.append(f"{where} 的 mailbox 与 members 只能二选一")
+        elif not has_box and not has_members:
+            errs.append(f"{where} 必须有 mailbox 或 members 之一")
+        if has_box:
+            name_error(f"{where} 的 mailbox", node["mailbox"])
+        if has_members:
+            members = node["members"]
+            if not isinstance(members, list):
+                errs.append(f"{where} 的 members 必须是字符串数组")
+            elif not members:
+                errs.append(f"{where} 的 members 不能是空数组")
+            else:
+                for m in members:
+                    name_error(f"{where} 的成员", m)
+        if "label" in node and not isinstance(node["label"], str):
+            errs.append(f"{where} 的 label 必须是字符串")
+        children = node.get("children")
+        if "children" in node:
+            if not isinstance(children, list):
+                errs.append(f"{where} 的 children 必须是节点数组")
+            else:
+                for i, c in enumerate(children, start=1):
+                    node_errors(c, f"{where} 的第 {i} 个子节点")
+
+    node_errors(panel.get("organization"), "organization")
+    dup = sorted({n for n in seen if seen.count(n) > 1})
+    if dup:
+        errs.append(f"同一物理信箱在树里出现了多次：{'、'.join(dup)}")
+    return errs
+
+
+def panel_node(node):
+    """The normalized presentation tree: every node is mailbox|members + label(缺省"") + children(缺省[])."""
+    out = {"label": node.get("label") or "",
+           "children": [panel_node(c) for c in node.get("children") or []]}
+    out["mailbox" if "mailbox" in node else "members"] = \
+        node["mailbox"] if "mailbox" in node else list(node["members"])
+    return out
+
+
+def panel_config():
+    """The "panel" section as /api/state presents it, judged in isolation from routing.
+
+    Reads config.json directly (never load_config/config_errors): a broken panel subtree yields
+    a presentation error while routing keeps working, and routing errors never blank a valid
+    panel. An unparsable whole file is the shared case: both sides see nothing.
+    """
+    blank = {"ok": True, "label": "", "operator": "", "organization": None}
+    if not CONFIG.exists():
+        return blank
+    try:
+        cfg = json.loads(CONFIG.read_text(encoding="utf-8"), object_pairs_hook=_reject_dup_keys)
+    except (ValueError, OSError):
+        return blank
+    if not isinstance(cfg, dict) or "panel" not in cfg:
+        return blank
+    errs = panel_errors(cfg, load_routes())
+    if errs:
+        head = errs[0] if len(errs) == 1 else f"{len(errs)} 处问题，第一处：{errs[0]}"
+        return {"ok": False, "error": f"panel 配置：{head}",
+                "label": "", "operator": "", "organization": None}
+    p = cfg["panel"]
+    return {"ok": True, "label": p.get("label") or "", "operator": p["operator"],
+            "organization": panel_node(p["organization"])}
 
 
 def alias_target(spec, routes):
@@ -2636,6 +2750,47 @@ def cmd_hook(_a):
         time.sleep(POLL)
 
 
+def slack_alert(name, route, group):
+    """Best-effort one-shot webhook page for the human operator mailbox.
+
+    Fires only on the confirmed codex/notify delivery path: the panel section names this mailbox
+    as operator, the box is a plain notify mailbox, and the batch carries formal letters (receipt
+    notifications never page; the hook/plugin grace-timeout path never calls here). One batch is
+    one POST. A dead or slow webhook changes nothing about delivery, logs one secret-free line
+    (never the URL) and is never retried.
+    """
+    if not SLACK_WEBHOOK or route.get("methods") != ["notify"] \
+            or name != panel_config().get("operator"):
+        return
+    formal, _receipts = mail_split(group)
+    if not formal:
+        return
+    link = f"{PANEL_BASE_URL}#/mail/{name}" if PANEL_BASE_URL else f"#/mail/{name}"
+    if len(formal) == 1:
+        p = formal[0]
+        text = "\n".join([
+            f"{letter_sender(p) or '?'} 有新信",
+            f"事由：{header_field(p, '事由：') or '（无）'}",
+            f"需要：{header_field(p, '需要：') or '（无）'}",
+            f"打开：{link}/{p.stem}",
+        ])
+    else:
+        text = "\n".join([f"{name} 有新信：{len(formal)} 封"]
+                         + [f"- {letter_sender(p) or '?'}：{header_field(p, '事由：') or '（无）'}"
+                            for p in formal]
+                         + [f"打开：{link}"])
+    import urllib.request
+    req = urllib.request.Request(
+        SLACK_WEBHOOK, data=json.dumps({"text": text}, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=3).close()
+    except Exception as e:
+        code = getattr(e, "code", "")
+        log("postman.log", f"slack 告警未送达（{type(e).__name__}{f' {code}' if code else ''}）；"
+                           f"投递不受影响，本轮不重试")
+
+
 def cmd_postman(_a):
     """Delivers codex_queue / notify mailboxes and watches that hook/plugin mailboxes really got woken."""
     state = HOME / ".delivered.json"
@@ -2795,6 +2950,7 @@ def cmd_postman(_a):
                         presented_add(name, [p.stem for p in group])
                     except Exception as e:
                         log("postman.log", f"{name} presented 记录失败（不影响投递）：{e}")
+                slack_alert(name, r, group)
         except Exception as e:
             log("postman.log", f"邮递员本轮异常（已忽略，继续）：{e}")
         time.sleep(POLL)
@@ -3234,7 +3390,8 @@ def mail_state(name, snap):
         counts[status] += 1
         letters.append({"file": p.name, "status": status,
                         "subject": field(p, "事由").replace("事由：", "")[:60],
-                        "from": field(p, "来源").replace("来源：", "").split("（")[0][:30]})
+                        "from": field(p, "来源").replace("来源：", "").split("（")[0][:30],
+                        "mtime": int(p.stat().st_mtime)})
     return letters, counts
 
 
@@ -3274,12 +3431,39 @@ def panel_state():
     return {"home": str(HOME), "boxes": rows, "broadcasts": broadcast_rows(),
             "groups": group_rows(routes, snap), "aliases": alias_rows(), "switches": switch_rows(),
             "config": str(CONFIG) if cfg is not None else "", "config_error": cfg_err,
+            "panel": panel_config(),
             "log": [{"t": t, "src": s, "msg": m} for t, s, m in lines[-40:]][::-1]}
+
+
+def panel_base_origin(base):
+    """The exact Origin a browser would send for the panel's public base URL, else sys.exit.
+
+    scheme must be http/https, a host is required, embedded user:pass is refused; the port is
+    kept only when it is not the scheme's default. Empty/absent input means the feature is off.
+    """
+    if not base:
+        return ""
+    from urllib.parse import urlsplit
+    u = urlsplit(base)
+    if u.scheme not in ("http", "https"):
+        sys.exit(f"POSTOFFICE_PANEL_BASE_URL 不合法：{base!r}（要以 http:// 或 https:// 开头）")
+    if u.username or u.password:
+        sys.exit(f"POSTOFFICE_PANEL_BASE_URL 不合法：{base!r}（不许携带用户名密码）")
+    if not u.hostname:
+        sys.exit(f"POSTOFFICE_PANEL_BASE_URL 不合法：{base!r}（要有主机名）")
+    try:
+        uport = u.port
+    except ValueError:
+        sys.exit(f"POSTOFFICE_PANEL_BASE_URL 不合法：{base!r}（端口不是数字）")
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    default = 80 if u.scheme == "http" else 443
+    return f"{u.scheme}://{host}" + (f":{uport}" if uport and uport != default else "")
 
 
 def cmd_panel(a):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import webbrowser
+    trusted = panel_base_origin(PANEL_BASE_URL)
     html = (REPO / "panel" / "index.html").read_bytes()
     port = a.port
 
@@ -3295,8 +3479,11 @@ def cmd_panel(a):
             self.wfile.write(body)
 
         def _local(self):
-            # only our own page may change things (blocks other websites from poking localhost)
+            # only our own page may change things (blocks other websites from poking localhost);
+            # PANEL_BASE_URL adds one more exact origin, never a wildcard or suffix match
             origin = self.headers.get("Origin")
+            if trusted and origin == trusted:
+                return True
             return origin in (None, f"http://127.0.0.1:{port}", f"http://localhost:{port}")
 
         def _letter(self):
@@ -3457,6 +3644,8 @@ def cmd_panel(a):
             sys.exit(f"旧面板没能关掉，端口 {port} 仍被占用")
     url = f"http://127.0.0.1:{port}/"
     print(f"联络总站面板：{url}（Ctrl+C 关闭）", flush=True)
+    if trusted:
+        print(f"对外公布地址：{PANEL_BASE_URL}（写操作只认同源 Origin：{trusted}）", flush=True)
     if not a.no_open:
         webbrowser.open(url)
     srv.serve_forever()
