@@ -120,7 +120,9 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
     document: {
       title: "", documentElement: {}, body: makeEl("body"),
       getElementById: (id) => els[id] || null,
-      addEventListener() {}, createElement: (t) => makeEl(t),
+      _h: {},
+      addEventListener(type, fn) { (this._h[type] = this._h[type] || []).push(fn); },
+      createElement: (t) => makeEl(t),
     },
     window: { localStorage, addEventListener() {}, location: { hash }, ...(width !== undefined ? { innerWidth: width } : {}) },
     navigator: { languages: langs, language: langs[0] || "" },
@@ -156,7 +158,8 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
   const fire = (id, type, event) => {
     for (const fn of els[id].handlers[type] || []) fn(event);
   };
-  return { ctx, els, calls, confirmations, fire };
+  return { ctx, els, calls, confirmations, fire,
+           fireDoc: (type, event) => { for (const fn of ctx.document._h[type] || []) fn(event); } };
 }
 
 const clickIn = (container, matcher) => (e) => e.fire(container, "click", { target: { closest: matcher } });
@@ -590,6 +593,32 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   is(posts(e, "/api/send").length, 1, "点选后照常发送一次");
   e.fire("btn-compose", "click", { target: {} }); await settle();
   is(open(), false, "重开写信下拉收起");
+}
+
+// ============ 16) 收件人下拉：点输入框保持、点外面才收起（真实浏览器事件序列回归） ============
+{
+  const e = makeEnv(); await settle();
+  e.fire("btn-compose", "click", { target: {} }); await settle();
+  const open = () => e.els["compose-sug"].hidden === false;
+  e.fire("compose-to", "focus", {}); await settle();
+  is(open(), true, "聚焦后下拉打开");
+  // 点输入框本身：document 外点守卫不得收起（mousedown 后 focus 打开下拉，click 目标仍是输入框）
+  e.fireDoc("click", { target: { closest: (s) => (s === "#compose-to" ? e.els["compose-to"] : null) } });
+  is(open(), true, "点输入框下拉保持打开");
+  is(e.els["compose-to"].getAttribute("aria-expanded"), "true", "aria-expanded 保持 true");
+  // 点下拉内部：同样不收起
+  e.fireDoc("click", { target: { closest: (s) => (s === "#compose-sug" ? e.els["compose-sug"] : null) } });
+  is(open(), true, "点下拉内部保持打开");
+  // 点弹窗其它地方：收起
+  e.fireDoc("click", { target: { closest: () => null } });
+  is(open(), false, "点外面收起下拉");
+  is(e.els["compose-to"].getAttribute("aria-expanded"), "false", "收起后 aria-expanded 复位");
+  // 焦点没变时再点输入框：重新打开（focus 不会再触发）
+  e.fire("compose-to", "click", {}); await settle();
+  is(open(), true, "焦点已在输入框时再点一下重新打开");
+  // 下拉必须悬浮定位：撑高弹窗会让 mousedown/mouseup 落在不同元素，外点守卫误判收起
+  has(html, ".sug{position:absolute", "下拉绝对定位（不撑高弹窗）");
+  has(html, ".to-wrap{position:relative}", "下拉锚定收件人行");
 }
 
 console.log(failures ? `FAIL ${failures}` : "PASS");
