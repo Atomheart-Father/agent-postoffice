@@ -11,9 +11,13 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(here, "..", "panel", "index.html"), "utf8");
-const script = html.match(/<script>([\s\S]*?)<\/script>/);
-if (!script) { console.error("BAD: panel/index.html has no inline script"); process.exit(1); }
-const CODE = script[1];
+// v1.13 contract C adds a tiny <head> bootstrap <script> (theme before paint), so the first
+// <script> in the file is no longer guaranteed to be the app. Pick the block that defines the
+// string table (the real app script); fall back to the last block.
+const scriptBlocks = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+const APP = scriptBlocks.find((s) => s.includes("const STR")) || scriptBlocks[scriptBlocks.length - 1];
+if (!APP) { console.error("BAD: panel/index.html has no inline script"); process.exit(1); }
+const CODE = APP;
 
 let failures = 0;
 const ok = (msg) => console.log("ok   - " + msg);
@@ -71,28 +75,35 @@ function makeEnv({ langs = ["en-US"], storage = new Map(), storageThrows = false
                    letter = null, archive = null } = {}) {
   const ids = ["title", "home", "hint", "err", "boxes", "groups", "aliases", "switches",
                "broadcasts", "log", "langs", "h-groups", "h-aliases", "h-switches",
-               "h-broadcasts", "h-log", "letter", "letter-status"];
+               "h-broadcasts", "h-log", "letter", "letter-status", "theme"];
   const els = {};
   for (const id of ids) els[id] = makeEl(id);
   const btn = (l) => ({ dataset: { lang: l }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } });
   els["langs"].children = [btn("zh"), btn("en")];
+  // v1.13: theme group (labels/aria-pressed are set by applyLang, mirroring `langs`)
+  const thBtn = (c) => ({ dataset: { themeChoice: c }, textContent: "", attrs: {},
+    setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } });
+  els["theme"].children = [thBtn("system"), thBtn("light"), thBtn("dark")];
 
   const localStorage = {
     getItem: (k) => { if (storageThrows) throw new Error("denied"); return storage.has(k) ? storage.get(k) : null; },
     setItem: (k, v) => { if (storageThrows) throw new Error("denied"); storage.set(k, v); },
   };
+  const matchMedia = (q) => ({ matches: /prefers-color-scheme:\s*dark/.test(String(q)),
+    media: String(q), addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
   const calls = [];
   const confirmations = [];
   const ctx = {
     console,
     document: {
-      title: "", documentElement: {}, body: makeEl("body"),
+      title: "", documentElement: { dataset: {}, lang: "" }, body: makeEl("body"),
       getElementById: (id) => els[id] || null,
       addEventListener() {}, createElement: (t) => makeEl(t),
     },
-    window: { localStorage, addEventListener() {} },
+    window: { localStorage, addEventListener() {}, matchMedia },
     navigator: { languages: langs, language: langs[0] || "" },
     localStorage,
+    matchMedia,
     fetch: async (url, opts = {}) => {
       calls.push({ url, method: opts.method || "GET", body: opts.body || null });
       if (fetchFails) throw new Error("offline");
@@ -276,6 +287,41 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
   has(en.els["letter"].innerHTML, "Close", "英文关闭按钮渲染");
   has(en.els["letter"].innerHTML, "第二封待投递", "英文界面下用户内容仍原样");
   hasNot(en.els["letter"].innerHTML, "信件详情", "英文界面下没有中文详情标题");
+}
+
+// 8) v1.13 new STR keys exist in BOTH languages with the exact frozen values. Reading the
+//    in-context `STR` binding is precise: it proves the key→value mapping, not just that the
+//    Chinese/English words appear somewhere in the file.
+{
+  const e = makeEnv({ langs: ["en-US"] }); await settle();
+  const S = (l, k) => vm.runInContext(`STR.${l}.${k}`, e.ctx);
+  const exact = [
+    ["tabInbox", "收件箱", "INBOX"],
+    ["tabOutbox", "发件箱", "OUTBOX"],
+    ["outboxEmpty", "暂无当前可观察的已发普通信", "No observable outgoing mail right now"],
+    ["outboxLocked", "已送达，不能修改", "Delivered — locked"],
+    ["outboxUnknown", "状态无法确认，不能修改", "Status unknown — locked"],
+    ["actWorking", "运行中", "WORKING"],
+    ["actIdle", "空闲", "IDLE"],
+    ["actUnknown", "未知", "UNKNOWN"],
+    ["actLabel", "活动", "ACTIVITY"],
+    ["actHuman", "人类", "HUMAN"],
+    ["appearance", "外观", "Appearance"],
+    ["themeSystem", "跟随系统", "SYSTEM"],
+    ["themeLight", "浅色", "LIGHT"],
+    ["themeDark", "深色", "DARK"],
+  ];
+  for (const [k, zh, en] of exact) {
+    is(S("zh", k), zh, `STR.zh.${k} 精确值「${zh}」`);
+    is(S("en", k), en, `STR.en.${k} 精确值「${en}」`);
+  }
+  // editSave / retract have no frozen literal in the ticket: assert presence + translation only.
+  for (const k of ["editSave", "retract"]) {
+    const zh = S("zh", k), en = S("en", k);
+    is(typeof zh === "string" && zh.length > 0, true, `STR.zh.${k} 存在且非空`);
+    is(typeof en === "string" && en.length > 0, true, `STR.en.${k} 存在且非空`);
+    is(zh !== en, true, `STR.${k} 是翻译过的（zh≠en）`);
+  }
 }
 
 console.log(failures ? `FAIL ${failures}` : "PASS");

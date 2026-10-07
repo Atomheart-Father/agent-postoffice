@@ -22,9 +22,11 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(here, "..", "panel", "index.html"), "utf8");
-const script = html.match(/<script>([\s\S]*?)<\/script>/);
-if (!script) { console.error("BAD: panel/index.html has no inline script"); process.exit(1); }
-const CODE = script[1];
+const scriptBlocks = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+// v1.13 contract C adds a <head> bootstrap <script> (theme before paint), so the first <script> is
+// no longer the app. Pick the block that defines the string table (the real app script).
+const CODE = scriptBlocks.find((s) => s.includes("const STR")) || scriptBlocks[scriptBlocks.length - 1];
+if (!CODE) { console.error("BAD: panel/index.html has no inline script"); process.exit(1); }
 
 let failures = 0;
 const ok = (msg) => console.log("ok   - " + msg);

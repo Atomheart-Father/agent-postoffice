@@ -49,8 +49,17 @@ const RECEIPT_WAIT_MS = Number(process.env.POSTOFFICE_RECEIPT_WAIT || 600) * 100
 const ALARM_MIN = 1
 const ALARM_MAX = 1440
 const ALARM_TEXT = "你设的闹钟到了，请检查刚才安排的任务。"
+const ACTIVITY_DIR = `${ROOT}/runtime/activity`
+const ACTIVITY_THROTTLE_MS = 60_000
 
 type Route = { methods?: string[]; session_id?: string; status?: string }
+type Activity = {
+  state: "working" | "idle"
+  since: number
+  observed: number
+  source: "opencode_plugin"
+  binding: string
+}
 type Alarm = {
   id: string
   box: string
@@ -133,13 +142,11 @@ const claim = async (box: string, file: string) => {
   }
 }
 
-const head3 = async (path: string) => {
-  try {
-    return (await readFile(path, "utf8")).split("\n").slice(0, 3).join("\n")
-  } catch {
-    return "（读取开头失败，请直接打开信件）"
-  }
-}
+// Neutral single-letter wake head, rebuilt from parsed fields — never echo the raw 来源 line:
+// an old letter may still carry the retired parenthetical identity assertion, and the wake must
+// not re-inject it. The letter file is untouched; only this summary is regenerated.
+const wakeHead = (m: { src: string; subj: string; need: string }) =>
+  `来源：${m.src || "?"}\n事由：${m.subj || "（无）"}\n需要：${m.need}`
 
 // the original subject of a receipt notification (metadata only)
 const receiptSubject = (fieldOf: (k: string) => string) =>
@@ -159,9 +166,9 @@ const letterHead = async (box: string, file: string) => {
       const l = head.find((x) => x.startsWith(k))
       return l ? l.slice(k.length).trim() : ""
     }
-    return { src: fieldOf("来源：").split("（")[0].trim(), subj: fieldOf("事由：") }
+    return { src: fieldOf("来源：").split("（")[0].trim(), subj: fieldOf("事由："), need: fieldOf("需要：") }
   } catch {
-    return { src: "", subj: "" }
+    return { src: "", subj: "", need: "" }
   }
 }
 
@@ -183,6 +190,37 @@ const presentedAdd = async (box: string, ids: string[]) => {
   const tmp = `${p}.tmp-${process.pid}`
   await writeFile(tmp, JSON.stringify(merged), "utf8")
   await rename(tmp, p)
+}
+
+// ---------------------------------------------------------------- 运行态活动（runtime presence）
+// 纯展示的旁路：只回答「这个信箱此刻是忙还是空着」，永远不是投递真相 —— 投递真相仍在
+// 账本 / 认领 / .presented.json 里。路径 <HOME>/runtime/activity/<box>.json，原子写
+// （tmp + rename），任何错误都吞掉，绝不影响投递或唤醒。
+// 同状态保留 since、推进 observed；状态一变就重置 since；同状态重写节流到 60s 一次。
+const activityPath = (box: string) => `${ACTIVITY_DIR}/${box}.json`
+
+const writeActivity = async (box: string, sessionID: string, state: "working" | "idle") => {
+  try {
+    const observed = Date.now() / 1000
+    const p = activityPath(box)
+    let prev: Activity | null = null
+    try {
+      const v = JSON.parse(await readFile(p, "utf8"))
+      if (v && typeof v === "object") prev = v as Activity
+    } catch {}
+    if (prev && prev.state === state && prev.binding === sessionID) {
+      const seen = typeof prev.observed === "number" ? prev.observed : 0
+      if (observed - seen < ACTIVITY_THROTTLE_MS / 1000) return   // 同会话同状态：60s 内不重写
+    }
+    const since = prev && prev.state === state && prev.binding === sessionID && typeof prev.since === "number" ? prev.since : observed
+    const rec: Activity = { state, since, observed, source: "opencode_plugin", binding: sessionID }
+    await mkdir(ACTIVITY_DIR, { recursive: true })
+    const tmp = `${p}.tmp-${process.pid}`
+    await writeFile(tmp, JSON.stringify(rec), "utf8")
+    await rename(tmp, p)
+  } catch (e) {
+    await log(`activity 写入失败（已忽略）${box}: ${e}`)
+  }
 }
 
 // ---------------------------------------------------------------- 闹钟记录
@@ -406,6 +444,8 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
         } catch {
           continue
         }
+        // 顺手刷新本箱运行态活动（best-effort：写活动失败也不能挡住这封信）
+        await writeActivity(box, sessionID, st === "busy" ? "working" : "idle")
         if (st !== "idle") continue
         // 读开头块分出正式信、闹钟提醒与回执通知；正文永不注入
         type Item = { file: string; src: string; subj: string; id: string; mtime: number }
@@ -488,7 +528,7 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
             parts.push(`按各信“需要”字段处理；回信/回执/归档规则见 postoffice skill。`)
           } else {
             for (const f of claimedFormal) {
-              parts.push(`【联络总站新信｜${box}】\n== ${ROOT}/${box}/inbox/${f}\n${await head3(`${ROOT}/${box}/inbox/${f}`)}\n` +
+              parts.push(`【联络总站新信｜${box}】\n== ${ROOT}/${box}/inbox/${f}\n${wakeHead(await letterHead(box, f))}\n` +
                 `按信件“需要”字段处理；回信/回执/归档规则见 postoffice skill。`)
             }
           }
@@ -567,9 +607,28 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
   await log(`投递插件上岗（实例 ${directory}）`)
   const timer = setInterval(() => void scan("poll"), POLL_MS)
   void scan("boot")
-  const event = async ({ event }: { event: { type?: string } }) => {
+  const event = async ({ event }: {
+    event: { type?: string; properties?: { sessionID?: string; status?: { type?: string } } }
+  }) => {
     try {
       if (event?.type === "session.idle") void scan("session.idle")
+      // 运行态活动：只认「本插件自己登记的信箱」的事件；别的会话一个字节都不写。
+      // session.status 的 busy/idle 与 session.idle 都映射到同一个 presence。
+      const sid = event?.properties?.sessionID
+      if (typeof sid === "string") {
+        let state: "working" | "idle" | null = null
+        if (event?.type === "session.status") {
+          const t = event.properties?.status?.type
+          if (t === "busy") state = "working"
+          else if (t === "idle") state = "idle"
+        } else if (event?.type === "session.idle") {
+          state = "idle"
+        }
+        if (state) {
+          const who = await resolveOwnBox(sid)
+          if (who.box) await writeActivity(who.box, sid, state)
+        }
+      }
     } catch {}
   }
   // args 按官方形态声明：ToolDefinition 就是 tool() 的返回类型，args 是 z.ZodRawShape。

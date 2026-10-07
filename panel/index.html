@@ -11,17 +11,27 @@
   --bg:#e6e4de; --panel:#efede7; --panel2:#f6f4ee;
   --ink:#1d1c18; --ink2:#5f5c54; --rule:#45423a; --rule2:#cfccc2;
   --accent:#ff4d00; --accent-ink:#b23a00; --ok:#20713f; --off:#98948b; --warn:#7d5d05; --bad:#b3362b;
+  --ink-strong:#000; --overlay:rgba(29,28,24,.32);
   --radius:2px;
+  color-scheme:light dark;
+}
+/* 外观只影响呈现：data-theme 由 <head> 引导脚本与顶栏外观控件设置，绝不改动任何路由/状态 */
+[data-theme="dark"]{
+  --bg:#14130f; --panel:#1c1a15; --panel2:#232019;
+  --ink:#ece9e0; --ink2:#a8a396; --rule:#6a6558; --rule2:#3a362d;
+  --accent:#ff6a2b; --accent-ink:#ff8a55; --ok:#4fb477; --off:#6f6a5e; --warn:#d9a441; --bad:#e07a70;
+  --ink-strong:#ffffff; --overlay:rgba(0,0,0,.6);
+  color-scheme:dark;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased;min-height:100dvh}
 button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
 .mono{font-family:var(--mono)}
 .dim{color:var(--ink2)}
 :focus-visible{outline:2px solid var(--accent-ink);outline-offset:2px}
 
 /* ---------- top rail ---------- */
-header.rail{display:flex;align-items:stretch;border-bottom:1px solid var(--rule);background:var(--bg);position:sticky;top:0;z-index:20}
+header.rail{display:flex;align-items:stretch;border-bottom:1px solid var(--rule);background:var(--bg);position:sticky;top:0;z-index:20;padding-top:env(safe-area-inset-top);padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
 .rail .brand{padding:8px 20px;border-right:1px solid var(--rule)}
 .rail .brand h1{font-size:16px;letter-spacing:.16em;font-weight:800;display:block;line-height:1.15}
 .rail .brand .sub{font-family:var(--mono);font-size:10px;letter-spacing:.3em;color:var(--ink2)}
@@ -35,12 +45,16 @@ nav.tabs button[aria-pressed="true"]::after{content:"";position:absolute;left:0;
 .act{font-family:var(--mono);font-size:11px;letter-spacing:.16em;color:var(--ink2);padding:8px 10px;min-height:44px}
 .act:hover{color:var(--ink)}
 .compose-btn{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--ink);background:var(--ink);color:var(--bg);padding:8px 16px;font-family:var(--mono);font-size:11px;letter-spacing:.14em;border-radius:var(--radius);min-height:44px}
-.compose-btn:hover{background:#000}
+.compose-btn:hover{background:var(--ink-strong)}
 .compose-btn[disabled]{opacity:.45;cursor:not-allowed}
 .langs{display:inline-flex;gap:2px;margin:0 8px}
 .langs button{font-family:var(--mono);font-size:11px;padding:6px 8px;color:var(--ink2);min-height:44px}
 .langs button:hover{color:var(--ink)}
 .langs button[aria-pressed="true"]{color:var(--ink);border-bottom:2px solid var(--accent)}
+.themes{display:inline-flex;gap:2px;margin:0 8px}
+.themes button{font-family:var(--mono);font-size:11px;padding:6px 8px;color:var(--ink2);min-height:44px}
+.themes button:hover{color:var(--ink)}
+.themes button[aria-pressed="true"]{color:var(--ink);border-bottom:2px solid var(--accent)}
 .op-btn{display:flex;align-items:center;gap:10px;padding:0 16px;border-left:1px solid var(--rule);min-height:44px;text-align:left}
 .op-btn:hover{background:var(--panel2)}
 .op-btn .lbl{display:flex;flex-direction:column;line-height:1.3}
@@ -58,7 +72,7 @@ nav.tabs button[aria-pressed="true"]::after{content:"";position:absolute;left:0;
 .chip.bad{border-color:var(--bad);color:var(--bad)}
 .chip.mid{border-color:var(--warn);color:var(--warn)}
 
-main{max-width:1280px;margin:0 auto;padding:18px 26px 120px}
+main{max-width:1280px;margin:0 auto;padding:18px 26px calc(120px + env(safe-area-inset-bottom))}
 .hint{font-family:var(--mono);font-size:11px;color:var(--ink2);letter-spacing:.04em;margin-bottom:10px}
 .err{color:var(--bad);font-family:var(--mono);font-size:11px;min-height:1em;margin-bottom:6px}
 .note{font-family:var(--mono);font-size:11px;color:var(--accent-ink);min-height:1em;margin-bottom:6px}
@@ -200,14 +214,14 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
 .hintp{font-family:var(--mono);font-size:11px;color:var(--ink2);padding:8px 2px}
 
 /* ---------- compose modal ---------- */
-.modal{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:50;background:rgba(29,28,24,.32)}
+.modal{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:50;background:var(--overlay)}
 .modal[hidden]{display:none}
 .modal .card{width:560px;max-width:94vw;background:var(--panel);border:1px solid var(--ink);border-radius:var(--radius);padding:18px}
 .modal h3{font-size:16px;font-weight:800;margin-bottom:12px}
 .frow{display:grid;grid-template-columns:120px 1fr;gap:10px;align-items:center;margin-bottom:10px}
 .frow label{font-family:var(--mono);font-size:11px;letter-spacing:.18em;color:var(--ink2)}
 .frow .fixed{border:1px solid var(--rule2);border-radius:var(--radius);padding:8px 10px;background:var(--panel2);display:flex;justify-content:space-between;align-items:center;gap:8px}
-.frow input,.frow textarea{border:1px solid var(--rule2);border-radius:var(--radius);padding:8px 10px;background:var(--panel2);font:inherit;width:100%}
+.frow input,.frow textarea{border:1px solid var(--rule2);border-radius:var(--radius);padding:8px 10px;background:var(--panel2);font:inherit;font-size:16px;width:100%}
 .seg{display:inline-flex;border:1px solid var(--rule);border-radius:var(--radius);overflow:hidden;margin-bottom:6px}
 .seg button{font-family:var(--mono);font-size:11px;letter-spacing:.12em;padding:5px 12px;color:var(--ink2);min-height:44px}
 .seg button:hover{color:var(--ink)}
@@ -225,6 +239,29 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
 .close-x{float:right;font-family:var(--mono);font-size:12px;color:var(--ink2);padding:4px 8px;min-height:44px;min-width:44px}
 .close-x:hover{color:var(--ink)}
 
+/* ---------- inspector tabs + OUTBOX + activity ---------- */
+.ins-tabs{display:flex;border-bottom:1px solid var(--rule);margin:10px 0 6px}
+.ins-tabs button{flex:1;font-family:var(--mono);font-size:11px;letter-spacing:.16em;color:var(--ink2);padding:10px 6px;min-height:44px;position:relative}
+.ins-tabs button[aria-pressed="true"]{color:var(--ink)}
+.ins-tabs button[aria-pressed="true"]::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:3px;background:var(--accent)}
+#outbox{margin-top:4px}
+.obrow{border-top:1px solid var(--rule2);padding:9px 2px;display:flex;flex-direction:column;gap:6px}
+.obrow .l1{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px}
+.obrow .to{font-weight:700;overflow-wrap:anywhere}
+.obrow .ref{font-family:var(--mono);font-size:10px;color:var(--ink2);overflow-wrap:anywhere}
+.obrow .age{font-family:var(--mono);font-size:10px;color:var(--ink2);margin-left:auto}
+.obrow .sj{font-size:13px;overflow-wrap:anywhere}
+.obrow .nd{font-size:12px;color:var(--ink2);overflow-wrap:anywhere}
+.obrow .obacts{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.obrow button{font-family:var(--mono);font-size:11px;letter-spacing:.08em;border:1px solid var(--rule2);background:none;color:var(--ink);padding:0 12px;min-height:44px}
+.obrow button:hover{border-color:var(--ink)}
+.obnote{font-family:var(--mono);font-size:11px;color:var(--ink2)}
+/* activity badge: label + duration, never color-only */
+.act-badge{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10px;letter-spacing:.1em;border:1px solid var(--rule2);border-radius:var(--radius);padding:1px 6px;color:var(--ink2);margin-left:8px}
+.act-badge[data-activity="working"]{border-color:var(--ok);color:var(--ok)}
+.act-badge[data-activity="idle"]{border-color:var(--rule2);color:var(--ink2)}
+.act-badge[data-activity="human"]{border-color:var(--accent-ink);color:var(--accent-ink)}
+
 @media (max-width:900px){
   main{padding:12px 12px 120px}
   .cols{grid-template-columns:1fr}
@@ -233,6 +270,9 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
   .inspector,.letter{width:100vw;border-left:none}
   .opstrip .nm{font-size:26px}
   .rail .brand .sub,.rail .home{display:none}
+  /* iPad 竖屏 768/820：顶栏在 701–900 之间若不让换行，aux 会整体溢出到视口右侧 */
+  .rail{flex-wrap:wrap}
+  .aux{flex-wrap:wrap}
 }
 @media (max-width:700px){
   .rail{flex-wrap:wrap}
@@ -242,6 +282,9 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
   .frow{grid-template-columns:1fr}
   #racks{overflow-x:auto}
   .opstrip .nm{font-size:22px}
+  /* 编外信箱行：窄屏上「标签 + 节点 + 连接线」挤在一行会顶出视口，允许换行并让节点随宽度收缩 */
+  .t1row{flex-wrap:wrap}
+  .t1row .t1node{min-width:0;max-width:100%}
 }
 @media (prefers-reduced-motion:reduce){.letter,.drawer,.opstrip .arrow{transition:none}}
 ::selection{background:var(--ink);color:var(--bg)}
@@ -257,6 +300,15 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
 .unassigned{margin-top:34px}
 .unassigned .k{display:block;margin-bottom:10px}
 </style>
+<script>
+/* 外观引导：在样式渲染前就定好 data-theme，避免首屏闪一下浅色（只读 localStorage，不写） */
+try {
+  var _saved = localStorage.getItem("postoffice.theme");
+  var _dark = _saved === "dark" || ((!_saved || _saved === "system")
+    && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = _dark ? "dark" : "light";
+} catch (e) {}
+</script>
 </head>
 <body>
 
@@ -277,6 +329,11 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
     <span class="langs" id="langs" role="group">
       <button type="button" data-lang="zh">中文</button>
       <button type="button" data-lang="en">English</button>
+    </span>
+    <span class="themes" id="theme" role="group">
+      <button type="button" data-theme-choice="system"></button>
+      <button type="button" data-theme-choice="light"></button>
+      <button type="button" data-theme-choice="dark"></button>
     </span>
   </div>
   <button type="button" class="op-btn" id="op-shortcut"></button>
@@ -395,6 +452,14 @@ const STR = {
     noGroupMatch: "无匹配分组，仅可单独开关。",
     configuredGroups: "已配置分组",
     harnessOn: "ON", harnessOff: "OFF", harnessMixed: "MIXED",
+    tabInbox: "收件箱", tabOutbox: "发件箱",
+    outboxEmpty: "暂无当前可观察的已发普通信",
+    outboxLocked: "已送达，不能修改", outboxUnknown: "状态无法确认，不能修改",
+    editSave: "保存", retract: "撤回",
+    retractConfirm: "撤回发给 {to} 的这封信（编号 {id}）吗？原信会原样存档，不会通知对方，也不会补发。",
+    retractDone: "已撤回，原信已存档。",
+    actWorking: "运行中", actIdle: "空闲", actUnknown: "未知", actLabel: "活动", actHuman: "人类",
+    appearance: "外观", themeSystem: "跟随系统", themeLight: "浅色", themeDark: "深色",
   },
   en: {
     title: "Post Office",
@@ -451,6 +516,14 @@ const STR = {
     noGroupMatch: "No matching config group — individual switches only.",
     configuredGroups: "CONFIGURED GROUPS",
     harnessOn: "ON", harnessOff: "OFF", harnessMixed: "MIXED",
+    tabInbox: "INBOX", tabOutbox: "OUTBOX",
+    outboxEmpty: "No observable outgoing mail right now",
+    outboxLocked: "Delivered — locked", outboxUnknown: "Status unknown — locked",
+    editSave: "Save", retract: "Retract",
+    retractConfirm: "Retract the letter to {to} (id {id})? The original is archived as-is; the recipient is not notified and nothing is resent.",
+    retractDone: "Retracted; the original is archived.",
+    actWorking: "WORKING", actIdle: "IDLE", actUnknown: "UNKNOWN", actLabel: "ACTIVITY", actHuman: "HUMAN",
+    appearance: "Appearance", themeSystem: "SYSTEM", themeLight: "LIGHT", themeDark: "DARK",
   },
 };
 
@@ -473,6 +546,43 @@ const browserLang = () => {
 };
 lang = store.get() || (browserLang().toLowerCase().startsWith("zh") ? "zh" : "en");
 
+// 外观：与语言一样只影响呈现，存 localStorage、绝不发写请求。system 交给系统解析。
+const THEME_KEY = "postoffice.theme";
+const themeStore = {
+  get() { try { return window.localStorage.getItem(THEME_KEY); } catch { return null; } },
+  set(v) { try { window.localStorage.setItem(THEME_KEY, v); } catch {} },
+};
+let themeChoice = "system";
+{ const saved = themeStore.get(); if (saved === "light" || saved === "dark" || saved === "system") themeChoice = saved; }
+const prefersDark = () => {
+  try { return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches); } catch { return false; }
+};
+const resolveTheme = (c) => (c === "dark" ? "dark" : c === "light" ? "light" : (prefersDark() ? "dark" : "light"));
+function applyTheme(choice) {
+  themeChoice = (choice === "light" || choice === "dark") ? choice : "system";
+  themeStore.set(themeChoice);
+  try { document.documentElement.dataset.theme = resolveTheme(themeChoice); } catch {}
+  const g = $("theme");
+  if (g && g.children) {
+    try { g.setAttribute("aria-label", t("appearance")); } catch {}
+    for (const b of g.children) {
+      const c = b.dataset && b.dataset.themeChoice;
+      b.textContent = c === "light" ? t("themeLight") : c === "dark" ? t("themeDark") : t("themeSystem");
+      if (b.setAttribute) b.setAttribute("aria-pressed", String(c === themeChoice));
+    }
+  }
+}
+// SYSTEM 跟随系统明暗变化；显式 LIGHT/DARK 不受系统事件影响（只读本地，不发任何写请求）
+const syncSystemTheme = () => {
+  if (themeChoice !== "system") return;
+  try { document.documentElement.dataset.theme = resolveTheme("system"); } catch {}
+};
+try {
+  const mq = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)");
+  if (mq && mq.addEventListener) mq.addEventListener("change", syncSystemTheme);
+  else if (mq && mq.addListener) mq.addListener(syncSystemTheme);
+} catch {}
+
 // null-safe listeners: the page also runs under minimal DOM stubs in tests
 const setClass = (el, cls, on) => { try { if (!el || !el.classList) return; if (on) el.classList.add(cls); else el.classList.remove(cls); } catch {} };
 const on = (id, ev, fn) => { const el = $(id); if (el) el.addEventListener(ev, fn); };
@@ -482,6 +592,8 @@ let STATE = null;                 // latest /api/state
 let view = "org";                 // org | hk
 let insBox = null;                // mailbox shown in the inspector
 let insOpen = !(typeof window !== "undefined" && window.innerWidth <= 900); // 手机首屏不开工作台（否则全屏盖住组织视图）；桌面默认常开
+let insTab = "inbox";             // 工作台内部标签：inbox | outbox（不是第三个导航页）
+let OUTBOX = null;                // 最近一次 /api/outbox 的行（null = 还没读过）
 let composeMode = "new";          // new | reply
 let replyOf = null;               // {box,id} when composing a reply
 let sending = false;              // compose double-click guard
@@ -503,6 +615,25 @@ const counterHTML = (n, hot) => n > 0 ? `<span class="counter ${hot ? "hot" : ""
 
 /* ---------- ORGANIZATION view (generic; rendered from panel.organization + live boxes) ---------- */
 
+/* ---------- runtime presence (presentation only; never touches routing) ---------- */
+
+const isOperatorBox = (b) => !!b && b.name === operatorName() && operatorValid();
+const durText = (since) => {
+  if (typeof since !== "number" || !isFinite(since)) return "";
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - since));
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+};
+// 操作员是人：永远 HUMAN，绝不假装 IDLE；其余箱只呈现服务端给出的 working/idle/unknown
+function activityBadge(b, asOperator) {
+  if (asOperator) return `<span class="act-badge" data-activity="human">${esc(t("actHuman"))}</span>`;
+  const a = (b && b.activity) || {};
+  const st = a.state === "working" || a.state === "idle" ? a.state : "unknown";
+  const label = st === "working" ? t("actWorking") : st === "idle" ? t("actIdle") : t("actUnknown");
+  const d = st === "unknown" ? "" : durText(a.since);
+  return `<span class="act-badge" data-activity="${st}">${esc(label)}${d ? ` · ${esc(d)}` : ""}</span>`;
+}
+
 const nodeBtn = (name, extraClass = "") => {
   const b = boxOf(name);
   if (!b) return "";
@@ -510,7 +641,7 @@ const nodeBtn = (name, extraClass = "") => {
   return `<button type="button" class="node ${extraClass} ${b.online ? "" : "dead"}" data-box="${esc(name)}"
     ${insBox === name ? 'aria-current="true"' : ""} aria-label="${esc(label)}">
     <span class="l1"><span class="nm">${esc(label)}</span><span class="idchip">${esc(b.name)}</span>${counterHTML(b.counts.waiting, true)}</span>
-    <span class="l2">${stHTML(b.online)}<span class="chip">${esc(b.app)}</span></span>
+    <span class="l2">${stHTML(b.online)}<span class="chip">${esc(b.app)}</span>${activityBadge(b, isOperatorBox(b))}</span>
   </button>`;
 };
 let orgLabels = {};
@@ -603,6 +734,77 @@ function flatGrid() {
 
 /* ---------- inspector (operator workbench / mailbox card) ---------- */
 
+/* ---------- OUTBOX rows (read model; derived server-side, never a second copy here) ---------- */
+
+function outboxRowHTML(r) {
+  const to = esc(r.to), id = esc(r.id);
+  const ref = esc(r.ref || `${r.to}/${r.id}`);
+  const pending = r.status === "pending";
+  const age = durText(r.mtime);
+  // 具体原因来自服务端（inflight / delivered / unknown 各自不同），不再用泛称；alias 是发送时冻结的原文
+  const note = r.reason || (r.status === "locked" ? t("outboxLocked") : t("outboxUnknown"));
+  const acts = pending
+    ? `<div class="obacts">
+         <button type="button" data-outbox-action="edit" data-to="${to}" data-id="${id}">${esc(t("editSave"))}</button>
+         <button type="button" data-outbox-action="retract" data-to="${to}" data-id="${id}">${esc(t("retract"))}</button>
+       </div>`
+    : `<div class="obacts"><span class="obnote">${esc(note)}</span></div>`;
+  return `<div class="obrow" data-outbox="1" data-to="${to}" data-id="${id}">
+    <div class="l1">
+      <span class="to">${r.alias ? `${esc(r.alias)} → ${to}` : to}</span>
+      <span class="chip">${esc(r.status)}</span>
+      ${age ? `<span class="age">${esc(age)}</span>` : ""}
+    </div>
+    <div class="ref">${ref}</div>
+    <div class="sj">${esc(r.subject || "")}</div>
+    ${r.need ? `<div class="nd">${esc(r.need)}</div>` : ""}
+    ${acts}
+  </div>`;
+}
+function outboxHTML() {
+  const rows = OUTBOX || [];
+  const inner = rows.length ? rows.map(outboxRowHTML).join("")
+    : `<p class="hintp">${esc(t("outboxEmpty"))}</p>`;
+  return `<div id="outbox">${inner}</div>`;
+}
+
+// §8：点击发件箱行进入只读详情（TO/ID/REF/SUBJECT/NEED/BODY/STATUS）；只有 PENDING 才给编辑/撤回入口
+function openOutboxDetail(to, id) {
+  const r = (OUTBOX || []).find((x) => x.to === to && x.id === id);
+  if (!r) return;
+  letterSeq++;                       // 与 openEdit 共用同一层的请求失效：迟到的读信不得覆盖本层
+  currentLetter = null;
+  editingOutbox = null;
+  openOutboxRef = { to, id };        // 记住详情层展示的是哪封发件信（撤回成功后要与列表对齐）
+  const el = $("letter");
+  if (!el) return;
+  const ref = r.ref || `${r.to}/${r.id}`;
+  const pending = r.status === "pending";
+  const note = r.reason || (r.status === "locked" ? t("outboxLocked") : t("outboxUnknown"));
+  const acts = pending
+    ? `<div class="acts" style="justify-content:flex-end">
+         <button type="button" class="btn ghost" data-outbox-action="retract" data-to="${esc(to)}" data-id="${esc(id)}">${esc(t("retract"))}</button>
+         <button type="button" class="btn primary" data-outbox-action="edit" data-to="${esc(to)}" data-id="${esc(id)}">${esc(t("editSave"))}</button>
+       </div>`
+    : `<p class="fine">${esc(note)}</p>`;
+  el.innerHTML = `<div class="card">
+    <button type="button" class="close-x" data-edit-close="1">✕ ${esc(t("close"))}</button>
+    <div class="k">${esc(t("tabOutbox"))} · ${esc(ref)}</div>
+    <div class="kv">
+      <span class="k">TO</span><span style="font-weight:700">${esc(r.to)}</span>
+      <span class="k">ID/REF</span><span>${esc(ref)}</span>
+      ${r.alias ? `<span class="k">${esc(t("segAlias"))}</span><span>${esc(r.alias)} → ${esc(r.to)}</span>` : ""}
+      <span class="k">${esc(t("subject"))}</span><span style="font-weight:600">${esc(r.subject || "")}</span>
+      <span class="k">${esc(t("need"))}</span><span style="color:var(--accent-ink);font-weight:600">${esc(r.need || "")}</span>
+      <span class="k">STATUS</span><span class="chip">${esc(r.status)}</span>
+    </div>
+    <div class="body">${esc(r.body || "")}</div>
+    ${acts}
+  </div>`;
+  el.hidden = false; setClass(el, "open", true);
+  const bg = $("sheet-bg"); setClass(bg, "open", true);
+}
+
 function pickDefaultInspector() {
   if (insBox && boxOf(insBox)) return;
   const op = operatorName();
@@ -615,6 +817,12 @@ function inspectorHTML() {
   if (!b) return "";
   const c = b.counts || { waiting: 0, reminded: 0, failed: 0 };
   const isOp = b.name === operatorName() && operatorValid();
+  const insCount = String((b.pending || []).length).padStart(2, "0");
+  const obCount = OUTBOX ? String(OUTBOX.length).padStart(2, "0") : "";
+  const tabs = `<div class="ins-tabs" role="tablist">
+    <button type="button" id="ins-tab-inbox" data-ins-tab="inbox" aria-pressed="${insTab === "inbox"}">${esc(t("tabInbox"))} ${insCount}</button>
+    <button type="button" id="ins-tab-outbox" data-ins-tab="outbox" aria-pressed="${insTab === "outbox"}">${esc(t("tabOutbox"))}${obCount ? " " + obCount : ""}</button>
+  </div>`;
   const head = isOp ? `
     <div class="k">${esc(t("humanOperator"))}</div><h3>${esc(b.name)}</h3>
     <div style="margin:4px 0">${stHTML(b.online)} <span class="chip">${esc(b.app)}</span></div>
@@ -643,12 +851,15 @@ function inspectorHTML() {
       <span class="k">STATUS</span><span>${counts(c)}${c.failed ? ` · <span class="chip bad">${esc(fmt("failedLine", { n: c.failed }))}</span>` : ""}</span>
     </div>`;
   const opNote = !operatorValid() ? `<div class="cerr">${esc(t("operatorBad"))}</div>` : "";
+  const actSec = `<div class="sec"><span>${esc(t("actLabel"))}</span><span></span></div>
+    <div style="margin:2px 0 4px">${activityBadge(b, isOp)}</div>`;
   return `<aside class="inspector open" id="ins" aria-label="${esc(b.name)}">
     <button type="button" class="close-x" data-ins-close="1" aria-label="${esc(t("close"))}"
       style="position:absolute;top:10px;right:10px">✕</button>
     ${head}
-    ${pending}
-    ${acks}
+    ${tabs}
+    ${insTab === "outbox" ? outboxHTML() : pending + acks}
+    ${actSec}
     ${meta}
     ${opNote}
     <div class="acts">
@@ -683,7 +894,7 @@ function harnessHTML() {
     const rows = members.map((b, i) => `
       <tr>
         <td>${String(i + 1).padStart(2, "0")}</td>
-        <td><span class="chname"><span class="dot ${b.online ? "on" : ""}"></span>${esc(b.name)} <span class="id">${esc(b.who || "")}</span></span></td>
+        <td><span class="chname"><span class="dot ${b.online ? "on" : ""}"></span>${esc(b.name)} <span class="id">${esc(b.who || "")}</span>${activityBadge(b, isOperatorBox(b))}</span></td>
         <td>${stHTML(b.online)}</td>
         <td class="mono">${b.counts.waiting || "—"}</td>
         <td><button type="button" class="toggle onoff" data-name="${esc(b.name)}" data-online="${b.online}"
@@ -718,6 +929,8 @@ function opBadgeHTML() {
 
 let currentLetter = null;           // 当前详情里那封信的 {box, id}（按钮不带业务数据，以它为准）
 let letterSeq = 0;                  // 请求序号：过期的读取不得改写更新过的视图
+let editingOutbox = null;           // {to,id} of the outgoing letter being edited in the overlay
+let openOutboxRef = null;           // {to,id} of the outgoing letter shown in the read-only detail layer
 
 const letterIndex = () => String((letterSeq % 9999) + 1).padStart(4, "0");
 
@@ -749,6 +962,8 @@ function letterHTML(d) {
 
 async function openLetter(box, id) {
   const seq = ++letterSeq;
+  editingOutbox = null;              // 视图切回读信：编辑层作废
+  openOutboxRef = null;              // 读信层作废发件箱详情
   $("letter-status").textContent = "";
   try {
     const r = await fetch(`/api/letter?box=${encodeURIComponent(box)}&id=${encodeURIComponent(id)}`);
@@ -776,6 +991,8 @@ async function openLetter(box, id) {
 function closeLetter() {
   letterSeq++;                      // 作废所有在途读取，避免它们把详情又打开
   currentLetter = null;
+  editingOutbox = null;
+  openOutboxRef = null;
   const el = $("letter");
   el.hidden = true;
   el.innerHTML = "";
@@ -1008,6 +1225,7 @@ function applyLang(next) {
   }
   closeLetter();                    // 详情是临时视图：换语言不留旧语言的残留
   setTxt("letter-status", "");
+  applyTheme(themeChoice);          // 外观标签/aria 跟着语言刷新（仍只读本地、不发写请求）
   return load();
 }
 
@@ -1023,9 +1241,7 @@ async function load() {
     // 主视图：组织树 + 工作台；HARNESS 页 racks 自带列表，#boxes 只承载工作台。
     // 工作台是全局右轨（两个视图都在），关闭时两个视图都不渲染。
     const boxesEl = $("boxes");
-    if (boxesEl) boxesEl.innerHTML = (view === "org")
-      ? orgHTML() + (insOpen ? inspectorHTML() : "")
-      : (insOpen ? inspectorHTML() : "");
+    if (boxesEl) renderBoxes();
     const hkEl = $("view-hk");
     if (hkEl) {
       hkEl.hidden = view !== "hk";
@@ -1088,6 +1304,90 @@ async function load() {
   }
 }
 
+/* ---------- inspector tabs / outbox mutations (share the server's edit/retract core) ---------- */
+
+function renderBoxes() {
+  const el = $("boxes");
+  if (!el) return;
+  el.innerHTML = view === "org" ? orgHTML() + (insOpen ? inspectorHTML() : "")
+    : (insOpen ? inspectorHTML() : "");
+}
+
+async function refreshOutbox() {
+  try {
+    const j = await (await fetch("/api/outbox")).json();
+    OUTBOX = (j && j.outbox) || [];
+  } catch { OUTBOX = OUTBOX || []; }
+}
+
+async function switchInsTab(tab) {
+  insTab = tab === "outbox" ? "outbox" : "inbox";
+  if (insTab === "outbox") await refreshOutbox();   // 切到发件箱才读一次 /api/outbox（纯读）
+  renderBoxes();
+}
+
+function openEdit(to, id) {
+  const r = (OUTBOX || []).find((x) => x.to === to && x.id === id);
+  if (!r) return;
+  letterSeq++;                       // 作废在途的 openLetter：迟到的读信不得覆盖编辑层或改编辑目标
+  currentLetter = null;
+  editingOutbox = { to, id };
+  openOutboxRef = null;
+  const el = $("letter");
+  if (!el) return;
+  el.innerHTML = `<div class="card">
+    <button type="button" class="close-x" data-edit-close="1">✕ ${esc(t("close"))}</button>
+    <div class="k">${esc(t("tabOutbox"))} · ${esc(to)}/${esc(id)}</div>
+    <div class="frow"><label for="edit-subject">${esc(t("subject"))}</label><input id="edit-subject"></div>
+    <div class="frow"><label for="edit-need">${esc(t("need"))}</label><input id="edit-need"></div>
+    <div class="frow" style="align-items:start"><label for="edit-body" style="padding-top:8px">${esc(t("body"))}</label><textarea id="edit-body" rows="5"></textarea></div>
+    <div class="acts" style="justify-content:flex-end">
+      <button type="button" class="btn primary" data-edit-save="1">${esc(t("editSave"))}</button>
+    </div></div>`;
+  el.hidden = false; setClass(el, "open", true);
+  const bg = $("sheet-bg"); setClass(bg, "open", true);
+  const sj = $("edit-subject"), nd = $("edit-need"), bd = $("edit-body");
+  if (sj) sj.value = r.subject || "";
+  if (nd) nd.value = r.need || "";
+  if (bd) bd.value = r.body || "";
+}
+
+async function saveEdit() {
+  if (!editingOutbox) return;
+  const { to, id } = editingOutbox;
+  const payload = { to, id,
+    subject: ($("edit-subject") || {}).value || "",
+    need: ($("edit-need") || {}).value || "",
+    body: ($("edit-body") || {}).value || "" };
+  try {
+    const r = await fetch("/api/edit-one", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { setTxt("letter-status", j.message || t("errStatus")); return; }   // 失败：保留编辑层
+    editingOutbox = null;
+    closeLetter();
+    await refreshOutbox();
+    renderBoxes();
+  } catch { setTxt("letter-status", t("errOffline")); }
+}
+
+async function doRetract(to, id) {
+  if (!confirm(fmt("retractConfirm", { to, id }))) return;
+  try {
+    const r = await fetch("/api/retract-one", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to, id }) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { setTxt("letter-status", j.message || t("errStatus")); return; }   // 失败：保留该行
+    await refreshOutbox();
+    renderBoxes();
+    // 撤回成功：正在展示这封信的详情层必须与列表一致——关掉它并明确反馈成功
+    if (openOutboxRef && openOutboxRef.to === to && openOutboxRef.id === id) {
+      closeLetter();
+      setTxt("letter-status", t("retractDone"));
+    }
+  } catch { setTxt("letter-status", t("errOffline")); }
+}
+
 /* ---------- delegated actions ---------- */
 
 // shared by the org view (#boxes) and the harness racks (#racks)
@@ -1132,16 +1432,20 @@ async function mainClick(ev) {
     const b = $("boxes"); if (b) b.innerHTML = view === "org" ? orgHTML() : "";
     return;
   }
+  const it = t0.closest("[data-ins-tab]");   // 工作台内部标签：INBOX | OUTBOX（零写请求）
+  if (it) return switchInsTab(it.dataset.insTab);
+  const oa = t0.closest("[data-outbox-action]");   // 已发普通信：改 / 撤回（与 CLI 同一 core）
+  if (oa) return oa.dataset.outboxAction === "retract"
+    ? doRetract(oa.dataset.to, oa.dataset.id) : openEdit(oa.dataset.to, oa.dataset.id);
+  const orow = t0.closest("[data-outbox]");        // 点击发件箱行：打开只读详情（按钮已在上面拦掉）
+  if (orow) return openOutboxDetail(orow.dataset.to, orow.dataset.id);
   const nd = t0.closest("[data-box]");       // open the mailbox inspector (org nodes / strips)
   if (nd) { insBox = nd.dataset.box; insOpen = true; const b = $("boxes"); if (b && view === "org") b.innerHTML = orgHTML() + inspectorHTML(); }
 }
 on("boxes", "click", mainClick);
 on("racks", "click", mainClick);
 
-on("letter", "click", async (ev) => {
-  const b = ev.target.closest("[data-letter-action]");
-  if (!b || b.disabled) return;
-  const action = b.dataset.letterAction;
+async function handleLetterAction(action) {
   if (action === "close") return closeLetter();
   if (!currentLetter) return;
   const { box, id } = currentLetter;
@@ -1176,6 +1480,21 @@ on("letter", "click", async (ev) => {
   } catch (e) {
     $("letter-status").textContent = t("errArchive");
   }
+}
+on("letter", "click", async (ev) => {
+  const la = ev.target.closest("[data-letter-action]");
+  if (la && la.dataset && la.dataset.letterAction) {
+    if (la.disabled) return;
+    return handleLetterAction(la.dataset.letterAction);
+  }
+  const oa = ev.target.closest("[data-outbox-action]");   // 发件箱详情层里的改 / 撤回
+  if (oa && oa.dataset && oa.dataset.outboxAction) {
+    if (oa.disabled) return;
+    return oa.dataset.outboxAction === "retract"
+      ? doRetract(oa.dataset.to, oa.dataset.id) : openEdit(oa.dataset.to, oa.dataset.id);
+  }
+  if (ev.target.closest("[data-edit-save]")) return saveEdit();
+  if (ev.target.closest("[data-edit-close]")) return closeLetter();
 });
 
 // partial failure: the reply is already out — retry filing ONLY, never send again
@@ -1207,6 +1526,11 @@ on("groups", "click", async (ev) => {
 on("langs", "click", (ev) => {
   const b = ev.target.closest("button[data-lang]");
   if (b) applyLang(b.dataset.lang);   // display only
+});
+
+on("theme", "click", (ev) => {
+  const b = ev.target.closest("[data-theme-choice]");
+  if (b && b.dataset && b.dataset.themeChoice) applyTheme(b.dataset.themeChoice);   // display only
 });
 
 /* ---------- tabs / drawer / compose chrome ---------- */
