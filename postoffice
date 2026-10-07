@@ -34,6 +34,40 @@ LOGS = HOME / "logs"
 REPO = Path(__file__).resolve().parent
 SELF = Path(__file__).resolve()
 
+# ---------- $POSTOFFICE_HOME/.env: private runtime settings ----------
+# launchd 起的邮递员/面板不继承终端里的 export，所以用一个极小的 stdlib 读取器补上：
+# process env 优先，.env 只填 os.environ 里还没有的 POSTOFFICE_* 键。无 shell 语法、
+# 无变量展开、无命令替换；格式不合法的行安全忽略并只报行号（绝不回显该行内容）。
+_ENV_KEY_RE = re.compile(r"^POSTOFFICE_[A-Z0-9_]+$")
+
+
+def load_home_env():
+    try:
+        text = (HOME / ".env").read_text(encoding="utf-8")
+    except OSError:
+        return
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            print(f"postoffice：.env 第 {n} 行不是 KEY=value，已忽略", file=sys.stderr)
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not _ENV_KEY_RE.match(key):
+            continue
+        if value[:1] in ("'", '"'):
+            if len(value) < 2 or value[-1] != value[0]:
+                print(f"postoffice：.env 第 {n} 行引号不配对，已忽略", file=sys.stderr)
+                continue
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+
+
+load_home_env()
+
 POLL = int(os.environ.get("POSTOFFICE_POLL", 10))   # seconds between inbox checks
 RATE_N, RATE_WIN = 6, 600   # at most 6 wakes per mailbox per 10 minutes
 GRACE = int(os.environ.get("POSTOFFICE_GRACE", 1200))  # hook/plugin mailbox not woken within 20 min → tell the human
@@ -3517,6 +3551,14 @@ def cmd_panel(a):
             if self.path not in ("/api/status", "/api/clear", "/api/archive-one", "/api/ack-one", "/api/send") \
                     or not self._local() \
                     or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                # 先把请求体排空再拒绝：带着未读数据关连接会让内核发 RST，客户端
+                # 偶尔拿不到这条 403（浏览器变成网络错误，测试偶发 ConnectionReset）。
+                try:
+                    n = int(self.headers.get("Content-Length", 0) or 0)
+                    if 0 < n <= 1 << 20:
+                        self.rfile.read(n)
+                except (ValueError, OSError):
+                    pass
                 return self._send(403, b'{"ok":false}')
             message, status, payload, refused = "", None, None, ""
             try:
