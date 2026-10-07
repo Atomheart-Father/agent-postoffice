@@ -27,7 +27,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.12.3"
+VERSION = "1.12.4"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"

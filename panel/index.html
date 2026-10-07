@@ -796,7 +796,7 @@ function clearHash() {
 
 /* ---------- compose / reply ---------- */
 
-function openCompose(mode) {
+function openCompose(mode, to) {
   const m = $("compose"); if (!m) return;
   composeMode = mode || "new";
   replyOf = composeMode === "reply" ? currentLetter : null;
@@ -827,6 +827,8 @@ function openCompose(mode) {
     const s = row?.subject || "";
     $("compose-subject").value = /^re:/i.test(s) ? s : `Re: ${s}`;
   }
+  // 从某个信箱的工作台点「写信」进来的：收件人默认就是它（仍可改）
+  if (composeMode === "new" && to) $("compose-to").value = to;
   $("compose-err").textContent = operatorValid() ? "" : t("operatorBad");
   $("compose-send").disabled = !operatorValid();
   m.hidden = false;
@@ -858,7 +860,8 @@ function renderSug() {
   const inp = $("compose-to"), box = $("compose-sug");
   if (!inp || !box) return;
   const q = (inp.value || "").trim().toLowerCase();
-  const hits = recipientList().filter((r) => !q || recipientMatch(r.v, q)).slice(0, 8);
+  // 全量列出（不截断）：名单只有几十条，少截断比“找不到”强；超出高度由 .sug 滚动
+  const hits = recipientList().filter((r) => !q || recipientMatch(r.v, q));
   box.innerHTML = hits.map((r) => `<button type="button" data-v="${esc(r.v)}" role="option">` +
     `<span>${esc(r.v)}</span><span class="kind">${esc(r.kind)}</span></button>`).join("");
   box.hidden = hits.length === 0;
@@ -1111,7 +1114,7 @@ async function mainClick(ev) {
   const row = t0.closest("[data-letter]");
   if (row) return openLetter(row.dataset.box, row.dataset.id);
   const cm = t0.closest("[data-compose]");
-  if (cm) return openCompose("new");
+  if (cm) return openCompose("new", insBox || "");
   const gb = t0.closest("button[data-group]");
   if (gb) {
     const r = await fetch("/api/status", { method: "POST", headers: { "Content-Type": "application/json" },
