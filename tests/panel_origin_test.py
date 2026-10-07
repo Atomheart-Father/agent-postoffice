@@ -262,6 +262,17 @@ class BaseUrlOriginMatrix(unittest.TestCase):
                 self.assertEqual(status, 403, f"origin={origin!r} 必须拒绝：{d}")
                 self.assertIs(d.get("ok"), False, f"origin={origin!r}: {d}")
 
+    def test_rejected_post_with_large_body_still_returns_readable_403(self):
+        """拒绝路径必须先排空请求体：否则带大 body 的坏 Origin 请求会在读到 403 前
+        被内核 RST 打断（旧实现 0/10 可读，修复后确定性 10/10）。"""
+        big = "x" * 262144
+        for i in range(5):
+            status, d = self.jpost("/api/status",
+                                   {"name": "chief", "status": "online", "pad": big},
+                                   origin="https://evil.example")
+            self.assertEqual(status, 403, f"第 {i} 次：403 必须可读")
+            self.assertEqual(d, {"ok": False}, f"第 {i} 次：body 必须是 {{ok:false}}")
+
     def test_deep_link_letter_id_served_by_api_letter(self):
         out = run_po("send", "chief", "chief", "深链对照", "回复",
                      home=self.home, stdin="正文\n")
