@@ -2777,6 +2777,7 @@ def slack_alert(name, route, group):
     else:
         text = "\n".join([f"{name} 有新信：{len(formal)} 封"]
                          + [f"- {letter_sender(p) or '?'}：{header_field(p, '事由：') or '（无）'}"
+                            f"｜需要：{header_field(p, '需要：') or '（无）'}"
                             for p in formal]
                          + [f"打开：{link}"])
     import urllib.request

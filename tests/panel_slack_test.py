@@ -9,8 +9,9 @@
   text 必须包含：来源信箱名 + "有新信"、"事由：" 与事由原文、"需要：" 与需要原文；
   永不包含信件正文。设置了 POSTOFFICE_PANEL_BASE_URL 时，text 里带
   <base>#/mail/<operator>/<完整编号> 的深链；未设置时 text 不许出现任何 "http"。
-  同一轮投出的多封正式信合并为一次告警：text 提到 "2 封"，链接是收件箱根
-  #/mail/<operator>，不带单封编号。
+  同一轮投出的多封正式信合并为一次告警：text 提到 "2 封"，每封一行带
+  来源 + 事由 + 需要（正文绝不出现），链接是收件箱根 #/mail/<operator>，
+  不带单封编号。
   webhook 未设置 → 一次请求都没有；webhook 返回 500 → 信照常投递入账
   （.delivered.json、认领照旧）、轮次照常完成，下一轮不重发同一封的告警；
   webhook 长时间不响应 → 投递不被拖住（尽力而为、短超时，本文件用「8 秒才应答的
@@ -285,7 +286,8 @@ class SlackAlert(unittest.TestCase):
         self.assertIn("有新信", text)
 
     def test_two_letters_same_round_alert_once_with_inbox_root(self):
-        ids = [self.send("chief", "coder", f"批量告警{i}") for i in range(2)]
+        ids = [self.send("chief", "coder", "发布检查", need="回复", body=f"{SENTINEL}\n"),
+               self.send("chief", "helper", "实验结果", need="决定", body="第二封正文\n")]
         self.round_(webhook=self.webhook_url)
         reqs = self.slack_requests()
         self.assertEqual(len(reqs), 1, f"两封同轮只许一次告警，实际 {len(reqs)} 次：{reqs}")
@@ -293,6 +295,11 @@ class SlackAlert(unittest.TestCase):
         self.assertIn("2 封", text, f"批量告警要说清封数：{text!r}")
         self.assertIn("有新信", text)
         self.assertIn("#/mail/chief", text, f"批量告警给收件箱根链接：{text!r}")
+        for sender, subj, need in (("coder", "发布检查", "回复"), ("helper", "实验结果", "决定")):
+            self.assertIn(sender, text, f"批量告警保留每封来源：{text!r}")
+            self.assertIn(subj, text, f"批量告警保留每封事由：{text!r}")
+            self.assertIn(f"需要：{need}", text, f"批量告警保留每封需要：{text!r}")
+        self.assertNotIn(SENTINEL, text, f"Slack 绝不带正文：{text!r}")
         for lid in ids:
             self.assertNotIn(f"#/mail/chief/{lid}", text,
                              f"批量形态不带单封编号链接：{text!r}")
