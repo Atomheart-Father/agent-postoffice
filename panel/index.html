@@ -471,6 +471,7 @@ const setTxt = (id, s) => { const el = $(id); if (el) el.textContent = s; };
 let STATE = null;                 // latest /api/state
 let view = "org";                 // org | hk
 let insBox = null;                // mailbox shown in the inspector
+let insOpen = !(typeof window !== "undefined" && window.innerWidth <= 900); // 手机首屏不开工作台（否则全屏盖住组织视图）；桌面默认常开
 let composeMode = "new";          // new | reply
 let replyOf = null;               // {box,id} when composing a reply
 let sending = false;              // compose double-click guard
@@ -633,6 +634,8 @@ function inspectorHTML() {
     </div>`;
   const opNote = !operatorValid() ? `<div class="cerr">${esc(t("operatorBad"))}</div>` : "";
   return `<aside class="inspector open" id="ins" aria-label="${esc(b.name)}">
+    <button type="button" class="close-x" data-ins-close="1" aria-label="${esc(t("close"))}"
+      style="position:absolute;top:10px;right:10px">✕</button>
     ${head}
     ${pending}
     ${acks}
@@ -944,11 +947,11 @@ async function load() {
     STATE = st;
     setTxt("err", "");
     setTxt("home", st.home);
-    document.body?.classList?.toggle("with-ins", view === "org");
-    // 主视图：组织（含 inspector）+ 设备
+    document.body?.classList?.toggle("with-ins", view === "org" && insOpen);
+    // 主视图：组织（含 inspector）+ 设备；工作台关闭时不渲染（桌面收起右轨、手机回到组织视图）
     const boxesEl = $("boxes");
     if (boxesEl) boxesEl.innerHTML = (view === "org")
-      ? orgHTML() + inspectorHTML()
+      ? orgHTML() + (insOpen ? inspectorHTML() : "")
       : "";   // HARNESS 自带 rack 列表；#boxes 在该页留空（空状态文案只属于通讯录真空的组织页）
     const hkEl = $("view-hk");
     if (hkEl) {
@@ -1049,8 +1052,15 @@ async function mainClick(ev) {
     }
     return load();
   }
+  const ic = t0.closest("[data-ins-close]"); // close the workbench: desktop collapses the rail, phone returns to the org view
+  if (ic) {
+    insOpen = false;
+    document.body?.classList?.toggle("with-ins", false);
+    const b = $("boxes"); if (b && view === "org") b.innerHTML = orgHTML();
+    return;
+  }
   const nd = t0.closest("[data-box]");       // open the mailbox inspector (org nodes / strips)
-  if (nd) { insBox = nd.dataset.box; const b = $("boxes"); if (b && view === "org") b.innerHTML = orgHTML() + inspectorHTML(); }
+  if (nd) { insBox = nd.dataset.box; insOpen = true; const b = $("boxes"); if (b && view === "org") b.innerHTML = orgHTML() + inspectorHTML(); }
 }
 on("boxes", "click", mainClick);
 on("racks", "click", mainClick);
@@ -1147,6 +1157,7 @@ on("op-shortcut", "click", () => {
   const op = operatorName();
   if (op && boxOf(op)) {
     insBox = op;
+    insOpen = true;
     setView("org");
     const b = $("boxes");
     if (b) b.innerHTML = orgHTML() + inspectorHTML();
@@ -1181,6 +1192,7 @@ function handleDeepLink() {
     const box = dec(one[1]);
     if (box !== null && /^[A-Za-z0-9_\-]+$/.test(box) && boxOf(box)) {
       insBox = box;                 // 单段深链：直达该信箱的工作台
+      insOpen = true;
       if (view !== "org") setView("org");       // 在 HARNESS 页收到深链也要能落到工作台
       else { const b = $("boxes"); if (b) b.innerHTML = orgHTML() + inspectorHTML(); }
       return;
