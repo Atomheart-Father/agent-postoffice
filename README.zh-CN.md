@@ -20,7 +20,7 @@
 - **只走邮局**：各会话之间传话都通过邮局，不要直接 `codex queue`——绕过邮局的消息不受离线开关管，会在对方没额度时堆积，一上线全弹出来。
 - **发错了还能撤回，也能原地改**：`postoffice edit --box <发信信箱> <收件信箱>/<信件编号> [--subject …|--need …|--body …]`（至少给一个字段）**原地重写**一封普通信——编号、文件名、来源、收件人都不会变，收件方只会看到新版（已经脚本上手或投递中时看到的是旧文）；`postoffice retract <发信信箱> <收件信箱> <完整信件编号>` 则把信原样撤回。两者都只在收件方通道还没接受它的时候才行。编号要精确（不接受路径、通配符或前缀），信必须还在那个信箱的 `inbox/` 里，信头来源要和你写的发信箱一致。回执通知、广播副本、交接信、闹钟信都不归它管，会被拒绝。每条投递通道（OpenCode 插件、Claude 钩子、postman 的 codex/notify）都按**自己**的记录判断有没有被接受——认领文件、插件台账、`.seen`、`.woken.json`；核实不了的通道一律 **fail closed**，宁可不改/不撤。改成功只替换那几个字段、文件留在原地；撤回成功只是把原信原样挪进 `archived/`：不改正文、不写通知、不叫醒、**不替你补发修正信**；已送达或投递中时两者都直接拒绝并让你自己决定要不要另发一封。改/撤和投递是**抢同一把认领**的：谁抢到对方就拒绝——所以不会出现「改/撤成功但对方已经被叫醒」，而且撤回失败时也会把认领还回去（否则这封信的投递会被一把没人持有的锁挡住）。投递入口也只在**拿到认领之后**才唤醒会话。
 - **回执默认不答复**：`postoffice ack` 回执只记账、在空闲时给发信方发一条**元数据通知**（来源、原事由、一条查询命令），不再把回执正文塞进上下文；单条回执三行以内，同一轮里多条回执合并成一条“另有 N 条回执”清单、排在正式信后面。正文仅按需 `postoffice receipt <信箱> <ID>` 查询，处理提醒后即可 `postoffice archive-receipt <信箱> <ID>` 归档（无需先查正文）。广播一封变一封：`broadcast` 发出多封带编号的信，收件人 `ack`，全员回齐（或到截止时间）后发信方只收到一封汇总（各人一句话同样按需查询）。
-- **操作面板**：`postoffice panel` 打开本机网页，每个会话一个开关，一键断开/恢复它的连接，还能看广播回执进度和最近投递记录。每个信箱显示 **待投递 / 已提醒待归档 / 投递失败** 三态计数，与列表取自同一份逐信快照（待投递=还没发出去；已提醒待归档=通道已接受提醒但信还在 `inbox/`；投递失败=该通道已放弃、需要人工看）。不新增状态库：已提醒取自 Claude 的 `.seen`、插件台账的 `DELIVERED` 行或邮递员的接受记录，不把 20 分钟兜底记号当提醒，`FAILED_FINAL` 算投递失败而不是已送达。归档按钮的确认框会**逐项列出总数和三类数量**（待投递 + 已提醒未归档 + 投递失败需人工处理），写明是把收件箱里的**全部**信件和通知一起存档、文件保留在 `archived/`，待投递的归档后不再补送、投递失败的也一并归档不再重试。页面按浏览器语言显示（`zh*` 中文，其余英文），并有明显的中文 / English 切换按钮，切换只重画：不改状态、不调用写入接口、不唤醒会话。信箱名、信件事由、回执正文、交接路径和原始日志一律按原文显示。点 pending 里的一封可看**全文**（来源、事由、需要、正文——转义后按原文显示、不翻译，`<script>` 只会是文本），旁边的**仅归档**按钮只把这一封 `inbox/ → done/`，别的信一概不动（已归档过是幂等成功；`done/` 已有同名则 fail closed，两边都不碰）。读信与单封归档（GET `/api/letter`、POST `/api/archive-one`）对所有信箱通用（人类信箱同样适用），与“归档全部”那种管理性收进 `archived/` 是两回事：读接口是纯读（不碰认领、presented、台账，不唤醒）。为下一票预置了两个纯后端 seam（本票无 UI）：POST `/api/ack-one` 走 `postoffice ack` 同一个核心记回执（幂等——重复调用绝不产生第二份回执；发件人照常收到既有回执通知、原信入 `done/`）；POST `/api/send` 走 `postoffice send` 同一个核心发普通信（`@` 逻辑地址按候选顺序在发信那一刻解析、全离线按既有文案拒绝，返回 `{id, ref}`；故意不做 reply/thread 数据模型——回复只是把 to 预填成原发信方的普通 `send`）。
+- **操作面板**：`postoffice panel` 打开本机网页，每个会话一个开关，一键断开/恢复它的连接，还能看广播回执进度和最近投递记录。每个信箱显示 **待投递 / 已提醒待归档 / 投递失败** 三态计数，与列表取自同一份逐信快照（待投递=还没发出去；已提醒待归档=通道已接受提醒但信还在 `inbox/`；投递失败=该通道已放弃、需要人工看）。不新增状态库：已提醒取自 Claude 的 `.seen`、插件台账的 `DELIVERED` 行或邮递员的接受记录，不把 20 分钟兜底记号当提醒，`FAILED_FINAL` 算投递失败而不是已送达。归档按钮的确认框会**逐项列出总数和三类数量**（待投递 + 已提醒未归档 + 投递失败需人工处理），写明是把收件箱里的**全部**信件和通知一起存档、文件保留在 `archived/`，待投递的归档后不再补送、投递失败的也一并归档不再重试。页面按浏览器语言显示（`zh*` 中文，其余英文），并有明显的中文 / English 切换按钮，切换只重画：不改状态、不调用写入接口、不唤醒会话。信箱名、信件事由、回执正文、交接路径和原始日志一律按原文显示。点 pending 里的一封可看**全文**（来源、事由、需要、正文——转义后按原文显示、不翻译，`<script>` 只会是文本），旁边的**仅归档**按钮只把这一封 `inbox/ → done/`，别的信一概不动（已归档过是幂等成功；`done/` 已有同名则 fail closed，两边都不碰）。读信与单封归档（GET `/api/letter`、POST `/api/archive-one`）对所有信箱通用（人类信箱同样适用），与“归档全部”那种管理性收进 `archived/` 是两回事：读接口是纯读（不碰认领、presented、台账，不唤醒）。POST `/api/ack-one` 走 `postoffice ack` 同一个核心记回执（幂等——重复调用绝不产生第二份回执；发件人照常收到既有回执通知、原信入 `done/`）；POST `/api/send` 走 `postoffice send` 同一个核心发普通信（`@` 逻辑地址按候选顺序在发信那一刻解析、全离线按既有文案拒绝，返回 `{id, ref}`；故意不做 reply/thread 数据模型——回复只是把 to 预填成原发信方的普通 `send`）。v1.12 的**人类控制台**（见下节）就在这两个 seam 之上加了组织 / Harness 视图与操作员的写信 / 回复 / 回执工作流。
 - **兜底**：会话没开、送不到，20 分钟后弹一次系统通知给你——计时起点取“信落地”和“该信箱最近一次上线”里更晚的那个，离线时长不计（`online_since` 只在真正离线→在线时更新，重复点在线不刷新；升级时已在线又没基线的信箱，以邮递员首次以新版运行的时间补基线）；提醒送到了但**需要处理**的信 30 分钟还躺在 inbox 里（会话卡住、Codex 线程没加载等），也弹一次。分类：回执通知/广播汇总、`需要：仅告知` → 不提醒；`需要：回复`/`审核`、自由文本只含肯定词（回复/审核/处理/修改/决定/确认）→ 提醒；自由文本只含否定词（仅告知/无需/不用回/默认不答复/无需操作）→ 不提醒；正负混合或识别不了 → 仍提醒（不宣称零误报）。`仅告知`、回执通知、广播汇总只算积压、不打扰人。
 - 纯标准库 Python 3.9+，无第三方依赖；macOS 优先（Linux 能用，通知用 `notify-send`，邮递员需自己常驻）。
 
@@ -90,6 +90,27 @@ MSG
 | `postoffice remove coder` | 从通讯录移除 |
 | `postoffice postman` | 前台运行邮递员（不想用开机自启时） |
 | `postoffice uninstall claude` / `postman` | 卸载钩子 / 自启 |
+
+## 人类控制台：组织、Harness 与操作员信箱（可选，v1.12）
+
+`postoffice panel` 是同一份真相文件之上的**人类控制面**，绝不是第二个邮局：
+
+- **组织视图**渲染 `config.json` 里可选的 `panel` 段：一棵纯展示用树（节点 = `mailbox` 或 `members` 同级对，可带 `label` 与 `children`）。它对真相文件是纯装饰——`panel` 段写坏只会在**这一个视图**报错，physical 发信、`@` 逻辑地址、分组、邮递员、Harness 和每个信箱照常工作，`routes.json` 字节不变。（示例里的 BOXZ 只是示例数据；任何项目都可以描述自己的树，ACME 形状的树工作方式完全相同。）
+- **未分配（UNASSIGNED）**：已注册但组织树**没有安排**的信箱仍会列出——自动出现在「未分配」区域，不会被漏写配置而静默隐藏。纯展示：邮局绝不改 `config.json`、绝不按名字或 harness 猜部门；该信箱照常打开工作台、收发信、开关在线；一旦你把它写进树，它就从「未分配」消失、出现在正式位置。每个信箱全树最多出现一次。
+- **Harness** 按 `routes.json` 里真实的 `method`（claude_hook / opencode_plugin / codex_queue / notify）分组，ON / OFF / MIXED 每次渲染实时派生、绝不持久化。只有当某个 `groups` 配置的成员集与一个 rack **恰好相等**时才显示整组开关，否则每个会话保留自己的开关——这里不重新实现任何分组引擎，按钮调的还是同一个 status 接口。
+- **人类操作员**：`panel.operator` 点名一个信箱（通常是人的 `--notify` 信箱）。它的横条在组织视图顶部——点它（或右上角 OPERATOR 徽章）进入收件工作台：待办「需要」列表 → 最近回执 → 技术元数据。operator 无效时一切照常可读，但写信 / 回复 / 回执会禁用并说明原因。
+- **写信 / 回复 / 回执 / 归档**：＋写信以操作员身份发信（收件人 = 信箱或 `@` 逻辑地址；分组拒绝）。回复预填规范发信方与 `Re:` 主题，走 `/api/send` 发出后把原信归档——正式回复**绝不**再发 `ack`（否则对方收两份）。若发送成功但归档失败，页面明确提示并只提供「重试归档」（绝不二次发送；已回复记录只活在本页会话）。收到并归档走 `/api/ack-one`（recorded / already / receipt_notice 三态）；仅归档走 `/api/archive-one`（不发回执）。打开一封信是零副作用的纯读。
+- **深链**：`#/mail/<box>` 直达某信箱工作台；`#/mail/<box>/<id>` 直达某封信。深链一次性消费（hash 经 `history.replaceState` 清除）：关闭后不会被 5 秒刷新重新拉起，浏览器后退也不会重放已消费的链接；非法深链只提示一次。
+- **远程访问（可选）**：面板仍只监听 `127.0.0.1`。设置 `POSTOFFICE_PANEL_BASE_URL=https://host.ts.net` 后深链使用该前缀，且写接口只放行这**一个精确** Origin——不支持通配符、后缀匹配、`X-Forwarded-Host`，值非法时面板拒绝启动。推荐隧道是 `tailscale serve`；不开它，localhost 照常用。
+- **Slack 操作员提醒（可选，仅出站）**：设置 `POSTOFFICE_SLACK_WEBHOOK` 后，操作员信箱确认收到正式信时，邮递员会发一条简短 Slack 提醒（发件方、事由、需要、深链——绝不带正文；一轮多封合并成一条「N 封」加收件链接）。尽力而为、约 3 秒超时：慢、失败甚至挂起的 webhook 绝不改变投递结果、绝不重试，最多让那一轮短暂等一下。webhook 地址是机密：只从环境变量读，绝不写进 `config.json`、`routes.json`、状态文件、HTML、日志或本仓库。没有任何入站——Slack 不能往邮局发信。
+
+界面一览（BOXZ 示例数据，1600×1000，中文界面）：
+
+| 组织视图（右侧为操作员工作台） | Harness（按真实 method 分组） |
+|---|---|
+| ![组织视图](docs/screenshots/org-zh.png) | ![Harness](docs/screenshots/harness-zh.png) |
+| **信件详情**（纯读；回复 / 收到并归档 / 仅归档） | **写信**（以操作员身份，收件人区分信箱 / 逻辑地址） |
+| ![信件详情](docs/screenshots/letter-zh.png) | ![写信](docs/screenshots/compose-zh.png) |
 
 ## 会话给自己设闹钟（OpenCode，可选）
 
@@ -182,7 +203,7 @@ OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己
 | 项目 | 状态 |
 |---|---|
 | 收发信、去重、限流、在线/离线、ack 记账、回执查询、广播汇总、安装卸载、按需提醒、稳定认人、回执合并 | `tests/smoke.sh` 自动测试 |
-| 配置导入校验、分组开关、逻辑地址解析与回退、切换广播（基线 / 稳定后通知 / 稳定期内撤销 / 无人 / 恢复 / 主事复归 / 交接失败后只补交接）、面板分组与按钮、按物理信编号回执、归档先报数量 | 同一次 `tests/smoke.sh`（共 250 项；v1.7 用例在独立临时邮局里跑；每条新规则都用变异体验证过这些断言会真的变红） |
+| 配置导入校验、分组开关、逻辑地址解析与回退、切换广播（基线 / 稳定后通知 / 稳定期内撤销 / 无人 / 恢复 / 主事复归 / 交接失败后只补交接）、面板分组与按钮、按物理信编号回执、归档先报数量 | 同一次 `tests/smoke.sh`（共 252 项；v1.7 用例在独立临时邮局里跑；每条新规则都用变异体验证过这些断言会真的变红） |
 | 审核退回的六处负例：运行时完整校验配置（版本非法 / 成员写重 / notify 指向已删除信箱时分组与逻辑地址一起停用、routes 与 inbox 无副作用）、首轮全员离线等满稳定期才通知一次、删除逻辑地址后基线真的落盘、一次切换只一份广播记录且送达名单丢失也不重播、空或非法「广播：」信头回执被拒且账本与原信不动、归档确认框列出投递失败与总数 | 同一次 `tests/smoke.sh` 的第 14 块（共 60 条断言，每个用例跑在各自的临时邮局里）；另用 8 个变异体验证，其中一个是把事件步骤整段换回退修前的实现 |
 | 阻塞退修的两处：广播编号不撞（同秒确认两个逻辑地址 / 通知对象相同与不同 / 各自独立回执 / 非收件信箱不能代回）、真实硬中断后的恢复（信留在收件箱、已归档到 `done/`、已被 `clear` 归档三种位置各跑一遍，交接提醒自己的落盘窗口同样三种位置各跑一遍） | 同一次 `tests/smoke.sh` 的第 14 块（新增 4b/4c/4d 共 12 条断言）；硬中断用例在进程内加载真实 `postoffice` 模块，投信成功落地后抛一个 `BaseException`（普通 `except Exception` 抓不到），再从磁盘重新加载模块跑第二轮，并断言恢复分支确实走到了 |
 | 会话自设闹钟的纵切（工具入口、身份解析、定时、最短渲染、取消、每会话锁、lettered 记录必须指着它自己那封信） | `tests/alarm_test.py`（46 项，含 flock 的并发、kill -9 接管与暂停恢复）与 `tests/alarm_plugin_test.mjs`（47 项，都对着 mock OpenCode；记录由 Python 在锁内写，插件只解析信箱归属），几轮审核累计试了 20 个变异体。**没有跑过真实模型**：模型还从没真的调用过这两个工具，那句固定短句也没在真实 OpenCode 轮次里出现过 |
@@ -193,6 +214,10 @@ OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己
 | 单封回执 HTTP 接口（POST `/api/ack-one`）：与 CLI `ack` 共用同一个核心（回执入账、原信 `inbox → done`、发件人收到既有回执通知与查询命令）、重复调用幂等且不产生第二份回执、未知信箱 / 查无此信 / 非法编号 fail closed 且什么都不动、非法 JSON / 错 Content-Type / 错 Origin 仍被拒 | `tests/panel_send_ack_test.py`（真实面板 + 临时邮局；同时断言 CLI `ack` 也走同一 helper、账本与通知完全等价） |
 | 发信 HTTP 接口（POST `/api/send`）：物理信箱目标、`@` 逻辑地址 first-online、靠前候选在线时绝不跳级、靠前候选离线才 fallback、全离线按既有「没有在线信箱」文案拒绝、目标变化后旧信不搬、未知发信方 / 未登记目标被拒、生成的信与 CLI `send` 逐字节一致 | `tests/panel_send_ack_test.py` |
 | 共享 skill 不再教「手动 `mv` 到 `done/`」：归档统一走 `postoffice_archive_current`（OpenCode）/ `archive-current`（其它 harness）/ 同一个 core API（面板）；回归直接读 skill 文件 | `tests/smoke.sh` 第 16 块 + code review（skill 还必须保持组织无关——层级由项目本地配置提供） |
+| 面板展示配置：可选 `panel` 段（label/operator/organization）、节点规则（mailbox 与 members 二选一、未知字段、alias 拒绝）、全树唯一、规范化形状、absent/error/valid 三态——以及**隔离性**：故意写坏 `panel` 段后，physical 发信、`@alias`、分组操作、完整邮递员一轮与 `/api/state` 照常工作且 `routes.json` 字节不变 | `tests/panel_presentation_test.py`（11 项；含非 BOXZ 的 ACME 树） |
+| 面板 BASE_URL 与 Origin：非法 `POSTOFFICE_PANEL_BASE_URL` 拒绝启动、只放行那一个精确 Origin、scheme/后缀/其它主机探测 403、localhost 仍可用、仍只绑 127.0.0.1 | `tests/panel_origin_test.py`（6 项，临时家真服务器） |
+| Slack 操作员提醒：只有操作员 + 正式信触发、带 BASE_URL 深链、批量形态、失败不改投递也不重发、机密不进日志/状态/HTML、未设置零请求、挂起 webhook 不拖住下一个信箱 | `tests/panel_slack_test.py`（10 项，本地假 webhook） |
+| 人类控制台 UI：通用组织渲染（ACME）、操作员横条/徽章、Harness rack 与精确匹配组控（部分重叠绝不显示）、写信/回复全矩阵（含发送成功+归档失败→只重试归档、绝不二次发送、绝不 ack）、回执三态、仅归档、纯读、深链一次性生命周期、未分配区域（渲染纯度、不重复）、operator 无效禁写 | `tests/panel_console_ui_test.mjs`（12 块，DOM stub） |
 | 面板 UI：点 pending 行 → 详情显示接口取回的（不是行内的）内容且被转义；仅归档只发一次 `{box,id}` POST，然后关闭并刷新；读取/归档失败的提示；切换语言关闭详情且不发写请求（在途读取也会作废）；新文案两种语言都在 | `tests/panel_letter_ui_test.mjs` 加扩展后的 `tests/panel_i18n_test.mjs` |
 | 逐级升级走现有 alias 引擎：A/B→Q 不跳级（所有候选都在线、每封信仍全进 Q）、Q 离线 → T1、T1 全离线 → 人类、人类离线 → 既有“没有在线信箱”拒绝、恢复回 Q、目标变化后旧信字节不变、层级 alias 的切换/交接在轮次与重启间恰好一次、全离线通知恰好一次、旧版两候选数组配置行为完全不变 | `tests/hierarchy_test.py`（9 项，各自独立临时邮局；锁的是现有引擎行为——本票没有改生产 routing） |
 | 回执提醒精简且只含元数据；`postoffice receipt` 精确 ID 只读，`postoffice archive-receipt` 只归档本箱对应通知 | `tests/receipt_test.py`（15 项，含旧通知文件、shell 引用与归档幂等）和 `tests/receipt_plugin_test.mjs` |
@@ -213,6 +238,11 @@ OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己
 - **Codex 线程没加载**：`codex queue` 仍返回成功，但线程不会自己醒；靠“已提醒 30 分钟未处理”的通知兜底。
 - **升级 agent-postoffice 之后**：只是就地更新脚本的话，Claude 不用重启——现有监视在下一轮 Stop/SessionStart 钩子时会加载新代码；重启 Claude App 反而会让各会话的监视消失，得先跑一轮恢复。已开着的 OpenCode 会一直用旧插件，需重启。只有钩子配置本身变了（首次安装，或增删钩子）才需要重载 Claude App。
 
+- **面板页面启动时缓存**：`postoffice panel` 启动时读一次 `panel/index.html`，改了 UI 要重启面板才生效。
+- **Slack 提醒跟着邮递员轮次走**：hook/plugin 的实际投递最多晚一个轮询间隔才提醒，且依赖邮递员存活；单条提醒最多让一轮同步阻塞约 3 秒（超时），绝不更久，也绝不改变投递。
+- **「已回复」记录只活在本页**：发送成功/归档失败后，硬刷新页面会丢掉这个页面内存记录、重新显示可重试归档的状态（磁盘上的信件才是真相）。
+- **`config.json` 里任何位置的重复 JSON 键会让 routing 和 panel 一起空白**：重复键拒绝是全文件级设计（fail closed）。
+
 ## Future work
 
 - **叫醒已停止的 Claude 会话**：会话后台进程不在时，钩子无能为力。可研究借 Claude App 自带的会话间消息，由一个常驻会话代为转达（每次转达要花一次模型调用）。
@@ -227,7 +257,7 @@ OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己
 ## 测试
 
 ```bash
-./tests/smoke.sh                                              # 250 项，全在临时目录里跑
+./tests/smoke.sh                                              # 252 项，全在临时目录里跑
 python3 tests/receipt_test.py                                 # 回执：元数据提醒（Claude 钩子与 Codex 队列模拟）、精确查询、不跨箱泄露、只读、旧通知文件、广播、--wake
 node --experimental-strip-types tests/receipt_plugin_test.mjs # OpenCode 插件（模拟客户端，不调用模型）
 node --experimental-strip-types tests/panel_i18n_test.mjs     # 面板页面：逐信统计、中英切换、用户原文显示
@@ -238,7 +268,11 @@ node --experimental-strip-types tests/message_flow_plugin_test.mjs  # 批量收�
 python3 tests/hierarchy_test.py                               # 逐级升级走现有 alias 引擎：不跳级、离线回退、旧信不搬
 python3 tests/panel_letter_test.py                            # 面板读单封信 + 单封 inbox→done（真实 HTTP）
 node --experimental-strip-types tests/panel_letter_ui_test.mjs # 面板详情 / 仅归档 UI 行为（DOM stub）
-python3 tests/panel_send_ack_test.py                           # HTTP seam：单封 ack-one（与 CLI ack 同核心）与 send（@逻辑地址、不跳级、各类拒绝）
+python3 tests/panel_send_ack_test.py                          # HTTP seam：单封 ack-one（与 CLI ack 同核心）与 send（@逻辑地址、不跳级、各类拒绝）
+python3 tests/panel_presentation_test.py                       # 可选 panel 段：校验、形状、与 routing 的隔离
+python3 tests/panel_origin_test.py                             # POSTOFFICE_PANEL_BASE_URL + 精确 Origin，仍只绑 loopback
+python3 tests/panel_slack_test.py                              # 仅出站的 Slack 操作员提醒（本地假 webhook）
+node --experimental-strip-types tests/panel_console_ui_test.mjs # 人类控制台 UI：组织/Harness/操作员/写信/回复/深链/未分配
 ```
 
 都不碰真实配置、信箱和账本，也不调用模型。

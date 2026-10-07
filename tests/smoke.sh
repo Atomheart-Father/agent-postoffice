@@ -1096,6 +1096,11 @@ grep -q '收件箱里的全部' "$PANEL_HTML" && grep -q "inbox" "$PANEL_HTML" \
   && ok "退修6 确认文案明确是整个收件箱" || bad "退修6 确认文案没说清是收件箱"
 grep -q 'data-f="${c.failed}"' "$PANEL_HTML" && grep -q 'data-n="${b.pending.length}"' "$PANEL_HTML" \
   && ok "退修6 归档按钮把失败数与总数传给确认框" || bad "退修6 按钮没传失败数或总数"
+# v1.12 控制台守护：信件详情的「回复/仅归档」说明必须双语都在；HARNESS 页必须让位给 inspector 右轨
+test "$(grep -c 'letterHint:' "$PANEL_HTML")" = "2" \
+  && ok "v1.12 信件详情说明（letterHint）中英文都在" || bad "v1.12 letterHint 缺语言"
+grep -q 'with-ins' "$PANEL_HTML" \
+  && ok "v1.12 组织页给 inspector 右轨让位（with-ins）" || bad "v1.12 缺 with-ins 让位样式"
 po17_new pnl "$SW_CFG" "$SW_ON"
 POSTOFFICE_HOME="$P2" "$PO" add cbox --claude "面板确认用会话" >/dev/null
 POSTOFFICE_HOME="$P2" "$PO" add obox6 --notify >/dev/null
