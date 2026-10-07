@@ -102,6 +102,7 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
                "op-shortcut", "drawer", "drawer-x", "compose", "compose-x", "compose-cancel",
                "compose-send", "compose-to", "compose-subject", "compose-need", "compose-body",
                "compose-err", "compose-from", "compose-fromnote", "compose-title", "compose-to-label",
+               "compose-sug",
                "c-sj", "c-nd", "c-bd", "seg-mbox", "seg-alias", "sheet-bg"];
   const els = {};
   for (const id of ids) els[id] = makeEl(id);
@@ -516,6 +517,79 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   has(m.els["boxes"].innerHTML, 'class="inspector', "手机打开后轮询保持");
   closeIt(m); await settle();
   hasNot(m.els["boxes"].innerHTML, 'class="inspector', "手机关闭回到组织视图");
+}
+
+// ============ 14) 速修：HARNESS 页开 OPERATOR 不切回组织视图（工作台是全局右轨） ============
+{
+  const e = makeEnv(); await settle();
+  e.fire("tab-hk", "click", { target: {} }); await settle();
+  is(e.els["view-hk"].hidden, false, "先切到 HARNESS");
+  has(e.els["boxes"].innerHTML, 'class="inspector', "HARNESS 页工作台仍在（右轨不随切页消失）");
+  has(e.els["racks"].innerHTML, "MIXED", "racks 正常渲染");
+  e.fire("boxes", "click", { target: { closest: (s) => (s === "[data-ins-close]" ? { dataset: {} } : null) } }); await settle();
+  hasNot(e.els["boxes"].innerHTML, 'class="inspector', "HARNESS 页关闭后不渲染");
+  e.fire("op-shortcut", "click", { target: {} }); await settle();
+  is(e.els["view-hk"].hidden, false, "点 OPERATOR 不切回组织视图");
+  is(e.els["tab-hk"].getAttribute("aria-pressed"), "true", "HARNESS 标签仍选中");
+  has(e.els["boxes"].innerHTML, 'class="inspector', "工作台在当前视图打开");
+  has(e.els["boxes"].innerHTML, "director-who", "打开的是操作员工作台");
+  is(e.ctx.document.body.classList.contains("with-ins"), true, "打开后让出右轨");
+  await e.ctx.load(); await settle();
+  is(e.els["view-hk"].hidden, false, "轮询后仍是 HARNESS");
+  has(e.els["boxes"].innerHTML, 'class="inspector', "轮询保持工作台");
+  const m = makeEnv({ width: 390 }); await settle();
+  m.fire("tab-hk", "click", { target: {} }); await settle();
+  hasNot(m.els["boxes"].innerHTML, 'class="inspector', "手机 HARNESS 首屏无工作台");
+  m.fire("op-shortcut", "click", { target: {} }); await settle();
+  is(m.els["view-hk"].hidden, false, "手机点 OPERATOR 也不切页");
+  has(m.els["boxes"].innerHTML, 'class="inspector', "手机就地打开工作台");
+}
+
+// ============ 15) 速修：收件人下拉 + 前缀模糊匹配（名单来自 /api/state，非第二份路由真相） ============
+{
+  const st = JSON.parse(JSON.stringify(ACME));
+  st.aliases = [{ name: "escalate", target: "lead", confirmed: "lead", pending: "", pending_in: 0,
+    notify: [], handoff: "", candidates: [{ name: "lead", known: true, online: true }] }];
+  const e = makeEnv({ state: st }); await settle();
+  e.fire("btn-compose", "click", { target: {} }); await settle();
+  const sug = () => String(e.els["compose-sug"].innerHTML);
+  const open = () => e.els["compose-sug"].hidden === false;
+  is(open(), false, "打开写信时下拉默认收起");
+  e.fire("compose-to", "focus", {}); await settle();
+  is(open(), true, "聚焦即出下拉");
+  is((sug().match(/<button/g) || []).length, 8, "空查询最多 8 条");
+  has(sug(), "director", "下拉含物理信箱");
+  is(e.els["compose-to"].getAttribute("aria-expanded"), "true", "aria-expanded 同步");
+  e.els["compose-to"].value = "res";
+  e.fire("compose-to", "input", {}); await settle();
+  has(sug(), "research-a", "前缀命中 research-a");
+  has(sug(), "research-b", "前缀命中 research-b");
+  hasNot(sug(), "director", "不匹配项被过滤");
+  e.els["compose-to"].value = "b";           // 分段前缀
+  e.fire("compose-to", "input", {}); await settle();
+  has(sug(), "research-b", "段前缀命中 research-b");
+  has(sug(), "ops-b", "段前缀命中 ops-b");
+  e.els["compose-to"].value = "@esc";
+  e.fire("compose-to", "input", {}); await settle();
+  has(sug(), "@escalate", "逻辑地址前缀命中");
+  e.fire("compose-sug", "click", { target: { closest: (s) => (s === "button[data-v]" ? { dataset: { v: "research-a" } } : null) } });
+  await settle();
+  is(e.els["compose-to"].value, "research-a", "点选写入输入框");
+  is(open(), false, "点选后收起");
+  is(e.els["compose-to"].getAttribute("aria-expanded"), "false", "aria-expanded 复位");
+  e.els["compose-to"].value = "dir";
+  e.fire("compose-to", "input", {}); await settle();
+  is(open(), true, "再次输入重新打开");
+  let stopped = false;
+  e.fire("compose-to", "keydown", { key: "Escape", stopPropagation: () => { stopped = true; } });
+  is(open(), false, "Escape 只收下拉");
+  is(stopped, true, "Escape 被拦住不冒泡");
+  is(e.els["compose"].hidden, false, "写信弹窗保持打开");
+  e.els["compose-subject"].value = "s"; e.els["compose-body"].value = "b";
+  e.fire("compose-send", "click", { target: {} }); await settle();
+  is(posts(e, "/api/send").length, 1, "点选后照常发送一次");
+  e.fire("btn-compose", "click", { target: {} }); await settle();
+  is(open(), false, "重开写信下拉收起");
 }
 
 console.log(failures ? `FAIL ${failures}` : "PASS");
