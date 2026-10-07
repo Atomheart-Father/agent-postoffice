@@ -213,6 +213,13 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
 .seg button:hover{color:var(--ink)}
 .seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
 .cerr{color:var(--bad);font-family:var(--mono);font-size:11px;min-height:1em;margin:4px 0}
+/* 收件人下拉：纯本地建议列表（名单来自 /api/state，不是第二份路由真相） */
+.sug{margin-top:4px;border:1px solid var(--rule);background:var(--panel2);max-height:216px;overflow:auto}
+.sug[hidden]{display:none}
+.sug button{display:flex;justify-content:space-between;gap:8px;width:100%;text-align:left;border:0;border-bottom:1px solid var(--rule2);padding:9px 10px;font-family:var(--mono);font-size:12px;min-height:44px}
+.sug button:last-child{border-bottom:0}
+.sug button:hover{background:var(--panel)}
+.sug .kind{color:var(--ink2);font-size:10px;letter-spacing:.08em}
 .close-x{float:right;font-family:var(--mono);font-size:12px;color:var(--ink2);padding:4px 8px;min-height:44px;min-width:44px}
 .close-x:hover{color:var(--ink)}
 
@@ -312,7 +319,8 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
           <button type="button" id="seg-mbox" aria-pressed="true"></button>
           <button type="button" id="seg-alias" aria-pressed="false"></button>
         </div>
-        <input id="compose-to" autocomplete="off" aria-describedby="compose-err">
+        <input id="compose-to" autocomplete="off" aria-describedby="compose-err" aria-autocomplete="list" aria-expanded="false" aria-controls="compose-sug">
+        <div class="sug" id="compose-sug" role="listbox" hidden></div>
       </div>
     </div>
     <div class="frow"><label for="compose-subject" id="c-sj"></label><input id="compose-subject" autocomplete="off"></div>
@@ -805,6 +813,7 @@ function openCompose(mode) {
   setTxt("seg-alias", t("segAlias"));
   setSeg("mailbox");
   $("compose-to").value = "";
+  hideSug();
   $("compose-subject").value = "";
   $("compose-need").value = composeMode === "reply" ? t("needDefault") : "";
   $("compose-body").value = "";
@@ -820,12 +829,68 @@ function openCompose(mode) {
   $("compose-send").disabled = !operatorValid();
   m.hidden = false;
 }
-function closeCompose() { const m = $("compose"); if (m) m.hidden = true; replyOf = null; }
+function closeCompose() { const m = $("compose"); if (m) m.hidden = true; hideSug(); replyOf = null; }
 function setSeg(which) {
   const a = $("seg-mbox"), b = $("seg-alias");
   if (a) a.setAttribute("aria-pressed", String(which === "mailbox"));
   if (b) b.setAttribute("aria-pressed", String(which === "alias"));
 }
+
+/* ---------- recipient suggestions: dropdown + prefix fuzzy match ---------- */
+// 名单来自 /api/state（物理信箱 + 逻辑地址）——纯展示建议，不是第二份路由真相；
+// 选中后写进输入框，发信仍走 /api/send 同一 core（含 first-online / 全离线拒绝）。
+function recipientList() {
+  const out = [];
+  for (const b of (STATE?.boxes || [])) out.push({ v: b.name, kind: t("segMailbox") });
+  for (const a of (STATE?.aliases || [])) if (!a.error) out.push({ v: "@" + a.name, kind: t("segAlias") });
+  return out;
+}
+// 前缀模糊：整体前缀，或 _ . - 分段后的段前缀（输入 b 能命中 research-b）
+function recipientMatch(name, q) {
+  const n = name.toLowerCase();
+  if (n.startsWith(q)) return true;
+  for (const seg of n.split(/[_\.\-]+/)) if (seg.startsWith(q)) return true;
+  return false;
+}
+function renderSug() {
+  const inp = $("compose-to"), box = $("compose-sug");
+  if (!inp || !box) return;
+  const q = (inp.value || "").trim().toLowerCase();
+  const hits = recipientList().filter((r) => !q || recipientMatch(r.v, q)).slice(0, 8);
+  box.innerHTML = hits.map((r) => `<button type="button" data-v="${esc(r.v)}" role="option">` +
+    `<span>${esc(r.v)}</span><span class="kind">${esc(r.kind)}</span></button>`).join("");
+  box.hidden = hits.length === 0;
+  inp.setAttribute("aria-expanded", String(!box.hidden));
+}
+function hideSug() {
+  const box = $("compose-sug"), inp = $("compose-to");
+  if (box) box.hidden = true;
+  if (inp) inp.setAttribute("aria-expanded", "false");
+}
+on("compose-to", "input", renderSug);
+on("compose-to", "focus", renderSug);
+on("compose-to", "keydown", (e) => {
+  // Escape 只收下拉：拦住冒泡，别把写信弹窗一起关了
+  if (e && e.key === "Escape" && $("compose-sug") && !$("compose-sug").hidden) {
+    hideSug();
+    if (e.stopPropagation) e.stopPropagation();
+  }
+});
+on("compose-sug", "click", (e) => {
+  const b = e.target.closest("button[data-v]");
+  if (!b) return;
+  $("compose-to").value = b.dataset.v;
+  hideSug();
+});
+try {
+  // 真实浏览器里点别处收起；点输入框/下拉本身不收起
+  document.addEventListener("click", (e) => {
+    const t = e && e.target;
+    if (!t || !t.closest) return;
+    if (t.closest("#compose-sug") || t.closest("#compose-to")) return;
+    hideSug();
+  });
+} catch {}
 
 async function sendCompose() {
   if (sending) return;                       // 双击只发一次
@@ -947,12 +1012,13 @@ async function load() {
     STATE = st;
     setTxt("err", "");
     setTxt("home", st.home);
-    document.body?.classList?.toggle("with-ins", view === "org" && insOpen);
-    // 主视图：组织（含 inspector）+ 设备；工作台关闭时不渲染（桌面收起右轨、手机回到组织视图）
+    document.body?.classList?.toggle("with-ins", insOpen);
+    // 主视图：组织树 + 工作台；HARNESS 页 racks 自带列表，#boxes 只承载工作台。
+    // 工作台是全局右轨（两个视图都在），关闭时两个视图都不渲染。
     const boxesEl = $("boxes");
     if (boxesEl) boxesEl.innerHTML = (view === "org")
       ? orgHTML() + (insOpen ? inspectorHTML() : "")
-      : "";   // HARNESS 自带 rack 列表；#boxes 在该页留空（空状态文案只属于通讯录真空的组织页）
+      : (insOpen ? inspectorHTML() : "");
     const hkEl = $("view-hk");
     if (hkEl) {
       hkEl.hidden = view !== "hk";
@@ -1052,11 +1118,11 @@ async function mainClick(ev) {
     }
     return load();
   }
-  const ic = t0.closest("[data-ins-close]"); // close the workbench: desktop collapses the rail, phone returns to the org view
+  const ic = t0.closest("[data-ins-close]"); // close the workbench: desktop collapses the rail; stay in the current view
   if (ic) {
     insOpen = false;
     document.body?.classList?.toggle("with-ins", false);
-    const b = $("boxes"); if (b && view === "org") b.innerHTML = orgHTML();
+    const b = $("boxes"); if (b) b.innerHTML = view === "org" ? orgHTML() : "";
     return;
   }
   const nd = t0.closest("[data-box]");       // open the mailbox inspector (org nodes / strips)
@@ -1158,9 +1224,7 @@ on("op-shortcut", "click", () => {
   if (op && boxOf(op)) {
     insBox = op;
     insOpen = true;
-    setView("org");
-    const b = $("boxes");
-    if (b) b.innerHTML = orgHTML() + inspectorHTML();
+    load();                     // 在当前视图打开工作台：HARNESS 页不再被切回组织视图
   }
 });
 on("seg-mbox", "click", () => setSeg("mailbox"));
