@@ -13,9 +13,13 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(path.join(here, "..", "panel", "index.html"), "utf8");
-const script = html.match(/<script>([\s\S]*?)<\/script>/);
-if (!script) { console.error("BAD: panel/index.html has no inline script"); process.exit(1); }
-const CODE = script[1];
+// v1.13 contract C adds a tiny <head> bootstrap <script> (theme before paint), so the first
+// <script> in the file is no longer guaranteed to be the app. Pick the block that defines the
+// string table (the real app script); fall back to the last block.
+const scriptBlocks = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+const APP = scriptBlocks.find((s) => s.includes("const STR")) || scriptBlocks[scriptBlocks.length - 1];
+if (!APP) { console.error("BAD: panel/index.html has no inline script"); process.exit(1); }
+const CODE = APP;
 
 let failures = 0;
 const ok = (msg) => console.log("ok   - " + msg);
@@ -94,7 +98,12 @@ function makeEl(id) {
 
 function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200, json: LETTER },
                    ack = null, send = { status: 200, json: { ok: true, id: "S1", ref: "lead/S1" } },
-                   archive = { status: 200, json: { ok: true, state: "moved" } }, hash = "", width = undefined } = {}) {
+                   archive = { status: 200, json: { ok: true, state: "moved" } },
+                   outbox = { status: 200, json: { ok: true, outbox: [] } },
+                   edit = { status: 200, json: { ok: true } },
+                   retract = { status: 200, json: { ok: true, state: "retracted" } },
+                   storage = undefined, storageThrows = false, matchDark = false,
+                   hash = "", width = undefined } = {}) {
   const ids = ["title", "home", "hint", "err", "boxes", "groups", "aliases", "switches",
                "broadcasts", "log", "langs", "h-groups", "h-aliases", "h-switches",
                "h-broadcasts", "h-log", "letter", "letter-status",
@@ -103,36 +112,63 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
                "compose-send", "compose-to", "compose-subject", "compose-need", "compose-body",
                "compose-err", "compose-from", "compose-fromnote", "compose-title", "compose-to-label",
                "compose-sug",
-               "c-sj", "c-nd", "c-bd", "seg-mbox", "seg-alias", "sheet-bg"];
+               "c-sj", "c-nd", "c-bd", "seg-mbox", "seg-alias", "sheet-bg",
+               "ins-tab-inbox", "ins-tab-outbox", "outbox", "theme",
+               "edit-subject", "edit-need", "edit-body"];
   const els = {};
   for (const id of ids) els[id] = makeEl(id);
   const btn = (l) => ({ dataset: { lang: l }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } });
   els["langs"].children = [btn("zh"), btn("en")];
+  // top-rail theme group: static buttons, aria-pressed/labels driven by applyLang (mirrors `langs`)
+  const thBtn = (c) => ({ dataset: { themeChoice: c }, textContent: "", attrs: {},
+    setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } });
+  els["theme"].children = [thBtn("system"), thBtn("light"), thBtn("dark")];
 
-  const localStorage = { getItem: () => null, setItem: () => {} };
+  const store = storage || new Map();
+  const localStorage = {
+    getItem: (k) => { if (storageThrows) throw new Error("denied"); return store.has(k) ? store.get(k) : null; },
+    setItem: (k, v) => { if (storageThrows) throw new Error("denied"); store.set(k, v); },
+  };
   const calls = [];
   const confirmations = [];
+  const deferred = [];
   const reply = (status, obj) => ({
     ok: status >= 200 && status < 300, status, json: async () => JSON.parse(JSON.stringify(obj)),
   });
+  const nth = (spec) => (Array.isArray(spec) ? (spec.shift() || { status: 200, json: {} }) : spec);
+  const mqDark = {
+    matches: !!matchDark, media: "(prefers-color-scheme: dark)", _handlers: [],
+    addEventListener(t, fn) { if (t === "change") this._handlers.push(fn); },
+    removeEventListener() {},
+    addListener(fn) { this._handlers.push(fn); }, removeListener() {},
+    _set(m) { this.matches = m; for (const fn of this._handlers) fn(this); },
+  };
+  const matchMedia = (q) => (/prefers-color-scheme:\s*dark/.test(String(q)) ? mqDark
+    : { matches: false, media: String(q), addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
   const ctx = {
     console,
     document: {
-      title: "", documentElement: {}, body: makeEl("body"),
+      title: "", documentElement: { dataset: {}, lang: "" }, body: makeEl("body"),
       getElementById: (id) => els[id] || null,
       _h: {},
       addEventListener(type, fn) { (this._h[type] = this._h[type] || []).push(fn); },
       createElement: (t) => makeEl(t),
     },
-    window: { localStorage, addEventListener() {}, location: { hash }, ...(width !== undefined ? { innerWidth: width } : {}) },
+    window: { localStorage, addEventListener() {}, matchMedia, location: { hash }, ...(width !== undefined ? { innerWidth: width } : {}) },
     navigator: { languages: langs, language: langs[0] || "" },
     localStorage,
+    matchMedia,
     fetch: async (url, opts = {}) => {
       const method = opts.method || "GET";
       calls.push({ url, method, body: opts.body || null });
       if (method === "GET" && url.startsWith("/api/state")) return reply(200, state);
       if (method === "GET" && url.startsWith("/api/letter")) {
-        const spec = Array.isArray(letter) ? (letter.shift() || { status: 200, json: {} }) : letter;
+        const spec = nth(letter);
+        if (spec && spec.defer) return new Promise((resolve) => { deferred.push(() => resolve(reply(spec.status, spec.json))); });
+        return reply(spec.status, spec.json);
+      }
+      if (method === "GET" && url.startsWith("/api/outbox")) {
+        const spec = nth(outbox);
         return reply(spec.status, spec.json);
       }
       if (method === "POST" && url.startsWith("/api/archive-one")) {
@@ -143,8 +179,14 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
         return reply(ack ? ack.status : 200, ack ? ack.json : { ok: true, state: "recorded", id: "L1", to: "lead" });
       }
       if (method === "POST" && url.startsWith("/api/send")) {
-        const spec = Array.isArray(send) ? (send.shift() || { status: 200, json: { ok: true, id: "S", ref: "x/S" } }) : send;
+        const spec = nth(send);
         return reply(spec.status, spec.json);
+      }
+      if (method === "POST" && url.startsWith("/api/edit-one")) {
+        return reply(edit.status, edit.json);
+      }
+      if (method === "POST" && url.startsWith("/api/retract-one")) {
+        return reply(retract.status, retract.json);
       }
       if (method !== "GET") return reply(200, {});
       return reply(200, state);
@@ -158,7 +200,9 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
   const fire = (id, type, event) => {
     for (const fn of els[id].handlers[type] || []) fn(event);
   };
-  return { ctx, els, calls, confirmations, fire,
+  return { ctx, els, calls, confirmations, storage: store, fire,
+           systemDark: (m) => mqDark._set(m),
+           resolveDeferred: async () => { for (const f of deferred.splice(0)) f(); },
            fireDoc: (type, event) => { for (const fn of ctx.document._h[type] || []) fn(event); } };
 }
 
@@ -629,6 +673,439 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   // 下拉必须悬浮定位：撑高弹窗会让 mousedown/mouseup 落在不同元素，外点守卫误判收起
   has(html, ".sug{position:absolute", "下拉绝对定位（不撑高弹窗）");
   has(html, ".to-wrap{position:relative}", "下拉锚定收件人行");
+}
+
+/* ============================ v1.13 Human Console maturity ============================
+   A) operator inspector INBOX|OUTBOX tabs + outbox edit/retract
+   B) runtime presence display (activity badges + duration + human/operator)
+   C) appearance control (system/light/dark, persisted, head bootstrap)
+   All rendering here is presentation-only: zero write requests.
+   ==================================================================================== */
+
+const insTab = (tab) => (e) => e.fire("boxes", "click", { target: { closest: (s) => {
+  if (s.includes("ins-tab") || s.includes("data-ins-tab")) return { id: "ins-tab-" + tab, dataset: { insTab: tab } };
+  return null;
+} } });
+const outboxAct = (action, row) => (e) => e.fire("boxes", "click", { target: { closest: (s) => {
+  if (s.includes("outbox-action")) return { dataset: { outboxAction: action, to: row.to, id: row.id } };
+  if (s.includes("data-outbox")) return { dataset: { to: row.to, id: row.id } };
+  return null;
+} } });
+// 点击发件箱行本体（不落在按钮上）：closest("[data-outbox-action]") 返回 null，closest("[data-outbox]") 命中
+const outboxOpen = (row) => (e) => e.fire("boxes", "click", { target: { closest: (s) => {
+  if (s.includes("outbox-action")) return null;
+  if (s.includes("data-outbox")) return { dataset: { to: row.to, id: row.id } };
+  return null;
+} } });
+// 点击发件箱详情层里的按钮（#letter 层的事件委托：[data-outbox-action]）
+const detailAct = (e, action, row) => e.fire("letter", "click", { target: { closest: (s) => {
+  if (s.includes("outbox-action")) return { dataset: { outboxAction: action, to: row.to, id: row.id } };
+  return null;
+} } });
+const editSave = (e) => e.fire("letter", "click", { target: { closest: (s) => (s.includes("edit-save") ? { dataset: {} } : null) } });
+const boxSideHTML = (e) => String((e.els["boxes"] && e.els["boxes"].innerHTML) || "")
+  + String((e.els["outbox"] && e.els["outbox"].innerHTML) || "");
+const insHTML = (e) => { const h = boxSideHTML(e); const i = h.indexOf('class="inspector'); return i < 0 ? "" : h.slice(i); };
+const tabPressed = (e, id) => {
+  const el = e.els[id];
+  const direct = el && el.getAttribute ? el.getAttribute("aria-pressed") : undefined;
+  if (direct != null) return direct;
+  const tag = (boxSideHTML(e).match(new RegExp('<[^>]*\\bid="' + id + '"[^>]*>')) || [])[0] || "";
+  const m = tag.match(/aria-pressed="(true|false)"/);
+  return m ? m[1] : undefined;
+};
+const thBtn = (e, choice) => (e.els["theme"].children || []).find((b) => b.dataset && b.dataset.themeChoice === choice) || null;
+const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { closest: (s) =>
+  (s.includes("theme-choice") || s.includes("data-theme") ? { dataset: { themeChoice: choice } } : null) } });
+
+// ============ 17) Inspector tabs INBOX | OUTBOX: counts, zero-write switch, row model ============
+{
+  const stA = JSON.parse(JSON.stringify(ACME));
+  stA.boxes.find((b) => b.name === "director").pending.push({ file: "L2.md", status: "waiting", subject: "第二封", from: "scribe" });
+  const OBOX = [
+    { to: "lead", id: "O1", subject: "第一封外发", need: "仅告知", body: "正文一", status: "pending" },
+    { to: "scribe", id: "O2", subject: "第二封外发", need: "决策", body: "正文二", status: "pending" },
+    { to: "ops-a", id: "O3", subject: "已送达的信", need: "仅告知", body: "正文三", status: "locked" },
+    { to: "ware", id: "O4", subject: "状态未知的信", need: "仅告知", body: "正文四", status: "unknown" },
+  ];
+  const e = makeEnv({ state: stA, outbox: { status: 200, json: { ok: true, outbox: OBOX } } }); await settle();
+  has(e.els["boxes"].innerHTML, 'id="ins-tab-inbox"', "工作台有收件箱标签");
+  has(e.els["boxes"].innerHTML, 'id="ins-tab-outbox"', "工作台有发件箱标签");
+  is(tabPressed(e, "ins-tab-inbox"), "true", "默认收件箱标签选中");
+  is(tabPressed(e, "ins-tab-outbox"), "false", "默认发件箱标签未选中");
+  has(boxSideHTML(e), "收件箱 02", "收件箱标签旁显示待处理计数 02");
+  is(posts(e).length, 0, "首屏渲染零写请求");
+  e.calls.length = 0;
+  insTab("outbox")(e); await settle();
+  is(tabPressed(e, "ins-tab-outbox"), "true", "切到发件箱后标签选中");
+  is(tabPressed(e, "ins-tab-inbox"), "false", "切到发件箱后收件箱取消选中");
+  is(e.els["view-hk"].hidden, true, "切标签仍是组织视图");
+  has(boxSideHTML(e), 'data-box="director"', "切标签后组织树仍在");
+  is(posts(e).length, 0, "切标签零写请求");
+  is(e.calls.filter((c) => c.url.startsWith("/api/outbox")).length, 1, "切到发件箱只读一次 /api/outbox");
+  const h = boxSideHTML(e);
+  has(h, 'id="outbox"', "发件箱容器存在");
+  is((h.match(/data-outbox(?=[\s=>])/g) || []).length, 4, "发件箱 4 行");
+  has(h, 'data-to="lead"', "行带 data-to");
+  has(h, 'data-id="O1"', "行带 data-id");
+  has(h, "发件箱 04", "发件箱标签旁显示行数 04");
+  is((h.match(/data-outbox-action="edit"/g) || []).length, 2, "仅 pending 行有编辑按钮");
+  is((h.match(/data-outbox-action="retract"/g) || []).length, 2, "仅 pending 行有撤回按钮");
+  has(h, "已送达，不能修改", "locked 行显示锁定文案");
+  has(h, "状态无法确认，不能修改", "unknown 行显示状态未知文案");
+}
+
+// ============ 18) Outbox: empty state is honest (never claims permanent history) ============
+{
+  const e = makeEnv({ outbox: { status: 200, json: { ok: true, outbox: [] } } }); await settle();
+  insTab("outbox")(e); await settle();
+  const h = boxSideHTML(e);
+  has(h, "暂无当前可观察的已发普通信", "空发件箱文案");
+  hasNot(h, "从未发送过信", "空发件箱不谎称从未发过信");
+}
+
+// ============ 19) Outbox rows escape user content ============
+{
+  const evil = [{ to: 'a"b', id: "O1", subject: "<script>alert(1)</script>", need: "x", body: "y", status: "pending" }];
+  const e = makeEnv({ outbox: { status: 200, json: { ok: true, outbox: evil } } }); await settle();
+  insTab("outbox")(e); await settle();
+  const h = boxSideHTML(e);
+  has(h, "&lt;script&gt;alert(1)&lt;/script&gt;", "outbox 主题被转义");
+  hasNot(h, "<script>alert(1)</script>", "outbox 原始脚本不进标记");
+  has(h, "a&quot;b", "outbox 收件人引号被转义");
+}
+
+// ============ 20) Outbox edit: prefill, exactly-one POST (no sender), refetch, new subject ============
+{
+  const row = { to: "lead", id: "O1", subject: "旧主题", need: "仅告知", body: "旧正文", status: "pending" };
+  const after = { to: "lead", id: "O1", subject: "新主题", need: "请示", body: "新正文", status: "pending" };
+  const e = makeEnv({ outbox: [
+    { status: 200, json: { ok: true, outbox: [row] } },
+    { status: 200, json: { ok: true, outbox: [after] } },
+  ] }); await settle();
+  insTab("outbox")(e); await settle();
+  e.calls.length = 0;
+  outboxAct("edit", { to: "lead", id: "O1" })(e); await settle();
+  is(e.els["letter"].hidden, false, "编辑打开信件 overlay");
+  has(e.els["letter"].innerHTML, "edit-subject", "overlay 有主题编辑框");
+  has(e.els["letter"].innerHTML, "edit-need", "overlay 有需要编辑框");
+  has(e.els["letter"].innerHTML, "edit-body", "overlay 有正文编辑框");
+  is(e.els["edit-subject"].value, "旧主题", "主题预填");
+  is(e.els["edit-need"].value, "仅告知", "需要预填");
+  is(e.els["edit-body"].value, "旧正文", "正文预填");
+  has(e.els["letter"].innerHTML, "data-edit-save", "有保存按钮");
+  e.els["edit-subject"].value = "新主题";
+  e.els["edit-need"].value = "请示";
+  e.els["edit-body"].value = "新正文";
+  editSave(e); await settle();
+  const edits = posts(e, "/api/edit-one");
+  is(edits.length, 1, "保存只发一次 edit-one");
+  const eb = edits[0] ? JSON.parse(edits[0].body) : {};
+  is(Object.keys(eb).sort().join(","), "body,id,need,subject,to", "edit 请求体恰好 to,id,subject,need,body（无 sender/from）");
+  is(eb.to, "lead", "edit to 正确"); is(eb.id, "O1", "edit id 正确");
+  is(eb.subject, "新主题", "edit subject 用新值"); is(eb.need, "请示", "edit need 用新值"); is(eb.body, "新正文", "edit body 用新值");
+  is(e.calls.filter((c) => c.url.startsWith("/api/outbox")).length, 1, "保存成功后重新读一次 outbox");
+  has(boxSideHTML(e), "新主题", "行显示新主题");
+}
+
+// ============ 21) Outbox edit failure: server message, overlay kept ============
+{
+  const row = { to: "lead", id: "O1", subject: "旧", need: "仅告知", body: "b", status: "pending" };
+  const e = makeEnv({ outbox: { status: 200, json: { ok: true, outbox: [row] } },
+    edit: { status: 400, json: { ok: false, error: "refused", message: "已经不能改" } } }); await settle();
+  insTab("outbox")(e); await settle();
+  outboxAct("edit", { to: "lead", id: "O1" })(e); await settle();
+  editSave(e); await settle();
+  has(e.els["letter-status"].textContent, "已经不能改", "编辑失败显示服务端消息");
+  is(e.els["letter"].hidden, false, "编辑失败保留 overlay");
+}
+
+// ============ 22) Outbox retract: confirm, exactly-one POST, row disappears after refetch ============
+{
+  const O1 = { to: "lead", id: "O1", subject: "甲", need: "仅告知", body: "", status: "pending" };
+  const O2 = { to: "scribe", id: "O2", subject: "乙", need: "仅告知", body: "", status: "pending" };
+  const e = makeEnv({ outbox: [
+    { status: 200, json: { ok: true, outbox: [O1, O2] } },
+    { status: 200, json: { ok: true, outbox: [O2] } },
+  ] }); await settle();
+  insTab("outbox")(e); await settle();
+  const before = e.confirmations.length;
+  e.calls.length = 0;
+  outboxAct("retract", { to: "lead", id: "O1" })(e); await settle();
+  is(e.confirmations.length, before + 1, "撤回前有一次确认");
+  const rs = posts(e, "/api/retract-one");
+  is(rs.length, 1, "撤回发一次 retract-one");
+  is(rs[0] ? Object.keys(JSON.parse(rs[0].body)).sort().join(",") : "", "id,to", "撤回请求体恰好 to,id");
+  hasNot(boxSideHTML(e), 'data-id="O1"', "撤回首行消失");
+  has(boxSideHTML(e), 'data-id="O2"', "其余行保留");
+}
+
+// ============ 23) Outbox retract failure: message shown, row kept ============
+{
+  const O1 = { to: "lead", id: "O1", subject: "甲", need: "仅告知", body: "", status: "pending" };
+  const e = makeEnv({ outbox: { status: 200, json: { ok: true, outbox: [O1] } },
+    retract: { status: 400, json: { ok: false, error: "refused", message: "不能撤回" } } }); await settle();
+  insTab("outbox")(e); await settle();
+  outboxAct("retract", { to: "lead", id: "O1" })(e); await settle();
+  has(e.els["letter-status"].textContent, "不能撤回", "撤回失败显示消息");
+  has(boxSideHTML(e), 'data-id="O1"', "撤回失败保留行");
+}
+
+// ============ 24) Runtime presence: org node badges + duration (pure presentation) ============
+{
+  const ACT = JSON.parse(JSON.stringify(ACME));
+  const now = Math.floor(Date.now() / 1000);
+  const byName = {}; for (const b of ACT.boxes) byName[b.name] = b;
+  byName["lead"].activity = { state: "working", since: now - (17 * 60 + 20) };
+  byName["research-a"].activity = { state: "idle", since: now - (4 * 3600 + 12 * 60 + 20) };
+  byName["ops-a"].activity = { state: "unknown", since: null };
+  const e = makeEnv({ state: ACT }); await settle();
+  const b = e.els["boxes"].innerHTML;
+  has(b, "act-badge", "组织节点有活动徽章");
+  has(b, 'data-activity="working"', "working 节点徽章");
+  has(b, 'data-activity="idle"', "idle 节点徽章");
+  has(b, 'data-activity="unknown"', "unknown 节点徽章");
+  has(b, "运行中", "working 标签");
+  has(b, "空闲", "idle 标签");
+  has(b, "未知", "unknown 标签");
+  has(b, "17m", "分钟时长 · 17m");
+  has(b, "4h 12m", "小时+分钟时长 · 4h 12m");
+  const um = b.match(/data-activity="unknown"[^>]*>([^<]*)</);
+  is(!!um && !um[1].includes("·"), true, "unknown 不带时长");
+  is(posts(e).length, 0, "活动展示零写请求");
+  const en = makeEnv({ langs: ["en-US"], state: ACT }); await settle();
+  const eb = en.els["boxes"].innerHTML;
+  has(eb, "WORKING", "en working 标签");
+  has(eb, "IDLE", "en idle 标签");
+  has(eb, "UNKNOWN", "en unknown 标签");
+}
+
+// ============ 25) Runtime presence: harness rows carry the same badge ============
+{
+  const ACT = JSON.parse(JSON.stringify(ACME));
+  const now = Math.floor(Date.now() / 1000);
+  const byName = {}; for (const b of ACT.boxes) byName[b.name] = b;
+  byName["lead"].activity = { state: "working", since: now - (17 * 60 + 20) };
+  byName["research-a"].activity = { state: "idle", since: now - (4 * 3600 + 12 * 60 + 20) };
+  byName["ops-a"].activity = { state: "unknown", since: null };
+  const e = makeEnv({ state: ACT }); await settle();
+  e.fire("tab-hk", "click", { target: {} }); await settle();
+  const r = e.els["racks"].innerHTML;
+  has(r, 'data-activity="working"', "racks working 行活动");
+  has(r, 'data-activity="idle"', "racks idle 行活动");
+  has(r, 'data-activity="unknown"', "racks unknown 行活动");
+  has(r, "17m", "racks 显示时长");
+  is(posts(e).length, 0, "racks 活动零写请求");
+}
+
+// ============ 26) Runtime presence: inspector row; operator is HUMAN, never a fake IDLE ============
+{
+  const ACT = JSON.parse(JSON.stringify(ACME));
+  const now = Math.floor(Date.now() / 1000);
+  const byName = {}; for (const b of ACT.boxes) byName[b.name] = b;
+  byName["lead"].activity = { state: "working", since: now - (17 * 60 + 20) };
+  const e = makeEnv({ state: ACT }); await settle();
+  nodeClick("lead")(e); await settle();
+  const ins = insHTML(e);
+  has(ins, "活动", "inspector 有活动标签");
+  has(ins, "运行中", "inspector 显示 working");
+  has(ins, "17m", "inspector 显示时长");
+  is(posts(e).length, 0, "inspector 活动零写请求");
+  e.fire("op-shortcut", "click", { target: {} }); await settle();
+  const op = insHTML(e);
+  has(op, "活动", "操作员 inspector 有活动标签");
+  has(op, "人类", "操作员显示 HUMAN");
+  hasNot(op, "空闲", "操作员不渲染假 IDLE");
+  hasNot(op, 'data-activity="idle"', "操作员无假 idle 徽章");
+  const en = makeEnv({ langs: ["en-US"], state: ACT }); await settle();
+  nodeClick("lead")(en); await settle();
+  has(insHTML(en), "ACTIVITY", "en inspector 活动标签");
+  has(insHTML(en), "WORKING", "en inspector working");
+}
+
+// ============ 27) Appearance: default system, click persists, no writes, no language change ============
+{
+  const e = makeEnv({ storage: new Map(), matchDark: true }); await settle();
+  is(thBtn(e, "system").getAttribute("aria-pressed"), "true", "默认选中跟随系统");
+  is(thBtn(e, "light").getAttribute("aria-pressed"), "false", "默认浅色未选中");
+  is(thBtn(e, "dark").getAttribute("aria-pressed"), "false", "默认深色未选中");
+  is(e.ctx.document.documentElement.dataset.theme, "dark", "跟随系统+系统深色 → data-theme=dark");
+  is(posts(e).length, 0, "主题初始零写请求");
+
+  const storage = new Map();
+  const d = makeEnv({ storage, matchDark: false }); await settle();
+  const title = d.els["title"].textContent;
+  d.calls.length = 0;
+  themeClick("dark")(d); await settle();
+  is(d.ctx.document.documentElement.dataset.theme, "dark", "点深色设置 data-theme=dark");
+  is(storage.get("postoffice.theme"), "dark", "深色写入 localStorage postoffice.theme");
+  is(thBtn(d, "dark").getAttribute("aria-pressed"), "true", "深色按钮选中");
+  is(d.els["title"].textContent, title, "切主题不改语言");
+  is(posts(d).length, 0, "切主题零写请求");
+}
+
+// ============ 28) Appearance: persist across reload, system resolves, storage unusable ============
+{
+  const storage = new Map([["postoffice.theme", "light"]]);
+  const reload = makeEnv({ storage, matchDark: true }); await settle();
+  is(thBtn(reload, "light").getAttribute("aria-pressed"), "true", "重载后沿用已存的 light");
+  is(reload.ctx.document.documentElement.dataset.theme, "light", "存 light 时系统深色也被覆盖");
+
+  const s2 = new Map();
+  const e = makeEnv({ storage: s2, matchDark: true }); await settle();
+  themeClick("light")(e); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "light", "点浅色");
+  themeClick("system")(e); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "dark", "跟随系统解析为 dark");
+  is(s2.get("postoffice.theme"), "system", "跟随系统存储 system");
+  is(thBtn(e, "system").getAttribute("aria-pressed"), "true", "系统按钮选中");
+
+  const broken = makeEnv({ storageThrows: true, matchDark: true }); await settle();
+  is(thBtn(broken, "system").getAttribute("aria-pressed"), "true", "存储不可用回退 system");
+  is(broken.ctx.document.documentElement.dataset.theme, "dark", "存储不可用仍能解析");
+  themeClick("dark")(broken); await settle();
+  is(broken.ctx.document.documentElement.dataset.theme, "dark", "存储不可用仍可切换");
+}
+
+// ============ 29) Appearance: labels via STR both languages + head bootstrap + color-scheme ============
+{
+  const zh = makeEnv({ langs: ["zh-Hans-CN"], matchDark: true }); await settle();
+  is(thBtn(zh, "system").textContent, "跟随系统", "zh 系统标签");
+  is(thBtn(zh, "light").textContent, "浅色", "zh 浅色标签");
+  is(thBtn(zh, "dark").textContent, "深色", "zh 深色标签");
+  has(String(zh.els["theme"].getAttribute("aria-label") || ""), "外观", "zh 主题组 aria-label=外观");
+  const en = makeEnv({ langs: ["en-US"], matchDark: true }); await settle();
+  is(thBtn(en, "system").textContent, "SYSTEM", "en SYSTEM 标签");
+  is(thBtn(en, "light").textContent, "LIGHT", "en LIGHT 标签");
+  is(thBtn(en, "dark").textContent, "DARK", "en DARK 标签");
+  has(String(en.els["theme"].getAttribute("aria-label") || ""), "Appearance", "en 主题组 aria-label=Appearance");
+
+  // source: a head bootstrap script reads postoffice.theme and sets data-theme, before the app script
+  const scripts = html.match(/<script(?:\s[^>]*)?>[\s\S]*?<\/script>/g) || [];
+  const boot = scripts.find((s) => s.includes("postoffice.theme") && (s.includes("data-theme") || s.includes("dataset.theme")));
+  is(!!boot, true, "源码含引导脚本：读 postoffice.theme 并设 data-theme");
+  const idxBoot = html.indexOf("postoffice.theme");
+  const idxApp = html.indexOf("const STR");
+  is(idxBoot > -1 && idxBoot < idxApp, true, "引导脚本在主脚本之前（head，先于样式渲染）");
+  has(html, "color-scheme", "CSS 定义 color-scheme");
+}
+
+// ============ 30) Outbox rows: need + frozen alias + id/ref + age + the SPECIFIC reason ============
+{
+  const now = Math.floor(Date.now() / 1000);
+  const OBOX = [
+    { to: "lead", id: "O1", ref: "lead/O1", subject: "外发一", need: "决定", body: "正文一", alias: "@ocode.lead", mtime: now - 17 * 60, status: "pending", reason: "" },
+    { to: "scribe", id: "O2", ref: "scribe/O2", subject: "在途", need: "仅告知", body: "正文二", alias: "", mtime: now - 60, status: "locked", reason: "投递进行中（已有投递认领）" },
+    { to: "ware", id: "O3", ref: "ware/O3", subject: "已送达", need: "仅告知", body: "正文三", alias: "", mtime: now - 120, status: "locked", reason: "已送达（插件台账 DELIVERED）" },
+    { to: "ops-a", id: "O4", ref: "ops-a/O4", subject: "未知", need: "仅告知", body: "正文四", alias: "", mtime: now - 200, status: "unknown", reason: "无法核实该通道（codex_queue）是否已接受，fail closed 不撤回" },
+  ];
+  const e = makeEnv({ outbox: { status: 200, json: { ok: true, outbox: OBOX } } }); await settle();
+  insTab("outbox")(e); await settle();
+  const h = boxSideHTML(e);
+  has(h, "lead/O1", "行显示 id/ref");
+  has(h, "@ocode.lead", "行显示发送时冻结的 alias（不重新解析）");
+  has(h, "决定", "行显示 need");
+  has(h, "17m", "行显示 age/time");
+  const rowOf = (html, id) => { const i = html.indexOf(`data-id="${id}"`); if (i < 0) return ""; const j = html.indexOf('data-id="', i + 10); return html.slice(i, j < 0 ? undefined : j); };
+  const r2 = rowOf(h, "O2");
+  has(r2, "投递进行中", "在途行显示具体原因");
+  hasNot(r2, "已送达", "在途行不得泛称已送达");
+  has(rowOf(h, "O3"), "已送达", "已送达行显示已送达原因");
+  has(rowOf(h, "O4"), "fail closed", "unknown 行显示 fail-closed 原因");
+}
+
+// ============ 31) Outbox PENDING click → read-only detail; locked → reason, no edit entry ============
+{
+  const OBOX = [
+    { to: "lead", id: "O1", ref: "lead/O1", subject: "外发一", need: "决定", body: "正文一", alias: "@ocode.lead", mtime: 1, status: "pending", reason: "" },
+    { to: "ware", id: "O3", ref: "ware/O3", subject: "已送达", need: "仅告知", body: "正文三", alias: "", mtime: 1, status: "locked", reason: "已送达（插件台账 DELIVERED）" },
+  ];
+  const e = makeEnv({ outbox: { status: 200, json: { ok: true, outbox: OBOX } } }); await settle();
+  insTab("outbox")(e); await settle();
+  e.calls.length = 0;
+  outboxOpen({ to: "lead", id: "O1" })(e); await settle();
+  is(e.els["letter"].hidden, false, "点 PENDING 行打开详情层");
+  const d = e.els["letter"].innerHTML;
+  has(d, "lead/O1", "详情显示 ID/REF");
+  has(d, "决定", "详情显示 NEED");
+  has(d, "正文一", "详情显示 BODY");
+  has(d, "pending", "详情显示 STATUS");
+  has(d, 'data-outbox-action="edit"', "PENDING 详情给编辑入口");
+  is(posts(e).length, 0, "详情是只读，零写请求");
+  e.fire("letter", "click", { target: { closest: (s) => (s.includes("edit-close") ? { dataset: {} } : null) } }); await settle();
+  outboxOpen({ to: "ware", id: "O3" })(e); await settle();
+  const d3 = e.els["letter"].innerHTML;
+  has(d3, "已送达", "locked 详情显示具体原因");
+  hasNot(d3, 'data-outbox-action="edit"', "locked 详情无编辑入口");
+}
+
+// ============ 32) Open edit invalidates an in-flight letter read (out-of-order response) ============
+{
+  const row = { to: "lead", id: "O1", ref: "lead/O1", subject: "外发", need: "仅告知", body: "外发正文", status: "pending" };
+  const e = makeEnv({
+    letter: { defer: true, status: 200, json: LETTER },
+    outbox: { status: 200, json: { ok: true, outbox: [row] } },
+  }); await settle();
+  insTab("outbox")(e); await settle();
+  // 先发起一封收件信读取（尚未返回）
+  e.fire("boxes", "click", { target: { closest: (s) => (s === "[data-letter]" ? { dataset: { box: "director", id: "L1" } } : null) } });
+  await settle();
+  // 立刻打开编辑层（同一层）
+  outboxAct("edit", { to: "lead", id: "O1" })(e); await settle();
+  is(e.els["letter"].innerHTML.includes("edit-subject"), true, "编辑层已打开");
+  // 迟到的读信返回：不得覆盖编辑层，也不得改编辑目标
+  await e.resolveDeferred(); await settle();
+  is(e.els["letter"].innerHTML.includes("edit-subject"), true, "迟到读信不得覆盖编辑层");
+  is(e.els["edit-subject"].value, "外发", "编辑目标未被改变");
+}
+
+// ============ 33) Appearance: SYSTEM follows live media change; explicit choice is immune ============
+{
+  const e = makeEnv({ storage: new Map(), matchDark: false }); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "light", "初始 system + 系统浅色");
+  e.systemDark(true); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "dark", "system 时系统转深色 → 实时跟随");
+  e.systemDark(false); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "light", "system 时系统转浅色 → 实时跟随");
+  themeClick("light")(e); await settle();
+  e.systemDark(true); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "light", "显式 LIGHT 不受系统变化影响");
+  themeClick("dark")(e); await settle();
+  e.systemDark(false); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "dark", "显式 DARK 不受系统变化影响");
+  is(posts(e).length, 0, "系统跟随零写请求");
+}
+
+// ============ 34) Retract from the detail layer: detail closes, success shown, list refreshed ============
+{
+  const O1 = { to: "lead", id: "O1", ref: "lead/O1", subject: "外发一", need: "决定", body: "正文一", status: "pending", reason: "" };
+  const e = makeEnv({ outbox: [
+    { status: 200, json: { ok: true, outbox: [O1] } },
+    { status: 200, json: { ok: true, outbox: [] } },
+  ] }); await settle();
+  insTab("outbox")(e); await settle();
+  outboxOpen({ to: "lead", id: "O1" })(e); await settle();
+  is(e.els["letter"].hidden, false, "详情层已打开");
+  e.calls.length = 0;
+  const before = e.confirmations.length;
+  detailAct(e, "retract", { to: "lead", id: "O1" }); await settle();
+  is(e.confirmations.length, before + 1, "从详情撤回前有一次确认");
+  is(posts(e, "/api/retract-one").length, 1, "从详情撤回发一次 retract-one");
+  is(e.els["letter"].hidden, true, "撤回成功后详情层关闭，与列表一致");
+  has(e.els["letter-status"].textContent, "已撤回", "撤回成功后明确反馈");
+  hasNot(boxSideHTML(e), 'data-id="O1"', "列表该行消失");
+}
+
+// ============ 35) Retract from detail failure: detail kept + real reason ============
+{
+  const O1 = { to: "lead", id: "O1", ref: "lead/O1", subject: "外发一", need: "决定", body: "正文一", status: "pending", reason: "" };
+  const e = makeEnv({ outbox: { status: 200, json: { ok: true, outbox: [O1] } },
+    retract: { status: 400, json: { ok: false, error: "refused", message: "已送达，不能撤回" } } }); await settle();
+  insTab("outbox")(e); await settle();
+  outboxOpen({ to: "lead", id: "O1" })(e); await settle();
+  detailAct(e, "retract", { to: "lead", id: "O1" }); await settle();
+  is(e.els["letter"].hidden, false, "撤回失败保留详情层");
+  has(e.els["letter-status"].textContent, "已送达，不能撤回", "失败显示真实原因");
 }
 
 console.log(failures ? `FAIL ${failures}` : "PASS");

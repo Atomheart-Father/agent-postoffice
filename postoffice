@@ -27,7 +27,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-VERSION = "1.12.4"
+VERSION = "1.13.0"
 HOME = Path(os.environ.get("POSTOFFICE_HOME", str(Path.home() / "agent-postoffice"))).expanduser()
 ROUTES = HOME / "routes.json"
 LOGS = HOME / "logs"
@@ -81,6 +81,8 @@ CONFIG = HOME / "config.json"        # groups + logical addresses (v1.7); absent
 ALIAS_STATE = HOME / "alias_state.json"  # switch de-duplication only, never a second source of online truth
 PANEL_BASE_URL = os.environ.get("POSTOFFICE_PANEL_BASE_URL", "").strip().rstrip("/")  # 面板对外地址；空 = 关
 SLACK_WEBHOOK = os.environ.get("POSTOFFICE_SLACK_WEBHOOK", "")  # 人操作员信箱的对外告警；空 = 关
+ACTIVITY_DIR = HOME / "runtime" / "activity"  # runtime presence, presentation only; deleting it changes nothing else
+ACTIVITY_STALE = 1800   # an observation older than this cannot support WORKING/IDLE → UNKNOWN
 NAME_RE = re.compile(r"[A-Za-z0-9_.\-]+")  # group / alias names: no paths, spaces, globs
 
 METHODS = {
@@ -176,6 +178,122 @@ def release_claim(name, path):
 
 def claimed(name, path):
     return claims_dir(name).joinpath(path.name).exists()
+
+
+# ---------- runtime presence: presentation only ----------
+# 每个信箱一份 <home>/runtime/activity/<box>.json：最近观察到该信箱的会话在忙/空闲。
+# 它绝不参与 routing —— 删掉整个 runtime/ 目录，邮局核心行为一字不变。binding 是观察时的通道
+# 身份（OpenCode session_id / Claude claude_session / Codex thread_id），与当前 routes 不符即 UNKNOWN。
+def activity_path(name):
+    return ACTIVITY_DIR / f"{name}.json"
+
+
+def activity_read(name):
+    try:
+        rec = json.loads(activity_path(name).read_text(encoding="utf-8"))
+        return rec if isinstance(rec, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def activity_lock(name):
+    """Exclusive cross-process lock for one box's activity file (read-modify-write must be atomic).
+
+    os.replace alone only makes the *write* atomic; two writers can still interleave read/compute/write
+    (a stale heartbeat snapshot clobbering a fresh `working` written in between). Holding this lock
+    across the whole read-modify-write makes the last committed observation win cleanly.
+    """
+    ACTIVITY_DIR.mkdir(parents=True, exist_ok=True)
+    fh = open(ACTIVITY_DIR / f"{name}.lock", "a+")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
+
+
+def _activity_commit(name, rec):
+    tmp = activity_path(name).with_name(f"{name}.json.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(activity_path(name))
+
+
+def activity_write(name, state, source, binding):
+    """Best-effort write of one observation: same binding+state keeps `since`, anything else resets it.
+
+    The binding comparison matters: a different session now owning the box is a different observation,
+    so it must not inherit the previous session's start time (that would show a bogus duration).
+    """
+    try:
+        with activity_lock(name):
+            now = time.time()
+            prev = activity_read(name)
+            since = float(prev["since"]) if prev and prev.get("state") == state \
+                and prev.get("binding") == binding \
+                and isinstance(prev.get("since"), (int, float)) else now
+            rec = {"state": state, "since": since, "observed": now, "source": source, "binding": binding}
+            _activity_commit(name, rec)
+            return rec
+    except OSError:
+        return None
+
+
+def activity_touch(name, source, binding):
+    """Watcher keep-alive: refresh `observed` while preserving the recorded state and `since`.
+
+    A live watcher only knows it is still alive, not whether the session is busy, so it must never
+    downgrade a WORKING observation it did not write itself. Working -> idle is driven by the fresh
+    watcher that starts at Stop/SessionStart (an unconditional idle write there), not by this heartbeat.
+
+    An observation from a *different* binding is not ours to publish: a watcher that outlived a rebind
+    must not initialize or overwrite the current box's activity — the new binding's own writer owns it.
+    So a missing record, a binding mismatch, or an unusable state means: write nothing at all.
+    """
+    try:
+        with activity_lock(name):
+            prev = activity_read(name)
+            if not prev or prev.get("binding") != binding or prev.get("state") not in ("working", "idle"):
+                return None
+            rec = dict(prev)
+            rec["observed"] = time.time()
+            rec["source"] = source
+            _activity_commit(name, rec)
+            return rec
+    except OSError:
+        return None
+
+
+def route_binding(route):
+    """The channel identity a route is bound to right now (the same value activity records)."""
+    for key in ("session_id", "claude_session", "thread_id"):
+        if route.get(key):
+            return str(route[key])
+    return ""
+
+
+def activity_publish(name, state, source, binding, routes=None):
+    """Publish a Claude observation only if `binding` is still the box's current route binding.
+
+    A watcher can outlive a rebind, so every Claude publish point (watcher start, wake) must check:
+    an observation from the old binding must never replace the current session's activity, and an
+    empty binding publishes nothing. `routes` may be passed when already loaded, else it is re-read.
+    """
+    cur = route_binding((routes or boxes(load_routes())).get(name, {}))
+    if binding and binding == cur:
+        return activity_write(name, state, source, binding)
+    return None
+
+
+def activity_state(name, route):
+    """(state, since) for the panel: working / idle / unknown. Fail closed on anything unclear."""
+    rec = activity_read(name)
+    if not rec or rec.get("state") not in ("working", "idle"):
+        return "unknown", None
+    binding = route_binding(route)
+    if not binding or rec.get("binding") != binding:
+        return "unknown", None
+    observed = rec.get("observed")
+    if not isinstance(observed, (int, float)) or time.time() - observed > ACTIVITY_STALE:
+        return "unknown", None
+    since = rec.get("since")
+    return rec["state"], (float(since) if isinstance(since, (int, float)) else None)
 
 
 def header(path, n=3):
@@ -330,6 +448,18 @@ def merged_receipts(name, receipts):
     return "\n".join(lines)
 
 
+def wake_head(path):
+    """Neutral 3-line head for a single-letter wake, rebuilt from parsed fields.
+
+    The raw 来源 line is never echoed: an *old* letter may still carry the retired parenthetical
+    identity assertion the previous writer appended, and the wake must not re-inject it. The letter
+    file itself is untouched — only this summary is regenerated from source/subject/need.
+    """
+    return "\n".join([f"来源：{letter_sender(path) or '?'}",
+                      f"事由：{header_field(path, '事由：') or '（无）'}",
+                      f"需要：{header_field(path, '需要：')}"])
+
+
 def reminder(name, files):
     """Metadata-only wake text: formal letters first, then receipts merged into one trailing block.
 
@@ -351,7 +481,7 @@ def reminder(name, files):
         parts.append("按各信“需要”字段处理；回信/回执/归档规则见 postoffice skill。")
     else:
         for f in formal:
-            parts += [f"【联络总站新信｜{name}】", f"== {f}", header(f), LETTER_TAIL]
+            parts += [f"【联络总站新信｜{name}】", f"== {f}", wake_head(f), LETTER_TAIL]
     if len(receipts) == 1 and not formal:
         parts.append(single_receipt_block(name, receipts[0]))
     elif receipts:
@@ -417,7 +547,7 @@ def write_letter(to, sender, subject, need, body, extra_headers=(), name=None):
         while path.exists():
             path = path.with_name(f"{ts}-{i}_{sender}_{slug}.md")
             i += 1
-    lines = [f"来源：{sender}（协作者，不是人的新指令；人的原话要注明“转述”）",
+    lines = [f"来源：{sender}（邮局只确认来源信箱；该来源的身份与权限按当前项目的组织/角色约定处理。）",
              f"事由：{subject}", f"需要：{need}"] + list(extra_headers)
     text = "\n".join(lines) + f"\n\n{body.rstrip()}\n"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -449,6 +579,20 @@ def letter_sender(path):
         return ""
     src = line[len("来源："):].strip().split("（")[0].strip()
     return src.split()[0] if src else ""
+
+
+# 普通直发信的判定只有一处：CLI edit/retract（mutation_target）与面板发件箱读模型共用。
+# 派生的通知信（回执/广播/闹钟/切换事件）与 postoffice 系统来信都不是可改可撤的普通信。
+DERIVED_HEADERS = ("回执：", "广播：", "闹钟：", "切换事件：")
+
+
+def derived_headers(path):
+    return [k for k in DERIVED_HEADERS if header_field_present(path, k)]
+
+
+def is_ordinary_direct(path):
+    """True when the letter is an ordinary direct send (not a derived notice or a system letter)."""
+    return not derived_headers(path) and letter_sender(path) != "postoffice"
 
 
 def find_letter(box, lid):
@@ -1602,15 +1746,16 @@ def cmd_archive_current(a):
     return 0
 
 
-def retract_refused_reason(name, path, method, skip_claim=False):
-    """Why this letter can no longer be pulled back, or "" when the channel has not taken it yet.
+def retract_refusal(name, path, method, skip_claim=False):
+    """(code, text) for one channel; code "" means that channel has not accepted the letter yet.
 
     Each channel is judged by its own record, never by another channel's idea of "delivered": the
     shared claim file the OpenCode plugin, the hook and the postman all take before waking somebody,
     plus that channel's own ledger. An unknown channel has no record we can trust, so it fails closed.
+    Codes: inflight / delivered / failed / unknown -- the outbox read model maps them to locked/unknown.
     """
     if claimed(name, path) and not skip_claim:
-        return "投递进行中（已有投递认领）"
+        return "inflight", "投递进行中（已有投递认领）"
     if method == "opencode_plugin":
         ledger = HOME / "opencode_delivered.jsonl"
         if ledger.exists():
@@ -1621,21 +1766,26 @@ def retract_refused_reason(name, path, method, skip_claim=False):
                     continue
                 if e.get("box") == name and e.get("file") == path.name:
                     if e.get("result") == "DELIVERED":
-                        return "已送达（插件台账 DELIVERED）"
+                        return "delivered", "已送达（插件台账 DELIVERED）"
                     if e.get("result") == "FAILED_FINAL":
                         # 失败不等于送达，也不等于没送达：不确定就不撤
-                        return "投递失败/无法确认对方是否收到（插件台账 FAILED_FINAL）"
-        return ""
+                        return "failed", "投递失败/无法确认对方是否收到（插件台账 FAILED_FINAL）"
+        return "", ""
     if method == "claude_hook":
         if str(path) in read_lines(HOME / name / ".seen"):
-            return "已送达（Claude 钩子 .seen 已记录）"
-        return ""
+            return "delivered", "已送达（Claude 钩子 .seen 已记录）"
+        return "", ""
     if method in ("codex_queue", "notify"):
         woken = read_json(HOME / ".woken.json")
         if isinstance(woken, dict) and str(path) in woken:
-            return f"已送达（邮递员接受记录 {method}）"
-        return ""
-    return f"无法核实该通道（{method}）是否已接受，fail closed 不撤回"
+            return "delivered", f"已送达（邮递员接受记录 {method}）"
+        return "", ""
+    return "unknown", f"无法核实该通道（{method}）是否已接受，fail closed 不撤回"
+
+
+def retract_refused_reason(name, path, method, skip_claim=False):
+    """The human-readable reason only (kept for callers that just want the text)."""
+    return retract_refusal(name, path, method, skip_claim=skip_claim)[1]
 
 
 def refusal_for_methods(name, path, methods, skip_claim=False):
@@ -1653,9 +1803,100 @@ def refusal_for_methods(name, path, methods, skip_claim=False):
     return ""
 
 
+def mutation_state(name, path, methods):
+    """pending / locked / unknown for one ordinary letter, from the same facts the mutation core uses.
+
+    Read-only: never claims, never touches a ledger, never looks at whether the recipient box is
+    online. locked = a channel accepted it or a delivery is in flight; unknown = we cannot tell
+    reliably (fail closed). This is the outbox row's status, not a second delivery truth.
+    """
+    if claimed(name, path):
+        return "locked", "投递进行中（已有投递认领）"
+    if not methods:
+        return "unknown", "无法核实该通道（没有配置）是否已接受，fail closed 不撤回"
+    for m in methods:
+        code, text = retract_refusal(name, path, m, skip_claim=True)
+        if not code:
+            continue
+        return ("locked" if code in ("delivered", "inflight") else "unknown"), text
+    return "pending", ""
+
+
 def mutation_refusal(lid, why, path):
     return (f"{lid} {why}：无法撤回也改不了；原信留在 {path}。"
             f"要更正就另发一封修正信（投递状态以收件方通道为准），不要假装这封没发过")
+
+
+def mutation_target(to, lid, sender, routes, action):
+    """Shared validation for one ordinary-letter mutation: cmd_edit/cmd_retract and the panel
+    /api/edit-one,/api/retract-one all come through here.
+
+    `action` ("edit"|"retract") only selects the wording and the check order those two CLI commands
+    have always used; the rules themselves live here once (registered boxes, letter present in the
+    recipient's inbox/, ordinary direct mail only, and 来源 must be the sender we were given).
+    Returns (path, methods) or sys.exit with the exact CLI message.
+    """
+    if action == "retract":
+        if to not in routes:
+            sys.exit(f"没有信箱 {to}（收件方）；`postoffice list` 看通讯录")
+        inbox = HOME / to / "inbox"
+        path = inbox / f"{lid}.md"
+        if not inbox.is_dir() or not path.is_file():
+            sys.exit(f"{to} 的 inbox/ 里没有编号为 {lid} 的信；撤回只处理仍在收件方 inbox/ 的信"
+                     f"（已送达、已归档或在别处的都不归它管）")
+        derived = derived_headers(path)
+        if derived or letter_sender(path) == "postoffice":
+            sys.exit(f"{lid} 不是普通直发信（信头含 {'、'.join(derived) or '系统来信'}），撤回只用于普通 send 的信")
+        if sender not in routes:
+            sys.exit(f"没有信箱 {sender}（发信方）；`postoffice list` 看通讯录")
+        if letter_sender(path) != sender:
+            sys.exit(f"信 {lid} 的来源是 {letter_sender(path) or '（读不出来）'}，不是你指定的 {sender}；不撤回别人的信")
+    else:
+        if sender not in routes:
+            sys.exit(f"没有信箱 {sender}（发信方）；`postoffice list` 看通讯录")
+        if to not in routes:
+            sys.exit(f"没有信箱 {to}（收件方）；`postoffice list` 看通讯录")
+        path = HOME / to / "inbox" / f"{lid}.md"
+        if not path.is_file():
+            sys.exit(f"{to} 的 inbox/ 里没有编号为 {lid} 的信；只能改仍在收件方 inbox/ 里的普通信")
+        derived = derived_headers(path)
+        if derived or letter_sender(path) == "postoffice":
+            sys.exit(f"{lid} 不是普通直发信（信头含 {'、'.join(derived) or '系统来信'}），只能改普通 send 的信")
+        if letter_sender(path) != sender:
+            sys.exit(f"信 {lid} 的来源是 {letter_sender(path) or '（读不出来）'}，不是你指定的 {sender}；不改别人的信")
+    return path, routes[to].get("methods", ["notify"])
+
+
+def apply_mutation(action, to, path, methods, subject=None, need=None, body=None):
+    """Arbitrate one in-place mutation against every delivery entry and apply it, or sys.exit.
+
+    The shared per-letter claim decides who wins between a mutation and any delivery entry; after
+    winning it the delivery records are checked again (skip_claim, so our own claim is not read as a
+    competitor's). edit rewrites 事由/需要/正文 in place; retract moves the original letter to
+    archived/. Shared by the CLI commands and the panel seams -- there is no second eligibility engine.
+    """
+    lid = path.stem
+    why = refusal_for_methods(to, path, methods)
+    if why:
+        sys.exit(mutation_refusal(lid, why, path))
+    if not claim_letter(to, path):
+        sys.exit(mutation_refusal(lid, "投递进行中（认领已被投递方抢到）", path))
+    try:
+        why = refusal_for_methods(to, path, methods, skip_claim=True)
+        if why:
+            sys.exit(mutation_refusal(lid, why, path))
+        if action == "edit":
+            rewrite_letter(path, subject=subject, need=need, body=body)
+            return {"id": lid, "to": to, "methods": methods}
+        dst_dir = HOME / to / "archived" / time.strftime("%Y%m%d-%H%M%S")
+        dst = dst_dir / path.name
+        if dst.exists():
+            sys.exit(f"归档里已有同名文件，未撤回（{dst}）；请人工处理")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        path.replace(dst)
+        return {"id": lid, "to": to, "methods": methods, "dst": dst, "method": methods[0]}
+    finally:
+        release_claim(to, path)
 
 
 def parse_message_ref(ref):
@@ -1705,37 +1946,14 @@ def cmd_edit(a):
     letter is already on its way.
     """
     routes = boxes(load_routes())
-    if a.box not in routes:
-        sys.exit(f"没有信箱 {a.box}（发信方）；`postoffice list` 看通讯录")
     if a.subject is None and a.need is None and a.body is None:
         sys.exit("至少要改一个字段：--subject / --need / --body")
     to, lid = parse_message_ref(a.ref)
-    if to not in routes:
-        sys.exit(f"没有信箱 {to}（收件方）；`postoffice list` 看通讯录")
-    path = HOME / to / "inbox" / f"{lid}.md"
-    if not path.is_file():
-        sys.exit(f"{to} 的 inbox/ 里没有编号为 {lid} 的信；只能改仍在收件方 inbox/ 里的普通信")
-    derived = [k for k in ("回执：", "广播：", "闹钟：", "切换事件：") if header_field_present(path, k)]
-    if derived or letter_sender(path) == "postoffice":
-        sys.exit(f"{lid} 不是普通直发信（信头含 {'、'.join(derived) or '系统来信'}），只能改普通 send 的信")
-    if letter_sender(path) != a.box:
-        sys.exit(f"信 {lid} 的来源是 {letter_sender(path) or '（读不出来）'}，不是你指定的 {a.box}；不改别人的信")
-    methods = routes[to].get("methods", ["notify"])
-    why = refusal_for_methods(to, path, methods)
-    if why:
-        sys.exit(mutation_refusal(lid, why, path))
-    if not claim_letter(to, path):
-        sys.exit(mutation_refusal(lid, "投递进行中（认领已被投递方抢到）", path))
-    try:
-        why = refusal_for_methods(to, path, methods, skip_claim=True)
-        if why:
-            sys.exit(mutation_refusal(lid, why, path))
-        rewrite_letter(path, subject=a.subject,
-                       need=None if a.need is None else clean_need(a.need), body=a.body)
-    finally:
-        release_claim(to, path)
-    log("postman.log", f"更新 {a.box} → {to} {lid}：通道 {','.join(methods)} 未接受，原地改成新版本")
-    print(f"已更新 {lid}（{a.box} → {to}）")
+    path, methods = mutation_target(to, lid, a.box, routes, "edit")
+    info = apply_mutation("edit", to, path, methods, subject=a.subject,
+                          need=None if a.need is None else clean_need(a.need), body=a.body)
+    log("postman.log", f"更新 {a.box} → {to} {info['id']}：通道 {','.join(methods)} 未接受，原地改成新版本")
+    print(f"已更新 {info['id']}（{a.box} → {to}）")
     print("收件方尚未收到旧版本；编号、文件名、来源、收件人都没变，只会看到新版")
     print("还想改就再 edit 一次；想收回就 retract；已经投递的只能另发一封修正信")
     return 0
@@ -1753,51 +1971,16 @@ def cmd_retract(a):
     the body is untouched, and no correction is sent for you.
     """
     routes = boxes(load_routes())
-    if a.to not in routes:
-        sys.exit(f"没有信箱 {a.to}（收件方）；`postoffice list` 看通讯录")
     if not a.id or any(c in a.id for c in "/\\*?[]") or a.id.startswith("."):
         sys.exit(f"撤回只接受完整信件编号，不接受路径、通配符或前缀：{a.id!r}")
     if a.id.endswith(".md"):
         sys.exit(f"信件编号是文件名去掉 .md，不要带后缀：{a.id!r}")
-    inbox = HOME / a.to / "inbox"
-    path = inbox / f"{a.id}.md"
-    if not inbox.is_dir() or not path.is_file():
-        sys.exit(f"{a.to} 的 inbox/ 里没有编号为 {a.id} 的信；撤回只处理仍在收件方 inbox/ 的信"
-                 f"（已送达、已归档或在别处的都不归它管）")
-    derived = [k for k in ("回执：", "广播：", "闹钟：", "切换事件：") if header_field_present(path, k)]
-    if derived or letter_sender(path) == "postoffice":
-        sys.exit(f"{a.id} 不是普通直发信（信头含 {'、'.join(derived) or '系统来信'}），撤回只用于普通 send 的信")
-    if a.sender not in routes:
-        sys.exit(f"没有信箱 {a.sender}（发信方）；`postoffice list` 看通讯录")
-    sender = letter_sender(path)
-    if sender != a.sender:
-        sys.exit(f"信 {a.id} 的来源是 {sender or '（读不出来）'}，不是你指定的 {a.sender}；不撤回别人的信")
-    methods = routes[a.to].get("methods", ["notify"])
-    method = methods[0]
-    why = refusal_for_methods(a.to, path, methods)
-    if why:
-        sys.exit(mutation_refusal(a.id, why, path))
-    # 和投递方原子地争同一把认领：认领是 O_EXCL 的，所以要么我们赢、要么投递方赢，
-    # 不存在「我们查完还没动，投递方就来认领并唤醒」的中间态。
-    if not claim_letter(a.to, path):
-        sys.exit(mutation_refusal(a.id, "投递进行中（认领已被投递方抢到）", path))
-    try:
-        # 认领已经握在手里，所以这一次只看台账（skip_claim）：不然会把自己刚拿的认领当成别人
-        why = refusal_for_methods(a.to, path, methods, skip_claim=True)
-        if why:
-            sys.exit(mutation_refusal(a.id, why, path))
-        dst_dir = HOME / a.to / "archived" / time.strftime("%Y%m%d-%H%M%S")
-        dst = dst_dir / path.name
-        if dst.exists():
-            sys.exit(f"归档里已有同名文件，未撤回（{dst}）；请人工处理")
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        path.replace(dst)
-    finally:
-        release_claim(a.to, path)   # 原信已经不在 inbox/，投递方下一轮不会再看见它
-    log("postman.log", f"撤回 {a.sender} → {a.to} {a.id}：通道 {method} 未接受，原信存档到 {dst}")
-    print(f"已撤回 {a.id}")
-    print(f"原信原样存档到 {dst}（正文未改，没有写任何通知，也没有替你补发修正）")
-    print(f"核实依据：{a.to} 走 {method} 通道，投递认领为空、该通道的送达记录里没有这封信")
+    path, methods = mutation_target(a.to, a.id, a.sender, routes, "retract")
+    info = apply_mutation("retract", a.to, path, methods)
+    log("postman.log", f"撤回 {a.sender} → {a.to} {info['id']}：通道 {info['method']} 未接受，原信存档到 {info['dst']}")
+    print(f"已撤回 {info['id']}")
+    print(f"原信原样存档到 {info['dst']}（正文未改，没有写任何通知，也没有替你补发修正）")
+    print(f"核实依据：{a.to} 走 {info['method']} 通道，投递认领为空、该通道的送达记录里没有这封信")
     print("收件方没有被提醒过，也不会再因这封信被唤醒。如果对方已从别的途径得知内容，要不要另发修正由你决定")
     return 0
 
@@ -2662,6 +2845,29 @@ def cmd_list(_a):
         print("".join(pad(row[i], widths[i]) for i in range(4)) + f"{row[4]}  [{row[5]}]")
 
 
+def cmd_activity(a):
+    """One-shot presence write for a Claude Code hook (UserPromptSubmit → working).
+
+    Fail-soft by design: presence bookkeeping must never disturb a hook, so anything unclear
+    (no stdin, unresolvable identity, unknown/ambiguous box) just exits 0 without a word.
+    """
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except (ValueError, OSError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    identity, _source = resolve_claude_identity(data)
+    if not identity:
+        return 0
+    routes = boxes(load_routes())
+    hits = [n for n, r in routes.items()
+            if "claude_hook" in (r.get("methods") or []) and str(r.get("claude_session") or "") == identity]
+    if len(hits) == 1:
+        activity_write(hits[0], a.state, "claude_hook", identity)
+    return 0
+
+
 def cmd_hook(_a):
     """Claude Code Stop / SessionStart hook (asyncRewake). Waits for mail; exit 2 wakes the session."""
     try:
@@ -2735,6 +2941,10 @@ def cmd_hook(_a):
         pass
     pidf.write_text(str(me))
     log("claude_hook.log", f"{name} 监视上岗 pid={me} owner={owner}")
+    # 监视上岗 = 这一轮 Claude 已经停下（Stop/SessionStart），先记 idle；真正忙起来是唤醒那一刻。
+    # 只有当前路由确实绑到这个身份时才写：一次改绑之后，旧 watcher 不许发布旧身份的 observation。
+    act_binding = identity or str(routes.get(name, {}).get("claude_session") or "")
+    activity_publish(name, "idle", "claude_hook", act_binding, routes)
     paused = False
     while True:
         try:
@@ -2751,6 +2961,9 @@ def cmd_hook(_a):
         r = boxes(load_routes()).get(name)
         if r is None:
             return 0
+        # 心跳只保活：刷新 observed，不改状态。绝不能把 UserPromptSubmit 刚写的 working 按回 idle ——
+        # working→idle 由 Stop/SessionStart 启动的新 watcher（上岗时无条件写 idle）负责。
+        activity_touch(name, "claude_hook", act_binding)
         if online(r):
             seen = read_lines(seenf)
             new = [p for p in pending(name) if str(p) not in seen]
@@ -2773,6 +2986,7 @@ def cmd_hook(_a):
                         rate_mark(name)      # merged receipts: one wake counts once, however many letters
                         for p in new:
                             log("claude_hook.log", f"{name} 唤醒 {p.name}")
+                        activity_publish(name, "working", "claude_hook", act_binding)
                         pidf.unlink(missing_ok=True)
                         return 2
                 if not paused:
@@ -3003,7 +3217,8 @@ def backup(path):
 
 
 def is_ours(cmd):
-    return "claude_hook.sh" in cmd or ("postoffice" in cmd and cmd.rstrip().endswith(" hook"))
+    return "claude_hook.sh" in cmd \
+        or ("postoffice" in cmd and (cmd.rstrip().endswith(" hook") or " activity " in cmd))
 
 
 def cmd_install_claude(_a):
@@ -3015,14 +3230,18 @@ def cmd_install_claude(_a):
     # for command hooks; set an explicit long timeout so neither reading can kill the watcher after 10 min.
     ours = {"type": "command", "command": f'exec "{SELF}" hook', "asyncRewake": True, "timeout": HOOK_TIMEOUT}
     hooks = cfg.setdefault("hooks", {})
-    for event, extra in (("Stop", {}), ("SessionStart", {"matcher": "startup|resume|clear|compact"})):
+    entries = [("Stop", {}, ours),
+               ("SessionStart", {"matcher": "startup|resume|clear|compact"}, ours),
+               # 每次提交提示前记一次 working：这是 Claude 侧最诚实的「正在干活」信号（同步钩子，失败静默）
+               ("UserPromptSubmit", {}, {**ours, "command": f'exec "{SELF}" activity --state working'})]
+    for event, extra, hook in entries:
         groups = []
         for g in hooks.get(event, []):
             g = dict(g)
             g["hooks"] = [h for h in g.get("hooks", []) if not is_ours(h.get("command", ""))]
             if g["hooks"]:
                 groups.append(g)
-        groups.append(dict(extra, hooks=[ours]))
+        groups.append(dict(extra, hooks=[hook]))
         hooks[event] = groups
     s.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Claude Code 钩子已装入 {s}" + (f"（原文件备份：{bk}）" if bk else ""))
@@ -3034,7 +3253,7 @@ def cmd_uninstall_claude(_a):
         return
     cfg = json.loads(s.read_text(encoding="utf-8"))
     backup(s)
-    for event in ("Stop", "SessionStart"):
+    for event in ("Stop", "SessionStart", "UserPromptSubmit"):
         groups = []
         for g in cfg.get("hooks", {}).get(event, []):
             g["hooks"] = [h for h in g.get("hooks", []) if not is_ours(h.get("command", ""))]
@@ -3430,6 +3649,39 @@ def mail_state(name, snap):
     return letters, counts
 
 
+def outbox_rows(operator):
+    """Read model: the operator's still-observable outgoing ordinary mail, derived at request time.
+
+    Scans every registered box's inbox/ for ordinary direct letters whose 来源 is the operator
+    (derived notices are excluded the same way the edit/retract core excludes them). Pure read:
+    never claims, never writes, never re-resolves an alias -- the frozen 逻辑地址： header is shown
+    as-is. The row status is the very same mutation arbitration the edit/retract core uses, so a
+    row that says pending can still lose the race to a delivery (the POST re-checks and fails closed).
+    """
+    if not operator:
+        return []
+    routes = boxes(load_routes())
+    rows = []
+    for to, r in routes.items():
+        methods = r.get("methods", ["notify"])
+        for p in pending(to):
+            if letter_sender(p) != operator:      # 只列 operator 发的；来源读不出或别人的都不进
+                continue
+            if not is_ordinary_direct(p):          # 与 edit/retract 共用同一套普通直发信判定
+                continue
+            detail, err = read_letter_detail(to, p.stem)
+            if err or not detail:
+                continue
+            alias_line = field(p, "逻辑地址：")
+            state, reason = mutation_state(to, p, methods)
+            rows.append({"to": to, "id": p.stem, "ref": f"{to}/{p.stem}",
+                         "subject": detail["subject"], "need": detail["need"], "body": detail["body"],
+                         "alias": alias_line[len("逻辑地址："):].strip() if alias_line else "",
+                         "mtime": int(p.stat().st_mtime), "status": state, "reason": reason})
+    rows.sort(key=lambda x: x["mtime"], reverse=True)
+    return rows
+
+
 def panel_state():
     rows = []
     full = load_routes()
@@ -3438,11 +3690,13 @@ def panel_state():
     for name, r in routes.items():
         m = r.get("methods", ["notify"])[0]
         letters, counts = mail_state(name, snap)
+        act, act_since = activity_state(name, r)
         rows.append({
             "name": name, "app": APP.get(m, m), "method": m, "who": r.get("who", ""),
             "online": online(r),
             "ident": r.get("claude_title") or r.get("session_id") or r.get("thread_id") or "",
             "pending": letters, "counts": counts,
+            "activity": {"state": act, "since": act_since},
             "acks": recent_acks(name),
         })
     lines = []
@@ -3544,11 +3798,17 @@ def cmd_panel(a):
             elif self.path.split("?", 1)[0] == "/api/letter":
                 status, payload = self._letter()
                 self._send(status, json.dumps(payload, ensure_ascii=False).encode())
+            elif self.path == "/api/outbox":
+                # 纯读：operator 仍可观察的已发普通信，从真实状态推导，不落任何一份副本
+                op = panel_config().get("operator") or ""
+                self._send(200, json.dumps({"ok": True, "outbox": outbox_rows(op)},
+                                           ensure_ascii=False).encode())
             else:
                 self._send(404, b"{}")
 
         def do_POST(self):
-            if self.path not in ("/api/status", "/api/clear", "/api/archive-one", "/api/ack-one", "/api/send") \
+            if self.path not in ("/api/status", "/api/clear", "/api/archive-one", "/api/ack-one", "/api/send",
+                                 "/api/edit-one", "/api/retract-one") \
                     or not self._local() \
                     or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 # 先把请求体排空再拒绝：带着未读数据关连接会让内核发 RST，客户端
@@ -3628,6 +3888,53 @@ def cmd_panel(a):
                             ok = True
                             payload = {"ok": True, "id": path.stem, "ref": f"{to}/{path.stem}"}
                             log("postman.log", f"面板：发信 {sender} → {to}（{path.stem}）")
+                        except SystemExit as e:
+                            ok, status, message, refused = False, 400, "refused", str(e)
+                        except OSError:
+                            ok, status, message = False, 500, "failed"
+                elif self.path in ("/api/edit-one", "/api/retract-one"):
+                    # 与 CLI edit/retract 共用 mutation_target/apply_mutation 核心：sender 只来自
+                    # config.panel.operator，浏览器传 from/sender 一概不作数；每次 POST 都重新
+                    # 走 claim→复检→mutation，所以列表快照说 pending 也可能在竞争里失败（fail closed）
+                    op = panel_config().get("operator") or ""
+                    box, lid = d.get("to"), d.get("id")
+                    if not isinstance(box, str) or not isinstance(lid, str) or not box or not lid \
+                            or not letter_id_ok(lid):
+                        ok, status, message = False, 400, "bad_request"
+                    elif not box_name_ok(box) or box not in boxes(load_routes()):
+                        ok, status, message = False, 404, "not_found"
+                    elif not (HOME / box / "inbox" / f"{lid}.md").is_file():
+                        ok, status, message = False, 404, "not_found"
+                    elif not op:
+                        ok, status, message, refused = False, 400, "refused", "面板没有配置 operator，不能改信或撤回"
+                    elif self.path == "/api/edit-one":
+                        fields = {k: d.get(k) for k in ("subject", "need", "body")}
+                        if any(v is not None and not isinstance(v, str) for v in fields.values()) \
+                                or all(v is None for v in fields.values()):
+                            ok, status, message = False, 400, "bad_request"
+                        else:
+                            try:
+                                routes = boxes(load_routes())
+                                path, methods = mutation_target(box, lid, op, routes, "edit")
+                                info = apply_mutation(
+                                    "edit", box, path, methods, subject=fields["subject"],
+                                    need=None if fields["need"] is None else clean_need(fields["need"]),
+                                    body=fields["body"])
+                                ok = True
+                                payload = {"ok": True, "state": "updated", "id": info["id"], "to": box}
+                                log("postman.log", f"面板：改信 {op} → {box}/{info['id']}（通道未接受，原地改）")
+                            except SystemExit as e:
+                                ok, status, message, refused = False, 400, "refused", str(e)
+                            except OSError:
+                                ok, status, message = False, 500, "failed"
+                    else:
+                        try:
+                            routes = boxes(load_routes())
+                            path, methods = mutation_target(box, lid, op, routes, "retract")
+                            info = apply_mutation("retract", box, path, methods)
+                            ok = True
+                            payload = {"ok": True, "state": "retracted", "id": info["id"], "to": box}
+                            log("postman.log", f"面板：撤回 {op} → {box}/{info['id']}（通道未接受，原信存档）")
                         except SystemExit as e:
                             ok, status, message, refused = False, 400, "refused", str(e)
                         except OSError:
@@ -3793,6 +4100,9 @@ def main():
     p.set_defaults(fn=cmd_broadcast)
     sp.add_parser("list", help="通讯录与积压").set_defaults(fn=cmd_list)
     sp.add_parser("hook", help="（内部）Claude Code 钩子入口").set_defaults(fn=cmd_hook)
+    p = sp.add_parser("activity", help="（内部）Claude Code UserPromptSubmit 钩子：记一次「正在干活」")
+    p.add_argument("--state", required=True, choices=("working", "idle"), help="要记录的状态")
+    p.set_defaults(fn=cmd_activity)
     sp.add_parser("postman", help="前台运行邮递员").set_defaults(fn=cmd_postman)
     sp.add_parser("doctor", help="体检").set_defaults(fn=cmd_doctor)
     p = sp.add_parser("panel", help="打开网页操作面板（开关各会话的连接）")
