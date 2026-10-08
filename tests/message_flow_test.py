@@ -453,6 +453,8 @@ class MessageFlow(unittest.TestCase):
         self.assertEqual(text.count("postoffice skill"), 1)
         self.assertIn("另有 1 条回执", text, "回执仍是尾部合并块")
         self.assertNotIn(SENTINEL, text, "回执正文永不注入")
+        self.assertNotIn("<!--po-batch", text, "不得再带 base64 元数据副本（省 context）")
+        self.assertNotRegex(text, r"[A-Za-z0-9+/]{200,}={0,2}", "不得内嵌长 base64 副本")
         # Python 侧沿用 v1.4 的 shlex.quote 约定（安全串不加引号）；插件侧才是总是加单引号。
         self.assertIn("postoffice receipt " + shlex.quote("coded") + " " + shlex.quote("orig-1"), text)
 
@@ -521,6 +523,30 @@ class MessageFlow(unittest.TestCase):
         postman(self.home)
         self.assertEqual(len(self.codex_calls()), 3, "没有新信时不许再产生通道操作")
         self.assertEqual(len(self.fake_pending()), 1)
+
+    def test_codex_more_than_twenty_receipts_all_queue_and_mark(self):
+        # 21 receipts over the 20 cap: the 21st must NOT be silently dropped — it continues in a
+        # second item, and EVERY id is queued and marked accepted (none lost, none un-accounted).
+        self._seed_fake_state([], busy=True)
+        paths, rids = [], []
+        for i in range(21):
+            rid = f"r{i:02d}"
+            rids.append(rid)
+            f = self.home / "coded" / "inbox" / f"20260101-0000{i:02d}_ghost_回执{i}.md"
+            f.write_text(f"来源：ghost\n事由：回执：旧{i}\n需要：回执（默认不答复）\n"
+                         f"回执：{rid}\n原事由：旧{i}\n\n正文\n", encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(f, (old, old))
+            paths.append(str(f))
+        postman(self.home)
+        pend = self.fake_pending()
+        self.assertEqual(len(pend), 2, f"21 条回执应分两项（20+1），实际 {len(pend)}")
+        text = self.fake_pending_text()
+        for rid in rids:
+            self.assertIn(rid, text, f"每个回执 ID 都要在索引里：{rid}")
+        delivered = set(json.loads((self.home / ".delivered.json").read_text(encoding="utf-8")))
+        for p in paths:
+            self.assertIn(p, delivered, f"每个回执都要记账为已接受：{p}")
 
     def test_codex_never_touches_a_user_queued_message(self):
         # 只更新确证归属邮局、且尚未启动的项：用户自己排队的消息原样不动。
