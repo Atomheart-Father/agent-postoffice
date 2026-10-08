@@ -75,7 +75,41 @@ grep -q "兼容旧命令" "$POSTOFFICE_HOME/.delivered.json" 2>/dev/null || grep
 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM
 [ $(grep -c "notify bob" "$POSTOFFICE_HOME/logs/postman.log") -eq 1 ] && ok "邮递员重启不重投" || bad "邮递员重投"
 
-printf '#!/bin/sh\nexit 0\n' > "$T/fakecodex"; chmod +x "$T/fakecodex"   # 假 codex：queue 永远“受理成功”
+# 假 codex app-server：说 stdio JSON-RPC（initialize/list/add/update）。cap 传 "-" 时不记录；
+# 否则把每轮索引文本追加到 cap（供 grep）。永远受理成功。
+mkcodex() {  # <script> <cap|->
+  _cap="$2"
+  cat > "$1" <<PYEOF
+#!/usr/bin/env python3
+import json, sys
+CAP = "$_cap"
+def emit(o):
+    sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+def text_of(p):
+    return "\n".join(x.get("text", "") for x in (p.get("input") or []) if isinstance(x, dict) and x.get("type") == "text")
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+    m, rid, p = msg.get("method"), msg.get("id"), (msg.get("params") or {})
+    if m == "initialize":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "fake", "codexHome": ".", "platformFamily": "unix", "platformOs": "macos"}})
+    elif m == "thread/queue/list":
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"data": [], "nextCursor": None}})
+    elif m in ("thread/queue/add", "thread/queue/update"):
+        if CAP != "-":
+            open(CAP, "a").write(text_of(p) + "\n")
+        emit({"jsonrpc": "2.0", "id": rid, "result": {"queuedSubmission": None}})
+    else:
+        emit({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}})
+PYEOF
+  chmod +x "$1"
+}
+mkcodex "$T/fakecodex" -   # 假 codex：永远“受理成功”
 "$PO" add carol --codex thread-1 >/dev/null
 python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r['carol']['codex_cli']=sys.argv[2];json.dump(r,open(p,'w'))" "$POSTOFFICE_HOME/routes.json" "$T/fakecodex"
 echo "x" | "$PO" send carol alice "没人处理的信" "回复" >/dev/null
@@ -218,8 +252,8 @@ POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/de
   && ok "系统广播不向不存在的信箱写汇总" || bad "系统广播写出了汇总"
 
 # ---------- v1.6：稳定认人 + 只为真阻塞提醒 + 回执合并排后（docs/SPEC_v1.6.md rev2） ----------
-mkcap() { printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$1" > "$2"; chmod +x "$2"; }
-mkfail() { printf '#!/bin/sh\nexit 1\n' > "$1"; chmod +x "$1"; }
+mkcap() { mkcodex "$2" "$1"; }   # 假 codex app-server，把索引文本记进 cap
+mkfail() { printf '#!/bin/sh\nexit 1\n' > "$1"; chmod +x "$1"; }   # 假 codex：启动即失败（读不到 JSON-RPC 响应）
 clog() { printf '%s Mapping internal session %s to CLI session %s\n' "$1" "$2" "$3" >> "$T/main.log"; }
 titleonly() { printf '{"transcript_path":"%s/%s.jsonl"}' "$T" "$1"; }
 DHD() { hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop POSTOFFICE_CLAUDE_MAINLOG="$T/main.log" -- "$@"; }

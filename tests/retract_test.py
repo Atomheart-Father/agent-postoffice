@@ -113,10 +113,31 @@ class Retract(unittest.TestCase):
         return r
 
     def fake_codex(self):
-        """假 codex CLI：把被调用的次数写进 capture 文件（投递到底有没有发生）。"""
+        """假 codex app-server：每受理一次把 called 写进 capture 文件（投递到底有没有发生）。"""
         cap = self.home / "codex.calls"
-        script = self.home / "fake_codex.sh"
-        script.write_text(f'#!/bin/sh\necho called >> "{cap}"\nexit 0\n')
+        script = self.home / "fake_codex.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"CAP = {str(cap)!r}\n"
+            "def emit(o):\n"
+            "    sys.stdout.write(json.dumps(o) + '\\n'); sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line: continue\n"
+            "    try: msg = json.loads(line)\n"
+            "    except ValueError: continue\n"
+            "    m, rid = msg.get('method'), msg.get('id')\n"
+            "    if m == 'initialize':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'userAgent':'fake','codexHome':'.','platformFamily':'unix','platformOs':'macos'}})\n"
+            "    elif m == 'thread/queue/list':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'data':[],'nextCursor':None}})\n"
+            "    elif m in ('thread/queue/add','thread/queue/update'):\n"
+            "        open(CAP,'a').write('called\\n')\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'queuedSubmission':None}})\n"
+            "    else:\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'method not found'}})\n",
+            encoding="utf-8")
         script.chmod(0o755)
         return script
 
