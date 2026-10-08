@@ -57,6 +57,9 @@
   **项目范围的角色不许自带 `handoff_file`**（交接来自项目唯一的 `status_file`），
   公司范围的角色可以显式给 `handoff_file`。
 - 老的、没有 `role` 的 alias（列表式或 `{candidates,notify,handoff}`）继续照旧工作。
+- 可选 `aliases.<名>.escalation_role`（字符串）：`candidates` 仍是**执行承载者**；只有当它们**全部离线**时，才一次性把事项升级到 `escalation_role` 指向的**已存在、带 `role` 的逻辑地址**，由它按自己的 candidates 接任（可兜底到 boss）。
+  升级受理者**不会**获得原岗位的 ACTIVE（`identity` 只把执行目标算作现职，`send` 会回显升级目的地）。
+  只允许一次升级：目标不得再配 `escalation_role`，且拒绝未知引用 / 自引用 / 非岗位 alias。没有该字段的 alias 行为完全不变。
 
 ## 命令
 
