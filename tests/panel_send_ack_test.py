@@ -223,6 +223,30 @@ class SendAckAPI(unittest.TestCase):
         self.assertEqual(len(self.acks()), before_acks, "归档回执通知不许再记一条回执")
         self.assertEqual(len(self.inbox("alice")), before_inbox - 1, "不许再产生新通知")
 
+    def test_ack_system_notification_ledgers_without_backsend(self):
+        # 系统通知（发信方 postoffice）只留知悉账：不回送、不注册假信箱、不报“未登记”
+        lid = "20260101-120000_postoffice_系统通知"
+        (self.home / "bob" / "inbox").mkdir(parents=True, exist_ok=True)
+        (self.home / "bob" / "inbox" / f"{lid}.md").write_text(
+            "来源：postoffice\n事由：系统通知\n需要：仅告知\n\n正文\n", encoding="utf-8")
+        before_acks = len(self.acks())
+        r = run_po("ack", "bob", lid, "知悉", home=self.home)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("已记账（知悉系统通知）", r.stdout)
+        self.assertNotIn("未登记", r.stdout, "不得报假“未登记”")
+        self.assertNotIn("已投递回执通知", r.stdout, "不得回送系统")
+        self.assertTrue((self.home / "bob" / "done" / f"{lid}.md").is_file(), "原信进 done")
+        rows = [e for e in self.acks() if e["id"] == lid]
+        self.assertEqual(len(rows), 1, "记一条知悉账")
+        self.assertEqual(rows[0]["to"], "postoffice")
+        self.assertEqual(len(self.acks()), before_acks + 1)
+        # 普通 ack 行为不变
+        lid2, _ = self.send_cli("bob", "alice", "普通信")
+        r2 = run_po("ack", "bob", lid2, "收到", home=self.home)
+        self.assertIn("已回执：", r2.stdout)
+        self.assertIn("空闲时通知 alice", r2.stdout)
+        self.assertTrue(self.notification("alice", lid2).is_file(), "普通 ack 照常通知")
+
     def test_ack_one_records_files_and_notifies(self):
         lid, path = self.send_cli("bob", "alice", "甲信", body="第一行\n第二行\n")
         raw = path.read_bytes()

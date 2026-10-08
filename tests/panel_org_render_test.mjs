@@ -136,5 +136,24 @@ for (const width of [390, 820, 1440]) {
   hasNot(e.els["boxes"].innerHTML, 'class="inspector', `${width}px: Esc closes it`);
 }
 
+// ---- 6) alias card: an escalation result is drawn from the data, a plain alias is not ----
+{
+  const S = mk([box("a", "Zeta"), box("d", "Zeta")], { ok: true, label: "", operator: "", organization: null });
+  S.aliases = [
+    { name: "p.impl", target: "d", confirmed: "d", pending: "", pending_in: 0, notify: [], handoff: "",
+      candidates: [{ name: "a", known: true, online: false }, { name: "d", known: true, online: true }],
+      kind: "escalation", escalation_role: "p.design", escalation: { role: "p.design", target: "d" } },
+    { name: "p.plain", target: "d", confirmed: "d", pending: "", pending_in: 0, notify: [], handoff: "",
+      candidates: [{ name: "d", known: true, online: true }] },
+  ];
+  const e = env(S); await settle();
+  const h = e.els["aliases"].innerHTML;
+  has(h, "@p.impl", "the escalating alias is drawn");
+  has(h, "escalated to @p.design", "the escalation line names the accepting role");
+  has(h, "does not take the original role's ACTIVE", "the escalation line says the acceptor keeps its own role");
+  is((h.match(/escalated to/g) || []).length, 1, "only the escalating alias shows the escalation line");
+  has(h, "@p.plain", "the plain alias is still drawn");
+}
+
 console.log(failures ? `FAIL ${failures}` : "PASS");
 process.exit(failures ? 1 : 0);

@@ -956,6 +956,7 @@ class MessageFlow(unittest.TestCase):
         rc, err = hook(self.home, self.title_transcript(), wait=8)
         self.assertEqual(rc, 2, err)
         self.assertIn("【联络总站新信｜claude】", err, "单封必须保持现有形态：\n" + err)
+        self.assertIn(f"引用：claude/{lid}", err, "单封也要给可直接复制的稳定引用：\n" + err)
         self.assertIn(f"== {p}", err)
         # 单封摘要按解析出的 source/subject/need 生成中性元数据，不回抄信头原始行（§27-32 退修）
         self.assertIn("来源：boss", err)

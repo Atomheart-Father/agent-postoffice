@@ -401,6 +401,33 @@ await t('archive 工具：只归档 presented、keep 保留、身份来自会话
   assert.ok((await inbox('flow_g2')).length === 0)
 })
 
+await t('archive 工具：按精确编号归档本箱信、幂等、拒绝路径/glob/跨箱', async () => {
+  const box = 'flow_arch'
+  const sid = await addBox(box)
+  const ids = ['20260101-190001_boss_精甲', '20260101-190002_boss_精乙']
+  for (const id of ids) await putLetter(box, id, { subject: '精确归档' })
+
+  const tool = plugin.tool.postoffice_archive
+  assert.ok(tool, 'postoffice_archive 应注册')
+  assert.deepEqual(Object.keys(tool.args), ['letter_id'], 'args 只能是 letter_id')
+  const r = await out(await tool.execute({ letter_id: ids[0] }, ctx(sid)))
+  assert.ok(typeof r === 'string' && r.length > 0, '工具要有结果说明：' + JSON.stringify(r))
+  assert.deepEqual(await done(box), [ids[0] + '.md'], '精确编号进 done')
+  assert.ok((await inbox(box)).includes(ids[1] + '.md'), '同箱别的信不动')
+
+  const r2 = await out(await tool.execute({ letter_id: ids[0] }, ctx(sid)))
+  assert.ok(typeof r2 === 'string' && r2.length > 0, '重复调用有结果（幂等）')
+  assert.deepEqual(await done(box), [ids[0] + '.md'], '重复调用不产生第二份')
+
+  await out(await tool.execute({ letter_id: '../evil' }, ctx(sid)))
+  await out(await tool.execute({ letter_id: '*.md' }, ctx(sid)))
+  assert.ok((await inbox(box)).includes(ids[1] + '.md'), '路径/glob 不得归档，原信仍在')
+
+  const sid2 = await addBox('flow_arch2')
+  await out(await tool.execute({ letter_id: ids[1] }, ctx(sid2)))
+  assert.ok((await inbox(box)).includes(ids[1] + '.md'), '别的会话不得按本箱编号归档')
+})
+
 // ---------------------------------------------------------------- A：message_edit
 await t('message_edit：按会话身份原地改自己的信', async () => {
   const sender = 'flow_h'
