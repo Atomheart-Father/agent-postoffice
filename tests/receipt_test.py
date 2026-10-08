@@ -337,7 +337,31 @@ class ReceiptFlow(unittest.TestCase):
     def test_codex_queue_reminder_has_metadata_only(self):
         cap = Path(self.tmp.name) / 'codex_capture.txt'
         fake = Path(self.tmp.name) / 'fakecodex'
-        fake.write_text(f'#!/bin/sh\nprintf %s "$*" >> {cap}\n')
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "CAP = " + repr(str(cap)) + "\n"
+            "def emit(o):\n"
+            "    sys.stdout.write(json.dumps(o) + '\\n'); sys.stdout.flush()\n"
+            "def text_of(p):\n"
+            "    return '\\n'.join(x.get('text','') for x in (p.get('input') or [])\n"
+            "                     if isinstance(x, dict) and x.get('type')=='text')\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line: continue\n"
+            "    try: msg = json.loads(line)\n"
+            "    except ValueError: continue\n"
+            "    m, rid, p = msg.get('method'), msg.get('id'), (msg.get('params') or {})\n"
+            "    if m == 'initialize':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'userAgent':'fake','codexHome':'.','platformFamily':'unix','platformOs':'macos'}})\n"
+            "    elif m == 'thread/queue/list':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'data':[],'nextCursor':None}})\n"
+            "    elif m in ('thread/queue/add', 'thread/queue/update'):\n"
+            "        open(CAP,'a').write(text_of(p))\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'queuedSubmission':None}})\n"
+            "    else:\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'method not found'}})\n",
+            encoding="utf-8")
         fake.chmod(0o755)
         self.run_po('add', 'carol', '--codex', 'thread-x')
         routes = json.loads((self.home / 'routes.json').read_text())

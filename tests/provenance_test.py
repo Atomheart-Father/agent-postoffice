@@ -75,12 +75,33 @@ class Provenance(unittest.TestCase):
         (HOME / "config.json").write_text(json.dumps(
             {"version": 1, "groups": {}, "aliases": {"al": ["aliasa"]}},
             ensure_ascii=False), encoding="utf-8")
-        # 假 codex CLI：把完整参数写进 capture 文件
+        # 假 codex app-server：把每轮索引文本写进 capture 文件（哨兵包裹）
         cap = HOME / "codex.calls"
-        script = HOME / "fake_codex.sh"
-        script.write_text("#!/bin/sh\n"
-                          f"printf '===8<===\\n%s\\n===>8===\\n' \"$*\" >> '{cap}'\n"
-                          "exit 0\n")
+        script = HOME / "fake_codex.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"CAP = {str(cap)!r}\n"
+            "def emit(o):\n"
+            "    sys.stdout.write(json.dumps(o) + '\\n'); sys.stdout.flush()\n"
+            "def text_of(p):\n"
+            "    return '\\n'.join(x.get('text','') for x in (p.get('input') or []) if isinstance(x, dict) and x.get('type')=='text')\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line: continue\n"
+            "    try: msg = json.loads(line)\n"
+            "    except ValueError: continue\n"
+            "    m, rid, p = msg.get('method'), msg.get('id'), (msg.get('params') or {})\n"
+            "    if m == 'initialize':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'userAgent':'fake','codexHome':'.','platformFamily':'unix','platformOs':'macos'}})\n"
+            "    elif m == 'thread/queue/list':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'data':[],'nextCursor':None}})\n"
+            "    elif m in ('thread/queue/add','thread/queue/update'):\n"
+            "        open(CAP,'a').write('===8<===\\n' + text_of(p) + '\\n===>8===\\n')\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'queuedSubmission':None}})\n"
+            "    else:\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'method not found'}})\n",
+            encoding="utf-8")
         script.chmod(0o755)
         r = json.loads((HOME / "routes.json").read_text(encoding="utf-8"))
         r["coded"] = {"methods": ["codex_queue"], "thread_id": "th-x",

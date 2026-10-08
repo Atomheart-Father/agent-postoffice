@@ -17,6 +17,7 @@ import json
 import os
 import platform
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -828,6 +829,134 @@ def find_codex():
         if c and Path(c).exists():
             return c
     return None
+
+
+# ---------- Codex app-server queue (cross-round notification merge) ----------
+# While a Codex session is BUSY, postman notifications arriving in different scan rounds must
+# accumulate into ONE pending queue item instead of one submission per round. We talk to an
+# ephemeral `codex app-server --listen stdio://` (the same thread store the `codex queue` CLI
+# uses) over newline-delimited JSON-RPC, and only ever touch a pending item whose
+# clientUserMessageId carries our exact prefix+box: user messages, other sources and already-started
+# turns are never listed-into or modified (no title-similarity matching). If the queue API is
+# unavailable we do NOT silently fall back to one submission per round; the batch stays undelivered
+# and the human is alerted once (diagnosable), never silently stopped.
+CODEX_PENDING_PREFIX = "postoffice:"
+
+
+class CodexAppServer:
+    """A short-lived stdio JSON-RPC client for one `codex app-server` process."""
+
+    def __init__(self, cli, timeout=60):
+        self.timeout = timeout
+        self._id = 0
+        self.proc = subprocess.Popen(
+            [cli, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def _read_msg(self, deadline):
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise RuntimeError("codex app-server 响应超时")
+            r, _, _ = select.select([self.proc.stdout], [], [], remaining)
+            if not r:
+                continue
+            chunk = self.proc.stdout.readline()      # one JSON object per line
+            if not chunk:
+                raise RuntimeError("codex app-server 提前关闭")
+            line = chunk.strip()
+            if not line:
+                continue
+            try:
+                return json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue                             # skip any non-JSON log line
+
+    def call(self, method, params):
+        self._id += 1
+        rid = self._id
+        req = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+        self.proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
+        self.proc.stdin.flush()
+        deadline = time.time() + self.timeout
+        while True:
+            msg = self._read_msg(deadline)
+            if msg.get("id") == rid:
+                if msg.get("error"):
+                    err = msg["error"]
+                    raise RuntimeError(f"{method} 失败：{err.get('message')}（code {err.get('code')}）")
+                return msg.get("result")
+
+    def initialize(self):
+        return self.call("initialize", {
+            "clientInfo": {"name": "agent-postoffice", "title": "agent-postoffice", "version": VERSION},
+            "capabilities": {"experimentalApi": True},
+        })
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=10)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+def _codex_input_text(input_):
+    """Concatenate the text variants of a queue submission's input (index text only, no bodies)."""
+    parts = []
+    for it in input_ or []:
+        if isinstance(it, dict) and it.get("type") == "text" and it.get("text"):
+            parts.append(it["text"])
+    return "\n".join(parts)
+
+
+def _codex_text_input(text):
+    return [{"type": "text", "text": text, "text_elements": []}]
+
+
+def codex_queue_deliver(cli, thread_id, box, text, merge=True, timeout=60):
+    """Deliver one reminder to a Codex thread, merging while busy. Returns (ok, detail).
+
+    While the thread is BUSY an existing postoffice-created PENDING item (matched by the exact
+    clientUserMessageId prefix+box) is UPDATED to append the new index, so successive rounds add up
+    to ONE pending submission; when idle the submission auto-starts and wakes the session. Only our
+    own pending item is ever touched. `merge=False` (used for a lone alarm reminder) never looks up
+    or updates anything: it always adds its own unique submission, so an alarm can never join the
+    ordinary formal batch.
+    """
+    app = CodexAppServer(cli, timeout=timeout)
+    try:
+        app.initialize()
+        mine = None
+        if merge:
+            result = app.call("thread/queue/list", {"threadId": thread_id}) or {}
+            data = result.get("data") if isinstance(result, dict) else None
+            cid = CODEX_PENDING_PREFIX + box
+            mine = next((it for it in (data or [])
+                         if isinstance(it, dict) and it.get("clientUserMessageId") == cid), None)
+        if mine and mine.get("id"):
+            old = _codex_input_text(mine.get("input"))
+            merged = (old + "\n\n" + text) if old else text
+            app.call("thread/queue/update", {"threadId": thread_id,
+                                             "queuedSubmissionId": mine["id"],
+                                             "input": _codex_text_input(merged)})
+            return True, f"merged into {mine['id']}"
+        cid = (CODEX_PENDING_PREFIX + box) if merge else \
+            f"{CODEX_PENDING_PREFIX}alarm:{box}:{time.time():.6f}"
+        app.call("thread/queue/add", {"threadId": thread_id,
+                                      "input": _codex_text_input(text),
+                                      "clientUserMessageId": cid})
+        return True, "queued"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        app.close()
 
 
 CLAUDE_MAP_RE = re.compile(r"Mapping internal session (local_\S+) to CLI session (\S+)")
@@ -3839,10 +3968,13 @@ def cmd_postman(_a):
                     # with letters: only receipts that have waited long enough ride along
                     candidates = ordinary[:MAX_FORMAL_BATCH] \
                         + [p for p in receipts if time.time() - p.stat().st_mtime > RECEIPT_WAIT]
+                    alarm_round = False
                 elif alarms:
                     candidates = [alarms[0]]      # the alarm reminder stays a lone round, no receipts
+                    alarm_round = True
                 else:
                     candidates = list(receipts)   # no letters: receipts go on their own
+                    alarm_round = False
                 if not candidates:
                     continue
                 if not rate_ok(name):
@@ -3862,11 +3994,9 @@ def cmd_postman(_a):
                 try:
                     if method == "codex_queue":
                         cli = r.get("codex_cli") or find_codex()
-                        res = subprocess.run([cli, "queue", "--thread", r["thread_id"], "--message", reminder(name, group)],
-                                             capture_output=True, text=True, timeout=60)
-                        ok = res.returncode == 0
-                        log("postman.log", f"codex_queue {name} {names} rc={res.returncode} "
-                                           f"{res.stdout.strip()[:200]} {res.stderr.strip()[:200]}")
+                        ok, detail = codex_queue_deliver(cli, r["thread_id"], name, reminder(name, group),
+                                                         merge=not alarm_round)
+                        log("postman.log", f"codex_queue {name} {names} ok={ok} {str(detail)[:200]}")
                     else:
                         first = group[0]
                         notify(f"联络总站：给 {name} 的新信",
