@@ -55,6 +55,17 @@ def run_po(*args, home=None, stdin=None, timeout=60):
                           env=env_for(home or BASE), input=stdin, timeout=timeout)
 
 
+def load_po(name="po_mflow_mod"):
+    """Import the postoffice CLI as a module to exercise its pure index helpers directly."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader(name, PO)
+    spec = importlib.util.spec_from_file_location(name, PO, loader=loader)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def hook(home, transcript, wait=12):
     """真跑一次 `postoffice hook`，交回 (退出码, stderr 唤醒负载)。
 
@@ -547,6 +558,74 @@ class MessageFlow(unittest.TestCase):
         delivered = set(json.loads((self.home / ".delivered.json").read_text(encoding="utf-8")))
         for p in paths:
             self.assertIn(p, delivered, f"每个回执都要记账为已接受：{p}")
+
+    def test_codex_full_receipt_batch_then_one_more_across_rounds(self):
+        # A full (20-receipt) item, then a 21st receipt next round: the 21st must continue in a
+        # second item, never be dropped by the 'already in' path (its slot is full).
+        self._seed_fake_state([], busy=True)
+        rids = []
+
+        def mk(i):
+            rid = f"x{i:02d}"
+            f = self.home / "coded" / "inbox" / f"20260103-0000{i:02d}_ghost_跨轮{i}.md"
+            f.write_text(f"来源：ghost\n事由：回执：跨{i}\n需要：回执（默认不答复）\n"
+                         f"回执：{rid}\n原事由：跨{i}\n\n正文\n", encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(f, (old, old))
+            rids.append(rid)
+            return f
+
+        for i in range(20):
+            mk(i)
+        postman(self.home)
+        self.assertEqual(len(self.fake_pending()), 1, "20 条刚好一项")
+        f21 = mk(20)
+        postman(self.home)
+        pend = self.fake_pending()
+        self.assertEqual(len(pend), 2, f"第21条必须落进续批，不能丢：{pend}")
+        text = self.fake_pending_text()
+        for rid in rids:
+            self.assertIn(rid, text, f"每个回执 ID 都要在索引里：{rid}")
+        delivered = set(json.loads((self.home / ".delivered.json").read_text(encoding="utf-8")))
+        self.assertIn(str(f21), delivered, "第21条必须记账为已接受")
+
+    def test_codex_receipt_query_survives_render_merge_render(self):
+        # Render→parse→merge→render round-trip per the real _receipt_item shape: the old query
+        # command must survive a later merge, and the bare stable id (unquoted) must round-trip so
+        # dedupe keeps working even when the id carries blanks/punctuation.
+        po = load_po()
+        d = self.home / "coded" / "inbox"
+        rid1 = "r 1：2(3)+4"
+        p1 = d / "20260104-000000_ghost_旧回执.md"
+        p1.write_text(f"来源：ghost\n事由：回执：旧\n需要：回执（默认不答复）\n"
+                      f"回执：{rid1}\n原事由：旧\n\n正文\n", encoding="utf-8")
+        e1 = po._codex_entry("coded", p1)
+        self.assertEqual(e1["k"], "r")
+        self.assertEqual(e1["ref"], rid1, "稳定引用是未加引号的裸 id")
+        parsed = po._codex_parse_entries(po._codex_batch_text([e1]))
+        self.assertEqual(len(parsed), 1, "单回执形态要能解析回来")
+        self.assertEqual(parsed[0]["ref"], rid1, "解析要还原裸 id（去掉 shell 引号）")
+        self.assertEqual(parsed[0]["query"], e1["query"], "旧查询命令必须原样保留")
+        self.assertEqual(parsed[0]["subj"], e1["subj"])
+
+        # dedupe is stable across the round trip
+        merged0, overflow0 = po._codex_merge_entries(parsed, [e1], 20, 20)
+        self.assertEqual(merged0, parsed)
+        self.assertEqual(overflow0, [])
+
+        # a new receipt arrives → merge → re-render keeps BOTH queries usable, bare ids stable
+        rid2 = "r2"
+        p2 = d / "20260104-000001_ghost_新回执.md"
+        p2.write_text(f"来源：ghost\n事由：回执：新\n需要：回执（默认不答复）\n"
+                      f"回执：{rid2}\n原事由：新\n\n正文\n", encoding="utf-8")
+        e2 = po._codex_entry("coded", p2)
+        merged, overflow = po._codex_merge_entries(parsed, [e2], 20, 20)
+        self.assertEqual(overflow, [])
+        t2 = po._codex_batch_text(merged)
+        self.assertIn(e1["query"], t2, "合并后旧查询命令仍可用")
+        self.assertIn(e2["query"], t2, "新查询命令可用")
+        refs = sorted(x["ref"] for x in po._codex_parse_entries(t2))
+        self.assertEqual(refs, sorted([rid1, rid2]), "裸稳定 ID 往返一致")
 
     def test_codex_never_touches_a_user_queued_message(self):
         # 只更新确证归属邮局、且尚未启动的项：用户自己排队的消息原样不动。
