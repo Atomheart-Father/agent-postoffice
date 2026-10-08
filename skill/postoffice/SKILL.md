@@ -49,6 +49,12 @@ MSG
 
 归档统一走邮局：OpenCode 用 `postoffice_archive_current`；其它 harness 用 `{POSTOFFICE} archive-current --box <你的信箱> [--keep <编号>...]`；面板走同一个 core API。不要在 shell 里自己 `mv` 信箱文件，也不要手改 `.presented.json`。
 
+**换会话 / 改绑后的旧信**：`archive-current` 只认**本会话被展示过**的那一批，换绑后新会话看不到旧会话的 presented 集合。要处理旧 `inbox` 里剩下的信，用显式精确编号归档（先读、选定、再逐封操作；它只归档、不是回复，不发信也不叫醒）：
+
+```
+{POSTOFFICE} archive <你的信箱> <信件编号>    # inbox/<编号>.md → done/；只认裸编号，不跨箱、不覆盖、幂等
+```
+
 ## 有配置时：分组开关与逻辑地址（v1.7）
 
 项目里配置了 manager 逻辑地址（`@{名字}`）就**优先发逻辑地址**，不要写死具体信箱：

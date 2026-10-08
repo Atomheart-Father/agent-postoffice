@@ -537,7 +537,12 @@ def write_letter(to, sender, subject, need, body, extra_headers=(), name=None):
     `name` forces the id (used by the alarm scheduler, so a retry after a crash reuses the same
     file instead of writing a second letter with a fresh timestamp).
     """
-    slug = re.sub(r'[\\/:*?"<>|\s]', "", subject)[:20] or "信"
+    # Id charset whitelist: keep only Unicode letters/digits plus . _ - (all shell-copyable and
+    # quote-free), drop every other character (spaces, / \ : * ? " < > |, and punctuation such as
+    # + ( ) × 「」). The old filter only stripped a handful of characters, so a subject like
+    # "…订正(+补给)" produced a reference ending in "(+" that users could not reliably copy.
+    # The cut is at 20 *code points* (never bytes), so a multi-byte character is never split.
+    slug = "".join(ch for ch in subject if ch.isalnum() or ch in "._-")[:20].strip("._-") or "信"
     if name:
         path = HOME / to / "inbox" / f"{name}.md"
     else:
@@ -1029,19 +1034,30 @@ def require_config(feature):
 
 
 def normalize_alias(value):
-    """(spec, error). The plain array form means candidates only: no notify, no handoff, no role."""
+    """(spec, error). The plain array form means candidates only: no notify, no handoff, no role.
+
+    `escalation_role` is optional: the name of another alias carrying a `role` that takes over
+    *once the execution candidates are all offline* (see alias_plan). candidates stay the qualified
+    EXECUTION carriers; escalation is not a candidate and never grants the original role.
+    """
     if isinstance(value, list):
-        return {"candidates": value, "notify": [], "handoff": "", "role": None}, ""
+        return {"candidates": value, "notify": [], "handoff": "", "role": None,
+                "escalation_role": ""}, ""
     if not isinstance(value, dict):
         return None, "必须是候选信箱数组，或含 candidates 的对象"
-    extra = sorted(set(value) - {"candidates", "notify", "handoff", "role"})
+    extra = sorted(set(value) - {"candidates", "notify", "handoff", "role", "escalation_role"})
     if extra:
-        return None, f"对象里有不支持的字段：{'、'.join(extra)}（允许 candidates / notify / handoff / role）"
+        return None, (f"对象里有不支持的字段：{'、'.join(extra)}"
+                      "（允许 candidates / notify / handoff / role / escalation_role）")
     if "candidates" not in value:
         return None, "对象缺 candidates"
+    er = value.get("escalation_role", "")
+    if er is not None and not isinstance(er, str):
+        return None, "escalation_role 必须是逻辑地址名（字符串）"
     role, _role_err = normalize_role(value.get("role"))   # role shape errors are org-level (see org_errors)
     return {"candidates": value["candidates"], "notify": value.get("notify", []),
-            "handoff": value.get("handoff", ""), "role": role}, ""
+            "handoff": value.get("handoff", ""), "role": role,
+            "escalation_role": (er or "")}, ""
 
 
 def normalize_role(value):
@@ -1264,6 +1280,21 @@ def config_errors(cfg, routes):
         if err:
             errs.append(f"alias {name}：{err}")
             continue
+        # escalation_role is a one-level pointer to an existing role alias: unknown / self / a
+        # non-role alias / a role alias that itself escalates are all rejected here, so a bad
+        # config fails the whole import and the old bytes stay untouched.
+        er = spec.get("escalation_role") or ""
+        if er:
+            if er == name:
+                errs.append(f"alias {name} 的 escalation_role 指向自己")
+            elif er not in aliases:
+                errs.append(f"alias {name} 的 escalation_role 指向 {er}，但它不是配置里的逻辑地址")
+            else:
+                espec, _eerr = normalize_alias(aliases[er])
+                if not espec or not espec.get("role"):
+                    errs.append(f"alias {name} 的 escalation_role 指向 {er}，但它不是岗位逻辑地址（缺 role）")
+                elif espec.get("escalation_role"):
+                    errs.append(f"alias {er} 不能再配 escalation_role：只允许一次升级，避免链式或循环")
         cands = spec["candidates"]
         if not isinstance(cands, list) or not cands:
             errs.append(f"alias {name} 的 candidates 必须是非空数组")
@@ -1406,8 +1437,44 @@ def alias_target(spec, routes):
     return None
 
 
+def alias_plan(cfg, name, spec, routes):
+    """ONE derived routing plan for @name shared by send / identity / transition.
+
+    candidates are the qualified EXECUTION carriers (same-tier backups included, only if the author
+    listed them). Only when none is online does the optional one-level `escalation_role` come into
+    play: that superior role alias resolves by its OWN candidates (its normal first-online rule,
+    which may itself end at the boss per that role's spec). The escalation acceptor is not the
+    original role's ACTIVE and the escalation never chains (validated in config_errors).
+
+    Returns {name, kind, exec_target, escalation, target, spec} where kind is
+    execution | escalation | none and target is the final delivery box (None if nobody can take it).
+    """
+    exec_target = alias_target(spec, routes)
+    esc = None
+    er = spec.get("escalation_role") or ""
+    if exec_target is None and er and isinstance(cfg, dict):
+        es = (cfg.get("aliases") or {}).get(er)
+        espec, _eerr = normalize_alias(es) if es is not None else (None, "")
+        if espec and espec.get("role"):
+            esc = {"role": er, "title": espec["role"].get("title", ""),
+                   "candidates": list(map(str, espec.get("candidates") or [])),
+                   "target": alias_target(espec, routes)}
+    if exec_target is not None:
+        final, kind = exec_target, "execution"
+    elif esc is not None:
+        final, kind = esc["target"], "escalation"
+    else:
+        final, kind = None, "none"
+    return {"name": name, "kind": kind, "exec_target": exec_target,
+            "escalation": esc, "target": final, "spec": spec}
+
+
 def resolve_alias(cfg, name, routes):
-    """(target, status_lines, spec) for a send to @name. Exits before any body is read."""
+    """(target, status_lines, spec) for a send to @name. Exits before any body is read.
+
+    An escalation target (when every execution candidate is offline) is reported in the status
+    lines and returned as the delivery target, but it is never presented as holding the role.
+    """
     raw = (cfg.get("aliases") or {}).get(name)
     if raw is None:
         if name in (cfg.get("groups") or {}):
@@ -1416,19 +1483,28 @@ def resolve_alias(cfg, name, routes):
     spec, err = normalize_alias(raw)
     if err:
         sys.exit(f"配置里的 @{name} 不可用：{err}")
-    cands = spec["candidates"]
     known = boxes(routes)
-    target, lines = None, []
-    for c in cands:
+    lines = []
+    for c in spec["candidates"]:
         r = known.get(c)
         if r is None:
             sys.exit(f"@{name} 引用了未登记信箱 {c}；没有投递到任何信箱")
-        if target is None and online(r):
-            target = c
         lines.append(f"- {c}：{'在线' if online(r) else '离线'}")
-    if target is None:
-        sys.exit(f"发送失败：@{name} 当前没有在线信箱\n候选：\n" + "\n".join(lines))
-    return target, lines, spec
+    plan = alias_plan(cfg, name, spec, routes)
+    if plan["kind"] == "escalation":
+        esc = plan["escalation"]
+        lines.append(f"执行候选全部离线，升级至 @{esc['role']}（{esc['title']}）→ "
+                     f"{esc['target'] or '（该上级当前也无在线候选）'}")
+        for c in esc["candidates"]:
+            r = known.get(c)
+            lines.append(f"- @{esc['role']} 候选 {c}："
+                         f"{'未登记' if r is None else ('在线' if online(r) else '离线')}")
+    if plan["target"] is None:
+        esc = plan.get("escalation")
+        tail = f"，升级 @{esc['role']} 也无在线候选" if esc else ""
+        sys.exit(f"发送失败：@{name} 当前没有在线信箱（执行候选全部离线{tail}）\n候选：\n"
+                 + "\n".join(lines))
+    return plan["target"], lines, spec
 
 
 def group_scope(ref, routes):
@@ -1583,6 +1659,56 @@ def read_file_state(path):
         return "missing", ""
 
 
+_AS_OF_LINE_RE = re.compile(r"^\s*AS_?OF\s*[:：]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+_SOURCE_LINE_RE = re.compile(r"^\s*SOURCE\s*[:：]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _parse_as_of(text):
+    """Parse a conventional AS_OF value to an epoch, or None. Accepts ISO date / date+time."""
+    t = text.strip()
+    try:
+        return datetime.datetime.fromisoformat(t).timestamp()
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(t, fmt))
+        except ValueError:
+            pass
+    return None
+
+
+def status_freshness(path):
+    """A freshness HINT for an explicitly referenced rules/STATUS file. Never an authority.
+
+    Convention (docs/STATUS_TEMPLATE.zh-CN.md): an optional `AS_OF: <date>` line records when the
+    summary was written and repeatable `SOURCE: <path>` lines point at the evidence it is based on.
+    When an existing SOURCE file is newer than AS_OF the pointer is flagged "stale" so a reader
+    refreshes it. This uses file mtimes only as a hint: mtime is never approval order, and nothing
+    is auto-summarized, auto-updated, or injected into letters.
+    Returns {state: ok|missing, as_of_text, stale, sources: [{path, exists, mtime}]}.
+    """
+    p = Path(path)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return {"state": "missing", "as_of_text": "", "stale": False, "sources": []}
+    m = _AS_OF_LINE_RE.search(text)
+    as_of_text = m.group(1).strip() if m else ""
+    as_of = _parse_as_of(as_of_text) if as_of_text else None
+    sources = []
+    for sm in _SOURCE_LINE_RE.finditer(text):
+        sp = Path(os.path.expanduser(sm.group(1).strip()))
+        if not sp.is_absolute():
+            sp = p.parent / sp
+        exists = sp.is_file()
+        mt = sp.stat().st_mtime if exists else None
+        sources.append({"path": str(sp), "exists": exists, "mtime": mt})
+    stale = bool(as_of is not None
+                 and any(s["exists"] and s["mtime"] and s["mtime"] > as_of for s in sources))
+    return {"state": "ok", "as_of_text": as_of_text, "stale": stale, "sources": sources}
+
+
 def alias_handoff_path(name, spec, cfg, routes=None, ok=None):
     """(path, reason) — the ONE handoff pointer an alias carries on a switch/handoff note.
 
@@ -1679,9 +1805,13 @@ def identity_snapshot(box, routes, cfg, ok=True, error="", now=None):
                                         "status_file": p.get("status_file", "")})
     for name, spec in role_specs(cfg):
         role = spec["role"]
-        target = alias_target(spec, routes)
+        plan = alias_plan(cfg, name, spec, routes)
+        target = plan["exec_target"]        # ACTIVE 只认执行目标：升级受理者不获得这个岗位
         entry = {"alias": name, "title": role["title"], "scope": dict(role["scope"]),
                  "candidates": list(map(str, spec["candidates"])), "active_target": target}
+        if plan["kind"] == "escalation":
+            entry["escalation"] = {"role": plan["escalation"]["role"],
+                                   "target": plan["escalation"]["target"]}
         if target == box:
             snap["active_roles"].append(entry)
         elif box in [str(c) for c in spec["candidates"]]:
@@ -1693,7 +1823,8 @@ def identity_snapshot(box, routes, cfg, ok=True, error="", now=None):
         rf = c.get("rules_file", "") if isinstance(c, dict) else ""
         if rf and rf not in seen_rules:
             seen_rules.add(rf)
-            snap["company_rules"].append({"company": cid, "path": resolve_ref(rf)})
+            snap["company_rules"].append({"company": cid, "path": resolve_ref(rf),
+                                          "freshness": status_freshness(resolve_ref(rf))})
 
     def add_project(pid):
         p = proj.get(pid) if isinstance(proj.get(pid), dict) else {}
@@ -1702,7 +1833,8 @@ def identity_snapshot(box, routes, cfg, ok=True, error="", now=None):
         path = resolve_ref(p.get("status_file", ""), p.get("root", ""))
         if path and path not in seen_status:
             seen_status.add(path)
-            snap["project_status"].append({"project": pid, "path": path})
+            snap["project_status"].append({"project": pid, "path": path,
+                                          "freshness": status_freshness(path)})
         if p.get("company_id"):
             add_company(str(p["company_id"]))   # the owning company's rules govern the project role
 
@@ -1759,7 +1891,9 @@ def identity_hint(name, routes, cfg, ok=None):
     if not s["config_ok"]:
         return f"身份（{name}）：组织配置已停用（{s['error'] or '配置有问题'}）——按 `postoffice identity {name}` 查询"
     parts = [f"现职 {r['alias']} · {r['title']}（{r['active_target']}）" for r in s["active_roles"]]
-    parts += [f"候选 {r['alias']} · {r['title']}（现在由 {r['active_target']} 受理，不是你的现职）"
+    parts += [f"候选 {r['alias']} · {r['title']}（"
+              + (f"执行候选全部离线，升级 @{r['escalation']['role']}，不是你的现职）"
+                 if r.get("escalation") else f"现在由 {r['active_target']} 受理，不是你的现职）")
               for r in s["candidate_only_roles"]]
     ptrs = [c["path"] for c in s["company_rules"]] + [c["path"] for c in s["project_status"]]
     if not parts and not ptrs:
@@ -1797,18 +1931,32 @@ def print_identity(s):
                 print(f"  - {m['kind']} {m['id']}（{m['name']}）")
         else:
             for m in rows:
-                extra = "" if key == "active_roles" else f"（当前由 {m['active_target']} 受理）"
-                print(f"  - {m['alias']} · {m['title']} → {m['active_target']}{extra}")
+                if key == "active_roles":
+                    extra = ""
+                elif m.get("escalation"):
+                    tgt = m["escalation"]["target"] or "（无在线）"
+                    extra = f"（执行候选全部离线，升级 @{m['escalation']['role']} → {tgt}）"
+                else:
+                    extra = f"（当前由 {m['active_target']} 受理）"
+                print(f"  - {m['alias']} · {m['title']} → {m['active_target'] or '（当前无执行者）'}{extra}")
         if not rows:
             print("  （无）")
+    def _fresh(c):
+        f = c.get("freshness") or {}
+        if f.get("state") == "missing":
+            return "（缺文件）"
+        if f.get("stale"):
+            return f"（来源晚于摘要 AS_OF {f.get('as_of_text') or '?'}，待刷新；仅提示）"
+        return ""
+
     if s["company_rules"]:
         print("COMPANY RULES")
         for c in s["company_rules"]:
-            print(f"  - {c['company']}: {c['path']}")
+            print(f"  - {c['company']}: {c['path']}{_fresh(c)}")
     if s["project_status"]:
         print("PROJECT STATUS")
         for c in s["project_status"]:
-            print(f"  - {c['project']}: {c['path']}")
+            print(f"  - {c['project']}: {c['path']}{_fresh(c)}")
     print(f"AS OF        {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s['as_of']))}")
     print(f"FINGERPRINT  {s['fingerprint']}")
 
@@ -2128,10 +2276,18 @@ def cmd_config(a):
             if spec is None or not isinstance(spec.get("candidates"), list):
                 print(f"  @{name}：不可用（{aerr}）")
                 continue
-            target = alias_target(spec, routes)
-            print(f"  @{name} → {target or '（当前没有在线候选）'}")
+            plan = alias_plan(cfg, name, spec, routes)
+            target = plan["target"]
+            print(f"  @{name} → {target or '（当前没有在线候选）'}"
+                  + ("（升级受理）" if plan["kind"] == "escalation" else ""))
             for c in spec["candidates"]:
                 print(f"    - {_box_mark(c, routes)}")
+            er = spec.get("escalation_role") or ""
+            if er:
+                espec, _eerr = normalize_alias((cfg.get("aliases") or {}).get(er))
+                et = alias_target(espec, routes) if espec else None
+                etitle = (espec or {}).get("role", {}).get("title", "") if espec and espec.get("role") else ""
+                print(f"    升级：执行候选全部离线时 → @{er}（{etitle}）→ {et or '（该上级当前也无在线候选）'}")
             print(f"    切换通知：{'、'.join(spec['notify']) or '（无）'}")
             hpath, hreason = alias_handoff_path(name, spec, cfg)
             print(f"    交接路径：{hreason or hpath or '（无，只作元数据，邮局不读这个文件）'}")
@@ -2183,14 +2339,17 @@ def _box_mark(name, routes):
 
 
 def resolve_send_target(to_arg, routes):
-    """@逻辑地址 → (目标信箱, 解析说明行)；物理信箱名原样返回、没有说明行。
+    """@逻辑地址 → (目标信箱, 解析说明行, plan)；物理信箱名原样返回、plan 为 None。
 
-    只在**发信那一刻**解析一次；解析失败按 CLI 既有文案 sys.exit（正文还没读）。
+    只在**发信那一刻**解析一次；解析失败按 CLI 既有文案 sys.exit（正文还没读）。plan 是同一份
+    统一解析结果（执行目标 / 升级受理），CLI 与面板共用，避免各自解释。
     """
     if not to_arg.startswith("@"):
-        return to_arg, []
-    target, lines, _spec = resolve_alias(require_config("逻辑地址"), to_arg[1:], routes)
-    return target, lines
+        return to_arg, [], None
+    cfg = require_config("逻辑地址")
+    name = to_arg[1:]
+    target, lines, spec = resolve_alias(cfg, name, routes)
+    return target, lines, alias_plan(cfg, name, spec, routes)
 
 
 def ensure_box_inbox(to):
@@ -2199,22 +2358,32 @@ def ensure_box_inbox(to):
         sys.exit(f"没有信箱 {to}；`postoffice list` 看通讯录")
 
 
-def send_letter(sender, to, subject, need, body, alias=None):
-    """把一封普通信写进 to 的 inbox：CLI `send` 与面板 /api/send 唯一的写信路径。"""
-    ensure_box_inbox(to)
-    extra = [f"逻辑地址：{alias}"] if alias else []
+def send_letter(sender, to, subject, need, body, alias=None, plan=None):
+    """把一封普通信写进 to 的 inbox：CLI `send` 与面板 /api/send 唯一的写信路径。
+
+    When the delivery is an escalation (every execution candidate offline), the letter records it
+    in a header so the recipient can tell why it was routed up; it stays an ordinary direct letter
+    (still editable/retractable) -- 升级只报告路由原因，不授予岗位。
+    """
+    extra = []
+    if alias:
+        extra.append(f"逻辑地址：{alias}")
+    if plan and plan.get("kind") == "escalation" and plan.get("escalation"):
+        extra.append(f"升级受理：@{plan['escalation']['role']}（执行候选全部离线）")
+    ensure_box_inbox(to)                 # 目标必须已登记：write_letter 不许把信写到一个新建的目录
     return write_letter(to, sender, subject, clean_need(need), body, extra_headers=extra)
 
 
 def cmd_send(a):
     routes = load_routes()
-    to, lines = resolve_send_target(a.to, routes)
+    to, lines, plan = resolve_send_target(a.to, routes)
     if lines:
         print(f"解析 {a.to} → {to}")
         print("\n".join(lines))
     ensure_box_inbox(to)                 # 先核实目标再读正文：不为打不开的信箱吞掉 stdin
     body = Path(a.file).read_text(encoding="utf-8") if a.file else sys.stdin.read()
-    path = send_letter(a.sender, to, a.subject, a.need, body, alias=a.to if a.to.startswith("@") else None)
+    path = send_letter(a.sender, to, a.subject, a.need, body,
+                       alias=a.to if a.to.startswith("@") else None, plan=plan)
     print(f"已投递：{path}")
     print(f"编号：{path.stem}")
     # stable reference for later edit/retract: <recipient>/<message-id>, no global index needed
@@ -2409,6 +2578,34 @@ def cmd_archive_current(a):
                  f"请人工核对后处理，剩下的下次再来")
     if not moved and not stale and not kept:
         print("没有待归档的已展示消息")
+    return 0
+
+
+def cmd_archive(a):
+    """Explicit exact-id archive: move ONE <box>/inbox/<id>.md to its own done/.
+
+    This is the successor's tool after a rebind: unlike archive-current it does not depend on the
+    presented set (which belongs to the session that was shown the mail), so a new session can file
+    the old inbox letters one explicit id at a time. It scans nothing, accepts no glob or path, never
+    crosses boxes, never overwrites an existing done/ file, and does not ack, reply, send or wake —
+    archiving is filing, not answering.
+    """
+    if not box_name_ok(a.box) or a.box not in boxes(load_routes()):
+        sys.exit(f"没有信箱 {a.box}；`postoffice list` 看通讯录")
+    if not letter_id_ok(a.id):
+        sys.exit("编号必须是本箱 inbox 里的裸文件名：不含路径、通配符或 .md 后缀（完整编号见发信时的「引用：」）")
+    try:
+        state = letter_done_state(a.box, a.id)
+    except OSError as e:
+        sys.exit(f"归档失败（{e}）；一个字节都没动（未覆盖、未移动）")
+    if state == "moved":
+        print(f"已归档：{a.box}/{a.id}（inbox → done）")
+    elif state == "already":
+        print(f"已在 done/（幂等）：{a.box}/{a.id}")
+    elif state == "conflict":
+        sys.exit(f"done/ 已有同名文件，未归档也未覆盖：{a.box}/{a.id}；请人工核对")
+    else:
+        sys.exit(f"没有这封信：{a.box}/inbox/{a.id}.md 不存在（不跨箱、不按通配匹配）")
     return 0
 
 
@@ -3296,13 +3493,17 @@ def notify_once(key, title, text, store=".notify_once.json"):
     return True
 
 
-def switch_reason(old, new, spec):
+def switch_reason(old, new, spec, plan=None):
     """Why the target moved, read off the actual change (never a canned 'went offline')."""
-    cands = spec["candidates"]
+    cands = [str(c) for c in spec["candidates"]]
+    if plan is not None and plan.get("kind") == "escalation":
+        return f"执行候选全部离线，升级至 @{plan['escalation']['role']}"
     if new is None:
         return "候选全离线"
     if old is None:
         return "候选上线"
+    if old not in cands and new in cands:
+        return "执行候选恢复，结束升级"
     if old not in cands or new not in cands:
         return "配置调整"
     if cands.index(new) < cands.index(old):
@@ -3350,7 +3551,8 @@ def process_alias_switches(routes):
             continue
         a = st["aliases"].setdefault(name, {"seen": False, "confirmed": None, "pending": None,
                                             "pending_since": 0.0, "events": {}})
-        target = alias_target(spec, routes)
+        plan = alias_plan(cfg, name, spec, routes)
+        target = plan["target"]
         if not a.get("seen"):
             # First sighting is a baseline, not a switch: it never announces the current target.
             # A baseline with nobody online is remembered as "not announced yet" so the spec's
@@ -3379,7 +3581,7 @@ def process_alias_switches(routes):
             continue
         if time.time() - float(a.get("pending_since") or 0) < ALIAS_STABLE:
             continue
-        reason = switch_reason(confirmed, target, spec)
+        reason = switch_reason(confirmed, target, spec, plan)
         ev = next((e for e in a["events"].values()
                    if e.get("from") == confirmed and e.get("to") == target and not e.get("done")), None)
         if ev is None:
@@ -3390,13 +3592,18 @@ def process_alias_switches(routes):
             seq = st["seq"]
             eid = f"E{seq}_{name}_{confirmed or 'none'}___{target or 'none'}"
             ev = {"id": eid, "seq": seq, "at": time.strftime("%Y%m%d-%H%M%S"),
-                  "from": confirmed, "to": target,
+                  "from": confirmed, "to": target, "kind": plan["kind"],
+                  "escalation": ((plan["escalation"] or {}).get("role", "")
+                                 if plan["kind"] == "escalation" else ""),
+                  "reason": reason,
                   "broadcast": None, "sent": [], "handoff": None, "notified": False, "done": False}
             a["events"][eid] = ev
             save_alias_state(st)                     # persist the id *before* any side effect
         ev.setdefault("sent", [])
         ev.setdefault("seq", st.get("seq", 1))
         ev.setdefault("at", time.strftime("%Y%m%d-%H%M%S"))
+        reason = ev.get("reason") or reason          # resume with the wording frozen at confirmation
+        esc_role = ev.get("escalation") or ""
         notify_boxes = [x for x in (spec.get("notify") or []) if x in routes]
         steps_ok = True
         if ev["broadcast"] != "-" and len(ev["sent"]) < len(notify_boxes):
@@ -3414,15 +3621,23 @@ def process_alias_switches(routes):
                 save_alias_state(st)
             else:
                 landed = set()
+                if esc_role:
+                    bsubj = f"逻辑地址 @{name} 执行岗位无人可接，升级至 @{esc_role}（{target or '无在线候选'}）受理"
+                    bbody = (f"逻辑地址 @{name} 的执行候选全部离线，事项升级至 @{esc_role} 受理。\n"
+                             f"之前：{confirmed or '（无在线候选）'}\n"
+                             f"现在：{target or '（无在线候选）'}（升级受理；未获得 @{name} 岗位）\n"
+                             f"原因：{reason}\n\n"
+                             f"这封信只报告路由变化：不授予任何额外权限、不替人开始工作、不移动已投递的信。")
+                else:
+                    bsubj = f"逻辑地址 @{name} 改由 {target or '（无在线候选）'} 受理"
+                    bbody = (f"逻辑地址 @{name} 的受理信箱有变化。\n"
+                             f"之前：{confirmed or '（无在线候选）'}\n"
+                             f"现在：{target or '（无在线候选）'}\n"
+                             f"原因：{reason}\n\n"
+                             f"这封信只报告收件路由变化：不授予任何额外权限、不替人开始工作、不移动已投递的信。")
                 try:
                     bid, sent = post_broadcast(
-                        "postoffice", notify_boxes, f"逻辑地址 @{name} 改由 {target or '（无在线候选）'} 受理",
-                        "仅告知",
-                        f"逻辑地址 @{name} 的受理信箱有变化。\n"
-                        f"之前：{confirmed or '（无在线候选）'}\n"
-                        f"现在：{target or '（无在线候选）'}\n"
-                        f"原因：{reason}\n\n"
-                        f"这封信只报告收件路由变化：不授予任何额外权限、不替人开始工作、不移动已投递的信。",
+                        "postoffice", notify_boxes, bsubj, "仅告知", bbody,
                         1800, bid=bid, only=pending_boxes, done_set=landed)
                     ev["broadcast"] = bid
                     ev["sent"] = sorted(set(ev["sent"]) | landed)
@@ -3453,13 +3668,23 @@ def process_alias_switches(routes):
                 else:
                     try:
                         hp, hreason = alias_handoff_path(name, spec, cfg, routes)
-                        path = write_letter(target, "postoffice", f"交接：@{name} 现在由你受理", "仅告知",
-                                            f"逻辑地址 @{name} 现在由你受理。\n\n"
-                                            f"之前：{confirmed or '（无在线候选）'}\n"
-                                            f"原因：{reason}\n"
-                                            f"交接路径：{hreason or hp or '（未配置）'}\n\n"
-                                            f"这封提醒只报告收件路由变化：不授予你额外权限、不自动开始任务、"
-                                            f"已投递的旧信不会搬走。",
+                        if esc_role:
+                            hsubj = f"升级：@{name} 执行岗位无人可接，请你（@{esc_role}）处理"
+                            hbody = (f"逻辑地址 @{name} 的执行候选全部离线，按升级配置交由 @{esc_role} 处理。\n\n"
+                                     f"之前：{confirmed or '（无在线候选）'}\n"
+                                     f"原因：{reason}\n"
+                                     f"交接路径：{hreason or hp or '（未配置）'}\n\n"
+                                     f"这是执行岗位无人可接的升级求助，不是把你设为 @{name}；"
+                                     f"不授予你额外权限、不自动开始任务、已投递的旧信不会搬走。")
+                        else:
+                            hsubj = f"交接：@{name} 现在由你受理"
+                            hbody = (f"逻辑地址 @{name} 现在由你受理。\n\n"
+                                     f"之前：{confirmed or '（无在线候选）'}\n"
+                                     f"原因：{reason}\n"
+                                     f"交接路径：{hreason or hp or '（未配置）'}\n\n"
+                                     f"这封提醒只报告收件路由变化：不授予你额外权限、不自动开始任务、"
+                                     f"已投递的旧信不会搬走。")
+                        path = write_letter(target, "postoffice", hsubj, "仅告知", hbody,
                                             extra_headers=[f"切换事件：{ev['id']}"])
                         ev["handoff"] = path.stem
                         log("postman.log", f"alias 交接提醒 {path.name} → {target}")
@@ -4261,7 +4486,10 @@ def alias_rows():
         left = 0
         if a.get("pending") and a.get("pending_since"):
             left = max(0, int(ALIAS_STABLE - (time.time() - float(a["pending_since"]))))
-        out.append({"name": name, "target": alias_target(spec, routes), "confirmed": a.get("confirmed"),
+        plan = alias_plan(cfg or {}, name, spec, routes)
+        out.append({"name": name, "target": plan["target"], "confirmed": a.get("confirmed"),
+                    "kind": plan["kind"], "escalation_role": spec.get("escalation_role") or "",
+                    "escalation": plan["escalation"],
                     "pending": a.get("pending"), "pending_in": left, "notify": spec.get("notify") or [],
                     "handoff": spec.get("handoff") or "",
                     "candidates": [{"name": c, "known": c in routes,
@@ -4600,9 +4828,9 @@ def cmd_panel(a):
                     else:
                         try:
                             routes = load_routes()
-                            to, _lines = resolve_send_target(to_arg, routes)
+                            to, _lines, plan = resolve_send_target(to_arg, routes)
                             path = send_letter(sender, to, subject, need, body,
-                                               alias=to_arg if to_arg.startswith("@") else None)
+                                               alias=to_arg if to_arg.startswith("@") else None, plan=plan)
                             ok = True
                             payload = {"ok": True, "id": path.stem, "ref": f"{to}/{path.stem}"}
                             log("postman.log", f"面板：发信 {sender} → {to}（{path.stem}）")
@@ -4825,6 +5053,10 @@ def main():
     p.add_argument("--keep", action="append", default=[], metavar="信件编号",
                    help="这些还留在 inbox（也不从 presented 里删）；可重复")
     p.set_defaults(fn=cmd_archive_current)
+    p = sp.add_parser("archive", help="按本箱精确编号把一封信从 inbox 归档到 done/（只认裸编号；不扫 inbox、不认通配、不回执、不发信、不叫醒）")
+    p.add_argument("box", help="本信箱")
+    p.add_argument("id", metavar="信件编号", help="完整编号（文件名去掉 .md）；不接受路径、通配符或前缀")
+    p.set_defaults(fn=cmd_archive)
     p = sp.add_parser("alarm-set", help="给一个 OpenCode 会话设一次性闹钟（由插件工具调用；在内核锁内改记录）")
     p.add_argument("--box", required=True, help="该会话绑定的信箱")
     p.add_argument("--session", required=True, help="OpenCode 会话 ID")
