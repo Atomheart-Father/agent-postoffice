@@ -1290,10 +1290,18 @@ def config_errors(cfg, routes):
             elif er not in aliases:
                 errs.append(f"alias {name} 的 escalation_role 指向 {er}，但它不是配置里的逻辑地址")
             else:
-                espec, _eerr = normalize_alias(aliases[er])
-                if not espec or not espec.get("role"):
+                # The escalation pointer must name a role-carrying alias. Whether the target's role
+                # DEFINITION is semantically valid is an org-level concern (org_errors), not core:
+                # a bad role.title on the target must disable identity presentation only, never the
+                # already-legal old routing. So require the target to DECLARE a role (raw `role` key
+                # present) and leave its shape validity to org_errors; only a target that declares no
+                # role at all is a core (pointer) error.
+                raw_target = aliases[er]
+                declares_role = isinstance(raw_target, dict) and raw_target.get("role") is not None
+                espec, _eerr = normalize_alias(raw_target)
+                if not declares_role:
                     errs.append(f"alias {name} 的 escalation_role 指向 {er}，但它不是岗位逻辑地址（缺 role）")
-                elif espec.get("escalation_role"):
+                elif espec is not None and espec.get("escalation_role"):
                     errs.append(f"alias {er} 不能再配 escalation_role：只允许一次升级，避免链式或循环")
         cands = spec["candidates"]
         if not isinstance(cands, list) or not cands:
@@ -1686,13 +1694,19 @@ def status_freshness(path):
     When an existing SOURCE file is newer than AS_OF the pointer is flagged "stale" so a reader
     refreshes it. This uses file mtimes only as a hint: mtime is never approval order, and nothing
     is auto-summarized, auto-updated, or injected into letters.
-    Returns {state: ok|missing, as_of_text, stale, sources: [{path, exists, mtime}]}.
+    Returns {state: ok|missing|unavailable, as_of_text, stale, sources: [{path, exists, mtime}],
+    error?}. Fail-soft: an unreadable/undecodable pointer file (or an unreadable SOURCE entry)
+    yields a diagnosable "unavailable" hint and never breaks the rest of the identity query,
+    the panel, or ordinary routing.
     """
     p = Path(path)
     try:
         text = p.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
         return {"state": "missing", "as_of_text": "", "stale": False, "sources": []}
+    except (OSError, UnicodeDecodeError) as e:
+        return {"state": "unavailable", "as_of_text": "", "stale": False, "sources": [],
+                "error": f"{type(e).__name__}: {e}"}
     m = _AS_OF_LINE_RE.search(text)
     as_of_text = m.group(1).strip() if m else ""
     as_of = _parse_as_of(as_of_text) if as_of_text else None
@@ -1701,8 +1715,11 @@ def status_freshness(path):
         sp = Path(os.path.expanduser(sm.group(1).strip()))
         if not sp.is_absolute():
             sp = p.parent / sp
-        exists = sp.is_file()
-        mt = sp.stat().st_mtime if exists else None
+        try:
+            exists = sp.is_file()
+            mt = sp.stat().st_mtime if exists else None
+        except OSError:
+            exists, mt = False, None
         sources.append({"path": str(sp), "exists": exists, "mtime": mt})
     stale = bool(as_of is not None
                  and any(s["exists"] and s["mtime"] and s["mtime"] > as_of for s in sources))
@@ -1945,6 +1962,8 @@ def print_identity(s):
         f = c.get("freshness") or {}
         if f.get("state") == "missing":
             return "（缺文件）"
+        if f.get("state") == "unavailable":
+            return f"（无法读取取证：{f.get('error') or '读取失败'}；仅提示）"
         if f.get("stale"):
             return f"（来源晚于摘要 AS_OF {f.get('as_of_text') or '?'}，待刷新；仅提示）"
         return ""
