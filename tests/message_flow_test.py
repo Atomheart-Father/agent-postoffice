@@ -512,7 +512,11 @@ class MessageFlow(unittest.TestCase):
         self.assertEqual(rc, 2, err)
         self.assertIn("【联络总站新信｜claude】", err, "单封必须保持现有形态：\n" + err)
         self.assertIn(f"== {p}", err)
-        self.assertIn(p.read_text(encoding="utf-8").splitlines()[0], err)
+        # 单封摘要按解析出的 source/subject/need 生成中性元数据，不回抄信头原始行（§27-32 退修）
+        self.assertIn("来源：boss", err)
+        self.assertIn("事由：单封形态", err)
+        self.assertIn("需要：回复", err)
+        self.assertNotIn("邮局只确认来源信箱", err, "唤醒不得回抄信头括号")
         self.assertIn("按信件", err)
         self.assertEqual(self.presented("claude"), {lid},
                          "送达接受后要把这封记进 presented")
