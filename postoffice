@@ -1038,8 +1038,10 @@ def _codex_batch_text(entries):
 # split on the fixed literal query prefix (never on arbitrary subject content), and the query is kept
 # verbatim so re-render is lossless; the bare stable name/ref come from undoing the shell quoting.
 _CODEX_FORMAL_LINE_RE = re.compile(r"^\d+\. (\S+)/(\S+)  来源：(\S+)  事由：(.*?)  (\S.*)$", re.M)
+# The single-letter shape gained a `引用：` line; older pending items (written before that) lack it,
+# so the line is OPTIONAL and a missing ref is recovered from the real path stem. Both shapes parse.
 _CODEX_SINGLE_FORMAL_RE = re.compile(
-    r"【联络总站新信｜(\S+)】\n引用：(\S+)/(\S+)\n== (\S.*)\n来源：(\S+)\n事由：(.*)\n需要：(.*)")
+    r"【联络总站新信｜(\S+)】\n(?:引用：(\S+)/(\S+)\n)?== (\S.*)\n来源：(\S+)\n事由：(.*)\n需要：(.*)")
 _CODEX_RECEIPT_LINE_RE = re.compile(
     r"^- (\S+)：(.*?)  (查询：postoffice receipt .*)$", re.M)
 _CODEX_SINGLE_RECEIPT_RE = re.compile(
@@ -3023,12 +3025,15 @@ def cmd_archive_current(a):
             stale.append(lid)
     if moved or stale:
         presented_update(a.box, remove=moved + stale)
-    if conflicts:
-        print(f"已归档 {len(moved)} 封已展示过的信到 done/；保留 {len(kept)} 封；清理 {len(stale)} 个失效引用")
-        sys.exit(f"done/ 里已有同名文件，没动也没清 presented：{'、'.join(conflicts)}；"
-                 f"请人工核对后处理，剩下的下次再来")
-    if not moved and not stale and not kept:
+    if not moved and not stale and not kept and not conflicts:
         print("没有待归档的已展示消息")
+        return 0
+    print(f"已归档 {len(moved)} 封到 done/；保留 {len(kept)} 封（--keep）；清理 {len(stale)} 个失效引用")
+    if conflicts:
+        # moved/kept/stale above already happened; be explicit that a conflict is PARTIAL, not "nothing
+        # was touched". We move nothing for the conflicting ids and keep their reference for review.
+        sys.exit(f"另有 {len(conflicts)} 封 done/ 已有同名文件，未归档也未覆盖：{'、'.join(conflicts)}；"
+                 f"请人工核对后处理，剩下的下次再来（已归档/已清理的不回滚）")
     return 0
 
 

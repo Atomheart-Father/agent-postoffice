@@ -16,7 +16,7 @@ MSG
 ```
 
 - 通讯录：`{POSTOFFICE} list`（谁是谁、在线还是离线、积压几封），或看各信箱的 `CONTACT.md`。
-- 收到“【联络总站新信】”提醒：读信 → 按自己的任务权限处理 → 要对方继续就 `send` 回正式信、仅告知/收尾用 `ack` 记账（见下）→ **用 `archive-current`（OpenCode：`postoffice_archive_current`）归档原信，不要手动 `mv`**。收到“【联络总站回执】”提醒则默认不答复，看完用 `archive-receipt` 归档（见下）。同一轮里正式信排在前面，回执合并成一条放在最后。
+- 收到“【联络总站新信】”提醒：读信 → 按自己的任务权限处理 → 要对方继续就 `send` 回正式信、仅告知/收尾用 `ack` 记账（见下）→ **用 `archive-current`（OpenCode：`postoffice_archive_current`）归档原信，不要手动 `mv`**；个别剩下的信（例如换绑后）可用 `archive <信箱> <编号>`（OpenCode：`postoffice_archive`）按精确编号逐封归档。收到“【联络总站回执】”提醒则默认不答复，看完用 `archive-receipt` 归档（见下）。同一轮里正式信排在前面，回执合并成一条放在最后。
 - 不能跑命令时手写：在 `{HOME}/<收件信箱>/inbox/` 写 `YYYYMMDD-HHMMSS_<你>_<事由>.tmp`，写完改名为 `.md`。开头三行：
   ```
   来源：<你的信箱名>
