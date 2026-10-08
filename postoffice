@@ -1660,9 +1660,10 @@ def identity_snapshot(box, routes, cfg, ok=True, error="", now=None):
     if not box or not snap["registered"]:
         return snap
     comp, proj = org_tables(cfg)
-    # "a section was configured" — distinct from "it validates": a BROKEN organization section still
-    # shows up (so callers can say it is disabled and why), while no section at all stays silent
-    snap["org_present"] = isinstance((cfg or {}).get("organization"), dict)
+    # 「有没有配 organization」按**字段是否存在**判断，不按它的类型/是否非空：
+    # organization=[] 或写成字符串都属于「配了但坏了」，必须由既有校验给出停用原因；
+    # 完全没有这个字段才算未配置（此时才静默）。
+    snap["org_present"] = isinstance(cfg, dict) and "organization" in cfg
     if not ok:
         return snap            # organization presentation disabled: no fabricated duties, no card text
     for cid in sorted(comp):
