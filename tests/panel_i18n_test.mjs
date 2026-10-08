@@ -317,7 +317,6 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
     ["actLabel", "活动", "Activity"],
     ["actHuman", "人类", "Human"],
     ["appearance", "外观", "Appearance"],
-    ["themeSystem", "跟随系统", "System"],
     ["themePaper", "纸白", "Paper"],
     ["themeNight", "夜", "Night"],
     ["themeMist", "雾", "Mist"],

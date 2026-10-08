@@ -59,7 +59,7 @@ The big red button, the operator button, or any seat opens a **centred window** 
 - **Activity** (left drawer): where each logical address points now, switch history, broadcast progress, the latest delivery log.
 - **Compose**: in this window the sender is always the operator (the HTTP API itself accepts any registered `from`, see docs/GOVERNANCE.zh-CN.md); the recipient is a mailbox name or `@logical-address` (with suggestions); never a group.
 - **中文 / English**: redraws only, no write request; user content (mailbox names, subjects, bodies, logs) is always shown verbatim.
-- **Appearance** (seven small squares, top right): System (paper by day, night when the OS is dark) or Paper / Night / Mist / Blueprint / Pine / Ember. Stored in this browser only.
+- **Appearance** (six small squares, top right): Paper / Night / Mist / Blueprint / Pine / Ember. There is no "follow the system" — the palette you pick is the palette you keep, on reload and when you arrive from a Slack link. Stored in this browser only.
 
   ![Six palettes](screenshots/themes.png)
 
