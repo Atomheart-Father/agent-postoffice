@@ -955,7 +955,7 @@ function orgHTML() {
   const mine = opOK ? waitingOf(boxOf(op)) : 0;
   const rootBox = root.mailbox ? boxOf(root.mailbox) : null;
 
-  const cols = (root.children || []).map((c, i) => {
+  const cols = kidsOf(root).map((c, i) => {   // the root's own members are seats too, one column each
     const hid = "h" + i;
     NODES[hid] = { parent: "root", kind: "head" };
     const seats = seatsUnder(c).filter((s) => boxOf(s));
@@ -1319,7 +1319,7 @@ function inspectorHTML() {
         ${tabs}
         <button type="button" class="close-x" data-ins-close="1">${esc(t("close"))}</button>
       </header>
-      <div class="dbody">
+      <div class="dbody" id="ins-body">
         <div class="list sb" id="ins-list">${insTab === "outbox" ? outboxHTML() : rows}</div>
         <div class="pane sb" id="ins-pane">
           ${head}
@@ -1431,6 +1431,7 @@ const focusSel = (a) => {   // a selector that finds the same control again afte
   try {
     if (!a || !a.getAttribute) return "";
     const g = (k) => a.getAttribute(k);
+    if (hasCls(a, "dlg")) return ".dlg";
     if (g("data-ins-tab")) return `[data-ins-tab="${qa(g("data-ins-tab"))}"]`;
     if (g("data-ins-close") && hasCls(a, "close-x")) return ".close-x[data-ins-close]";
     if (g("data-compose")) return "[data-compose]";
@@ -1563,7 +1564,7 @@ function letterHTML(d) {
     </div>
     <footer class="sf">
       <button type="button" class="btn ghost" data-letter-action="done">${esc(t("fileDone"))}</button>
-      <button type="button" class="btn" data-letter-action="ack" ${opOK ? "" : "disabled"}>${esc(t("ackFile"))}</button>
+      <button type="button" class="btn" data-letter-action="ack" ${opOK && !sent ? "" : "disabled"}>${esc(t("ackFile"))}</button>
       ${sent
         ? `<button type="button" class="btn primary" data-letter-action="retry">${esc(t("retryArchive"))}</button>`
         : `<button type="button" class="btn primary" data-letter-action="reply" ${opOK ? "" : "disabled"}>${esc(t("replySendFile"))}</button>`}
@@ -1879,7 +1880,7 @@ function renderBoxes() {
   let ins = insOpen ? inspectorHTML() : "";
   if (insOpen && !ins) insOpen = false;          // nothing to show (no mailbox left): never leave the page locked behind an empty window
   const html = (view === "org" ? orgHTML() : "") + ins;
-  if (paintInto("boxes", html, ["ins-list", "ins-pane"])) { redrawFx(); }
+  if (paintInto("boxes", html, ["ins-body", "ins-list", "ins-pane"])) { redrawFx(); }
   syncLayerState();      // the org wrapper is a new node after a repaint: re-apply inert
 }
 
@@ -2079,9 +2080,10 @@ async function handleLetterAction(action) {
   if (action === "close") return closeLetter();
   if (!currentLetter) return;
   const { box, id } = currentLetter;
-  if (action === "reply") return openCompose("reply");
+  if (action === "reply") { if (replySent.has(`${box}/${id}`)) return; return openCompose("reply"); }   // a reply is already out: never a second one
   if (action === "retry") return retryArchiveOnly(box, id);
   if (action === "ack") {
+    if (replySent.has(`${box}/${id}`)) return;   // the reply already answered it: only filing may be retried, never an ack
     try {
       const r = await fetch("/api/ack-one", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ box, id }) });
@@ -2238,9 +2240,32 @@ function handleDeepLink() {
 try { window.addEventListener && window.addEventListener("hashchange", handleDeepLink); } catch {}
 
 // Escape closes the top layer: compose, then the Activity drawer, then the letter, then the workbench
+// Tab stays inside the top layer (inert hides the page behind, but only a wrap-around keeps focus off the browser chrome and the address bar)
+function trapTab(e) {
+  try {
+    if (typeof document.querySelectorAll !== "function") return;
+    let roots = [];
+    if (composeOpen()) roots = [$("compose-card")];
+    else if (drawerOpen()) roots = [$("drawer")];
+    else if (letterOpen()) roots = hasCls($("letter"), "docked") ? [$("letter"), $("ins")] : [$("letter")];
+    else if (insOpen) roots = [$("ins")];
+    roots = roots.filter(Boolean);
+    if (!roots.length) return;
+    const sel = 'button:not([disabled]),input:not([disabled]),textarea:not([disabled]),select,a[href],[tabindex]:not([tabindex="-1"])';
+    const items = [];
+    for (const r of roots) for (const n of r.querySelectorAll(sel)) if (n.getClientRects().length) items.push(n);
+    if (!items.length) return;
+    const a = document.activeElement, i = items.indexOf(a);
+    const inside = roots.some((r) => r.contains(a));
+    if (e.shiftKey) { if (i <= 0) { e.preventDefault(); items[items.length - 1].focus(); } }
+    else if (i === items.length - 1 || !inside) { e.preventDefault(); items[0].focus(); }
+  } catch {}
+}
 try {
   document.addEventListener("keydown", (e) => {
-    if (!e || e.key !== "Escape") return;
+    if (!e) return;
+    if (e.key === "Tab") return trapTab(e);
+    if (e.key !== "Escape") return;
     closeTopLayer();
   });
 } catch {}

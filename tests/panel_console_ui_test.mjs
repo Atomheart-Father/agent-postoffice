@@ -379,6 +379,12 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   has(h.els["letter-status"].textContent, "回复已经发送，原信归档失败", "部分失败横幅");
   has(detail(h), "重试归档", "只提供重试归档按钮");
   hasNot(detail(h), "回复（发送回复并归档）", "不再提供再次回复");
+  // after a sent reply the original can only be filed: acknowledging is disabled AND refused by the handler
+  has(detail(h), 'data-letter-action="ack" disabled', "回复已发出后「收到并归档」按钮禁用");
+  h.calls.length = 0;
+  letterAct("ack")(h); await settle();
+  is(posts(h, "/api/ack-one").length, 0, "回复已发出后即使触发 ack 也不发请求");
+  is(posts(h, "/api/send").length, 0, "回复已发出后不会再 send");
   h.calls.length = 0;
   letterAct("retry")(h); await settle();
   is(posts(h, "/api/send").length, 0, "重试归档不再 send");

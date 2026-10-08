@@ -78,6 +78,16 @@ const seatCount = (h, name) => (h.match(new RegExp(`class="item seat[^"]*" data-
   is((e2.els["boxes"].innerHTML.match(/class="col"/g) || []).length, 1, "one column for one child");
 }
 
+// ---- 1b) members directly on the root are seats too ----
+{
+  const S = mk([box("ceo", "Manual"), box("a", "Zeta"), box("b", "Zeta")],
+    { ok: true, label: "", operator: "ceo", organization: { mailbox: "ceo", label: "Boss", members: ["a", "b"], children: [] } });
+  const e = env(S); await settle();
+  const h = e.els["boxes"].innerHTML;
+  is(seatCount(h, "a"), 1, "a root member is a seat"); is(seatCount(h, "b"), 1, "second root member is a seat");
+  hasNot(h, "Not in the organization", "root members are not reported as outside the tree");
+}
+
 // ---- 2) no organization: one column per app under the operator, with the reason on screen ----
 {
   const S = mk([box("ceo", "Manual"), box("a", "Zeta"), box("b", "Zeta"), box("c", "Omega")], { ok: true, label: "Foo", operator: "ceo", organization: null });
