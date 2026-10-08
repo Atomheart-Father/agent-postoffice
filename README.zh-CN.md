@@ -105,6 +105,14 @@ MSG
 - **Slack 操作员提醒（可选，仅出站）**：设置 `POSTOFFICE_SLACK_WEBHOOK` 后，操作员信箱确认收到正式信时，邮递员会发一条简短 Slack 提醒（发件方、事由、需要、深链——绝不带正文；一轮多封合并成一条「N 封」加收件链接）。尽力而为、约 3 秒超时：慢、失败甚至挂起的 webhook 绝不改变投递结果、绝不重试，最多让那一轮短暂等一下。webhook 地址是机密：只从环境变量读，绝不写进 `config.json`、`routes.json`、状态文件、HTML、日志或本仓库。没有任何入站——Slack 不能往邮局发信。
 - **私有运行设置（可选）：`$POSTOFFICE_HOME/.env`** —— launchd 起的邮递员/面板不继承你终端的 export，这个极小的 stdlib 文件（启动时读取；只认 `POSTOFFICE_*` 键；无 shell 语法、无变量展开；process env 永远赢过 `.env`；坏行安全跳过且诊断不回显内容）就是放它们的地方。示例（全是假值）：`POSTOFFICE_SLACK_WEBHOOK=https://hooks.slack.com/services/T000/B000/XXXX`、`POSTOFFICE_PANEL_BASE_URL=https://machine.example.ts.net`。记得 `chmod 600`；它只在你本机 HOME，**不属于本仓库**，也绝不写进 `routes.json`/`config.json`、状态、HTML 或日志。改完重启邮递员/面板生效。
 
+### v1.13：发件箱、运行状态、外观、移动端
+
+- **发件箱（操作性视图，不是永久已发送历史）**：工作台有 收件箱 | 发件箱 一对内部标签。发件箱列出操作员**仍然可观察**的已发普通信：请求时（GET `/api/outbox`）现扫所有已登记信箱的 `inbox/`，取来源是操作员、且不是回执/广播/闹钟/切换事件通知（也不是 `postoffice` 发的）的普通直发信。不复制、不落库：一旦归档、投递或被回执，行就消失，所以它是「现在还能动的东西」的快照，绝不是「发过的全部都记得」的日志。每行显示冻结的收件人、事由/需要、发信时写死的 `逻辑地址：` 信头（绝不重新解析），以及状态：**pending**（仍可改/撤回）或 **locked / unknown**（附中文原因：通道已接受、在途、或通道未知），locked/unknown 不给按钮。改 / 撤回走 POST `/api/edit-one`、POST `/api/retract-one`，与 CLI `edit`/`retract` 同一核心：发信方永远是 `panel.operator`（请求里的 `from`/`sender` 一概忽略），POST 时重新认领并复检，所以列表说 pending 也可能在竞争里失败（fail closed）；改是原地改事由/需要/正文（编号、来源、收件人不变），撤回把原信移进 `archived/`、不通知、不产生第二封信。
+- **运行状态（纯呈现）**：每个信箱带一个活动徽章——运行中 / WORKING、空闲 / IDLE 或 未知 / UNKNOWN，加时长（如 `· 17m`、`· 4h 12m`）——出现在组织树、Harness rack 和工作台里。信号存在 `$POSTOFFICE_HOME/runtime/activity/<box>.json`（`{state, since, observed, source, binding}`），由 OpenCode 插件（会话忙/闲）和 Claude `UserPromptSubmit` 钩子（`postoffice activity --state working`）尽力写入，**绝不参与 routing**：删掉整个 `runtime/` 目录，投递一字不变。只有记录里的通道身份仍与该信箱当前会话身份一致、且观测不超过 30 分钟时才显示状态，否则是 UNKNOWN。人类操作员永远显示 人类 / HUMAN，绝不假装 IDLE。
+- **外观**：顶栏 跟随系统 / 浅色 / 深色（SYSTEM / LIGHT / DARK）控件设置 `data-theme` 与 `color-scheme`；选择存在 `localStorage["postoffice.theme"]`，`<head>` 里的小引导脚本在首帧前应用（不闪浅色），存储不可用时回退 SYSTEM。只重画——不发写请求、不改语言。
+- **移动端 / iPad**：窄屏工作台首屏关闭、点节点打开，发件箱标签可达；布局用 `env(safe-area-inset-*)`、`100dvh` 和 ≥16px 表单控件（iOS 不缩放），且没有比视口更宽的固定面板（≤900px 时 inspector 变 `width:100vw`）。
+- **来源（provenance）**：信头中立地写明来源信箱——`来源：<sender>（邮局只确认来源信箱；该来源的身份与权限按当前项目的组织/角色约定处理。）`——唤醒文案同样带 `来源：<sender>`。运输层不再替来源主张「是不是人/是不是老板指令」，交给项目自己的组织/角色约定。
+
 界面一览（BOXZ 示例数据，1600×1000，中文界面）：
 
 | 组织视图（右侧为操作员工作台） | Harness（按真实 method 分组） |

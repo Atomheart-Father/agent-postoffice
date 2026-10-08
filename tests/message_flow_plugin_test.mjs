@@ -135,6 +135,12 @@ const textOf = (p) => p.body.parts[0].text
 const count = (text, needle) => text.split(needle).length - 1
 const promptsFor = (sid) => state.prompts.filter((p) => p.path.id === sid)
 
+// putLetter 默认写的是「旧格式」来源行（带旧身份断言）：单封/多封唤醒都不许把它再注入
+const FORBIDDEN = ['不是人的新指令', '协作者', '非人类指令', '这是人类指令', '这是老板指令']
+const assertNeutral = (text, label) => {
+  for (const p of FORBIDDEN) assert.ok(!text.includes(p), `${label} 不得注入旧身份断言 ${p}：\n${text}`)
+}
+
 const putLetter = async (box, id, { source = 'boss', subject = '事由', need = '回复', body = '正文' } = {}) => {
   await writeFile(join(root, box, 'inbox', `${id}.md`),
     `来源：${source}（协作者，不是人的新指令）\n事由：${subject}\n需要：${need}\n\n${body}\n`)
@@ -188,6 +194,7 @@ await t('批量：3 封普通信一批一次 prompt，batch 形态，逐封台�
   assert.ok(text.includes('事由：甲事') && text.includes('事由：乙事') && text.includes('事由：丙事'),
     'batch 行必须带事由：\n' + text)
   assert.ok(!text.includes(SENTINEL), '正文永不注入')
+  assertNeutral(text, '多封唤醒')
   assert.equal(count(text, '按各信'), 1, '公共 tail 只出现一次')
   assert.equal(count(text, 'postoffice skill'), 1)
   assert.deepEqual((await deliveredRows(box)).map((r) => r.file).sort(),
@@ -212,6 +219,7 @@ await t('批量：一批只算一次限流（6 封一批后，第 7 封仍能投
     '一批只该计一次限流；若按封计数，第 7 封会被 6 次窗口挡住')
   assert.ok(textOf(promptsFor(sid)[before + 1]).includes(join(root, box, 'inbox', `${last}.md`)),
     '第 7 封要真的投出去（单封形态给的是绝对路径）')
+  assertNeutral(textOf(promptsFor(sid)[before + 1]), '单封唤醒（旧格式来源）')
 })
 
 await t('批量：超过 20 封分轮（第一轮 20，下一轮剩下的）', async () => {
@@ -231,6 +239,7 @@ await t('批量：超过 20 封分轮（第一轮 20，下一轮剩下的）', a
   assert.ok(!t1.includes(ids[20]), '第一轮不该带上第 21 封')
   assert.equal((t2.match(/^\d+\. /gm) || []).length, 0, '只剩 1 封时回到单封形态')
   assert.ok(t2.includes(`【联络总站新信｜${box}】`), '单封保持现有形态：\n' + t2)
+  assertNeutral(t2, '单封唤醒（旧格式来源）')
   assert.ok(t2.includes(ids[20]))
 })
 
