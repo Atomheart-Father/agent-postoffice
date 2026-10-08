@@ -1,3 +1,5 @@
+> **Historical record** (written for the release it names; kept for the reasoning and evidence). It is not current usage documentation: for how things work now, read the README and docs/PANEL_GUIDE.md.
+
 # 开发说明 v1.6：稳定认人、只为真阻塞提醒、回执合并排后
 
 发起：T0（2026-10-05 批准三项）。规格/审核：postoffice_admin（Claude「‼️POSTOFFICE」）；联审：postoffice_codex。开发：postoffice_lab。

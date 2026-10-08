@@ -1,3 +1,5 @@
+> **Historical record** (written for the release it names; kept for the reasoning and evidence). It is not current usage documentation: for how things work now, read the README and docs/PANEL_GUIDE.md.
+
 # v1.7 实施规格：分组开关、逻辑地址与切换广播
 
 状态：已按用户需求及管理员转述授权进入实施；不是发布或部署授权。

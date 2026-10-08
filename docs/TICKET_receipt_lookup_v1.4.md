@@ -1,3 +1,5 @@
+> **Historical record** (written for the release it names; kept for the reasoning and evidence). It is not current usage documentation: for how things work now, read the README and docs/PANEL_GUIDE.md.
+
 # 开发记录：回执只提醒编号，内容按需查询（v1.4）
 
 本文记录 v1.4 的设计、实施与验收证据。基线：`9f46a10`（v1.3）。由两个 AI 会话协作完成：一个实现、一个设计验收。

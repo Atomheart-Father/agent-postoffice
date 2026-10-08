@@ -83,7 +83,7 @@ function makeEnv({ langs = ["en-US"], storage = new Map(), storageThrows = false
   // v1.13: theme group (labels/aria-pressed are set by applyLang, mirroring `langs`)
   const thBtn = (c) => ({ dataset: { themeChoice: c }, textContent: "", attrs: {},
     setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } });
-  els["theme"].children = [thBtn("system"), thBtn("light"), thBtn("dark")];
+  els["theme"].children = ["system", "paper", "night", "mist", "blueprint", "pine", "ember"].map(thBtn);
 
   const localStorage = {
     getItem: (k) => { if (storageThrows) throw new Error("denied"); return storage.has(k) ? storage.get(k) : null; },
@@ -128,6 +128,11 @@ function makeEnv({ langs = ["en-US"], storage = new Map(), storageThrows = false
   return { ctx, els, calls, confirmations, fire, storage };
 }
 const settle = () => new Promise((r) => setTimeout(r, 0));
+// the workbench is a dialog that starts closed: open one mailbox's before reading its letters and counts
+const openBox = async (e, name = 'dev"one') => {
+  e.fire("boxes", "click", { target: { closest: (s) => (s === "[data-box]" ? { dataset: { box: name } } : null) } });
+  await settle();
+};
 
 const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
 
@@ -135,15 +140,16 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
 {
   const a = makeEnv({ langs: ["zh-Hans-CN"] }); await settle();
   is(a.els["title"].textContent, "联络总站", "zh 浏览器默认中文");
-  is(a.els["h-groups"].textContent, "分组与逻辑地址", "zh 下分组标题是中文");
+  is(a.els["h-groups"].textContent, "分组", "zh 下分组标题是中文");
   const b = makeEnv({ langs: ["en-GB", "zh"] }); await settle();
   is(b.els["title"].textContent, "Post Office", "非 zh 浏览器默认英文（含 zh 在第二顺位）");
-  is(b.els["h-groups"].textContent, "Groups and logical addresses", "en 下分组标题是英文");
+  is(b.els["h-groups"].textContent, "Groups", "en 下分组标题是英文");
 }
 
 // 2) A manual choice switches every visible string and only redraws — no write call, no wake-up.
 {
   const e = makeEnv({ langs: ["en-US"] }); await settle();
+  await openBox(e);
   has(e.els["boxes"].innerHTML, "2 waiting / 1 reminded to file", "英文下数量文案正确");
   has(e.els["boxes"].innerHTML, ">reminded, to file<", "英文下逐封状态文案正确");
   const writesBefore = e.calls.filter((c) => c.method !== "GET").length;
@@ -181,6 +187,7 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
 // 4) User content is shown verbatim (escaped, never translated); our wording is translated.
 {
   const e = makeEnv({ langs: ["zh-Hans-CN"] }); await settle();
+  await openBox(e);
   const b = e.els["boxes"].innerHTML;
   has(b, "dev&quot;one", "信箱名里的引号被转义");
   hasNot(b, 'dev"one', "信箱名原样引号没有漏进 HTML");
@@ -207,6 +214,7 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
                   "1 failed delivery needing a human", "inbox"], "2 封待投递"],
   ]) {
     const e = makeEnv({ langs: [l] }); await settle();
+    await openBox(e);
     e.fire("boxes", "click", { target: target(".clear", { dataset: { clear: "dev_one", w: "2", r: "1",
                                                                     f: "1", n: "4" } }) });
     await settle();
@@ -219,9 +227,11 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
   }
   // The button must pass the real counts from the snapshot, including failed.
   const btn = makeEnv({ langs: ["en-US"] }); await settle();
+  await openBox(btn);
   has(btn.els["boxes"].innerHTML, 'data-f="1"', "归档按钮带上投递失败数量");
   has(btn.els["boxes"].innerHTML, 'data-n="4"', "归档按钮带上收件箱总数");
   const none = makeEnv({ langs: ["en-US"] }); await settle();
+  await openBox(none);
   is((none.els["boxes"].innerHTML.match(/data-clear=/g) || []).length, 1,
      "只有有信的信箱显示归档按钮（空信箱不给按钮）");
 }
@@ -296,20 +306,24 @@ const target = (sel, props) => ({ closest: (s) => (s === sel ? props : null) });
   const e = makeEnv({ langs: ["en-US"] }); await settle();
   const S = (l, k) => vm.runInContext(`STR.${l}.${k}`, e.ctx);
   const exact = [
-    ["tabInbox", "收件箱", "INBOX"],
-    ["tabOutbox", "发件箱", "OUTBOX"],
+    ["tabInbox", "收件箱", "Inbox"],
+    ["tabOutbox", "发件箱", "Outbox"],
     ["outboxEmpty", "暂无当前可观察的已发普通信", "No observable outgoing mail right now"],
     ["outboxLocked", "已送达，不能修改", "Delivered — locked"],
     ["outboxUnknown", "状态无法确认，不能修改", "Status unknown — locked"],
-    ["actWorking", "运行中", "WORKING"],
-    ["actIdle", "空闲", "IDLE"],
-    ["actUnknown", "未知", "UNKNOWN"],
-    ["actLabel", "活动", "ACTIVITY"],
-    ["actHuman", "人类", "HUMAN"],
+    ["actWorking", "运行中", "Working"],
+    ["actIdle", "空闲", "Idle"],
+    ["actUnknown", "未知", "Unknown"],
+    ["actLabel", "活动", "Activity"],
+    ["actHuman", "人类", "Human"],
     ["appearance", "外观", "Appearance"],
-    ["themeSystem", "跟随系统", "SYSTEM"],
-    ["themeLight", "浅色", "LIGHT"],
-    ["themeDark", "深色", "DARK"],
+    ["themeSystem", "跟随系统", "System"],
+    ["themePaper", "纸白", "Paper"],
+    ["themeNight", "夜", "Night"],
+    ["themeMist", "雾", "Mist"],
+    ["themeBlueprint", "蓝图", "Blueprint"],
+    ["themePine", "松", "Pine"],
+    ["themeEmber", "炭", "Ember"],
   ];
   for (const [k, zh, en] of exact) {
     is(S("zh", k), zh, `STR.zh.${k} 精确值「${zh}」`);

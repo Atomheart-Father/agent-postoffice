@@ -1,3 +1,5 @@
+> **Historical record** (written for the release it names; kept for the reasoning and evidence). It is not current usage documentation: for how things work now, read the README and docs/PANEL_GUIDE.md.
+
 # 小票交付：20 分钟未确认唤醒提醒同步 Slack
 
 - 工作树：`/Users/bozhongxiao/code/po-slack-grace`，分支 `slack-grace-timeout`，基线 `ce14581c185d5447bed65182ce65538f19cb1171`（master v1.12.4）。

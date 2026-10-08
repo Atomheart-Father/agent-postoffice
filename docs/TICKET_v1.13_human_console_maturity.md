@@ -1,3 +1,5 @@
+> **Historical record** (written for the release it names; kept for the reasoning and evidence). It is not current usage documentation: for how things work now, read the README and docs/PANEL_GUIDE.md.
+
 Q-TICKET-V1-13-HUMAN-CONSOLE-MATURITY-01
 
 Postoffice v1.13

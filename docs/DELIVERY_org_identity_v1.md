@@ -1,3 +1,5 @@
+> **Historical record** (written for the release it names; kept for the reasoning and evidence). It is not current usage documentation: for how things work now, read the README and docs/PANEL_GUIDE.md.
+
 # 交付：组织与身份标准化 v1（PO-ORG-IDENTITY-V1）
 
 - 隔离 worktree：`/Users/bozhongxiao/code/po-org-identity`

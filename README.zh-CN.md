@@ -31,7 +31,7 @@
 - **兜底**：会话没开、送不到，20 分钟后弹一次系统通知给你——计时起点取“信落地”和“该信箱最近一次上线”里更晚的那个，离线时长不计（`online_since` 只在真正离线→在线时更新，重复点在线不刷新；升级时已在线又没基线的信箱，以邮递员首次以新版运行的时间补基线）；提醒送到了但**需要处理**的信 30 分钟还躺在 inbox 里（会话卡住、Codex 线程没加载等），也弹一次。分类：回执通知/广播汇总、`需要：仅告知` → 不提醒；`需要：回复`/`审核`、自由文本只含肯定词（回复/审核/处理/修改/决定/确认）→ 提醒；自由文本只含否定词（仅告知/无需/不用回/默认不答复/无需操作）→ 不提醒；正负混合或识别不了 → 仍提醒（不宣称零误报）。`仅告知`、回执通知、广播汇总只算积压、不打扰人。
 - 纯标准库 Python 3.9+，无第三方依赖；macOS 优先（Linux 能用，通知用 `notify-send`，邮递员需自己常驻）。
 
-## 安装（三步）
+## 安装
 
 ```bash
 git clone https://github.com/Atomheart-Father/agent-postoffice.git ~/code/agent-postoffice
@@ -41,7 +41,7 @@ git clone https://github.com/Atomheart-Father/agent-postoffice.git ~/code/agent-
 安装脚本会（全部可重复运行，改动前自动备份到 `~/agent-postoffice/logs/`）：
 
 1. 建邮局目录 `~/agent-postoffice/`，把命令链接到 `~/.local/bin/postoffice`；
-2. 给 Claude Code 加两个钩子（`~/.claude/settings.json` 的 Stop、SessionStart，`asyncRewake`）；
+2. 给 Claude Code 加三个钩子（`~/.claude/settings.json` 的 Stop、SessionStart、UserPromptSubmit，`asyncRewake`；SessionStart 还会打印一行身份提示，UserPromptSubmit 为面板的活动徽章记「正在干活」）；
 3. 给 OpenCode 装全局插件（`~/.config/opencode/plugins/postoffice.ts`），并允许 OpenCode 读写邮局目录；
 4. 把技能 `postoffice` 装进 `~/.claude/skills`、`~/.agents/skills`（Codex/OpenCode 也读这里），让各家 AI 一看就会用；
 5. macOS 上把邮递员设为开机自启（launchd）。
@@ -79,7 +79,7 @@ MSG
 
 | 命令 | 作用 |
 |---|---|
-| `postoffice panel` | 打开网页操作面板（只监听本机 127.0.0.1），含广播回执进度、分组开关与逻辑地址当前解析对象 |
+| `postoffice panel [--port 8765] [--no-open]` | 打开网页操作面板（[使用指南](docs/PANEL_GUIDE.zh-CN.md)；只监听本机 127.0.0.1），含广播回执进度、分组开关与逻辑地址当前解析对象 |
 | `postoffice config import ./postoffice-config.json` | 导入 `config.json`（分组与逻辑地址）：先校验、备份旧文件、临时文件原子替换；整文件替换，不做合并 |
 | `postoffice config show` | 只读查看：有哪些分组、逻辑地址、各自现在解析到谁（不创建配置、不改状态） |
 | `postoffice offline @codex` / `online @codex` / `clear @codex` | 整组开关（`@` 加分组名）：先校验全部成员，再套用现有单信箱行为 |
@@ -100,12 +100,14 @@ MSG
 
 ## 人类控制台：组织、Harness 与操作员信箱（可选，v1.12）
 
+使用、优化、维护见 [docs/PANEL_GUIDE.zh-CN.md](docs/PANEL_GUIDE.zh-CN.md)（English: [PANEL_GUIDE.md](docs/PANEL_GUIDE.md)）；视觉系统见 [DESIGN.md](DESIGN.md)。
+
 `postoffice panel` 是同一份真相文件之上的**人类控制面**，绝不是第二个邮局：
 
 - **组织视图**渲染 `config.json` 里可选的 `panel` 段：一棵纯展示用树（节点 = `mailbox` 或 `members` 同级对，可带 `label` 与 `children`）。它对真相文件是纯装饰——`panel` 段写坏只会在**这一个视图**报错，physical 发信、`@` 逻辑地址、分组、邮递员、Harness 和每个信箱照常工作，`routes.json` 字节不变。（示例里的 BOXZ 只是示例数据；任何项目都可以描述自己的树，ACME 形状的树工作方式完全相同。）
-- **未分配（UNASSIGNED）**：已注册但组织树**没有安排**的信箱仍会列出——自动出现在「未分配」区域，不会被漏写配置而静默隐藏。纯展示：邮局绝不改 `config.json`、绝不按名字或 harness 猜部门；该信箱照常打开工作台、收发信、开关在线；一旦你把它写进树，它就从「未分配」消失、出现在正式位置。每个信箱全树最多出现一次。
+- **未编入组织**：已注册但组织树**没有安排**的信箱仍会列出——自动出现在「未编入组织」区域，不会被漏写配置而静默隐藏。纯展示：邮局绝不改 `config.json`、绝不按名字或 harness 猜部门；该信箱照常打开工作台、收发信、开关在线；一旦你把它写进树，它就从「未分配」消失、出现在正式位置。每个信箱全树最多出现一次。
 - **Harness** 按 `routes.json` 里真实的 `method`（claude_hook / opencode_plugin / codex_queue / notify）分组，ON / OFF / MIXED 每次渲染实时派生、绝不持久化。只有当某个 `groups` 配置的成员集与一个 rack **恰好相等**时才显示整组开关，否则每个会话保留自己的开关——这里不重新实现任何分组引擎，按钮调的还是同一个 status 接口。
-- **人类操作员**：`panel.operator` 点名一个信箱（通常是人的 `--notify` 信箱）。它的横条在组织视图顶部——点它（或右上角 OPERATOR 徽章）进入收件工作台：待办「需要」列表 → 最近回执 → 技术元数据。operator 无效时一切照常可读，但写信 / 回复 / 回执会禁用并说明原因。
+- **人类操作员**：`panel.operator` 点名一个信箱（通常是人的 `--notify` 信箱）。组织页上的大红按钮「N 封信等你处理」（或右上角操作员按钮、或点任意席位）会弹出收件箱**弹窗**，所有屏幕宽度一致（Esc、「关闭」键或点窗口外都能关；背景锁定不可点）：待办「需要」列表 → 最近回执 → 技术元数据。operator 无效时一切照常可读，但写信 / 回复 / 回执会禁用并说明原因。
 - **写信 / 回复 / 回执 / 归档**：＋写信以操作员身份发信（收件人 = 信箱或 `@` 逻辑地址；分组拒绝）。回复预填规范发信方与 `Re:` 主题，走 `/api/send` 发出后把原信归档——正式回复**绝不**再发 `ack`（否则对方收两份）。若发送成功但归档失败，页面明确提示并只提供「重试归档」（绝不二次发送；已回复记录只活在本页会话）。收到并归档走 `/api/ack-one`（recorded / already / receipt_notice 三态）；仅归档走 `/api/archive-one`（不发回执）。打开一封信是零副作用的纯读。
 - **深链**：`#/mail/<box>` 直达某信箱工作台；`#/mail/<box>/<id>` 直达某封信。深链一次性消费（hash 经 `history.replaceState` 清除）：关闭后不会被 5 秒刷新重新拉起，浏览器后退也不会重放已消费的链接；非法深链只提示一次。
 - **远程访问（可选）**：面板仍只监听 `127.0.0.1`。设置 `POSTOFFICE_PANEL_BASE_URL=https://host.ts.net` 后深链使用该前缀，且写接口只放行这**一个精确** Origin——不支持通配符、后缀匹配、`X-Forwarded-Host`，值非法时面板拒绝启动。推荐隧道是 `tailscale serve`；不开它，localhost 照常用。
@@ -114,21 +116,23 @@ MSG
 
 ### v1.13：发件箱、运行状态、外观、移动端
 
-- **发件箱（操作性视图，不是永久已发送历史）**：工作台有 收件箱 | 发件箱 一对内部标签。发件箱列出操作员**仍然可观察**的已发普通信：请求时（GET `/api/outbox`）现扫所有已登记信箱的 `inbox/`，取来源是操作员、且不是回执/广播/闹钟/切换事件通知（也不是 `postoffice` 发的）的普通直发信。不复制、不落库：一旦归档、投递或被回执，行就消失，所以它是「现在还能动的东西」的快照，绝不是「发过的全部都记得」的日志。每行显示冻结的收件人、事由/需要、发信时写死的 `逻辑地址：` 信头（绝不重新解析），以及状态：**pending**（仍可改/撤回）或 **locked / unknown**（附中文原因：通道已接受、在途、或通道未知），locked/unknown 不给按钮。改 / 撤回走 POST `/api/edit-one`、POST `/api/retract-one`，与 CLI `edit`/`retract` 同一核心：发信方永远是 `panel.operator`（请求里的 `from`/`sender` 一概忽略），POST 时重新认领并复检，所以列表说 pending 也可能在竞争里失败（fail closed）；改是原地改事由/需要/正文（编号、来源、收件人不变），撤回把原信移进 `archived/`、不通知、不产生第二封信。
-- **运行状态（纯呈现）**：每个信箱带一个活动徽章——运行中 / WORKING、空闲 / IDLE 或 未知 / UNKNOWN，加时长（如 `· 17m`、`· 4h 12m`）——出现在组织树、Harness rack 和工作台里。信号存在 `$POSTOFFICE_HOME/runtime/activity/<box>.json`（`{state, since, observed, source, binding}`），由 OpenCode 插件（会话忙/闲）和 Claude `UserPromptSubmit` 钩子（`postoffice activity --state working`）尽力写入，**绝不参与 routing**：删掉整个 `runtime/` 目录，投递一字不变。只有记录里的通道身份仍与该信箱当前会话身份一致、且观测不超过 30 分钟时才显示状态，否则是 UNKNOWN。人类操作员永远显示 人类 / HUMAN，绝不假装 IDLE。
-- **外观**：顶栏 跟随系统 / 浅色 / 深色（SYSTEM / LIGHT / DARK）控件设置 `data-theme` 与 `color-scheme`；选择存在 `localStorage["postoffice.theme"]`，`<head>` 里的小引导脚本在首帧前应用（不闪浅色），存储不可用时回退 SYSTEM。只重画——不发写请求、不改语言。
-- **移动端 / iPad**：窄屏工作台首屏关闭、点节点打开，发件箱标签可达；布局用 `env(safe-area-inset-*)`、`100dvh` 和 ≥16px 表单控件（iOS 不缩放），且没有比视口更宽的固定面板（≤900px 时 inspector 变 `width:100vw`）。
+- **发件箱（操作性视图，不是永久已发送历史）**：收件箱弹窗里有 收件箱 | 发件箱 一对标签。发件箱列出操作员**仍然可观察**的已发普通信：请求时（GET `/api/outbox`）现扫所有已登记信箱的 `inbox/`，取来源是操作员、且不是回执/广播/闹钟/切换事件通知（也不是 `postoffice` 发的）的普通直发信。不复制、不落库：一旦归档、投递或被回执，行就消失，所以它是「现在还能动的东西」的快照，绝不是「发过的全部都记得」的日志。每行显示冻结的收件人、事由/需要、发信时写死的 `逻辑地址：` 信头（绝不重新解析），以及状态：**pending**（仍可改/撤回）或 **locked / unknown**（附中文原因：通道已接受、在途、或通道未知），locked/unknown 不给按钮。改 / 撤回走 POST `/api/edit-one`、POST `/api/retract-one`，与 CLI `edit`/`retract` 同一核心：发信方永远是 `panel.operator`（请求里的 `from`/`sender` 一概忽略），POST 时重新认领并复检，所以列表说 pending 也可能在竞争里失败（fail closed）；改是原地改事由/需要/正文（编号、来源、收件人不变），撤回把原信移进 `archived/`、不通知、不产生第二封信。
+- **运行状态（纯呈现）**：每个信箱带一个活动徽章——运行中 / Working、空闲 / Idle 或 未知 / Unknown（人自己的信箱显示 人类 / Human），加时长（如 `· 17m`、`· 4h 12m`）——出现在组织树、Harness rack 和工作台里。信号存在 `$POSTOFFICE_HOME/runtime/activity/<box>.json`（`{state, since, observed, source, binding}`），由 OpenCode 插件（会话忙/闲）和 Claude `UserPromptSubmit` 钩子（`postoffice activity --state working`）尽力写入，**绝不参与 routing**：删掉整个 `runtime/` 目录，投递一字不变。只有记录里的通道身份仍与该信箱当前会话身份一致、且观测不超过 30 分钟时才显示状态，否则是 UNKNOWN。人类操作员永远显示 人类 / HUMAN，绝不假装 IDLE。
+- **外观**：顶栏七个小色块——跟随系统（白天纸白、系统深色时夜），或纸白 / 夜 / 雾 / 蓝图 / 松 / 炭六套配色——设置 `data-theme`（配色是同一组颜色角色的取值块；强调色永远只表示「有信在等」）；选择存在 `localStorage["postoffice.theme"]`，`<head>` 里的小引导脚本在首帧前应用（不闪浅色），存储不可用时回退跟随系统；旧版存的 `light` / `dark` 对应映射为纸白 / 夜。只重画——不发写请求、不改语言。
+- **移动端 / iPad**：收件箱弹窗任何宽度首屏都关闭，≤900px 全屏，发件箱标签可达；布局用 `env(safe-area-inset-*)`、`100dvh` 和 ≥16px 表单控件（iOS 不缩放），且没有比视口更宽的固定面板（≤900px 时弹窗变 `width:100vw`）。
 - **来源（provenance）**：信头中立地写明来源信箱——`来源：<sender>（邮局只确认来源信箱；该来源的身份与权限按当前项目的组织/角色约定处理。）`——唤醒文案同样带 `来源：<sender>`。运输层不再替来源主张「是不是人/是不是老板指令」，交给项目自己的组织/角色约定。
 
-界面一览（BOXZ 示例数据，1600×1000，中文界面）：
+界面一览（ACME 演示数据，1440×900，中文界面；收件箱是弹窗，信件盖在它的阅读区上）：
 
-| 组织视图（右侧为操作员工作台） | Harness（按真实 method 分组） |
+| 组织视图（由 `panel.organization` 画出的树） | Harness（每个会话一把钥匙，按真实 method 分组） |
 |---|---|
 | ![组织视图](docs/screenshots/org-zh.png) | ![Harness](docs/screenshots/harness-zh.png) |
-| **信件详情**（纯读；回复 / 收到并归档 / 仅归档） | **写信**（以操作员身份，收件人区分信箱 / 逻辑地址） |
+| **收件箱弹窗与信件**（纯读；回复 / 收到并归档 / 仅归档） | **写信**（以操作员身份，收件人区分信箱 / 逻辑地址） |
 | ![信件详情](docs/screenshots/letter-zh.png) | ![写信](docs/screenshots/compose-zh.png) |
 
 ## 组织与身份（可选，version 2 配置）
+
+> 这一层强制什么、不强制什么（它是协作系统，不是权限系统），以及人能控制什么、不能控制什么：[docs/GOVERNANCE.zh-CN.md](docs/GOVERNANCE.zh-CN.md)。
 
 动态路由会换掉「谁受理某个地址」，但旧笔记、旧交接里的固定任命还在叫人按老职责办事。
 这一层把「谁负责什么」变成**一个可查询的事实**。它不引入数据库、后台进程、第二套路由或
@@ -258,15 +262,15 @@ OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己
 | 发信 HTTP 接口（POST `/api/send`）：物理信箱目标、`@` 逻辑地址 first-online、靠前候选在线时绝不跳级、靠前候选离线才 fallback、全离线按既有「没有在线信箱」文案拒绝、目标变化后旧信不搬、未知发信方 / 未登记目标被拒、生成的信与 CLI `send` 逐字节一致 | `tests/panel_send_ack_test.py` |
 | 共享 skill 不再教「手动 `mv` 到 `done/`」：归档统一走 `postoffice_archive_current`（OpenCode）/ `archive-current`（其它 harness）/ 同一个 core API（面板）；回归直接读 skill 文件 | `tests/smoke.sh` 第 16 块 + code review（skill 还必须保持组织无关——层级由项目本地配置提供） |
 | 面板展示配置：可选 `panel` 段（label/operator/organization）、节点规则（mailbox 与 members 二选一、未知字段、alias 拒绝）、全树唯一、规范化形状、absent/error/valid 三态——以及**隔离性**：故意写坏 `panel` 段后，physical 发信、`@alias`、分组操作、完整邮递员一轮与 `/api/state` 照常工作且 `routes.json` 字节不变 | `tests/panel_presentation_test.py`（11 项；含非 BOXZ 的 ACME 树） |
-| 面板 BASE_URL 与 Origin：非法 `POSTOFFICE_PANEL_BASE_URL` 拒绝启动、只放行那一个精确 Origin、scheme/后缀/其它主机探测 403、localhost 仍可用、仍只绑 127.0.0.1 | `tests/panel_origin_test.py`（6 项，临时家真服务器） |
+| 面板 BASE_URL 与 Origin：非法 `POSTOFFICE_PANEL_BASE_URL` 拒绝启动、只放行那一个精确 Origin、scheme/后缀/其它主机探测 403、localhost 仍可用、仍只绑 127.0.0.1 | `tests/panel_origin_test.py`（7 项，临时家真服务器） |
 | Slack 操作员提醒：只有操作员 + 正式信触发、带 BASE_URL 深链、批量形态、失败不改投递也不重发、机密不进日志/状态/HTML、未设置零请求、挂起 webhook 不拖住下一个信箱 | `tests/panel_slack_test.py`（10 项，本地假 webhook） |
 | Slack 超时同步：hook/plugin 信箱过了宽限期仍未确认成功唤醒/投递 → 镜像桌面弹窗发一条只含元数据（目标信箱、事由、深链，绝无正文）的告警，沿用同一套一次性超时记号；未到点/已接受/离线/闹钟 → 零请求；下一轮绝不重发；notify 路径保持自己的措辞；失败/慢响应不阻断记账与下一个信箱；机密不进日志 | `tests/slack_grace_test.py`（12 项，本地假 webhook） |
 | `.env` 私有运行设置：只补缺失的 `POSTOFFICE_*` 键、process env 优先、注释/引号/坏行处理且不回显值、无 shell 展开/执行、launchd 风格（只有 `POSTOFFICE_HOME`+`PATH`）仍能读到 webhook/base URL、secret 不进日志/状态/HTML | `tests/env_file_test.py`（12 项） |
-| 人类控制台 UI：通用组织渲染（ACME）、操作员横条/徽章、Harness rack 与精确匹配组控（部分重叠绝不显示）、写信/回复全矩阵（含发送成功+归档失败→只重试归档、绝不二次发送、绝不 ack）、回执三态、仅归档、纯读、深链一次性生命周期、未分配区域（渲染纯度、不重复）、operator 无效禁写 | `tests/panel_console_ui_test.mjs`（12 块，DOM stub） |
+| 人类控制台 UI：通用组织渲染（ACME）、操作员按钮与收件箱弹窗、Harness rack 与精确匹配组控（部分重叠绝不显示）、写信/回复全矩阵（含发送成功+归档失败→只重试归档、绝不二次发送、绝不 ack）、回执三态、仅归档、纯读、深链一次性生命周期、未编入组织区域（渲染纯度、不重复）、operator 无效禁写 | `tests/panel_console_ui_test.mjs`（DOM stub）与 `tests/panel_org_render_test.mjs`（页面没见过的组织、无组织回退、配置损坏、连线图、弹窗契约） |
 | 面板 UI：点 pending 行 → 详情显示接口取回的（不是行内的）内容且被转义；仅归档只发一次 `{box,id}` POST，然后关闭并刷新；读取/归档失败的提示；切换语言关闭详情且不发写请求（在途读取也会作废）；新文案两种语言都在 | `tests/panel_letter_ui_test.mjs` 加扩展后的 `tests/panel_i18n_test.mjs` |
 | 逐级升级走现有 alias 引擎：A/B→Q 不跳级（所有候选都在线、每封信仍全进 Q）、Q 离线 → T1、T1 全离线 → 人类、人类离线 → 既有“没有在线信箱”拒绝、恢复回 Q、目标变化后旧信字节不变、层级 alias 的切换/交接在轮次与重启间恰好一次、全离线通知恰好一次、旧版两候选数组配置行为完全不变 | `tests/hierarchy_test.py`（9 项，各自独立临时邮局；锁的是现有引擎行为——本票没有改生产 routing） |
 | 回执提醒精简且只含元数据；`postoffice receipt` 精确 ID 只读，`postoffice archive-receipt` 只归档本箱对应通知 | `tests/receipt_test.py`（15 项，含旧通知文件、shell 引用与归档幂等）和 `tests/receipt_plugin_test.mjs` |
-| 组织与身份 v1：version 2 配置导入校验（公司/项目/成员/角色引用不合法、以及 v1 里出现 `organization` 一律拒绝，旧配置字节不变）、`identity` 快照（现职 vs 可候选、组织无效时停用但不致命、未登记信箱）、`add` 只改资料 vs 显式改绑并写入 `rebind.log` 交接记录、新信箱不给通道被拒、坏 organization 只停用身份呈现（合法 `@alias` 仍投递、物理信箱不受影响）、CONTACT / 面板 `/api/state` 与 CLI 报同一份推导身份 | `tests/org_identity_test.py`（22 项，各自临时邮局 + 真面板） |
+| 组织与身份 v1：version 2 配置导入校验（公司/项目/成员/角色引用不合法、以及 v1 里出现 `organization` 一律拒绝，旧配置字节不变）、`identity` 快照（现职 vs 可候选、组织无效时停用但不致命、未登记信箱）、`add` 只改资料 vs 显式改绑并写入 `rebind.log` 交接记录、新信箱不给通道被拒、坏 organization 只停用身份呈现（合法 `@alias` 仍投递、物理信箱不受影响）、CONTACT / 面板 `/api/state` 与 CLI 报同一份推导身份 | `tests/org_identity_test.py`（23 项，各自临时邮局 + 真面板） |
 | Claude 桌面版：空闲几分钟后被外部来信叫醒并处理信件 | 真机多次观察到 |
 | Claude 桌面版：不显式设 timeout 时，钩子 10 分钟后被结束 | 真机观察到（v1.0 的缺陷，v1.1 已显式设 7 天） |
 | Claude 桌面版：设了长 timeout 后，空闲 30 分钟以上仍能被叫醒 | 真机实测：监视活过 33 分钟，空闲 33 分钟后来信 3 秒内被叫醒 |
@@ -284,7 +288,7 @@ OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己
 - **Codex 线程没加载**：`codex queue` 仍返回成功，但线程不会自己醒；靠“已提醒 30 分钟未处理”的通知兜底。
 - **升级 agent-postoffice 之后**：只是就地更新脚本的话，Claude 不用重启——现有监视在下一轮 Stop/SessionStart 钩子时会加载新代码；重启 Claude App 反而会让各会话的监视消失，得先跑一轮恢复。已开着的 OpenCode 会一直用旧插件，需重启。只有钩子配置本身变了（首次安装，或增删钩子）才需要重载 Claude App。
 
-- **面板页面启动时缓存**：`postoffice panel` 启动时读一次 `panel/index.html`，改了 UI 要重启面板才生效。
+- **面板页面每次请求都重读**：改了 `panel/index.html` 刷新浏览器即可，不用重启面板（只有文件恰好读不到时才退回启动时读到的那份）。
 - **Slack 提醒跟着邮递员轮次走**：确认投递告警与超时同步告警都在邮递员一轮里发出、且依赖邮递员存活（超时告警最多在到点后一个轮询间隔内出现）；单条提醒最多让一轮同步阻塞约 3 秒（超时），绝不更久，也绝不改变投递或桌面弹窗。
 - **「已回复」记录只活在本页**：发送成功/归档失败后，硬刷新页面会丢掉这个页面内存记录、重新显示可重试归档的状态（磁盘上的信件才是真相）。
 - **`config.json` 里任何位置的重复 JSON 键会让 routing 和 panel 一起空白**：重复键拒绝是全文件级设计（fail closed）。
@@ -319,7 +323,7 @@ python3 tests/panel_presentation_test.py                       # 可选 panel �
 python3 tests/panel_origin_test.py                             # POSTOFFICE_PANEL_BASE_URL + 精确 Origin，仍只绑 loopback
 python3 tests/panel_slack_test.py                              # 仅出站的 Slack 操作员提醒（本地假 webhook）
 python3 tests/env_file_test.py                                # $POSTOFFICE_HOME/.env loader: precedence, launchd style, no expansion, secret hygiene
-node --experimental-strip-types tests/panel_console_ui_test.mjs # 人类控制台 UI：组织/Harness/操作员/写信/回复/深链/未分配
+node --experimental-strip-types tests/panel_console_ui_test.mjs # 人类控制台 UI：组织/Harness/操作员/写信/回复/深链/未编入组织
 python3 tests/org_identity_test.py                            # 组织与身份 v1：v2 配置导入校验、identity 快照、add 只改资料 vs 改绑、CONTACT/面板/CLI 一致
 ```
 
