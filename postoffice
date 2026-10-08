@@ -10,6 +10,7 @@ Data lives in $POSTOFFICE_HOME (default ~/agent-postoffice):
 Run `postoffice --help` for commands. Python 3.9+, standard library only.
 """
 import argparse
+import base64
 import datetime
 import fcntl
 import hashlib
@@ -841,10 +842,27 @@ def find_codex():
 # unavailable we do NOT silently fall back to one submission per round; the batch stays undelivered
 # and the human is alerted once (diagnosable), never silently stopped.
 CODEX_PENDING_PREFIX = "postoffice:"
+CODEX_MAX_FORMAL = MAX_FORMAL_BATCH      # formal letters per pending item (bounded batch)
+CODEX_MAX_RECEIPT = MAX_FORMAL_BATCH     # receipt lines per pending item (bounded batch)
+CODEX_LIST_PAGE = 100                    # page size for thread/queue/list
+CODEX_MAX_PAGES = 50                     # bounded pagination; beyond this we report uncertainty
+CODEX_UNCERTAIN = ".codex_uncertain.json"
+
+
+class CodexRpcError(RuntimeError):
+    """An explicit JSON-RPC error reply, or a write that never left: nothing was applied."""
+
+
+class CodexUnknown(RuntimeError):
+    """No reply after a request was written (timeout / early close): the outcome is UNKNOWN."""
 
 
 class CodexAppServer:
-    """A short-lived stdio JSON-RPC client for one `codex app-server` process."""
+    """A short-lived stdio JSON-RPC client for one `codex app-server` process.
+
+    It only INJECTS into the shared on-disk queue: it never loads the thread, so it never runs a
+    turn and closing it cannot kill one (the desktop app-server is the sole consumer).
+    """
 
     def __init__(self, cli, timeout=60):
         self.timeout = timeout
@@ -857,13 +875,13 @@ class CodexAppServer:
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
-                raise RuntimeError("codex app-server 响应超时")
+                raise CodexUnknown("codex app-server 响应超时")
             r, _, _ = select.select([self.proc.stdout], [], [], remaining)
             if not r:
                 continue
             chunk = self.proc.stdout.readline()      # one JSON object per line
             if not chunk:
-                raise RuntimeError("codex app-server 提前关闭")
+                raise CodexUnknown("codex app-server 提前关闭")
             line = chunk.strip()
             if not line:
                 continue
@@ -876,15 +894,18 @@ class CodexAppServer:
         self._id += 1
         rid = self._id
         req = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
-        self.proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            raise CodexRpcError(f"{method} 未发出：{e}")   # nothing was applied → safe to retry
         deadline = time.time() + self.timeout
         while True:
-            msg = self._read_msg(deadline)
+            msg = self._read_msg(deadline)               # timeout/close here → CodexUnknown
             if msg.get("id") == rid:
                 if msg.get("error"):
                     err = msg["error"]
-                    raise RuntimeError(f"{method} 失败：{err.get('message')}（code {err.get('code')}）")
+                    raise CodexRpcError(f"{method} 失败：{err.get('message')}（code {err.get('code')}）")
                 return msg.get("result")
 
     def initialize(self):
@@ -920,41 +941,253 @@ def _codex_text_input(text):
     return [{"type": "text", "text": text, "text_elements": []}]
 
 
-def codex_queue_deliver(cli, thread_id, box, text, merge=True, timeout=60):
-    """Deliver one reminder to a Codex thread, merging while busy. Returns (ok, detail).
+def codex_uncertain_path(box):
+    return HOME / box / CODEX_UNCERTAIN
 
-    While the thread is BUSY an existing postoffice-created PENDING item (matched by the exact
-    clientUserMessageId prefix+box) is UPDATED to append the new index, so successive rounds add up
-    to ONE pending submission; when idle the submission auto-starts and wakes the session. Only our
-    own pending item is ever touched. `merge=False` (used for a lone alarm reminder) never looks up
-    or updates anything: it always adds its own unique submission, so an alarm can never join the
-    ordinary formal batch.
+
+def codex_uncertain_load(box):
+    """A prior submission whose outcome is unknown, or None. Small, ids-only, per box."""
+    p = codex_uncertain_path(box)
+    if not p.exists():
+        return None
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def codex_uncertain_save(box, rec):
+    p = codex_uncertain_path(box)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.parent / (CODEX_UNCERTAIN + f".tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def codex_uncertain_clear(box):
+    try:
+        codex_uncertain_path(box).unlink()
+    except OSError:
+        pass
+
+
+def _codex_entry(name, p):
+    """One index entry for a letter: {'k':'f'|'r','ref':stable-id, ...metadata...}.
+
+    Formal carries {name,path,src,subj,need}; receipt carries {name,src,subj,query}. Only index
+    metadata (never a letter body) so a later merge can re-render the exact visible index.
+    """
+    rid = receipt_query_id(p)
+    if rid:
+        src, subj, query = _receipt_item(name, p)
+        return {"k": "r", "ref": rid, "name": name, "src": src, "subj": subj, "query": query}
+    src = letter_sender(p) or "?"
+    subj = header_field(p, "事由：") or "（无）"
+    need = header_field(p, "需要：")
+    return {"k": "f", "ref": p.stem, "name": name, "path": str(p),
+            "src": src, "subj": subj, "need": need}
+
+
+_CODEX_TRAILER_RE = re.compile(r"<!--po-batch:v1 ([A-Za-z0-9+/=]+)-->")
+
+
+def _codex_batch_text(entries):
+    """Canonical bounded index: the SAME shape reminder() uses (single-letter vs batch by formal
+    count, formal first, receipts merged last), plus a trailing base64 trailer.
+
+    The trailer carries the SAME entries (id + source + subject + path, never a letter body) so a
+    later merge can recover the exact set and de-duplicate by stable id. It is a machine copy of the
+    visible index, not a second letter-content store.
+    """
+    formal = [e for e in entries if e["k"] == "f"]
+    receipts = [e for e in entries if e["k"] == "r"]
+    parts = []
+    if len(formal) >= 2:
+        parts.append(f"【联络总站｜{len(formal)} 封新信】")
+        for i, e in enumerate(formal, start=1):
+            parts.append(f"{i}. {e.get('name', '')}/{e['ref']}  来源：{e.get('src', '?')}"
+                         f"  事由：{e.get('subj', '（无）')}  {e.get('path', '')}")
+        parts.append("按各信“需要”字段处理；回信/回执/归档规则见 postoffice skill。")
+    else:
+        for e in formal:
+            parts += [f"【联络总站新信｜{e.get('name', '')}】", f"== {e.get('path', '')}",
+                      f"来源：{e.get('src', '?')}", f"事由：{e.get('subj', '（无）')}",
+                      f"需要：{e.get('need', '')}", LETTER_TAIL]
+    if len(receipts) == 1 and not formal:
+        e = receipts[0]
+        head = (f"【联络总站回执｜{e.get('name', '')}】来自 {e.get('src', '?')} 的回执"
+                + (f"，原事由：{e['subj']}" if e.get("subj") else ""))
+        parts += [head, e.get("query", ""), "默认不答复"]
+    elif receipts:
+        parts.append(f"另有 {len(receipts)} 条回执（默认不答复，需要时按 ID 查询）：")
+        parts.extend(f"- {e.get('src', '?')}：{e.get('subj', '')}  {e.get('query', '')}"
+                     for e in receipts)
+    blob = base64.b64encode(json.dumps(entries, ensure_ascii=False).encode("utf-8")).decode("ascii")
+    parts.append(f"<!--po-batch:v1 {blob}-->")
+    return "\n".join(parts)
+
+
+def _codex_parse_entries(text):
+    """Recover our entries from an item we wrote (trailer); [] if it is not one of ours."""
+    m = _CODEX_TRAILER_RE.search(text or "")
+    if not m:
+        return []
+    try:
+        data = json.loads(base64.b64decode(m.group(1)).decode("utf-8"))
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [e for e in data if isinstance(e, dict) and e.get("k") in ("f", "r") and e.get("ref")]
+
+
+def _codex_merge_entries(old, new, max_formal, max_receipt):
+    """Union by (kind, ref) preserving old order then new; bounded. Returns (merged, overflow)."""
+    seen = {(e["k"], e["ref"]) for e in old}
+    merged = list(old)
+    overflow = []
+    fcount = sum(1 for e in merged if e["k"] == "f")
+    rcount = sum(1 for e in merged if e["k"] == "r")
+    for e in new:
+        key = (e["k"], e["ref"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if e["k"] == "f":
+            if fcount < max_formal:
+                merged.append(e)
+                fcount += 1
+            else:
+                overflow.append(e)
+        elif rcount < max_receipt:
+            merged.append(e)
+            rcount += 1
+        else:
+            overflow.append(e)
+    return merged, overflow
+
+
+def _codex_cid_seq(cid, base_cid):
+    if cid == base_cid:
+        return 1
+    if isinstance(cid, str) and cid.startswith(base_cid + "#"):
+        try:
+            return int(cid[len(base_cid) + 1:])
+        except ValueError:
+            return 0
+    return 0
+
+
+def _codex_find_items(app, thread_id, base_cid):
+    """All our pending items (cid == base or base#n), bounded pagination. Returns (items, complete).
+
+    items sorted by batch number. complete is False when pagination exceeded CODEX_MAX_PAGES, in
+    which case the caller must NOT guess: an unseen page could hold our item.
+    """
+    items = []
+    cursor = None
+    for _ in range(CODEX_MAX_PAGES):
+        params = {"threadId": thread_id, "limit": CODEX_LIST_PAGE}
+        if cursor is not None:
+            params["cursor"] = cursor
+        result = app.call("thread/queue/list", params) or {}
+        data = result.get("data") if isinstance(result, dict) else None
+        for it in (data or []):
+            cid = it.get("clientUserMessageId") if isinstance(it, dict) else None
+            if isinstance(cid, str) and (cid == base_cid or cid.startswith(base_cid + "#")):
+                items.append(it)
+        cursor = result.get("nextCursor") if isinstance(result, dict) else None
+        if not cursor:
+            items.sort(key=lambda it: _codex_cid_seq(it.get("clientUserMessageId"), base_cid))
+            return items, True
+    return items, False
+
+
+def _codex_next_cid(box, items):
+    base_cid = CODEX_PENDING_PREFIX + box
+    nxt = max([_codex_cid_seq(it.get("clientUserMessageId"), base_cid) for it in items] + [1]) + 1
+    return f"{base_cid}#{nxt}"
+
+
+def codex_queue_deliver(cli, thread_id, box, files, merge=True, timeout=60):
+    """Deliver one round of reminders to a Codex thread, merging while busy.
+
+    Returns (status, detail) with status in {"accepted","rejected","unknown"}:
+      accepted — the round is queued/merged (safe to mark delivered);
+      rejected — an explicit error, nothing applied (safe to retry next round);
+      unknown  — a mutation was written but no reply came; a per-box marker records the ids so the
+                 next round reconciles against the real queue instead of blindly re-adding.
+
+    While busy an existing postoffice-created pending item is UPDATED with the id-de-duplicated
+    union of its index and this round's letters (formal first, receipts last, rules once), so
+    successive rounds collapse into ONE bounded item; only our own items (matched by the exact
+    clientUserMessageId prefix+box, or base#n continuation) are ever touched. `merge=False` (a lone
+    alarm) never looks up or updates: it always adds its own unique submission.
     """
     app = CodexAppServer(cli, timeout=timeout)
     try:
-        app.initialize()
-        mine = None
-        if merge:
-            result = app.call("thread/queue/list", {"threadId": thread_id}) or {}
-            data = result.get("data") if isinstance(result, dict) else None
-            cid = CODEX_PENDING_PREFIX + box
-            mine = next((it for it in (data or [])
-                         if isinstance(it, dict) and it.get("clientUserMessageId") == cid), None)
-        if mine and mine.get("id"):
-            old = _codex_input_text(mine.get("input"))
-            merged = (old + "\n\n" + text) if old else text
-            app.call("thread/queue/update", {"threadId": thread_id,
-                                             "queuedSubmissionId": mine["id"],
-                                             "input": _codex_text_input(merged)})
-            return True, f"merged into {mine['id']}"
-        cid = (CODEX_PENDING_PREFIX + box) if merge else \
-            f"{CODEX_PENDING_PREFIX}alarm:{box}:{time.time():.6f}"
-        app.call("thread/queue/add", {"threadId": thread_id,
-                                      "input": _codex_text_input(text),
-                                      "clientUserMessageId": cid})
-        return True, "queued"
+        try:
+            app.initialize()
+        except (CodexUnknown, CodexRpcError) as e:
+            return "rejected", f"app-server 初始化失败：{e}"     # no queue op was sent
+        base_cid = CODEX_PENDING_PREFIX + box
+        if not merge:
+            text = reminder(box, files)
+            app.call("thread/queue/add", {
+                "threadId": thread_id, "input": _codex_text_input(text),
+                "clientUserMessageId": f"{CODEX_PENDING_PREFIX}alarm:{box}:{time.time():.6f}"})
+            return "accepted", "queued alarm"
+        marker = codex_uncertain_load(box)
+        items, complete = _codex_find_items(app, thread_id, base_cid)
+        if not complete:
+            return "unknown", "queue/list 分页超过上限，未确认本箱 pending；本轮不改动"
+        if marker is not None and not items:
+            # A prior write's outcome is unknown and no pending item proves it landed: the consumer
+            # may already have taken it. Do NOT resubmit (that could double-deliver); stay unknown.
+            return "unknown", "上一轮写入结果未知且无 pending 佐证，本轮不重复提交；请人工核对"
+        if marker is not None:
+            codex_uncertain_clear(box)          # a pending item proves the prior write landed
+        new = [_codex_entry(box, p) for p in files]
+        target = None
+        for it in items:
+            old = _codex_parse_entries(_codex_input_text(it.get("input")))
+            if not old:
+                return "unknown", f"本箱 pending {it.get('id')} 无可识别索引，拒绝覆盖"
+            if sum(1 for e in old if e["k"] == "f") < CODEX_MAX_FORMAL:
+                target = (it, old)
+        try:
+            if target is None:
+                merged, _ = _codex_merge_entries([], new, CODEX_MAX_FORMAL, CODEX_MAX_RECEIPT)
+                cid = _codex_next_cid(box, items) if items else base_cid
+                app.call("thread/queue/add", {
+                    "threadId": thread_id, "input": _codex_text_input(_codex_batch_text(merged)),
+                    "clientUserMessageId": cid})
+                return "accepted", f"queued {cid}"
+            it, old = target
+            merged, overflow = _codex_merge_entries(old, new, CODEX_MAX_FORMAL, CODEX_MAX_RECEIPT)
+            if merged == old:
+                return "accepted", f"already in {it['id']}"     # update-response-lost: no duplicate
+            app.call("thread/queue/update", {
+                "threadId": thread_id, "queuedSubmissionId": it["id"],
+                "input": _codex_text_input(_codex_batch_text(merged))})
+            if overflow:
+                extra, _ = _codex_merge_entries([], overflow, CODEX_MAX_FORMAL, CODEX_MAX_RECEIPT)
+                app.call("thread/queue/add", {
+                    "threadId": thread_id, "input": _codex_text_input(_codex_batch_text(extra)),
+                    "clientUserMessageId": _codex_next_cid(box, items)})
+            return "accepted", f"merged into {it['id']}"
+        except CodexUnknown as e:
+            codex_uncertain_save(box, {"ids": [p.stem for p in files],
+                                       "at": time.time(), "phase": "mutation"})
+            return "unknown", str(e)
+    except CodexRpcError as e:
+        return "rejected", str(e)
     except Exception as e:
-        return False, str(e)
+        return "unknown", f"{type(e).__name__}: {e}"
     finally:
         app.close()
 
@@ -3990,13 +4223,14 @@ def cmd_postman(_a):
                     continue
                 names = " ".join(p.name for p in group)
                 sig = f"{name}::" + "|".join(p.name for p in group)
-                ok = True
+                status = "accepted"
                 try:
                     if method == "codex_queue":
                         cli = r.get("codex_cli") or find_codex()
-                        ok, detail = codex_queue_deliver(cli, r["thread_id"], name, reminder(name, group),
-                                                         merge=not alarm_round)
-                        log("postman.log", f"codex_queue {name} {names} ok={ok} {str(detail)[:200]}")
+                        status, detail = codex_queue_deliver(cli, r["thread_id"], name, group,
+                                                             merge=not alarm_round)
+                        log("postman.log",
+                            f"codex_queue {name} {names} status={status} {str(detail)[:200]}")
                     else:
                         first = group[0]
                         notify(f"联络总站：给 {name} 的新信",
@@ -4004,14 +4238,22 @@ def cmd_postman(_a):
                                else (field(first, "事由") or first.name))
                         log("postman.log", f"notify {name} {names}")
                 except Exception as e:
-                    ok = False
+                    status = "rejected"
                     log("postman.log", f"投递异常 {name} {names}: {e}")
-                if not ok:
-                    # nothing in the batch is marked delivered, so every ID stays eligible for retry;
-                    # tell the human once per batch signature (no rate tick, nothing was woken)
+                if status != "accepted":
+                    # nothing in the batch is marked delivered, so every ID stays eligible for retry
                     for p in group:
                         release_claim(name, p)   # nobody was woken, so let it be claimed again
-                    if sig not in failed_batches:
+                    if status == "unknown":
+                        # a mutation was written but not confirmed: keep it diagnosable, never blindly
+                        # re-add (that could double-deliver). Tell the human once per marker.
+                        rec = codex_uncertain_load(name) or {}
+                        if not rec.get("notified"):
+                            rec["notified"] = True
+                            codex_uncertain_save(name, rec)
+                            notify("联络总站：投递结果未知",
+                                   f"{name} {names}：写入后未收到确认，原信保留未重复投递，请人工核对")
+                    elif sig not in failed_batches:
                         failed_batches.add(sig)
                         notify("联络总站：投递失败", f"{name} {names}，将重试")
                     continue
