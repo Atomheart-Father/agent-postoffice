@@ -1026,15 +1026,33 @@ def _codex_batch_text(entries):
 
 
 # Parsers for the ONE visible index (no hidden copy). Anchored on the exact shapes _codex_batch_text
-# emits; src/name/ref are whitespace-free, subjects are single-line header fields.
+# emits; src/name/ref are whitespace-free, subjects are single-line header fields. Receipt lines are
+# split on the fixed literal query prefix (never on arbitrary subject content), and the query is kept
+# verbatim so re-render is lossless; the bare stable name/ref come from undoing the shell quoting.
 _CODEX_FORMAL_LINE_RE = re.compile(r"^\d+\. (\S+)/(\S+)  来源：(\S+)  事由：(.*?)  (\S.*)$", re.M)
 _CODEX_SINGLE_FORMAL_RE = re.compile(
     r"【联络总站新信｜(\S+)】\n== (\S.*)\n来源：(\S+)\n事由：(.*)\n需要：(.*)")
 _CODEX_RECEIPT_LINE_RE = re.compile(
-    r"^- (\S+)：(.*?)  查询：postoffice receipt (\S+) (\S+)$", re.M)
+    r"^- (\S+)：(.*?)  (查询：postoffice receipt .*)$", re.M)
 _CODEX_SINGLE_RECEIPT_RE = re.compile(
     r"【联络总站回执｜(\S+)】来自 (\S+) 的回执(?:，原事由：(.*))?\n"
-    r"查询：postoffice receipt (\S+) (\S+)\n默认不答复")
+    r"(查询：postoffice receipt .*)\n默认不答复")
+
+
+def _codex_receipt_refs(query):
+    """Bare (name, rid) from a receipt query line, undoing shell quoting; (None, None) if malformed.
+
+    `_receipt_item` renders `查询：postoffice receipt {shlex.quote(name)} {shlex.quote(rid)}`, so a
+    name/rid containing blanks or punctuation arrives single-quoted. The STABLE dedupe key must be the
+    unquoted bare value, identical to what _codex_entry builds from the letter file.
+    """
+    try:
+        toks = shlex.split(query or "")
+    except ValueError:
+        return None, None
+    if len(toks) >= 4 and toks[1] == "receipt":
+        return toks[2], toks[3]
+    return None, None
 
 
 def _codex_parse_entries(text):
@@ -1054,11 +1072,18 @@ def _codex_parse_entries(text):
         out.append({"k": "f", "ref": Path(path).stem, "name": name, "src": src,
                     "subj": subj, "need": need, "path": path})
     for m in _CODEX_RECEIPT_LINE_RE.finditer(text):
-        src, subj, name, rid = m.groups()
-        out.append({"k": "r", "ref": rid, "name": name, "src": src, "subj": subj})
+        src, subj, query = m.groups()
+        name, rid = _codex_receipt_refs(query)
+        if rid is None:
+            continue
+        out.append({"k": "r", "ref": rid, "name": name, "src": src, "subj": subj, "query": query})
     for m in _CODEX_SINGLE_RECEIPT_RE.finditer(text):
-        name, src, subj, rname, rid = m.groups()
-        out.append({"k": "r", "ref": rid, "name": name, "src": src, "subj": subj or ""})
+        name, src, subj, query = m.groups()
+        _qname, rid = _codex_receipt_refs(query)
+        if rid is None:
+            continue
+        out.append({"k": "r", "ref": rid, "name": name, "src": src, "subj": subj or "",
+                    "query": query})
     return out
 
 
@@ -1204,14 +1229,19 @@ def codex_queue_deliver(cli, thread_id, box, files, merge=True, timeout=60):
                 return "accepted", "queued"
             it, old = target
             merged, overflow = _codex_merge_entries(old, new, CODEX_MAX_FORMAL, CODEX_MAX_RECEIPT)
-            if merged == old:
+            if merged == old and not overflow:
                 return "accepted", f"already in {it['id']}"     # update-response-lost: no duplicate
-            app.call("thread/queue/update", {
-                "threadId": thread_id, "queuedSubmissionId": it["id"],
-                "input": _codex_text_input(_codex_batch_text(merged))})
+            if merged != old:
+                app.call("thread/queue/update", {
+                    "threadId": thread_id, "queuedSubmissionId": it["id"],
+                    "input": _codex_text_input(_codex_batch_text(merged))})
             if overflow:
+                # The chosen item had no room for some of this round's entries (e.g. its receipt
+                # slot is full): continue them in fresh bounded items instead of dropping them.
                 _codex_add_batches(app, thread_id, box, items, overflow)
-            return "accepted", f"merged into {it['id']}"
+            if merged != old:
+                return "accepted", f"merged into {it['id']}"
+            return "accepted", f"continuation after {it['id']}"
         except CodexUnknown as e:
             codex_uncertain_save(box, {"ids": [p.stem for p in files],
                                        "at": time.time(), "phase": "mutation"})
