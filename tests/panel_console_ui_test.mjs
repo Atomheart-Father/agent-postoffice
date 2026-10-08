@@ -124,10 +124,10 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
   for (const id of ids) els[id] = makeEl(id);
   const btn = (l) => ({ dataset: { lang: l }, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } });
   els["langs"].children = [btn("zh"), btn("en")];
-  // top-rail theme group: static buttons, aria-pressed/labels driven by applyLang (mirrors `langs`)
+  // top-bar palette group: static buttons, aria-pressed/labels driven by applyLang (mirrors `langs`)
   const thBtn = (c) => ({ dataset: { themeChoice: c }, textContent: "", attrs: {},
     setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } });
-  els["theme"].children = [thBtn("system"), thBtn("light"), thBtn("dark")];
+  els["theme"].children = ["system", "paper", "night", "mist", "blueprint", "pine", "ember"].map(thBtn);
 
   const store = storage || new Map();
   const localStorage = {
@@ -228,11 +228,11 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   has(b, "Director", "根节点用 presentation label");
   has(b, "01", "部门大编号 01");
   has(b, "02", "部门大编号 02");
-  has(b, "CH-01", "TX-6 通道标记");
+  has(b, "5 个席位，3 在线", "栏头概览：席位数、在线数（含子孙）");
   has(b, "Research", "部门 label 渲染");
   has(b, "Scribe", "独立 T1 渲染");
   has(b, "Analyst", "嵌套子节点渲染");
-  has(b, "HUMAN OPERATOR", "根=操作员时显示 HUMAN OPERATOR");
+  has(b, "人类操作员", "根=操作员时显示人类操作员");
   has(b, 'data-box="lead"', "节点带 data-box 可点");
   hasNot(b, "BOXZ", "generic 视图不出现 BOXZ");
   is((b.match(/data-box="lead"/g) || []).length >= 1, true, "lead 节点存在");
@@ -249,11 +249,12 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
 // ============ 2) Operator strip / top-right shortcut → operator workbench ============
 {
   const e = makeEnv(); await settle();
-  has(e.els["op-shortcut"].innerHTML, "OPERATOR · director", "右上操作员徽章");
+  has(e.els["op-shortcut"].innerHTML, "director", "右上操作员按钮显示信箱名（原样）");
+  has(e.els["op-shortcut"].innerHTML, "收件箱", "右上操作员按钮写明是收件箱");
   has(e.els["op-shortcut"].innerHTML, "2", "右上显示 waiting 计数");
-  has(e.els["boxes"].innerHTML, "等待你处理", "inspector 默认是操作员工作台");
+  hasNot(e.els["boxes"].innerHTML, 'class="inspector', "工作台是弹窗：首屏不打开");
   e.fire("op-shortcut", "click", { target: {} }); await settle();
-  has(e.els["boxes"].innerHTML, "等待你处理", "点击右上徽章后仍是操作员工作台");
+  has(e.els["boxes"].innerHTML, "等待你处理", "点击右上按钮打开操作员工作台");
   // node click switches inspector
   e.fire("boxes", "click", { target: { closest: (s) => (s === "[data-box]" ? { dataset: { box: "lead" } } : null) } });
   await settle();
@@ -267,9 +268,9 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   const e = makeEnv(); await settle();
   e.fire("tab-hk", "click", { target: {} }); await settle();
   const r = e.els["racks"].innerHTML;
-  has(r, "MIXED", "混合状态 MIXED");
-  has(r, "ON", "全在线 ON");
-  has(r, "OFF", "全离线 OFF");
+  has(r, "部分开", "混合状态：部分开");
+  has(r, "已开", "全在线：已开");
+  has(r, "关", "离线成员的钥匙写明：关");
   has(r, "@ocode", "成员集恰好等于 config group 的 rack 显示组控制");
   is((r.match(/data-group="ocode"/g) || []).length, 1, "组控制只出现一次（精确匹配）");
   has(r, "仅可单独开关", "无匹配组的 rack 提示仅 individual");
@@ -444,7 +445,7 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   e.fire("compose-send", "click", { target: {} }); await settle();
   is(posts(e, "/api/send").length, 0, "operator 无效时 send 被禁止");
   e.fire("tab-hk", "click", { target: {} }); await settle();
-  has(e.els["racks"].innerHTML, "MIXED", "Harness 仍正常");
+  has(e.els["racks"].innerHTML, "部分开", "Harness 仍正常");
   rowClick(e); await settle();
   has(detail(e), "操作员", "信件详情显示操作员提示");
   has(detail(e), "disabled", "reply/ack 按钮禁用");
@@ -470,7 +471,7 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   const e = makeEnv({ state: badp }); await settle();
   has(e.els["boxes"].innerHTML, "panel 配置：信箱不存在", "组织视图显示 presentation 错误");
   e.fire("tab-hk", "click", { target: {} }); await settle();
-  has(e.els["racks"].innerHTML, "MIXED", "Harness 不受影响");
+  has(e.els["racks"].innerHTML, "部分开", "Harness 不受影响");
   is(e.els["letter"].hidden, true, "无副作用");
 }
 
@@ -480,7 +481,7 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   st.boxes.push(mkBox("stray", "notify", true, 1));
   const e = makeEnv({ state: st }); await settle();
   const b = e.els["boxes"].innerHTML;
-  has(b, "未分配", "UNASSIGNED 区域出现");
+  has(b, "未编入组织", "编外区域出现");
   has(b, 'data-box="stray"', "未分配信箱仍渲染为可点节点");
   is((b.match(/data-box="stray"/g) || []).length, 1, "不能 duplicate render（恰好一次）");
   e.fire("tab-hk", "click", { target: {} }); await settle();
@@ -488,7 +489,7 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   const st2 = JSON.parse(JSON.stringify(st));
   st2.panel.organization.children.push({ mailbox: "stray", label: "Stray" });
   const e2 = makeEnv({ state: st2 }); await settle();
-  hasNot(e2.els["boxes"].innerHTML, "未分配", "全部入编后 UNASSIGNED 区域消失");
+  hasNot(e2.els["boxes"].innerHTML, "未编入组织", "全部入编后编外区域消失");
   is((e2.els["boxes"].innerHTML.match(/data-box="stray"/g) || []).length, 1, "正式位置恰好一次");
   const n0 = e2.calls.length;
   await e2.ctx.load(); await settle();
@@ -528,73 +529,78 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
   is(s3.els["view-hk"].hidden, false, "先切到 HARNESS 页");
   s3.ctx.window.location.hash = "#/mail/lead";
   await s3.ctx.load(); await settle();
-  has(s3.els["boxes"].innerHTML, "lead-who", "HARNESS 页收到单段深链切回工作台");
-  is(s3.els["view-hk"].hidden, true, "视图已切回组织");
+  has(s3.els["boxes"].innerHTML, "lead-who", "HARNESS 页收到单段深链就地打开工作台");
+  is(s3.els["view-hk"].hidden, false, "工作台是弹窗：不切页，HARNESS 保持");
   const s2 = makeEnv({ hash: "#/mail/nobody..x" }); await settle();
   has(s2.els["letter-status"].textContent, "深链", "非法深链提示");
   is(s2.ctx.window.location.hash, "", "非法深链 hash 被清（不每 5s 重刷）");
   const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
-  is(/\.toggle\s*,\s*\.clear\s*\{[^}]*min-height:\s*44px/.test(css), true, ".toggle/.clear 有 ≥44px 规则");
+  is(/\.toggle[^{}]*\.clear[^{}]*\{[^}]*min-height:\s*44px/.test(css), true, ".toggle/.clear 有 ≥44px 规则");
 }
 
-// ============ 13) 工作台可关闭：桌面收起右轨、手机首屏不开、点节点/徽章重开 ============
+// ============ 13) 工作台是弹窗：默认关、点节点/徽章/CTA 开、关闭键与遮罩关、轮询保持、所有宽度一致 ============
 {
   const closeIt = (env) => env.fire("boxes", "click", { target: { closest: (s) => (s === "[data-ins-close]" ? { dataset: {} } : null) } });
-  const e = makeEnv(); await settle();
-  has(e.els["boxes"].innerHTML, 'class="inspector', "桌面默认打开工作台");
-  is(e.ctx.document.body.classList.contains("with-ins"), true, "桌面默认让出右轨");
-  closeIt(e); await settle();
-  hasNot(e.els["boxes"].innerHTML, 'class="inspector', "关闭后工作台不渲染");
-  is(e.ctx.document.body.classList.contains("with-ins"), false, "关闭后收起右轨");
-  has(e.els["boxes"].innerHTML, 'data-box="director"', "组织视图仍在");
-  await e.ctx.load(); await settle();
-  hasNot(e.els["boxes"].innerHTML, 'class="inspector', "关闭后轮询不得把它带回来");
-  nodeClick("lead")(e); await settle();
-  has(e.els["boxes"].innerHTML, 'class="inspector', "点节点重新打开");
-  has(e.els["boxes"].innerHTML, "lead-who", "显示点击的信箱");
-  await e.ctx.load(); await settle();
-  has(e.els["boxes"].innerHTML, 'class="inspector', "点节点后轮询保持打开（insOpen 已置位）");
-  closeIt(e); await settle();
-  e.fire("op-shortcut", "click", { target: {} }); await settle();
-  has(e.els["boxes"].innerHTML, 'class="inspector', "右上 OPERATOR 徽章重开工作台");
-  has(e.els["boxes"].innerHTML, "director-who", "回到老板工作台");
-  await e.ctx.load(); await settle();
-  has(e.els["boxes"].innerHTML, 'class="inspector', "徽章重开后轮询保持打开");
-  const m = makeEnv({ width: 390 }); await settle();
-  hasNot(m.els["boxes"].innerHTML, 'class="inspector', "手机首屏不开工作台（组织视图优先）");
-  is(m.ctx.document.body.classList.contains("with-ins"), false, "手机不让出右轨");
-  nodeClick("lead")(m); await settle();
-  has(m.els["boxes"].innerHTML, 'class="inspector', "手机点节点才打开");
-  await m.ctx.load(); await settle();
-  has(m.els["boxes"].innerHTML, 'class="inspector', "手机打开后轮询保持");
-  closeIt(m); await settle();
-  hasNot(m.els["boxes"].innerHTML, 'class="inspector', "手机关闭回到组织视图");
+  for (const width of [undefined, 1440, 820, 390]) {
+    const tag = width === undefined ? "默认" : `${width}px`;
+    const e = makeEnv(width === undefined ? {} : { width }); await settle();
+    hasNot(e.els["boxes"].innerHTML, 'class="inspector', `${tag}：首屏不开工作台（弹窗）`);
+    has(e.els["boxes"].innerHTML, 'data-box="director"', `${tag}：组织视图在`);
+    is(e.ctx.document.body.classList.contains("has-layer"), false, `${tag}：未开弹窗时页面可滚动`);
+    nodeClick("lead")(e); await settle();
+    has(e.els["boxes"].innerHTML, 'class="inspector', `${tag}：点节点打开`);
+    has(e.els["boxes"].innerHTML, "lead-who", `${tag}：显示点击的信箱`);
+    has(e.els["boxes"].innerHTML, 'role="dialog"', `${tag}：是对话框`);
+    is(e.ctx.document.body.classList.contains("has-layer"), true, `${tag}：弹窗打开时背景锁滚动`);
+    await e.ctx.load(); await settle();
+    has(e.els["boxes"].innerHTML, 'class="inspector', `${tag}：轮询保持打开`);
+    closeIt(e); await settle();
+    hasNot(e.els["boxes"].innerHTML, 'class="inspector', `${tag}：关闭后不渲染`);
+    has(e.els["boxes"].innerHTML, 'data-box="director"', `${tag}：关闭后组织视图仍在`);
+    is(e.ctx.document.body.classList.contains("has-layer"), false, `${tag}：关闭后解除滚动锁`);
+    await e.ctx.load(); await settle();
+    hasNot(e.els["boxes"].innerHTML, 'class="inspector', `${tag}：关闭后轮询不得带回来`);
+    e.fire("op-shortcut", "click", { target: {} }); await settle();
+    has(e.els["boxes"].innerHTML, 'class="inspector', `${tag}：右上操作员按钮重开`);
+    has(e.els["boxes"].innerHTML, "director-who", `${tag}：回到老板工作台`);
+    closeIt(e); await settle();
+    // the CTA on the organization page is a [data-box] button for the operator
+    nodeClick("director")(e); await settle();
+    has(e.els["boxes"].innerHTML, "等待你处理", `${tag}：根节点按钮打开老板收件箱`);
+  }
+  // the close control and the dimmed backdrop are both [data-ins-close]; Esc closes the top layer
+  const e2 = makeEnv(); await settle();
+  e2.fire("op-shortcut", "click", { target: {} }); await settle();
+  const html2 = e2.els["boxes"].innerHTML;
+  is((html2.match(/data-ins-close/g) || []).length >= 2, true, "关闭键和遮罩都带 data-ins-close（点外面也能关）");
+  e2.fireDoc("keydown", { key: "Escape" }); await settle();
+  hasNot(e2.els["boxes"].innerHTML, 'class="inspector', "Esc 关闭工作台");
 }
 
-// ============ 14) 速修：HARNESS 页开 OPERATOR 不切回组织视图（工作台是全局右轨） ============
+// ============ 14) 工作台弹窗在 HARNESS 页就地打开，不切页 ============
 {
   const e = makeEnv(); await settle();
   e.fire("tab-hk", "click", { target: {} }); await settle();
   is(e.els["view-hk"].hidden, false, "先切到 HARNESS");
-  has(e.els["boxes"].innerHTML, 'class="inspector', "HARNESS 页工作台仍在（右轨不随切页消失）");
-  has(e.els["racks"].innerHTML, "MIXED", "racks 正常渲染");
-  e.fire("boxes", "click", { target: { closest: (s) => (s === "[data-ins-close]" ? { dataset: {} } : null) } }); await settle();
-  hasNot(e.els["boxes"].innerHTML, 'class="inspector', "HARNESS 页关闭后不渲染");
+  hasNot(e.els["boxes"].innerHTML, 'class="inspector', "HARNESS 首屏没有弹窗");
+  has(e.els["racks"].innerHTML, "部分开", "racks 正常渲染");
   e.fire("op-shortcut", "click", { target: {} }); await settle();
-  is(e.els["view-hk"].hidden, false, "点 OPERATOR 不切回组织视图");
+  is(e.els["view-hk"].hidden, false, "点操作员按钮不切回组织视图");
   is(e.els["tab-hk"].getAttribute("aria-pressed"), "true", "HARNESS 标签仍选中");
-  has(e.els["boxes"].innerHTML, 'class="inspector', "工作台在当前视图打开");
+  has(e.els["boxes"].innerHTML, 'class="inspector', "弹窗在当前页打开");
   has(e.els["boxes"].innerHTML, "director-who", "打开的是操作员工作台");
-  is(e.ctx.document.body.classList.contains("with-ins"), true, "打开后让出右轨");
   await e.ctx.load(); await settle();
   is(e.els["view-hk"].hidden, false, "轮询后仍是 HARNESS");
-  has(e.els["boxes"].innerHTML, 'class="inspector', "轮询保持工作台");
+  has(e.els["boxes"].innerHTML, 'class="inspector', "轮询保持弹窗");
+  e.fire("boxes", "click", { target: { closest: (s) => (s === "[data-ins-close]" ? { dataset: {} } : null) } }); await settle();
+  hasNot(e.els["boxes"].innerHTML, 'class="inspector', "HARNESS 页关闭后不渲染");
+  is(e.els["view-hk"].hidden, false, "关闭后仍在 HARNESS");
   const m = makeEnv({ width: 390 }); await settle();
   m.fire("tab-hk", "click", { target: {} }); await settle();
-  hasNot(m.els["boxes"].innerHTML, 'class="inspector', "手机 HARNESS 首屏无工作台");
+  hasNot(m.els["boxes"].innerHTML, 'class="inspector', "手机 HARNESS 首屏无弹窗");
   m.fire("op-shortcut", "click", { target: {} }); await settle();
-  is(m.els["view-hk"].hidden, false, "手机点 OPERATOR 也不切页");
-  has(m.els["boxes"].innerHTML, 'class="inspector', "手机就地打开工作台");
+  is(m.els["view-hk"].hidden, false, "手机点操作员按钮也不切页");
+  has(m.els["boxes"].innerHTML, 'class="inspector', "手机就地打开弹窗");
 }
 
 // ============ 15) 速修：收件人下拉 + 前缀模糊匹配（名单来自 /api/state，非第二份路由真相） ============
@@ -687,10 +693,14 @@ const detail = (e) => (e.els["letter"].hidden ? "" : String(e.els["letter"].inne
    All rendering here is presentation-only: zero write requests.
    ==================================================================================== */
 
-const insTab = (tab) => (e) => e.fire("boxes", "click", { target: { closest: (s) => {
-  if (s.includes("ins-tab") || s.includes("data-ins-tab")) return { id: "ins-tab-" + tab, dataset: { insTab: tab } };
-  return null;
-} } });
+// the workbench is a dialog that starts closed: open the operator's first, then switch the tab
+const insTab = (tab) => (e) => {
+  if (!String(e.els["boxes"].innerHTML).includes('class="inspector')) e.fire("op-shortcut", "click", { target: {} });
+  e.fire("boxes", "click", { target: { closest: (s) => {
+    if (s.includes("ins-tab") || s.includes("data-ins-tab")) return { id: "ins-tab-" + tab, dataset: { insTab: tab } };
+    return null;
+  } } });
+};
 const outboxAct = (action, row) => (e) => e.fire("boxes", "click", { target: { closest: (s) => {
   if (s.includes("outbox-action")) return { dataset: { outboxAction: action, to: row.to, id: row.id } };
   if (s.includes("data-outbox")) return { dataset: { to: row.to, id: row.id } };
@@ -734,6 +744,7 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
     { to: "ware", id: "O4", subject: "状态未知的信", need: "仅告知", body: "正文四", status: "unknown" },
   ];
   const e = makeEnv({ state: stA, outbox: { status: 200, json: { ok: true, outbox: OBOX } } }); await settle();
+  e.fire("op-shortcut", "click", { target: {} }); await settle();
   has(e.els["boxes"].innerHTML, 'id="ins-tab-inbox"', "工作台有收件箱标签");
   has(e.els["boxes"].innerHTML, 'id="ins-tab-outbox"', "工作台有发件箱标签");
   is(tabPressed(e, "ins-tab-inbox"), "true", "默认收件箱标签选中");
@@ -880,9 +891,9 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
   is(posts(e).length, 0, "活动展示零写请求");
   const en = makeEnv({ langs: ["en-US"], state: ACT }); await settle();
   const eb = en.els["boxes"].innerHTML;
-  has(eb, "WORKING", "en working 标签");
-  has(eb, "IDLE", "en idle 标签");
-  has(eb, "UNKNOWN", "en unknown 标签");
+  has(eb, "Working", "en working 标签");
+  has(eb, "Idle", "en idle 标签");
+  has(eb, "Unknown", "en unknown 标签");
 }
 
 // ============ 25) Runtime presence: harness rows carry the same badge ============
@@ -924,66 +935,82 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
   hasNot(op, 'data-activity="idle"', "操作员无假 idle 徽章");
   const en = makeEnv({ langs: ["en-US"], state: ACT }); await settle();
   nodeClick("lead")(en); await settle();
-  has(insHTML(en), "ACTIVITY", "en inspector 活动标签");
-  has(insHTML(en), "WORKING", "en inspector working");
+  has(insHTML(en), "Activity", "en inspector 活动标签");
+  has(insHTML(en), "Working", "en inspector working");
 }
 
 // ============ 27) Appearance: default system, click persists, no writes, no language change ============
 {
   const e = makeEnv({ storage: new Map(), matchDark: true }); await settle();
   is(thBtn(e, "system").getAttribute("aria-pressed"), "true", "默认选中跟随系统");
-  is(thBtn(e, "light").getAttribute("aria-pressed"), "false", "默认浅色未选中");
-  is(thBtn(e, "dark").getAttribute("aria-pressed"), "false", "默认深色未选中");
-  is(e.ctx.document.documentElement.dataset.theme, "dark", "跟随系统+系统深色 → data-theme=dark");
+  is(thBtn(e, "paper").getAttribute("aria-pressed"), "false", "默认纸白未选中");
+  is(thBtn(e, "night").getAttribute("aria-pressed"), "false", "默认夜未选中");
+  is(e.ctx.document.documentElement.dataset.theme, "night", "跟随系统+系统深色 → data-theme=night");
   is(posts(e).length, 0, "主题初始零写请求");
 
   const storage = new Map();
   const d = makeEnv({ storage, matchDark: false }); await settle();
+  is(d.ctx.document.documentElement.dataset.theme, "paper", "跟随系统+系统浅色 → data-theme=paper");
   const title = d.els["title"].textContent;
   d.calls.length = 0;
-  themeClick("dark")(d); await settle();
-  is(d.ctx.document.documentElement.dataset.theme, "dark", "点深色设置 data-theme=dark");
-  is(storage.get("postoffice.theme"), "dark", "深色写入 localStorage postoffice.theme");
-  is(thBtn(d, "dark").getAttribute("aria-pressed"), "true", "深色按钮选中");
+  themeClick("night")(d); await settle();
+  is(d.ctx.document.documentElement.dataset.theme, "night", "点夜设置 data-theme=night");
+  is(storage.get("postoffice.theme"), "night", "夜写入 localStorage postoffice.theme");
+  is(thBtn(d, "night").getAttribute("aria-pressed"), "true", "夜按钮选中");
   is(d.els["title"].textContent, title, "切主题不改语言");
   is(posts(d).length, 0, "切主题零写请求");
+  for (const pal of ["mist", "blueprint", "pine", "ember", "paper"]) {
+    themeClick(pal)(d); await settle();
+    is(d.ctx.document.documentElement.dataset.theme, pal, `点 ${pal} 设置 data-theme=${pal}`);
+  }
+  themeClick("neon")(d); await settle();
+  is(d.ctx.document.documentElement.dataset.theme, "paper", "未知配色回到跟随系统（此处系统浅色 → paper）");
+  is(storage.get("postoffice.theme"), "system", "未知配色存为 system");
 }
 
-// ============ 28) Appearance: persist across reload, system resolves, storage unusable ============
+// ============ 28) Appearance: persist across reload, system resolves, storage unusable, legacy values ============
 {
-  const storage = new Map([["postoffice.theme", "light"]]);
+  const storage = new Map([["postoffice.theme", "mist"]]);
   const reload = makeEnv({ storage, matchDark: true }); await settle();
-  is(thBtn(reload, "light").getAttribute("aria-pressed"), "true", "重载后沿用已存的 light");
-  is(reload.ctx.document.documentElement.dataset.theme, "light", "存 light 时系统深色也被覆盖");
+  is(thBtn(reload, "mist").getAttribute("aria-pressed"), "true", "重载后沿用已存的 mist");
+  is(reload.ctx.document.documentElement.dataset.theme, "mist", "存了配色时系统深色也被覆盖");
+
+  // choices saved by the previous two-state switch keep working
+  const old = makeEnv({ storage: new Map([["postoffice.theme", "dark"]]), matchDark: false }); await settle();
+  is(old.ctx.document.documentElement.dataset.theme, "night", "旧版存的 dark → night");
+  is(thBtn(old, "night").getAttribute("aria-pressed"), "true", "旧版 dark 对应夜按钮选中");
+  const old2 = makeEnv({ storage: new Map([["postoffice.theme", "light"]]), matchDark: true }); await settle();
+  is(old2.ctx.document.documentElement.dataset.theme, "paper", "旧版存的 light → paper");
 
   const s2 = new Map();
   const e = makeEnv({ storage: s2, matchDark: true }); await settle();
-  themeClick("light")(e); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "light", "点浅色");
+  themeClick("paper")(e); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "paper", "点纸白");
   themeClick("system")(e); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "dark", "跟随系统解析为 dark");
+  is(e.ctx.document.documentElement.dataset.theme, "night", "跟随系统解析为 night");
   is(s2.get("postoffice.theme"), "system", "跟随系统存储 system");
   is(thBtn(e, "system").getAttribute("aria-pressed"), "true", "系统按钮选中");
 
   const broken = makeEnv({ storageThrows: true, matchDark: true }); await settle();
   is(thBtn(broken, "system").getAttribute("aria-pressed"), "true", "存储不可用回退 system");
-  is(broken.ctx.document.documentElement.dataset.theme, "dark", "存储不可用仍能解析");
-  themeClick("dark")(broken); await settle();
-  is(broken.ctx.document.documentElement.dataset.theme, "dark", "存储不可用仍可切换");
+  is(broken.ctx.document.documentElement.dataset.theme, "night", "存储不可用仍能解析");
+  themeClick("pine")(broken); await settle();
+  is(broken.ctx.document.documentElement.dataset.theme, "pine", "存储不可用仍可切换");
 }
 
 // ============ 29) Appearance: labels via STR both languages + head bootstrap + color-scheme ============
 {
   const zh = makeEnv({ langs: ["zh-Hans-CN"], matchDark: true }); await settle();
   is(thBtn(zh, "system").textContent, "跟随系统", "zh 系统标签");
-  is(thBtn(zh, "light").textContent, "浅色", "zh 浅色标签");
-  is(thBtn(zh, "dark").textContent, "深色", "zh 深色标签");
+  is(thBtn(zh, "paper").textContent, "纸白", "zh 纸白标签");
+  is(thBtn(zh, "night").textContent, "夜", "zh 夜标签");
   has(String(zh.els["theme"].getAttribute("aria-label") || ""), "外观", "zh 主题组 aria-label=外观");
   const en = makeEnv({ langs: ["en-US"], matchDark: true }); await settle();
-  is(thBtn(en, "system").textContent, "SYSTEM", "en SYSTEM 标签");
-  is(thBtn(en, "light").textContent, "LIGHT", "en LIGHT 标签");
-  is(thBtn(en, "dark").textContent, "DARK", "en DARK 标签");
+  is(thBtn(en, "system").textContent, "System", "en System 标签");
+  is(thBtn(en, "paper").textContent, "Paper", "en Paper 标签");
+  is(thBtn(en, "ember").textContent, "Ember", "en Ember 标签");
   has(String(en.els["theme"].getAttribute("aria-label") || ""), "Appearance", "en 主题组 aria-label=Appearance");
+  is(thBtn(en, "night").getAttribute("title"), "Night", "色块按钮 title 写明名字（颜色之外也有文字）");
 
   // source: a head bootstrap script reads postoffice.theme and sets data-theme, before the app script
   const scripts = html.match(/<script(?:\s[^>]*)?>[\s\S]*?<\/script>/g) || [];
@@ -993,6 +1020,14 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
   const idxApp = html.indexOf("const STR");
   is(idxBoot > -1 && idxBoot < idxApp, true, "引导脚本在主脚本之前（head，先于样式渲染）");
   has(html, "color-scheme", "CSS 定义 color-scheme");
+  // every palette the switch offers has a block in the stylesheet defining the same role variables
+  const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+  for (const pal of ["paper", "night", "mist", "blueprint", "pine", "ember"]) {
+    const m = css.match(new RegExp("\\[data-theme=" + pal + "\\]\\{([^}]*)\\}"));
+    is(!!m, true, `${pal} 配色块存在`);
+    for (const role of ["--paper:", "--ink:", "--red:", "--on-red:", "--wire:", "--key-on:", "--scrim:"])
+      is(!!m && m[1].includes(role), true, `${pal} 定义 ${role}`);
+  }
 }
 
 // ============ 30) Outbox rows: need + frozen alias + id/ref + age + the SPECIFIC reason ============
@@ -1067,17 +1102,17 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
 // ============ 33) Appearance: SYSTEM follows live media change; explicit choice is immune ============
 {
   const e = makeEnv({ storage: new Map(), matchDark: false }); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "light", "初始 system + 系统浅色");
+  is(e.ctx.document.documentElement.dataset.theme, "paper", "初始 system + 系统浅色");
   e.systemDark(true); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "dark", "system 时系统转深色 → 实时跟随");
+  is(e.ctx.document.documentElement.dataset.theme, "night", "system 时系统转深色 → 实时跟随");
   e.systemDark(false); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "light", "system 时系统转浅色 → 实时跟随");
-  themeClick("light")(e); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "paper", "system 时系统转浅色 → 实时跟随");
+  themeClick("mist")(e); await settle();
   e.systemDark(true); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "light", "显式 LIGHT 不受系统变化影响");
-  themeClick("dark")(e); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "mist", "显式配色不受系统变化影响");
+  themeClick("night")(e); await settle();
   e.systemDark(false); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "dark", "显式 DARK 不受系统变化影响");
+  is(e.ctx.document.documentElement.dataset.theme, "night", "显式夜不受系统变化影响");
   is(posts(e).length, 0, "系统跟随零写请求");
 }
 
@@ -1127,7 +1162,7 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
   is(posts(e).length, 0, "身份展示零写请求");
   const en = makeEnv({ langs: ["en-US"], state: ACME }); await settle();
   nodeClick("lead")(en); await settle();
-  has(insHTML(en), "ACTIVE", "en inspector 显示 ACTIVE");
+  has(insHTML(en), "Active", "en inspector 显示 Active");
 }
 
 console.log(failures ? `FAIL ${failures}` : "PASS");

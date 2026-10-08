@@ -5,7 +5,7 @@ description: 本机联络总站（agent-postoffice）——给本机其他 AI �
 
 # 联络总站
 
-完整说明：`{HOME}/README.md`。通讯录：`{POSTOFFICE} list`。
+完整说明：`{HOME}/README.md`（安装时由 docs/MAILBOX_GUIDE.md 生成的使用手册；功能全貌见仓库 README）。通讯录：`{POSTOFFICE} list`。
 
 ## 发信（唯一统一做法）
 

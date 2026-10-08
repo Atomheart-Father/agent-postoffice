@@ -1099,8 +1099,8 @@ grep -q 'data-f="${c.failed}"' "$PANEL_HTML" && grep -q 'data-n="${b.pending.len
 # v1.12 控制台守护：信件详情的「回复/仅归档」说明必须双语都在；HARNESS 页必须让位给 inspector 右轨
 test "$(grep -c 'letterHint:' "$PANEL_HTML")" = "2" \
   && ok "v1.12 信件详情说明（letterHint）中英文都在" || bad "v1.12 letterHint 缺语言"
-grep -q 'with-ins' "$PANEL_HTML" \
-  && ok "v1.12 组织页给 inspector 右轨让位（with-ins）" || bad "v1.12 缺 with-ins 让位样式"
+grep -q 'data-ins-close' "$PANEL_HTML" && grep -q 'has-layer' "$PANEL_HTML" \
+  && ok "收件箱是弹窗：遮罩/关闭键带 data-ins-close，打开时背景锁滚动（has-layer）" || bad "收件箱弹窗缺关闭钩子或滚动锁"
 po17_new pnl "$SW_CFG" "$SW_ON"
 POSTOFFICE_HOME="$P2" "$PO" add cbox --claude "面板确认用会话" >/dev/null
 POSTOFFICE_HOME="$P2" "$PO" add obox6 --notify >/dev/null

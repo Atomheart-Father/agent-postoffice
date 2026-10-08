@@ -16,7 +16,7 @@ MSG
 ```
 
 - 通讯录：`{POSTOFFICE} list`（谁是谁、在线还是离线、积压几封），或看各信箱的 `CONTACT.md`。
-- 收到“【联络总站新信】”提醒：读信 → 按自己的任务权限处理 → 要对方继续就 `send` 回正式信、仅告知/收尾用 `ack` 记账（见下）→ **把原信挪到自己信箱的 `done/`**。收到“【联络总站回执】”提醒则默认不答复，看完用 `archive-receipt` 归档（见下）。同一轮里正式信排在前面，回执合并成一条放在最后。
+- 收到“【联络总站新信】”提醒：读信 → 按自己的任务权限处理 → 要对方继续就 `send` 回正式信、仅告知/收尾用 `ack` 记账（见下）→ **用 `archive-current`（OpenCode：`postoffice_archive_current`）归档原信，不要手动 `mv`**。收到“【联络总站回执】”提醒则默认不答复，看完用 `archive-receipt` 归档（见下）。同一轮里正式信排在前面，回执合并成一条放在最后。
 - 不能跑命令时手写：在 `{HOME}/<收件信箱>/inbox/` 写 `YYYYMMDD-HHMMSS_<你>_<事由>.tmp`，写完改名为 `.md`。开头三行：
   ```
   来源：<你的信箱名>
@@ -113,7 +113,7 @@ MSG
 
 | 方式 | 谁负责 | 说明 |
 |---|---|---|
-| `claude_hook` | Claude Code 的 Stop / SessionStart 钩子（`asyncRewake`）在每轮结束和会话打开时自动在后台起 `postoffice hook` | 优先按 `CLAUDE_CODE_HOST_SESSION_ID` 认人（改名、回退都不丢），取不到再查日志映射，最后退回标题；空等不调用模型；有信就唤醒会话（忙时等这一轮做完） |
+| `claude_hook` | Claude Code 的 Stop / SessionStart / UserPromptSubmit 钩子（`asyncRewake`）在每轮结束和会话打开时自动在后台起 `postoffice hook` | 优先按 `CLAUDE_CODE_HOST_SESSION_ID` 认人（改名、回退都不丢），取不到再查日志映射，最后退回标题；空等不调用模型；有信就唤醒会话（忙时等这一轮做完） |
 | `opencode_plugin` | OpenCode 全局插件 | 会话空闲时用 OpenCode 自带接口发一条提醒 |
 | `codex_queue` | 邮递员 `postoffice postman` | 用 `codex queue` 往 Codex 线程排一条提醒 |
 | `notify` | 邮递员 | 只弹系统通知给人 |

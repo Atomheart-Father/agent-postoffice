@@ -415,7 +415,9 @@ class HookRateClaim(unittest.TestCase):
         head = (self.letter(lid)).read_text().splitlines()[:1]
         self.assertIn(f"【联络总站新信｜{BOX}】", err, "唤醒负载的形状不许变")
         self.assertIn(str(self.letter(lid)), err, "唤醒负载必须给出信件路径")
-        self.assertIn(head[0], err, "唤醒负载必须带信件开头")
+        # the letter header carries a trailing provenance sentence; the wake text deliberately carries only the neutral
+        # `来源：<sender>` part (provenance_test enforces that), so compare up to the sentence
+        self.assertIn(head[0].split("（")[0], err, "唤醒负载必须带信件开头（来源行，中性写法）")
         self.assertIn("按信件“需要”字段处理", err, "结尾那句不许变")
         self.assertEqual(self.seen(), [str(self.letter(lid))], "唤醒了就必须写 .seen")
         self.assertEqual(len(self.wake_times()), 1, "一次唤醒只记一次限流")

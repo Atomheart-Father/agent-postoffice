@@ -1,3 +1,5 @@
+> **Historical record** (written for the release it names; kept for the reasoning and evidence). It is not current usage documentation: for how things work now, read the README and docs/PANEL_GUIDE.md.
+
 # 交付报告 · Q-TICKET-V1-13-HUMAN-CONSOLE-MATURITY-01
 
 - 分支：`human-console-maturity`
@@ -25,7 +27,7 @@
 - `tests/activity_race_test.py`（§13-15 读改写竞态 / 旧绑定心跳负例）
 - `tests/layout_probe.mjs`（§21 真机浏览器布局探测，opt-in）
 
-交付文档：`TICKET-Q-TICKET-V1-13-HUMAN-CONSOLE-MATURITY-01.md`、`V1.13-PROBE-EVIDENCE.md`（§15/§21/§11 真机证据）。
+交付文档：`TICKET_v1.13_human_console_maturity.md`、`PROBE_EVIDENCE_v1.13.md`（§15/§21/§11 真机证据）。
 
 Diffstat（已跟踪文件）：11 files changed, 1382 insertions(+), 138 deletions(-)。
 
@@ -70,16 +72,16 @@ Diffstat（已跟踪文件）：11 files changed, 1382 insertions(+), 138 deleti
 
 ### 复验第 2 轮（Codex 复审 2 的 4 处，已逐条修）
 
-7. **心跳 vs 真实 working 的写交错**：加互斥锁后，心跳与另一进程的 `postoffice activity --state working` 交错时 working 不会被旧快照覆盖。负例：`tests/activity_race_test.py::test_touch_never_clobbers_a_concurrent_working_write`（60 轮真线程交错）。变异复核：去掉锁/回落逻辑时该用例会 RED（见 `V1.13-PROBE-EVIDENCE.md` §11 同款白盒）。
+7. **心跳 vs 真实 working 的写交错**：加互斥锁后，心跳与另一进程的 `postoffice activity --state working` 交错时 working 不会被旧快照覆盖。负例：`tests/activity_race_test.py::test_touch_never_clobbers_a_concurrent_working_write`（60 轮真线程交错）。变异复核：去掉锁/回落逻辑时该用例会 RED（见 `PROBE_EVIDENCE_v1.13.md` §11 同款白盒）。
 8. **旧 watcher 换绑定后不得污染**：见上第 2 条；真 watcher 跨绑定负例 `tests/activity_test.py::test_live_watcher_rebind_never_publishes_the_old_identity`（s1 watcher 存活 → routes 改绑 s2 → s2 写 working → 2.5s 旧心跳后仍 working/s2，面板不 UNKNOWN）。
 9. **从详情撤回后详情与列表一致**：详情层撤回成功后关闭详情并明确反馈「已撤回，原信已存档」（`retractDone`）；失败保留详情与真实原因。用例：`panel_console_ui_test.mjs` 34/35。
-10. **证据补齐**：`layout_probe.mjs` 重写为覆盖 §21 全部点名表面（top rail/Organization/Harness/workbench/Inbox/Outbox/letter/outbox-edit/compose/recipient-dropdown/Activity-drawer/Appearance），必需表面打不开即 FAIL，不再吞 skip；四档原始输出见 `V1.13-PROBE-EVIDENCE.md`。§15 补真实 harness 版本（Claude 2.1.276 / OpenCode 1.18.35 / Codex ChatGPT 154.0.8037.98）并区分「已证」与「未证（本票不部署）」。§11 附删除第二次检查后的 RED 原始输出。
+10. **证据补齐**：`layout_probe.mjs` 重写为覆盖 §21 全部点名表面（top rail/Organization/Harness/workbench/Inbox/Outbox/letter/outbox-edit/compose/recipient-dropdown/Activity-drawer/Appearance），必需表面打不开即 FAIL，不再吞 skip；四档原始输出见 `PROBE_EVIDENCE_v1.13.md`。§15 补真实 harness 版本（Claude 2.1.276 / OpenCode 1.18.35 / Codex ChatGPT 154.0.8037.98）并区分「已证」与「未证（本票不部署）」。§11 附删除第二次检查后的 RED 原始输出。
 11. **wake 分支的 binding 保护（复审 3，postoffice:2977）**：直接把「旧绑定发布」堵住——Claude 侧三类观察点里，**watcher 上岗**与 **wake 退出 2 分支**经 `activity_publish`（只有 `binding == 当前路由 binding` 才写，旧绑定一律不写）；**心跳**经 `activity_touch`（绑定不符时本就不写，见第 2 条）；单次 **`activity` CLI** 则先按当前 `routes` 解析身份，天然是当前绑定。真机负例 `activity_test.py::test_live_watcher_rebind_wake_branch_never_publishes_old_binding`；白盒变异（去掉 wake 保护）→ `binding` 写回 s1、面板 UNKNOWN 的 RED 原始输出见证据文档。
 
 校准：
 - §2 统一普通直发信判定：新增共享 `DERIVED_HEADERS`/`derived_headers()`/`is_ordinary_direct()`，`mutation_target` 与 `outbox_rows` 共用同一套。
 - §11 claim 后二次复检 RED 证据：`tests/mutation_second_check_test.py`（monkeypatch `claim_letter` 抢到认领后写 DELIVERED，断言 `apply_mutation` 拒绝且原信不动）；另附变异（删第二次检查）的 RED 原始输出。
-- §15/§21 真机证据见 `V1.13-PROBE-EVIDENCE.md`（生命周期能力探测 + 真实 harness 版本 + 390/430/768/820 真浏览器全表面横向溢出，含修复）。
+- §15/§21 真机证据见 `PROBE_EVIDENCE_v1.13.md`（生命周期能力探测 + 真实 harness 版本 + 390/430/768/820 真浏览器全表面横向溢出，含修复）。
 
 ## §27-32 来源口径
 

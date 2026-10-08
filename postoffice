@@ -4498,9 +4498,19 @@ def cmd_panel(a):
                 return 404, {"ok": False, "error": "not_found"}
             return 200, {"ok": True, **detail}
 
+        def _page(self):
+            # 每次请求都重读页面文件：改了 panel/index.html 刷新浏览器就生效，不用重启面板；
+            # 读不到（文件被替换的瞬间等）就退回启动时读到的那份，面板不会因此打不开。
+            nonlocal html
+            try:
+                html = (REPO / "panel" / "index.html").read_bytes()
+            except OSError:
+                pass
+            return html
+
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
-                self._send(200, html, "text/html; charset=utf-8")
+            if self.path.split("?", 1)[0] in ("/", "/index.html"):
+                self._send(200, self._page(), "text/html; charset=utf-8")
             elif self.path == "/api/state":
                 self._send(200, json.dumps(panel_state(), ensure_ascii=False).encode())
             elif self.path.split("?", 1)[0] == "/api/letter":

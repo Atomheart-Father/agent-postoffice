@@ -1,3 +1,5 @@
+> **Historical record** (written for the release it names; kept for the reasoning and evidence). It is not current usage documentation: for how things work now, read the README and docs/PANEL_GUIDE.md.
+
 # v1.7 面板补充：投递状态与中英文
 
 用户追加授权：纠正面板“积压”误导，并补齐中英文界面；并入当前 v1.7 批次，不另开发布。

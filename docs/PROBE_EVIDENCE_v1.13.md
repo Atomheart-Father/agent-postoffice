@@ -1,3 +1,5 @@
+> **Historical record** (written for the release it names; kept for the reasoning and evidence). It is not current usage documentation: for how things work now, read the README and docs/PANEL_GUIDE.md.
+
 # v1.13 能力探测与真机布局证据（§15 / §21）
 
 本文件记录退修校准要求的**真机证据**，不是 DOM stub，也不是 CSS 字符串断言。

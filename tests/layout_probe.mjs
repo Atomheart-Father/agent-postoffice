@@ -71,11 +71,11 @@ for (const width of WIDTHS) {
   await clickIf(page, "#tab-org");
   await clickIf(page, "#op-shortcut"); await record("workbench+Inbox", "#ins");
   await clickIf(page, "#ins-tab-outbox"); await record("OperatorOutbox", "#outbox");
-  await clickIf(page, "[data-outbox]"); await record("letter", "#letter");
+  await clickIf(page, "#outbox .obrow .sj"); await record("letter", "#letter");
   await clickIf(page, "[data-edit-close]");
   await clickIf(page, '[data-outbox-action="edit"]'); await record("outbox-edit", "#edit-subject");
   await clickIf(page, "[data-edit-close]");
-  await clickIf(page, "[data-ins-close]");   // 关掉工作台：fixed inspector(z40) 会盖住顶栏，挡住 compose/activity
+  await clickIf(page, ".close-x[data-ins-close]");   // 关掉工作台弹窗：它盖住整个页面，挡住 compose/activity
   await clickIf(page, "#btn-compose"); await record("compose", "#compose");
   const to = page.locator("#compose-to").first();
   if (await to.count()) { await to.click().catch(() => {}); await to.type("le", { delay: 20 }).catch(() => {}); await page.waitForTimeout(200); }
@@ -83,7 +83,7 @@ for (const width of WIDTHS) {
   await clickIf(page, "#compose-cancel");
   await clickIf(page, "#btn-activity"); await record("Activity-drawer", "#drawer.open");
   await clickIf(page, "#drawer-x");
-  await clickIf(page, '[data-theme-choice="dark"]'); await record("Appearance", "#theme");
+  await clickIf(page, '[data-theme-choice="night"]'); await record("Appearance", "#theme");
 
   for (const [label, m, okOpen] of rows) {
     const over = Math.max(m.docOver, m.bodyOver);
