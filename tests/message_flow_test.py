@@ -243,6 +243,11 @@ class MessageFlow(unittest.TestCase):
                                    if isinstance(x, dict) and x.get("type") == "text")
                            for it in self.fake_pending())
 
+    def _pending_formal_count(self, it):
+        text = "".join(x.get("text", "") for x in (it.get("input") or [])
+                       if isinstance(x, dict) and x.get("type") == "text")
+        return len(re.findall(r"^\d+\. \S+/", text, re.M))
+
     # ==================================================================== A
     # -- A1: send prints the stable ref -----------------------------------
     def test_send_prints_the_stable_ref_alongside_the_id(self):
@@ -451,24 +456,31 @@ class MessageFlow(unittest.TestCase):
         # Python 侧沿用 v1.4 的 shlex.quote 约定（安全串不加引号）；插件侧才是总是加单引号。
         self.assertIn("postoffice receipt " + shlex.quote("coded") + " " + shlex.quote("orig-1"), text)
 
-    def test_codex_postman_caps_a_batch_at_twenty_and_merges_the_rest_into_one_pending(self):
+    def test_codex_postman_caps_a_batch_at_twenty_and_continues_bounded(self):
         ids = [self.send("coded", subject=f"超批{i}") for i in range(21)]
         postman(self.home)
         postman(self.home)
         calls = self.codex_calls()
-        self.assertEqual(len(calls), 2, f"21 封应当恰好两轮（20 + 1 追加），实际 {len(calls)} 轮")
+        self.assertEqual(len(calls), 2, f"21 封应当恰好两轮（20 + 续批 1），实际 {len(calls)} 轮")
         first, second = calls
         ordered = sorted(ids)               # the postman queues in file-name order, not send order
         self.assertIn("【联络总站｜20 封新信】", first, "一轮最多 20 封：\n" + first)
         for i, lid in enumerate(ordered[:20], start=1):
             self.assertIn(f"{i}. coded/{lid}", first, "前 20 封逐封给稳定引用（按文件名序）")
         for lid in ordered[20:]:
-            self.assertNotIn(lid, first, "第 21 封留到下一轮，不得挤进这一批")
-        self.assertIn(ordered[20], second, "第二轮必须补上剩下那封")
-        # 忙时第二轮是 UPDATE 就地追加同一个 pending，不是新建提交：始终只有一个 postoffice pending
-        self.assertEqual(len(self.fake_pending()), 1, f"忙时应只有一个 postoffice pending：{self.fake_pending()}")
+            self.assertNotIn(lid, first, "第 21 封留到续批，不得挤进这一批")
+        self.assertIn(ordered[20], second, "续批必须补上剩下那封")
+        # 忙时超过上限就开一个「续批」pending（base#2），不是无限拼进同一项：有界且不丢信
+        pending = self.fake_pending()
+        self.assertEqual(len(pending), 2, f"超上限应有界续批为两个 pending：{pending}")
+        cids = sorted(it.get("clientUserMessageId") for it in pending)
+        self.assertEqual(cids, ["postoffice:coded", "postoffice:coded#2"])
+        joined = self.fake_pending_text()
         for lid in ids:
-            self.assertIn(f"{lid}.md", self.fake_pending_text(), "合并后的索引要含全部精确 ID")
+            self.assertIn(f"{lid}.md", joined, "续批后两个索引合起来要含全部精确 ID")
+        # 每项各自有界（正式信 ≤ 20）
+        for it in pending:
+            self.assertLessEqual(self._pending_formal_count(it), 20)
 
     def test_codex_alarm_letter_never_joins_the_formal_batch(self):
         ids = [self.send("coded", subject=f"普通{i}") for i in range(2)]
@@ -591,6 +603,203 @@ class MessageFlow(unittest.TestCase):
         self.assertEqual(len(self.wake_times("coded")), 2, "没有唤醒就不许再记限流")
         for lid in extra:
             self.assertNotIn(str(self.letter_path("coded", lid)), self.woken(), "抢不到就不许记账")
+
+    # -- B: robust boundaries (dedupe / pagination / lost response) --------
+    def test_codex_merge_dedupes_by_id_and_keeps_rules_once_formal_first(self):
+        l1 = self.send("coded", subject="去重一")
+        postman(self.home)
+        # an aged receipt notification rides along with the next formal round
+        rc = self.home / "coded" / "inbox" / "20260101-000000_ghost_回执.md"
+        rc.write_text("来源：ghost\n事由：回执：旧事\n需要：回执（默认不答复）\n"
+                      "回执：orig-9\n原事由：旧事\n\n正文\n", encoding="utf-8")
+        old = time.time() - 3600
+        os.utime(rc, (old, old))
+        l2 = self.send("coded", subject="去重二")
+        postman(self.home)
+        self.assertEqual(len(self.fake_pending()), 1, "仍合并为一个 pending")
+        text = self.fake_pending_text()
+        self.assertEqual(text.count(f"{l1}.md"), 1, "稳定引用必须去重，不得把旧 reminder 全文再拼一遍")
+        self.assertEqual(text.count("按各信"), 1, "公共规则只出现一次")
+        self.assertIn(f"{l2}.md", text)
+        self.assertIn("postoffice receipt coded orig-9", text, "回执仍按 ID 索引")
+        self.assertLess(text.index(f"{l2}.md"), text.index("另有 1 条回执"),
+                        "正式信在前、回执块在后")
+
+    def _paging_codex(self):
+        """Like fake_codex but returns ONE item per page (cursor = offset), to exercise pagination."""
+        script = self.home / "fake_codex_paged.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "D = os.path.dirname(os.path.abspath(__file__))\n"
+            "STATE = os.path.join(D, 'fake_codex_state.json')\n"
+            "CAP = os.path.join(D, 'codex.calls')\n"
+            "def load():\n"
+            "    try:\n"
+            "        return json.load(open(STATE))\n"
+            "    except Exception:\n"
+            "        return {'busy': True, 'pending': [], 'seq': 0}\n"
+            "def save(s):\n"
+            "    open(STATE, 'w').write(json.dumps(s))\n"
+            "def emit(o):\n"
+            "    sys.stdout.write(json.dumps(o) + '\\n'); sys.stdout.flush()\n"
+            "def text_of(p):\n"
+            "    return '\\n'.join(x.get('text','') for x in (p.get('input') or []) if isinstance(x, dict) and x.get('type')=='text')\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line: continue\n"
+            "    try: msg = json.loads(line)\n"
+            "    except ValueError: continue\n"
+            "    m, rid, p = msg.get('method'), msg.get('id'), (msg.get('params') or {})\n"
+            "    s = load()\n"
+            "    if m == 'initialize':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'userAgent':'fake','codexHome':D,'platformFamily':'unix','platformOs':'macos'}})\n"
+            "    elif m == 'thread/queue/list':\n"
+            "        off = int(p.get('cursor') or 0)\n"
+            "        page = s['pending'][off:off+1]\n"
+            "        nxt = str(off + 1) if off + 1 < len(s['pending']) else None\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'data':page,'nextCursor':nxt}})\n"
+            "    elif m == 'thread/queue/add':\n"
+            "        open(CAP,'a').write('===8<===\\n' + text_of(p) + '\\n===>8===\\n')\n"
+            "        if s['busy']:\n"
+            "            s['seq'] += 1\n"
+            "            s['pending'].append({'id':'q%d'%s['seq'],'input':p.get('input'),'clientUserMessageId':p.get('clientUserMessageId')})\n"
+            "        save(s)\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'queuedSubmission':None}})\n"
+            "    elif m == 'thread/queue/update':\n"
+            "        open(CAP,'a').write('===8<===\\n' + text_of(p) + '\\n===>8===\\n')\n"
+            "        for it in s['pending']:\n"
+            "            if it['id'] == p.get('queuedSubmissionId'):\n"
+            "                it['input'] = p.get('input')\n"
+            "        save(s)\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'queuedSubmission':None}})\n"
+            "    else:\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'method not found'}})\n",
+            encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    def test_codex_paginates_to_find_our_pending_beyond_the_first_page(self):
+        # 用户自己排了很多队时邮局 pending 落在后页：必须翻页精确找到，不能只看第一页就当「不存在」再 add。
+        self._seed_fake_state([{"id": "u1",
+                                "input": [{"type": "text", "text": "USER-A", "text_elements": []}],
+                                "clientUserMessageId": None}], seq=1)
+        self.set_methods("coded", "codex_queue", codex_cli=str(self._paging_codex()), thread_id="th-x")
+        l0 = self.send("coded", subject="翻页零")           # page2 empty → add our item
+        postman(self.home)
+        self.assertEqual(len(self.fake_pending()), 2, "用户项 + 邮局项")
+        l1 = self.send("coded", subject="翻页一")           # our item now on page 2 → must be found
+        postman(self.home)
+        pend = self.fake_pending()
+        self.assertEqual(len(pend), 2, f"翻页找到后是就地更新，不得新建第三项：{pend}")
+        ours = [p for p in pend if p["clientUserMessageId"] == "postoffice:coded"]
+        self.assertEqual(len(ours), 1)
+        ours_text = "".join(x.get("text", "") for x in ours[0]["input"])
+        self.assertIn(f"{l0}.md", ours_text)
+        self.assertIn(f"{l1}.md", ours_text)
+        users = [p for p in pend if p["clientUserMessageId"] is None]
+        self.assertEqual(users[0]["input"][0]["text"], "USER-A", "翻页不得碰用户项")
+
+    def _lossy_codex(self):
+        """fake_codex that RECORDS the add then exits without replying (accepted-but-response-lost)."""
+        script = self.home / "fake_codex_lossy.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "D = os.path.dirname(os.path.abspath(__file__))\n"
+            "STATE = os.path.join(D, 'fake_codex_state.json')\n"
+            "CAP = os.path.join(D, 'codex.calls')\n"
+            "def load():\n"
+            "    try:\n"
+            "        return json.load(open(STATE))\n"
+            "    except Exception:\n"
+            "        return {'busy': True, 'pending': [], 'seq': 0}\n"
+            "def save(s):\n"
+            "    open(STATE, 'w').write(json.dumps(s))\n"
+            "def emit(o):\n"
+            "    sys.stdout.write(json.dumps(o) + '\\n'); sys.stdout.flush()\n"
+            "def text_of(p):\n"
+            "    return '\\n'.join(x.get('text','') for x in (p.get('input') or []) if isinstance(x, dict) and x.get('type')=='text')\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line: continue\n"
+            "    try: msg = json.loads(line)\n"
+            "    except ValueError: continue\n"
+            "    m, rid, p = msg.get('method'), msg.get('id'), (msg.get('params') or {})\n"
+            "    s = load()\n"
+            "    if m == 'initialize':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'userAgent':'fake','codexHome':D,'platformFamily':'unix','platformOs':'macos'}})\n"
+            "    elif m == 'thread/queue/list':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'data':s['pending'],'nextCursor':None}})\n"
+            "    elif m == 'thread/queue/add':\n"
+            "        open(CAP,'a').write('===8<===\\n' + text_of(p) + '\\n===>8===\\n')\n"
+            "        if s['busy']:\n"
+            "            s['seq'] += 1\n"
+            "            s['pending'].append({'id':'q%d'%s['seq'],'input':p.get('input'),'clientUserMessageId':p.get('clientUserMessageId')})\n"
+            "        save(s)\n"
+            "        sys.exit(0)\n"          # accepted, but the reply is lost
+            "    else:\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'method not found'}})\n",
+            encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    def _vanishing_codex(self):
+        """fake_codex that records the add then exits without replying AND without persisting the
+        item — the write is lost with no on-queue evidence it ever landed."""
+        script = self.home / "fake_codex_vanishing.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "D = os.path.dirname(os.path.abspath(__file__))\n"
+            "CAP = os.path.join(D, 'codex.calls')\n"
+            "def emit(o):\n"
+            "    sys.stdout.write(json.dumps(o) + '\\n'); sys.stdout.flush()\n"
+            "def text_of(p):\n"
+            "    return '\\n'.join(x.get('text','') for x in (p.get('input') or []) if isinstance(x, dict) and x.get('type')=='text')\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line: continue\n"
+            "    try: msg = json.loads(line)\n"
+            "    except ValueError: continue\n"
+            "    m, rid, p = msg.get('method'), msg.get('id'), (msg.get('params') or {})\n"
+            "    if m == 'initialize':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'userAgent':'fake','codexHome':D,'platformFamily':'unix','platformOs':'macos'}})\n"
+            "    elif m == 'thread/queue/list':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'data':[],'nextCursor':None}})\n"
+            "    elif m == 'thread/queue/add':\n"
+            "        open(CAP,'a').write('===8<===\\n' + text_of(p) + '\\n===>8===\\n')\n"
+            "        sys.exit(0)\n"          # accepted? unknown — no reply and nothing persisted
+            "    else:\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'method not found'}})\n",
+            encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    def test_codex_lost_response_that_landed_recovers_without_duplicate_add(self):
+        # The add is accepted and persisted, but the reply is lost. The next round must find the
+        # real item (not blindly re-add) and reconcile — exactly one add, one item, delivered.
+        self.set_methods("coded", "codex_queue", codex_cli=str(self._lossy_codex()), thread_id="th-x")
+        l1 = self.send("coded", subject="丢响应")
+        postman(self.home)
+        self.assertEqual(len(self.codex_calls()), 1, "丢响应后不得再 add 一次（不许盲重试）")
+        self.assertEqual(len(self.fake_pending()), 1, "写入已落盘")
+        self.assertIn(f"{l1}.md", self.fake_pending_text())
+        self.assertFalse((self.home / "coded" / ".codex_uncertain.json").exists(),
+                         "找到真实 pending 后要清掉未知标记（确认恢复）")
+        self.assertIn(str(self.letter_path("coded", l1)), self.woken(), "恢复后记账为已投递")
+
+    def test_codex_lost_response_with_no_visible_item_stays_unknown_without_resubmit(self):
+        # The add's reply is lost AND no item is visible: the outcome is unknown, so the next round
+        # must NOT resubmit (could double-deliver); keep a diagnosable marker and leave the letter.
+        self.set_methods("coded", "codex_queue", codex_cli=str(self._vanishing_codex()), thread_id="th-x")
+        l1 = self.send("coded", subject="丢响应无痕")
+        postman(self.home)
+        self.assertEqual(len(self.codex_calls()), 1, "结果未知时不得盲重试再 add")
+        self.assertTrue((self.home / "coded" / ".codex_uncertain.json").exists(),
+                        "结果未知要留下可诊断标记")
+        self.assertEqual(self.woken(), {}, "unknown 不得记账为已投递")
+        self.assertIn(f"{l1}.md", self.inbox("coded"), "原信保留在 inbox")
 
     # -- B: Claude hook regression (same round, multi-letter, one wake) ----
     def test_hook_wakes_once_for_several_letters_and_records_presented_union(self):
