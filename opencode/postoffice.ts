@@ -12,12 +12,13 @@
 //   恢复规则由人决定：删掉 <信箱>/.claims/<文件名> 才允许再投一次，或把信挪进 done 收账
 // - 不改模型/工具/权限，不新建会话，不批准权限请求
 //
-// 另外提供四个原生工具，模型只能操作**当前会话自己**的信箱：
+// 另外提供五个原生工具，模型只能操作**当前会话自己**的信箱：
 //   postoffice_alarm_schedule(delay_minutes) —— 只收一个分钟数，没有收件人/信箱/正文参数
 //   postoffice_alarm_cancel()               —— 不收任何参数
 //   postoffice_message_edit(message_ref, content) —— 原地改（或 content=null 撤回）自己发出、
 //                                                   还没被对方通道接受的普通信；规矩同 CLI 的 edit/retract
 //   postoffice_archive_current(keep_unarchived)   —— 归档本会话已展示过、还没归档的信（presented 集合）
+//   postoffice_archive(letter_id)           —— 按精确编号归档本箱一封信（换绑/逐封收尾用）；同 CLI 的 archive
 // 身份只来自框架给的 ToolContext.sessionID，再唯一映射到已登记且启用插件的信箱；
 // 无映射、多个映射、信箱离线、身份核不上时一律拒绝，模型无法指定别的信箱或会话。
 // 改信/归档的真正改动都由 CLI 在既有的认领与锁下完成，插件自己不动信。
@@ -789,7 +790,30 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           const argv = ["archive-current", "--box", who.box]
           for (const k of keep) argv.push("--keep", k)
           const r = await runCLI(argv)
-          return r.text || "（归档没有输出）"
+          if (r.code !== 0) return `没归档（命令失败）：${r.text || "未知错误"}`
+          return r.text || "已归档：没有待归档的已展示消息。"
+        },
+      },
+      postoffice_archive: {
+        description:
+          "按**精确编号**归档**本会话自己信箱**里的一封信到 done/（不读正文、不回执、不发信、不叫醒）。" +
+          "编号必须是本箱 inbox 里的裸文件名（完整编号见发信时的「引用：」或信头），不接受路径、通配符或 .md 后缀；" +
+          "只动本箱、不跨箱，冲突不覆盖，已在 done/ 幂等。换绑/换会话后处理旧信、或逐封选定收尾时用它" +
+          "（archive-current 一键归档已展示过的一批；这个按编号逐封归档）。",
+        args: {
+          letter_id: zod.string().describe("本箱 inbox 里的信件编号（裸文件名，不含路径/通配符/.md）"),
+        },
+        async execute(args, ctx) {
+          const raw = (args as { letter_id?: unknown }).letter_id
+          const id = typeof raw === "string" ? raw.trim() : ""
+          if (!id) return "没归档：letter_id 必须是本箱 inbox 里的信件编号（裸文件名）。"
+          const who = await resolveOwnBox(ctx.sessionID)
+          if (!who.box) {
+            return `没归档：${who.why}。邮局只归档本会话自己信箱里的信。`
+          }
+          const r = await runCLI(["archive", who.box, id])
+          if (r.code !== 0) return `没归档：${r.text || "命令失败"}`
+          return r.text || `已归档：${who.box}/${id}`
         },
       },
     },

@@ -482,7 +482,8 @@ def reminder(name, files):
         parts.append("按各信“需要”字段处理；回信/回执/归档规则见 postoffice skill。")
     else:
         for f in formal:
-            parts += [f"【联络总站新信｜{name}】", f"== {f}", wake_head(f), LETTER_TAIL]
+            parts += [f"【联络总站新信｜{name}】", f"引用：{name}/{f.stem}",
+                      f"== {f}", wake_head(f), LETTER_TAIL]
     if len(receipts) == 1 and not formal:
         parts.append(single_receipt_block(name, receipts[0]))
     elif receipts:
@@ -1015,7 +1016,9 @@ def _codex_batch_text(entries):
         parts.append("按各信“需要”字段处理；回信/回执/归档规则见 postoffice skill。")
     else:
         for e in formal:
-            parts += [f"【联络总站新信｜{e.get('name', '')}】", f"== {e.get('path', '')}",
+            parts += [f"【联络总站新信｜{e.get('name', '')}】",
+                      f"引用：{e.get('name', '')}/{e['ref']}",
+                      f"== {e.get('path', '')}",
                       f"来源：{e.get('src', '?')}", f"事由：{e.get('subj', '（无）')}",
                       f"需要：{e.get('need', '')}", LETTER_TAIL]
     if len(receipts) == 1 and not formal:
@@ -1036,7 +1039,7 @@ def _codex_batch_text(entries):
 # verbatim so re-render is lossless; the bare stable name/ref come from undoing the shell quoting.
 _CODEX_FORMAL_LINE_RE = re.compile(r"^\d+\. (\S+)/(\S+)  来源：(\S+)  事由：(.*?)  (\S.*)$", re.M)
 _CODEX_SINGLE_FORMAL_RE = re.compile(
-    r"【联络总站新信｜(\S+)】\n== (\S.*)\n来源：(\S+)\n事由：(.*)\n需要：(.*)")
+    r"【联络总站新信｜(\S+)】\n引用：(\S+)/(\S+)\n== (\S.*)\n来源：(\S+)\n事由：(.*)\n需要：(.*)")
 _CODEX_RECEIPT_LINE_RE = re.compile(
     r"^- (\S+)：(.*?)  (查询：postoffice receipt .*)$", re.M)
 _CODEX_SINGLE_RECEIPT_RE = re.compile(
@@ -1073,8 +1076,8 @@ def _codex_parse_entries(text):
         name, ref, src, subj, path = m.groups()
         out.append({"k": "f", "ref": ref, "name": name, "src": src, "subj": subj, "path": path})
     for m in _CODEX_SINGLE_FORMAL_RE.finditer(text):
-        name, path, src, subj, need = m.groups()
-        out.append({"k": "f", "ref": Path(path).stem, "name": name, "src": src,
+        name, _box, ref, path, src, subj, need = m.groups()
+        out.append({"k": "f", "ref": ref or Path(path).stem, "name": name, "src": src,
                     "subj": subj, "need": need, "path": path})
     for m in _CODEX_RECEIPT_LINE_RE.finditer(text):
         src, subj, query = m.groups()
@@ -2894,13 +2897,18 @@ def ack_letter(name, ref, note="", wake=False, routes=None):
     append_ack({"time": now_str(), "by": name, "id": bid, "kind": kind, "note": note, "to": to})
     to_done(letter)
     lines, notified = [], False
+    system = (to == "postoffice")
     if kind == "broadcast":
         done = sum(1 for e in read_acks() if e.get("id") == bid and e.get("kind") == "broadcast")
         lines.append(f"已回执：{bid}（广播 {done}/{len(rec.get('to', []))}，不会单独叫醒 {to}）")
+    elif system:
+        lines.append(f"已记账（知悉系统通知）：{bid}；不回送系统。")
     else:
         lines.append(f"已回执：{bid}（空闲时通知 {to}，默认不答复）")
     if kind == "letter" or wake:
-        if to in boxes(routes) and (HOME / to / "inbox").is_dir():
+        if system:
+            pass                            # 系统通知：只留知悉账，绝不回送、不注册假信箱
+        elif to in boxes(routes) and (HOME / to / "inbox").is_dir():
             prefix = "copy that" if wake else "回执"
             body = (f"对应原信：{bid}\n"
                     f"回执正文只存在账本，按需查询：postoffice receipt {shlex.quote(to)} {shlex.quote(bid)}")

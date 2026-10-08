@@ -602,6 +602,7 @@ const STR = {
     groupOn: "{o}/{n} 在线", groupMail: "待投递 {w} / 已提醒待归档 {r}",
     aliasNone: "当前没有在线候选", aliasBad: "不可用", notRegistered: "未登记",
     aliasNotify: "通知 {n}", aliasPending: "已确认 {a}；待切换 {b}（稳定期还剩 {s} 秒，未确认前新信已按当前状态投递）",
+    aliasEscalate: "执行候选全部离线，升级 @{role} → {target}（升级受理方不获原岗位 ACTIVE）",
     cfgBad: "配置不可用：{e}",
     errClear: "归档失败", errStatus: "修改失败", errOffline: "连不上面板服务（postoffice panel 是否还开着？）",
     errGroup: "分组开关失败",
@@ -684,6 +685,7 @@ const STR = {
     aliasNone: "no online candidate", aliasBad: "unusable", notRegistered: "not registered",
     aliasNotify: "notify {n}",
     aliasPending: "confirmed {a}; switching to {b} in {s} s (new letters already go by the current state)",
+    aliasEscalate: "all execution candidates offline — escalated to @{role} → {target} (the acceptor does not take the original role's ACTIVE)",
     cfgBad: "Configuration unusable: {e}",
     errClear: "Archive failed", errStatus: "Change failed",
     errOffline: "Cannot reach the panel service (is postoffice panel still running?)",
@@ -1932,6 +1934,7 @@ async function load() {
           `<span class="chip">${esc(c.name)}${c.known ? "" : `（${esc(t("notRegistered"))}）`}${c.known ? (c.online ? ` ${esc(t("online"))}` : ` ${esc(t("offline"))}`) : ""}</span>`).join("")}
           ${a.notify && a.notify.length ? `<span class="chip">${esc(fmt("aliasNotify", { n: a.notify.map(esc).join("、") }))}</span>` : ""}</div>
         ${a.pending ? `<div class="settle">${esc(fmt("aliasPending", { a: a.confirmed || t("aliasNone"), b: a.pending || t("aliasNone"), s: a.pending_in }))}</div>` : ""}
+        ${a.kind === "escalation" && a.escalation ? `<div class="settle">${esc(fmt("aliasEscalate", { role: a.escalation.role, target: a.escalation.target || t("aliasNone") }))}</div>` : ""}
       </div>`; }).join("") : `<p class="hintp">${esc(t("noAliases"))}</p>`;
     const sw = st.switches || [];
     const switchesEl = $("switches");
