@@ -2998,14 +2998,33 @@ def cmd_hook(_a):
         time.sleep(POLL)
 
 
+def slack_post(text):
+    """One best-effort outbound webhook POST: short timeout, secret-free failure log, never retried.
+
+    Shared by the confirmed-delivery alert and the grace-timeout alert so both obey the same rules: a
+    dead or slow webhook changes nothing, blocks the round for at most ~3 s, and the URL is never
+    logged (only the exception type and HTTP code).
+    """
+    import urllib.request
+    req = urllib.request.Request(
+        SLACK_WEBHOOK, data=json.dumps({"text": text}, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=3).close()
+    except Exception as e:
+        code = getattr(e, "code", "")
+        log("postman.log", f"slack 告警未送达（{type(e).__name__}{f' {code}' if code else ''}）；"
+                           f"投递不受影响，本轮不重试")
+
+
 def slack_alert(name, route, group):
-    """Best-effort one-shot webhook page for the human operator mailbox.
+    """Best-effort one-shot webhook page for the human operator mailbox on confirmed delivery.
 
     Fires only on the confirmed codex/notify delivery path: the panel section names this mailbox
     as operator, the box is a plain notify mailbox, and the batch carries formal letters (receipt
-    notifications never page; the hook/plugin grace-timeout path never calls here). One batch is
-    one POST. A dead or slow webhook changes nothing about delivery, logs one secret-free line
-    (never the URL) and is never retried.
+    notifications never page). The hook/plugin grace-timeout path has its own alert
+    (slack_grace_alert). One batch is one POST. A dead or slow webhook changes nothing about
+    delivery and is never retried.
     """
     if not SLACK_WEBHOOK or route.get("methods") != ["notify"] \
             or name != panel_config().get("operator"):
@@ -3028,16 +3047,27 @@ def slack_alert(name, route, group):
                             f"｜需要：{header_field(p, '需要：') or '（无）'}"
                             for p in formal]
                          + [f"打开：{link}"])
-    import urllib.request
-    req = urllib.request.Request(
-        SLACK_WEBHOOK, data=json.dumps({"text": text}, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        urllib.request.urlopen(req, timeout=3).close()
-    except Exception as e:
-        code = getattr(e, "code", "")
-        log("postman.log", f"slack 告警未送达（{type(e).__name__}{f' {code}' if code else ''}）；"
-                           f"投递不受影响，本轮不重试")
+    slack_post(text)
+
+
+def slack_grace_alert(name, p):
+    """Best-effort one-shot Slack page for a letter the channel never confirmed within GRACE.
+
+    Mirrors the desktop popup on the claude_hook / opencode_plugin grace branch: mailbox, 事由 and a
+    panel deep link, never the body. The wording stays "未确认成功唤醒/投递" on purpose -- the system
+    has no read receipt, so it must not claim the session read the letter or the model ignored it.
+    Dedup is the caller's (the same timeout mark that suppresses the next popup), so it is never
+    re-sent; unset webhook means zero requests.
+    """
+    if not SLACK_WEBHOOK:
+        return
+    link = f"{PANEL_BASE_URL}#/mail/{name}" if PANEL_BASE_URL else f"#/mail/{name}"
+    text = "\n".join([
+        f"{name} 20 分钟未确认成功唤醒/投递",
+        f"事由：{header_field(p, '事由：') or '（无）'}",
+        f"打开：{link}/{p.stem}",
+    ])
+    slack_post(text)
 
 
 def cmd_postman(_a):
@@ -3128,6 +3158,7 @@ def cmd_postman(_a):
                             notify(f"联络总站：{name} 20 分钟未被唤醒", field(p, "事由") or p.name)
                             log("postman.log", f"{method} {name} {p.name} 超 20 分钟未送达，已通知人")
                             mark(key, reminded=False)
+                            slack_grace_alert(name, p)   # 去重/桌面弹窗照旧；只把这类超时提醒另同步一条到 Slack
                             continue
                         else:
                             continue

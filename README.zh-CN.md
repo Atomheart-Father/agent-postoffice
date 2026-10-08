@@ -102,7 +102,7 @@ MSG
 - **写信 / 回复 / 回执 / 归档**：＋写信以操作员身份发信（收件人 = 信箱或 `@` 逻辑地址；分组拒绝）。回复预填规范发信方与 `Re:` 主题，走 `/api/send` 发出后把原信归档——正式回复**绝不**再发 `ack`（否则对方收两份）。若发送成功但归档失败，页面明确提示并只提供「重试归档」（绝不二次发送；已回复记录只活在本页会话）。收到并归档走 `/api/ack-one`（recorded / already / receipt_notice 三态）；仅归档走 `/api/archive-one`（不发回执）。打开一封信是零副作用的纯读。
 - **深链**：`#/mail/<box>` 直达某信箱工作台；`#/mail/<box>/<id>` 直达某封信。深链一次性消费（hash 经 `history.replaceState` 清除）：关闭后不会被 5 秒刷新重新拉起，浏览器后退也不会重放已消费的链接；非法深链只提示一次。
 - **远程访问（可选）**：面板仍只监听 `127.0.0.1`。设置 `POSTOFFICE_PANEL_BASE_URL=https://host.ts.net` 后深链使用该前缀，且写接口只放行这**一个精确** Origin——不支持通配符、后缀匹配、`X-Forwarded-Host`，值非法时面板拒绝启动。推荐隧道是 `tailscale serve`；不开它，localhost 照常用。
-- **Slack 操作员提醒（可选，仅出站）**：设置 `POSTOFFICE_SLACK_WEBHOOK` 后，操作员信箱确认收到正式信时，邮递员会发一条简短 Slack 提醒（发件方、事由、需要、深链——绝不带正文；一轮多封合并成一条「N 封」加收件链接）。尽力而为、约 3 秒超时：慢、失败甚至挂起的 webhook 绝不改变投递结果、绝不重试，最多让那一轮短暂等一下。webhook 地址是机密：只从环境变量读，绝不写进 `config.json`、`routes.json`、状态文件、HTML、日志或本仓库。没有任何入站——Slack 不能往邮局发信。
+- **Slack 操作员提醒（可选，仅出站）**：设置 `POSTOFFICE_SLACK_WEBHOOK` 后，操作员信箱确认收到正式信时，邮递员会发一条简短 Slack 提醒（发件方、事由、需要、深链——绝不带正文；一轮多封合并成一条「N 封」加收件链接）。同一个 webhook 也会镜像**20 分钟兜底弹窗**：发给 hook/plugin 信箱、过了宽限期仍未确认成功唤醒/投递的信，会再发一条简短 Slack 告警（目标信箱、事由、深链——绝不带正文），措辞如实写「未确认成功唤醒/投递」（本系统没有已读检测）；它沿用同一套一次性超时记号，绝不重发。尽力而为、约 3 秒超时：慢、失败甚至挂起的 webhook 绝不改变投递结果、绝不重试，最多让那一轮短暂等一下。webhook 地址是机密：只从环境变量读，绝不写进 `config.json`、`routes.json`、状态文件、HTML、日志或本仓库。没有任何入站——Slack 不能往邮局发信。
 - **私有运行设置（可选）：`$POSTOFFICE_HOME/.env`** —— launchd 起的邮递员/面板不继承你终端的 export，这个极小的 stdlib 文件（启动时读取；只认 `POSTOFFICE_*` 键；无 shell 语法、无变量展开；process env 永远赢过 `.env`；坏行安全跳过且诊断不回显内容）就是放它们的地方。示例（全是假值）：`POSTOFFICE_SLACK_WEBHOOK=https://hooks.slack.com/services/T000/B000/XXXX`、`POSTOFFICE_PANEL_BASE_URL=https://machine.example.ts.net`。记得 `chmod 600`；它只在你本机 HOME，**不属于本仓库**，也绝不写进 `routes.json`/`config.json`、状态、HTML 或日志。改完重启邮递员/面板生效。
 
 ### v1.13：发件箱、运行状态、外观、移动端
@@ -226,6 +226,7 @@ OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己
 | 面板展示配置：可选 `panel` 段（label/operator/organization）、节点规则（mailbox 与 members 二选一、未知字段、alias 拒绝）、全树唯一、规范化形状、absent/error/valid 三态——以及**隔离性**：故意写坏 `panel` 段后，physical 发信、`@alias`、分组操作、完整邮递员一轮与 `/api/state` 照常工作且 `routes.json` 字节不变 | `tests/panel_presentation_test.py`（11 项；含非 BOXZ 的 ACME 树） |
 | 面板 BASE_URL 与 Origin：非法 `POSTOFFICE_PANEL_BASE_URL` 拒绝启动、只放行那一个精确 Origin、scheme/后缀/其它主机探测 403、localhost 仍可用、仍只绑 127.0.0.1 | `tests/panel_origin_test.py`（6 项，临时家真服务器） |
 | Slack 操作员提醒：只有操作员 + 正式信触发、带 BASE_URL 深链、批量形态、失败不改投递也不重发、机密不进日志/状态/HTML、未设置零请求、挂起 webhook 不拖住下一个信箱 | `tests/panel_slack_test.py`（10 项，本地假 webhook） |
+| Slack 超时同步：hook/plugin 信箱过了宽限期仍未确认成功唤醒/投递 → 镜像桌面弹窗发一条只含元数据（目标信箱、事由、深链，绝无正文）的告警，沿用同一套一次性超时记号；未到点/已接受/离线/闹钟 → 零请求；下一轮绝不重发；notify 路径保持自己的措辞；失败/慢响应不阻断记账与下一个信箱；机密不进日志 | `tests/slack_grace_test.py`（12 项，本地假 webhook） |
 | `.env` 私有运行设置：只补缺失的 `POSTOFFICE_*` 键、process env 优先、注释/引号/坏行处理且不回显值、无 shell 展开/执行、launchd 风格（只有 `POSTOFFICE_HOME`+`PATH`）仍能读到 webhook/base URL、secret 不进日志/状态/HTML | `tests/env_file_test.py`（12 项） |
 | 人类控制台 UI：通用组织渲染（ACME）、操作员横条/徽章、Harness rack 与精确匹配组控（部分重叠绝不显示）、写信/回复全矩阵（含发送成功+归档失败→只重试归档、绝不二次发送、绝不 ack）、回执三态、仅归档、纯读、深链一次性生命周期、未分配区域（渲染纯度、不重复）、operator 无效禁写 | `tests/panel_console_ui_test.mjs`（12 块，DOM stub） |
 | 面板 UI：点 pending 行 → 详情显示接口取回的（不是行内的）内容且被转义；仅归档只发一次 `{box,id}` POST，然后关闭并刷新；读取/归档失败的提示；切换语言关闭详情且不发写请求（在途读取也会作废）；新文案两种语言都在 | `tests/panel_letter_ui_test.mjs` 加扩展后的 `tests/panel_i18n_test.mjs` |
@@ -249,7 +250,7 @@ OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己
 - **升级 agent-postoffice 之后**：只是就地更新脚本的话，Claude 不用重启——现有监视在下一轮 Stop/SessionStart 钩子时会加载新代码；重启 Claude App 反而会让各会话的监视消失，得先跑一轮恢复。已开着的 OpenCode 会一直用旧插件，需重启。只有钩子配置本身变了（首次安装，或增删钩子）才需要重载 Claude App。
 
 - **面板页面启动时缓存**：`postoffice panel` 启动时读一次 `panel/index.html`，改了 UI 要重启面板才生效。
-- **Slack 提醒跟着邮递员轮次走**：hook/plugin 的实际投递最多晚一个轮询间隔才提醒，且依赖邮递员存活；单条提醒最多让一轮同步阻塞约 3 秒（超时），绝不更久，也绝不改变投递。
+- **Slack 提醒跟着邮递员轮次走**：确认投递告警与超时同步告警都在邮递员一轮里发出、且依赖邮递员存活（超时告警最多在到点后一个轮询间隔内出现）；单条提醒最多让一轮同步阻塞约 3 秒（超时），绝不更久，也绝不改变投递或桌面弹窗。
 - **「已回复」记录只活在本页**：发送成功/归档失败后，硬刷新页面会丢掉这个页面内存记录、重新显示可重试归档的状态（磁盘上的信件才是真相）。
 - **`config.json` 里任何位置的重复 JSON 键会让 routing 和 panel 一起空白**：重复键拒绝是全文件级设计（fail closed）。
 
