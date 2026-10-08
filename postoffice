@@ -940,23 +940,38 @@ def opencode_lookup(ref):
     return row
 
 
-def write_contact(name, r):
-    direct = []
-    if r.get("claude_title"):
-        direct.append(f"Claude 会话标题「{r['claude_title']}」")
-    if r.get("session_id"):
-        direct.append(f"OpenCode 会话 ID `{r['session_id']}`")
-    if r.get("thread_id"):
-        direct.append(f"`codex queue --thread {r['thread_id']} --message '<摘要+路径>'`")
-    method = r.get("methods", ["notify"])[0]
-    text = (f"# {name} 联络名片\n\n"
-            f"- **是谁**：{r.get('who') or '（未填写）'}，{APP.get(method, '?')}\n"
-            f"- **状态**：{'在线' if online(r) else '离线（信会留在信箱，不提醒，上线后补送）'}\n"
-            f"- **发信**：`postoffice send {name} <你的信箱名> \"<事由>\" \"<需要>\"`\n"
-            f"- **怎么被叫醒**：{METHODS.get(method, method)}\n"
-            f"- **标识**：{'；'.join(direct) if direct else '无'}\n\n"
-            f"本名片由 `postoffice` 生成；改联系方式请用 `postoffice add/online/offline`，别手改。\n")
-    (HOME / name / "CONTACT.md").write_text(text, encoding="utf-8")
+def write_contact(name, r, routes=None, cfg=None):
+    """Render <box>/CONTACT.md from the ONE derived identity (same result as panel/handoff).
+
+    Deliberately does NOT copy a live online/current-owner status or a direct session-queue hint:
+    who serves an address can change, so the card keeps a query entry instead and tells the reader
+    to check current identity before acting on an old duty.
+    """
+    routes = load_routes() if routes is None else routes
+    cfg = (load_config(validate=False)[0] or {}) if cfg is None else cfg
+    s = identity_snapshot(name, routes, cfg, ok=identity_ok(cfg, routes))
+    p = s["profile"]
+    lines = [f"# {name} 联络名片", "",
+             f"- **信箱**：{name}（固定收信身份；换会话不改信箱）",
+             f"- **显示名**：{p['display_name'] or '—'}",
+             f"- **类别**：{p['kind']}",
+             f"- **说明**：{p['description'] or p['legacy_note'] or '（未填写）'}",
+             f"- **当前绑定**：{binding_str(s['binding'])}（换绑用 `postoffice rebind`，改资料用 `postoffice add`）",
+             f"- **发信**：`postoffice send {name} <你的信箱名> \"<事由>\" \"<需要>\"`",
+             f"- **按身份查**：`postoffice identity {name}`（当前职责 / 公司规章 / 项目进度以这次查询为准，"
+             f"别照旧交接里的旧职责办事）"]
+    if s["org_present"] and not s["config_ok"]:
+        lines.append(f"- **组织身份**：已停用（{s['error']}）——物理收信照常")
+    elif s["org_present"]:
+        if s["memberships"]:
+            lines.append("- **属于**：" + "；".join(
+                f"{m['kind']} {m['id']}（{m['name']}）" for m in s["memberships"]))
+        for c in s["company_rules"]:
+            lines.append(f"- **公司规章**：{c['path']}（{read_file_state(c['path'])[0]}）")
+        for c in s["project_status"]:
+            lines.append(f"- **项目进度**：{c['path']}（{read_file_state(c['path'])[0]}）")
+    lines += ["", "本名片由 `postoffice` 生成；别手改。"]
+    (HOME / name / "CONTACT.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ---------- config.json: groups + logical addresses (v1.7) ----------
@@ -1014,27 +1029,205 @@ def require_config(feature):
 
 
 def normalize_alias(value):
-    """(spec, error). The plain array form means candidates only: no notify, no handoff."""
+    """(spec, error). The plain array form means candidates only: no notify, no handoff, no role."""
     if isinstance(value, list):
-        return {"candidates": value, "notify": [], "handoff": ""}, ""
+        return {"candidates": value, "notify": [], "handoff": "", "role": None}, ""
     if not isinstance(value, dict):
         return None, "必须是候选信箱数组，或含 candidates 的对象"
-    extra = sorted(set(value) - {"candidates", "notify", "handoff"})
+    extra = sorted(set(value) - {"candidates", "notify", "handoff", "role"})
     if extra:
-        return None, f"对象里有不支持的字段：{'、'.join(extra)}（只有 candidates / notify / handoff）"
+        return None, f"对象里有不支持的字段：{'、'.join(extra)}（允许 candidates / notify / handoff / role）"
     if "candidates" not in value:
         return None, "对象缺 candidates"
+    role, _role_err = normalize_role(value.get("role"))   # role shape errors are org-level (see org_errors)
     return {"candidates": value["candidates"], "notify": value.get("notify", []),
-            "handoff": value.get("handoff", "")}, ""
+            "handoff": value.get("handoff", ""), "role": role}, ""
+
+
+def normalize_role(value):
+    """(role, error). A Role is just an alias that carries an organization definition.
+
+    scope.kind is company|project and scope.id must name a registered entity (checked in
+    config_errors, which has the organization table). title is the formal duty label. Only a
+    company-scope role may pin an explicit handoff_file; a project role derives its handoff from
+    the project's single status_file, so a second conflicting pointer is refused here.
+    """
+    if value is None:
+        return None, ""
+    if not isinstance(value, dict):
+        return None, "role 必须是对象 {scope, title, handoff_file?}"
+    extra = sorted(set(value) - {"scope", "title", "handoff_file"})
+    if extra:
+        return None, f"role 里有不支持的字段：{'、'.join(extra)}（允许 scope / title / handoff_file）"
+    scope = value.get("scope")
+    if not isinstance(scope, dict):
+        return None, "role.scope 必须是对象 {kind, id}"
+    sextra = sorted(set(scope) - {"kind", "id"})
+    if sextra:
+        return None, f"role.scope 里有不支持的字段：{'、'.join(sextra)}"
+    if scope.get("kind") not in ("company", "project"):
+        return None, "role.scope.kind 必须是 company 或 project"
+    if not isinstance(scope.get("id"), str) or not scope["id"]:
+        return None, "role.scope.id 必须是非空字符串"
+    title = value.get("title", "")
+    if not isinstance(title, str) or not title.strip():
+        return None, "role.title 必须是非空字符串"
+    hf = value.get("handoff_file", "")
+    if not isinstance(hf, str):
+        return None, "role.handoff_file 必须是字符串路径"
+    return {"scope": {"kind": scope["kind"], "id": scope["id"]}, "title": title.strip(),
+            "handoff_file": hf}, ""
+
+
+def _org_ref(errs, where, ref, label, known):
+    if not isinstance(ref, str) or not ref:
+        errs.append(f"{where} 的{label}必须是信箱名")
+    elif ref not in known:
+        errs.append(f"{where} 的{label}指向未登记信箱 {ref}")
+
+
+def organization_errors(org, known):
+    """Every reason the organization section is unusable. [] = fine. Shallow, human-readable."""
+    if not isinstance(org, dict):
+        return ["organization 必须是对象"]
+    errs = []
+    extra = sorted(set(org) - {"companies", "projects"})
+    if extra:
+        errs.append(f"organization 里有不支持的字段：{'、'.join(extra)}（只有 companies / projects）")
+    companies, projects = org.get("companies", {}), org.get("projects", {})
+    if not isinstance(companies, dict):
+        errs.append("organization.companies 必须是对象")
+        companies = {}
+    if not isinstance(projects, dict):
+        errs.append("organization.projects 必须是对象")
+        projects = {}
+    for cid, c in companies.items():
+        if not isinstance(cid, str) or not NAME_RE.fullmatch(cid):
+            errs.append(f"company id 不合法：{cid!r}")
+        if not isinstance(c, dict):
+            errs.append(f"company {cid} 必须是对象")
+            continue
+        cextra = sorted(set(c) - {"name", "rules_file", "members"})
+        if cextra:
+            errs.append(f"company {cid} 有不支持的字段：{'、'.join(cextra)}（只有 name / rules_file / members）")
+        if not isinstance(c.get("name", ""), str):
+            errs.append(f"company {cid} 的 name 必须是字符串")
+        rf = c.get("rules_file", "")
+        if not isinstance(rf, str) or not rf:
+            errs.append(f"company {cid} 的 rules_file 必须是非空路径")
+        mem = c.get("members", [])
+        if not isinstance(mem, list):
+            errs.append(f"company {cid} 的 members 必须是信箱数组")
+        else:
+            if len(mem) != len(set(map(str, mem))):
+                errs.append(f"company {cid} 的 members 有重复")
+            for m in mem:
+                _org_ref(errs, f"company {cid}", m, "成员", known)
+    for pid, p in projects.items():
+        if not isinstance(pid, str) or not NAME_RE.fullmatch(pid):
+            errs.append(f"project id 不合法：{pid!r}")
+        if not isinstance(p, dict):
+            errs.append(f"project {pid} 必须是对象")
+            continue
+        pextra = sorted(set(p) - {"company_id", "name", "root", "status_file", "members"})
+        if pextra:
+            errs.append(f"project {pid} 有不支持的字段：{'、'.join(pextra)}"
+                        "（只有 company_id / name / root / status_file / members）")
+        cid = p.get("company_id")
+        if cid not in companies:
+            errs.append(f"project {pid} 的 company_id 指向不存在的公司 {cid!r}")
+        if not isinstance(p.get("name", ""), str):
+            errs.append(f"project {pid} 的 name 必须是字符串")
+        if not isinstance(p.get("root", ""), str) or not p.get("root"):
+            errs.append(f"project {pid} 的 root 必须是非空路径")
+        if not isinstance(p.get("status_file", ""), str) or not p.get("status_file"):
+            errs.append(f"project {pid} 的 status_file 必须是非空路径")
+        mem = p.get("members", [])
+        if not isinstance(mem, list):
+            errs.append(f"project {pid} 的 members 必须是信箱数组")
+        else:
+            if len(mem) != len(set(map(str, mem))):
+                errs.append(f"project {pid} 的 members 有重复")
+            cmem = set(map(str, (companies.get(cid) or {}).get("members", []))) if isinstance(companies.get(cid), dict) else set()
+            for m in mem:
+                _org_ref(errs, f"project {pid}", m, "成员", known)
+                if cid in companies and m not in cmem:
+                    errs.append(f"project {pid} 的成员 {m} 不是所属公司 {cid} 的成员")
+    return errs
+
+
+def org_errors(cfg, routes):
+    """Every reason the organization / identity PRESENTATION is unusable. [] = usable.
+
+    Deliberately separate from config_errors: a broken organization must never disable valid
+    groups/aliases routing (physical mail and @alias keep working exactly as before); it only turns
+    off the identity ornament, which then reports "已停用" + this reason. Core routing errors (bad
+    JSON, duplicate keys, unknown version, a malformed alias/group shape) stay fail-closed in
+    config_errors. `config import` gates on BOTH lists (a bad org is rejected at import time); the
+    runtime loader gates on config_errors only.
+    """
+    if not isinstance(cfg, dict):
+        return ["顶层必须是 JSON 对象"]
+    ver = cfg.get("version")
+    org = cfg.get("organization")
+    errs = []
+    if ver != 2:
+        if org is not None:
+            errs.append("organization 需要 config version 2")
+    companies = projects = {}
+    if ver == 2:
+        if org is not None and not isinstance(org, dict):
+            errs.append("organization 必须是对象")
+        elif isinstance(org, dict):
+            errs.extend(organization_errors(org, set(boxes(routes))))
+            companies = org.get("companies", {}) if isinstance(org.get("companies", {}), dict) else {}
+            projects = org.get("projects", {}) if isinstance(org.get("projects", {}), dict) else {}
+    aliases = cfg.get("aliases", {})
+    if isinstance(aliases, dict):
+        for name, value in aliases.items():
+            raw = value.get("role") if isinstance(value, dict) else None
+            if raw is None:
+                continue
+            if isinstance(value, dict) and value.get("handoff"):
+                errs.append(f"alias {name} 同时配了 role 和 alias.handoff："
+                            f"岗位交接只能来自 scope，二选一")
+            role, rerr = normalize_role(raw)
+            if rerr:
+                errs.append(f"alias {name} 的 role：{rerr}")
+                continue
+            if ver != 2:
+                errs.append(f"alias {name} 的 role 需要 config version 2 与 organization")
+                continue
+            kind, rid = role["scope"]["kind"], role["scope"]["id"]
+            table = companies if kind == "company" else projects
+            if rid not in table:
+                errs.append(f"alias {name} 的 role.scope 指向不存在的"
+                            f"{'公司' if kind == 'company' else '项目'} {rid}")
+            if role["handoff_file"] and kind != "company":
+                errs.append(f"alias {name} 是项目岗位：交接只能来自 project.status_file，"
+                            f"不能再配 role.handoff_file")
+    return errs
+
+
+def identity_ok(cfg, routes):
+    """The identity presentation is usable only when BOTH the core config and the org are valid."""
+    if not isinstance(cfg, dict):
+        return False
+    return not config_errors(cfg, routes) and not org_errors(cfg, routes)
 
 
 def config_errors(cfg, routes):
-    """Every reason a candidate config cannot be imported, as human lines. [] = importable."""
+    """Every reason a candidate config cannot be imported, as human lines. [] = importable.
+
+    version 2 additionally allows the optional `organization` section and role metadata on aliases;
+    version 1 keeps exactly its old semantics, so every existing config stays importable untouched.
+    """
     if not isinstance(cfg, dict):
         return ["顶层必须是 JSON 对象"]
     errs = []
-    if cfg.get("version") != 1:
-        errs.append(f"version 必须是 1（现在读到 {cfg.get('version')!r}）")
+    ver = cfg.get("version")
+    if ver not in (1, 2):
+        errs.append(f"version 必须是 1 或 2（现在读到 {ver!r}）")
     groups, aliases = cfg.get("groups", {}), cfg.get("aliases", {})
     if not isinstance(groups, dict):
         errs.append("groups 必须是对象")
@@ -1261,6 +1454,7 @@ def group_scope(ref, routes):
 def set_group_status(ref, status, quiet=False):
     """Validate every member first, then reuse the single-mailbox transition rules."""
     routes = load_routes()
+    cfg = load_config(validate=False)[0] or {}
     label, members = group_scope(ref, routes)
     for m in members:
         if m not in boxes(routes):
@@ -1272,7 +1466,7 @@ def set_group_status(ref, status, quiet=False):
     if members:
         save_routes(routes)
         for m in members:
-            write_contact(m, routes[m])
+            write_contact(m, routes[m], routes, cfg)
         log("postman.log", f"{label} 整组设为 {status}（{len(members)} 个信箱）")
     if not quiet:
         print(f"{label}：{len(members)} 个信箱已设为 {status}")
@@ -1304,6 +1498,468 @@ def clear_group(ref, quiet=False):
     return label, total
 
 
+# ---------- organization identity: one relation, one derived snapshot ----------
+# 组织身份不是一张会漂移的缓存：routes.json 里的 （profile / binding / status） + config.json 里的
+# organization + 既有 aliases 就是全部事实；这里只做「读一个快照、派生一个身份」。名片、面板、
+# harness 提示、交接提示都从同一个 identity_snapshot 取，绝不各自拼一份职责。
+_BINDING_FIELDS = (("codex_queue", "thread_id"), ("opencode_plugin", "session_id"),
+                   ("claude_hook", "claude_session"))
+
+
+def binding_of(r):
+    """The single current binding of a route as a structured view, or None.
+
+    Derived from the existing routes binding fields (never a second, independently editable copy):
+    the first session field present wins and names the kind. `notify` has no session field, so it is
+    not a session binding and reports None (the box is reachable by delivery, not by a live session).
+    """
+    for kind, field in _BINDING_FIELDS:
+        if r.get(field):
+            return {"kind": kind, field: str(r[field])}
+    return None
+
+
+def binding_str(b):
+    if not b:
+        return "（未绑定会话）"
+    field = dict(_BINDING_FIELDS).get(b["kind"])
+    return f"{b['kind']}:{b[field]}" if field and b.get(field) else b["kind"]
+
+
+def profile_of(r):
+    """{display_name, kind, description, legacy_note}. kind is only ever human/agent/unspecified."""
+    prof = r.get("profile") if isinstance(r.get("profile"), dict) else {}
+    kind = prof.get("kind")
+    if kind not in ("human", "agent", "unspecified"):
+        kind = "unspecified"
+    desc = prof.get("description") if isinstance(prof.get("description"), str) else ""
+    legacy = r.get("who") if isinstance(r.get("who"), str) else ""
+    return {"display_name": prof.get("display_name") if isinstance(prof.get("display_name"), str) else "",
+            "kind": kind, "description": desc, "legacy_note": legacy if not desc else ""}
+
+
+def route_display_name(r):
+    """The one display string a box presents: profile.display_name → description → legacy who."""
+    p = profile_of(r)
+    return p["display_name"] or p["description"] or p["legacy_note"]
+
+
+def org_tables(cfg):
+    """(companies, projects) dicts from an optional organization section; ({}, {}) if absent."""
+    org = cfg.get("organization") if isinstance(cfg, dict) else None
+    if not isinstance(org, dict):
+        return {}, {}
+    comp = org.get("companies") if isinstance(org.get("companies"), dict) else {}
+    proj = org.get("projects") if isinstance(org.get("projects"), dict) else {}
+    return comp, proj
+
+
+def role_specs(cfg):
+    """[(alias_name, spec)] for aliases that carry a role definition (candidate order = spec order)."""
+    out = []
+    aliases = cfg.get("aliases", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(aliases, dict):
+        return out
+    for name, value in aliases.items():
+        spec, err = normalize_alias(value)
+        if not err and spec and spec.get("role"):
+            out.append((name, spec))
+    return out
+
+
+def resolve_ref(path, root=None):
+    """Absolute path for a rules/status file; a project-relative path resolves from the project root."""
+    p = Path(os.path.expanduser(path))
+    if not p.is_absolute() and root:
+        p = Path(os.path.expanduser(root)) / p
+    return str(p)
+
+
+def read_file_state(path):
+    """('ok'|'missing', text) for an explicitly referenced rules/status file. Never invents content."""
+    try:
+        return "ok", Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return "missing", ""
+
+
+def alias_handoff_path(name, spec, cfg, routes=None, ok=None):
+    """(path, reason) — the ONE handoff pointer an alias carries on a switch/handoff note.
+
+    A role alias derives it from its scope and REQUIRES a valid organization: when the org is
+    invalid the pointer is empty and `reason` says why (a broken org must never publish a stale
+    STATUS/rules reference, and ordinary routing keeps working). A valid role pointer carries the
+    scope's company rules file and, for a project scope, the project's single status_file. A plain
+    alias keeps its own spec.handoff and is NOT subject to org validation. An alias may never carry
+    both a role and its own handoff (org_errors).
+    """
+    role = spec.get("role")
+    if not role:
+        return (spec.get("handoff") or ""), ""
+    if routes is None:
+        routes = load_routes()
+    if ok is None:
+        ok = identity_ok(cfg, routes)
+    if not ok:
+        err = "；".join((config_errors(cfg, routes) + org_errors(cfg, routes))[:3])
+        return "", f"组织身份已停用（{err}），岗位交接引用留空"
+    kind, rid = role["scope"]["kind"], role["scope"]["id"]
+    comp, proj = org_tables(cfg)
+    ptrs = []
+    if kind == "company":
+        c = comp.get(rid) if isinstance(comp.get(rid), dict) else {}
+        if role.get("handoff_file"):
+            ptrs.append(resolve_ref(role["handoff_file"]))
+        elif isinstance(c, dict) and c.get("rules_file"):
+            ptrs.append(resolve_ref(c["rules_file"]))
+    else:
+        p = proj.get(rid) if isinstance(proj.get(rid), dict) else {}
+        if isinstance(p, dict):
+            cid = p.get("company_id")
+            c = comp.get(cid) if isinstance(comp.get(cid), dict) else {}
+            if isinstance(c, dict) and c.get("rules_file"):
+                ptrs.append(resolve_ref(c["rules_file"]))
+            if p.get("status_file"):
+                ptrs.append(resolve_ref(p["status_file"], p.get("root", "")))
+    seen, out = set(), []
+    for x in ptrs:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return "、".join(out), ""
+
+
+def config_fingerprint(cfg, routes):
+    """Short stable hash of the (config, routes) snapshot an identity was derived from."""
+    def norm(x):
+        return json.dumps(x, ensure_ascii=False, sort_keys=True, default=str)
+    h = hashlib.sha256()
+    h.update(norm(cfg if isinstance(cfg, dict) else {}).encode("utf-8"))
+    h.update(b"\0")
+    h.update(norm(boxes(routes)).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def identity_snapshot(box, routes, cfg, ok=True, error="", now=None):
+    """ONE derived identity shared by CONTACT / panel / harness hints / role handoff.
+
+    Pure read over one routes snapshot + one config snapshot. `ok=False` (with `error`) means the
+    organization presentation is disabled (invalid org), but the physical facts (binding/status/
+    profile) still show so plain mailboxes keep working. `active` reuses the REAL immediate alias
+    resolver, never the notification state (confirmed/pending only decide who to notify).
+    """
+    now = time.time() if now is None else now
+    reg = boxes(routes)
+    r = reg.get(box, {})
+    snap = {"box": box, "registered": box in reg, "profile": profile_of(r),
+            "binding": binding_of(r), "status": r.get("status", "online") if r else "unknown",
+            "method": (r.get("methods") or ["notify"])[0] if r else "unknown", "as_of": now,
+            "memberships": [], "active_roles": [], "candidate_only_roles": [],
+            "company_rules": [], "project_status": [], "org_present": False,
+            "config_ok": bool(ok), "error": error, "fingerprint": config_fingerprint(cfg, routes)}
+    if not box or not snap["registered"]:
+        return snap
+    comp, proj = org_tables(cfg)
+    # 「有没有配 organization」按**字段是否存在**判断，不按它的类型/是否非空：
+    # organization=[] 或写成字符串都属于「配了但坏了」，必须由既有校验给出停用原因；
+    # 完全没有这个字段才算未配置（此时才静默）。
+    snap["org_present"] = isinstance(cfg, dict) and "organization" in cfg
+    if not ok:
+        return snap            # organization presentation disabled: no fabricated duties, no card text
+    for cid in sorted(comp):
+        c = comp[cid]
+        if isinstance(c, dict) and box in [str(x) for x in c.get("members", [])]:
+            snap["memberships"].append({"kind": "company", "id": cid, "name": c.get("name", cid),
+                                        "rules_file": c.get("rules_file", ""), "root": "", "status_file": ""})
+    for pid in sorted(proj):
+        p = proj[pid]
+        if isinstance(p, dict) and box in [str(x) for x in p.get("members", [])]:
+            snap["memberships"].append({"kind": "project", "id": pid, "name": p.get("name", pid),
+                                        "rules_file": "", "root": p.get("root", ""),
+                                        "status_file": p.get("status_file", "")})
+    for name, spec in role_specs(cfg):
+        role = spec["role"]
+        target = alias_target(spec, routes)
+        entry = {"alias": name, "title": role["title"], "scope": dict(role["scope"]),
+                 "candidates": list(map(str, spec["candidates"])), "active_target": target}
+        if target == box:
+            snap["active_roles"].append(entry)
+        elif box in [str(c) for c in spec["candidates"]]:
+            snap["candidate_only_roles"].append(entry)
+    seen_rules, seen_status = set(), set()
+
+    def add_company(cid):
+        c = comp.get(cid) if isinstance(comp.get(cid), dict) else {}
+        rf = c.get("rules_file", "") if isinstance(c, dict) else ""
+        if rf and rf not in seen_rules:
+            seen_rules.add(rf)
+            snap["company_rules"].append({"company": cid, "path": resolve_ref(rf)})
+
+    def add_project(pid):
+        p = proj.get(pid) if isinstance(proj.get(pid), dict) else {}
+        if not isinstance(p, dict):
+            return
+        path = resolve_ref(p.get("status_file", ""), p.get("root", ""))
+        if path and path not in seen_status:
+            seen_status.add(path)
+            snap["project_status"].append({"project": pid, "path": path})
+        if p.get("company_id"):
+            add_company(str(p["company_id"]))   # the owning company's rules govern the project role
+
+    # a non-member fallback successor still needs the scope's rules/STATUS pointers: derive them
+    # from the CURRENTLY HELD role's scope too, WITHOUT silently making the box a member.
+    scope_refs = [(m["kind"], m["id"]) for m in snap["memberships"]]
+    scope_refs += [(r["scope"]["kind"], r["scope"]["id"]) for r in snap["active_roles"]]
+    for kind, sid in scope_refs:
+        if kind == "company":
+            add_company(sid)
+        else:
+            add_project(sid)
+    return snap
+
+
+def org_context():
+    """(cfg, ok, error) for a CLI/panel caller: never raises, always returns a usable config dict."""
+    cfg = load_config(validate=False)[0]
+    if not isinstance(cfg, dict):
+        return {}, False, "没有可用的配置文件"
+    routes = load_routes()
+    errs = config_errors(cfg, routes) + org_errors(cfg, routes)
+    return cfg, (not errs), "；".join(errs[:4])
+
+
+def claude_hook_box(payload):
+    """The ONE registered claude_hook box a Claude hook payload belongs to, else "".
+
+    Reused by the presence writer and the resume identity hint: the payload's session id must map to
+    exactly one claude_hook box (an ambiguous or unknown identity resolves to "" and the caller stays
+    silent rather than guessing).
+    """
+    identity, _src = resolve_claude_identity(payload if isinstance(payload, dict) else {})
+    if not identity:
+        return ""
+    hits = [n for n, r in boxes(load_routes()).items()
+            if "claude_hook" in (r.get("methods") or []) and str(r.get("claude_session") or "") == identity]
+    return hits[0] if len(hits) == 1 else ""
+
+
+def identity_hint(name, routes, cfg, ok=None):
+    """One short identity line for a register / resume seam, or "" when there is nothing to say.
+
+    Shown only on register / resume / active query -- never attached to ordinary letters. Carries the
+    role, the ACTIVE target and the rules/STATUS pointers; a candidate-only box is told it is not the
+    current duty. A disabled organization reports itself instead of inventing a duty.
+    """
+    if ok is None:
+        ok = identity_ok(cfg, routes)
+    err = "" if ok else "；".join((config_errors(cfg, routes) + org_errors(cfg, routes))[:3])
+    s = identity_snapshot(name, routes, cfg, ok=ok, error=err)
+    if not s["org_present"]:
+        return ""
+    if not s["config_ok"]:
+        return f"身份（{name}）：组织配置已停用（{s['error'] or '配置有问题'}）——按 `postoffice identity {name}` 查询"
+    parts = [f"现职 {r['alias']} · {r['title']}（{r['active_target']}）" for r in s["active_roles"]]
+    parts += [f"候选 {r['alias']} · {r['title']}（现在由 {r['active_target']} 受理，不是你的现职）"
+              for r in s["candidate_only_roles"]]
+    ptrs = [c["path"] for c in s["company_rules"]] + [c["path"] for c in s["project_status"]]
+    if not parts and not ptrs:
+        return ""
+    line = f"身份（{name}）：" + ("；".join(parts) if parts else "无现职")
+    if ptrs:
+        line += "；规则/进度：" + "、".join(ptrs)
+    return line + f"。以 `postoffice identity {name}` 为准。"
+
+
+def print_identity(s):
+    print(f"MAILBOX      {s['box'] or '（缺）'}")
+    p = s["profile"]
+    print(f"  display    {p['display_name'] or '—'}")
+    print(f"  kind       {p['kind']}")
+    if p["description"]:
+        print(f"  desc       {p['description']}")
+    if p["legacy_note"]:
+        print(f"  note       {p['legacy_note']}（旧 who 字段，只读作备注）")
+    print(f"  binding    {binding_str(s['binding'])}")
+    print(f"  status     {s['status']}")
+    if not s["registered"]:
+        print("（该信箱未登记）")
+        print(f"AS OF        {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s['as_of']))}")
+        print(f"FINGERPRINT  {s['fingerprint']}")
+        return
+    if not s["config_ok"]:
+        print(f"组织身份：已停用（{s['error']}）")
+    for label, key in (("MEMBER OF", "memberships"), ("ACTIVE", "active_roles"),
+                       ("CANDIDATE ONLY", "candidate_only_roles")):
+        rows = s[key]
+        print(label)
+        if key == "memberships":
+            for m in rows:
+                print(f"  - {m['kind']} {m['id']}（{m['name']}）")
+        else:
+            for m in rows:
+                extra = "" if key == "active_roles" else f"（当前由 {m['active_target']} 受理）"
+                print(f"  - {m['alias']} · {m['title']} → {m['active_target']}{extra}")
+        if not rows:
+            print("  （无）")
+    if s["company_rules"]:
+        print("COMPANY RULES")
+        for c in s["company_rules"]:
+            print(f"  - {c['company']}: {c['path']}")
+    if s["project_status"]:
+        print("PROJECT STATUS")
+        for c in s["project_status"]:
+            print(f"  - {c['project']}: {c['path']}")
+    print(f"AS OF        {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(s['as_of']))}")
+    print(f"FINGERPRINT  {s['fingerprint']}")
+
+
+def cmd_identity(a):
+    cfg, ok, err = org_context()
+    routes = load_routes()
+    box = getattr(a, "box", None)
+    if getattr(a, "hint", False):
+        # register / resume seam: a short hint, or nothing at all. A bare `identity --hint` with no
+        # box resolves the box from a Claude hook payload on stdin, so a resume hook needs no argument.
+        if not box:
+            try:
+                box = claude_hook_box(json.loads(sys.stdin.read() or "{}"))
+            except (ValueError, OSError):
+                box = ""
+        line = identity_hint(box, routes, cfg, ok=ok) if box else ""
+        if line:
+            print(line)
+        return 0
+    if not box:
+        sys.exit("identity 需要一个信箱名：`postoffice identity <信箱>`")
+    snap = identity_snapshot(box, routes, cfg, ok=ok, error=err)
+    if getattr(a, "json", False):
+        print(json.dumps(snap, ensure_ascii=False, indent=2))
+    else:
+        print_identity(snap)
+    return 0
+
+
+# ---------- profile / binding: profile edits never rebind ----------
+
+def apply_profile(r, a):
+    """Profile fields are data only: never touch methods, binding, org relations, or delivery."""
+    prof = dict(r.get("profile")) if isinstance(r.get("profile"), dict) else {}
+    if getattr(a, "display_name", None) is not None:
+        prof["display_name"] = a.display_name
+    if getattr(a, "kind", None):
+        prof["kind"] = a.kind
+    desc = getattr(a, "desc", None)
+    if desc is None:
+        desc = getattr(a, "who", None)
+    if desc is not None:
+        prof["description"] = desc
+        r.pop("who", None)          # migrate: the structured description replaces the legacy who
+    if prof:
+        r["profile"] = prof
+    return r
+
+
+def apply_binding(r, a):
+    """Apply one receive method from the binding flags; returns the method or None if none given.
+
+    Only an EXPLICIT binding flag rebinds: it strips any previous session field first, so a box
+    never ends up with two session bindings at once.
+    """
+    if not (getattr(a, "claude", None) or getattr(a, "opencode", None) or getattr(a, "codex", None)):
+        return None
+    for k in ("claude_title", "claude_session", "session_id", "thread_id", "codex_cli"):
+        r.pop(k, None)
+    if getattr(a, "claude", None):
+        r["methods"] = ["claude_hook"]
+        r["claude_title"] = a.claude
+        if a.claude_session:
+            r["claude_session"] = a.claude_session
+        return "claude_hook"
+    if getattr(a, "opencode", None):
+        sid, title, directory = opencode_lookup(a.opencode)
+        r["methods"] = ["opencode_plugin"]
+        r["session_id"] = sid
+        print(f"OpenCode 会话：{title}（{sid}，目录 {directory}）")
+        return "opencode_plugin"
+    cli = find_codex()
+    if not cli:
+        print("提示：没找到 codex 命令，先登记；装好 Codex 后重跑本命令即可。")
+    r["methods"] = ["codex_queue"]
+    r["thread_id"] = a.codex
+    if cli:
+        r["codex_cli"] = cli
+    return "codex_queue"
+
+
+def record_rebind(box, old_binding, new_binding, handoff, source):
+    """Append one JSON line to logs/rebind.log. Records the fact of the rebind, nothing more.
+
+    `source` is how the operation was invoked; an unknown source is stored verbatim and never
+    dressed up as an authenticated identity. The record does not claim work continued.
+    """
+    LOGS.mkdir(parents=True, exist_ok=True)
+    rec = {"at": time.time(), "box": box, "from": old_binding, "to": new_binding,
+           "handoff": handoff or "", "source": source or "unknown"}
+    with open(LOGS / "rebind.log", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def rebind_handoff_for(routes, cfg, box):
+    """The handoff pointer a rebind of this box should carry: its active role's rules/status file.
+
+    Uses the SAME identity_ok gate as the card/panel: when the organization is invalid the snapshot
+    has no active roles, so the pointer is empty instead of a hand-edited wrong STATUS path.
+    """
+    snap = identity_snapshot(box, routes, cfg, ok=identity_ok(cfg, routes))
+    for m in snap["active_roles"]:
+        for spec_name, spec in role_specs(cfg):
+            if spec_name != m["alias"]:
+                continue
+            role = spec["role"]
+            if role["scope"]["kind"] == "company" and role["handoff_file"]:
+                return resolve_ref(role["handoff_file"])
+            if role["scope"]["kind"] == "project":
+                _, proj = org_tables(cfg)
+                p = proj.get(role["scope"]["id"], {})
+                if isinstance(p, dict) and p.get("status_file"):
+                    return resolve_ref(p["status_file"], p.get("root"))
+    return ""
+
+
+def cmd_rebind(a):
+    """Explicit rebind/handoff: reuse registration, record the fact. Never a second installer."""
+    cmd_init(quiet=True)
+    routes = load_routes()
+    if a.box not in routes:
+        sys.exit(f"没有信箱 {a.box}；先 `postoffice add` 登记")
+    if not (a.claude or a.opencode or a.codex):
+        sys.exit("rebind 必须显式给一个绑定：--claude/--opencode/--codex")
+    cfg = load_config(validate=False)[0] or {}
+    old = binding_str(binding_of(routes[a.box]))
+    r = dict(routes[a.box])
+    method = apply_binding(r, a)
+    routes[a.box] = r
+    save_routes(routes)
+    write_contact(a.box, r, routes, cfg)
+    new = binding_str(binding_of(r))
+    handoff = rebind_handoff_for(routes, cfg, a.box)
+    source = getattr(a, "source", "") or "cli"
+    record_rebind(a.box, old, new, handoff, source)
+    log("postman.log", f"rebind {a.box}: {old} → {new}（source={source}）")
+    print(f"已重绑 {a.box}：{old} → {new}（{METHODS[method]}）")
+    if handoff:
+        extra = f"；交接路径 {handoff}"
+    elif not identity_ok(cfg, routes):
+        extra = f"；组织身份已停用，交接路径留空（{org_context()[2]}）"
+    else:
+        extra = "；该箱当前没有可派生的交接路径"
+    print(f"交接记录写入 {LOGS / 'rebind.log'}" + extra)
+    hint = identity_hint(a.box, routes, cfg)
+    if hint:
+        print(hint)          # resume seam: a rebind is a resume onto a new binding
+    return 0
+
+
 # ---------- commands ----------
 
 def cmd_init(_a=None, quiet=False):
@@ -1332,38 +1988,47 @@ def cmd_add(a):
     if not re.fullmatch(r"[A-Za-z0-9_\-]+", a.name):
         sys.exit("信箱名只能用英文字母、数字、下划线、横线")
     routes = load_routes()
+    existing = a.name in routes
     r = dict(routes.get(a.name, {}))
-    for k in ("claude_title", "claude_session", "session_id", "thread_id", "codex_cli"):
-        r.pop(k, None)
-    if a.claude:
-        r["methods"] = ["claude_hook"]
-        r["claude_title"] = a.claude
-        if a.claude_session:
-            r["claude_session"] = a.claude_session
-    elif a.opencode:
-        sid, title, directory = opencode_lookup(a.opencode)
-        r["methods"] = ["opencode_plugin"]
-        r["session_id"] = sid
-        print(f"OpenCode 会话：{title}（{sid}，目录 {directory}）")
-    elif a.codex:
-        cli = find_codex()
-        if not cli:
-            print("提示：没找到 codex 命令，先登记；装好 Codex 后重跑本命令即可。")
-        r["methods"] = ["codex_queue"]
-        r["thread_id"] = a.codex
-        if cli:
-            r["codex_cli"] = cli
+    channel = bool(getattr(a, "claude", None) or getattr(a, "opencode", None)
+                   or getattr(a, "codex", None) or getattr(a, "notify", None))
+    session_flag = bool(getattr(a, "claude", None) or getattr(a, "opencode", None) or getattr(a, "codex", None))
+    cfg = load_config(validate=False)[0] or {}
+    if not existing and not channel:
+        sys.exit("新登记信箱必须指定收信通道：--claude / --opencode / --codex / --notify")
+    if existing and not channel:
+        # 已有信箱只改资料：绝不隐含重绑，也绝不把收信方式重置成 notify
+        apply_profile(r, a)
+        routes[a.name] = r
+        save_routes(routes)
+        write_contact(a.name, r, routes, cfg)
+        print(f"已更新资料 {a.name}（绑定与收信方式未变）")
+        return 0
+    old_binding = binding_str(binding_of(r)) if existing else ""
+    if session_flag:
+        apply_binding(r, a)
     else:
+        for k in ("claude_title", "claude_session", "session_id", "thread_id", "codex_cli"):
+            r.pop(k, None)
         r["methods"] = ["notify"]
-    if a.who:
-        r["who"] = a.who
+    apply_profile(r, a)
     r.setdefault("status", "online")
     routes[a.name] = r
     for d in ("inbox", "done"):
         (HOME / a.name / d).mkdir(parents=True, exist_ok=True)
     save_routes(routes)
-    write_contact(a.name, r)
-    print(f"已登记信箱 {a.name}：{METHODS[r['methods'][0]]}")
+    write_contact(a.name, r, routes, cfg)
+    if existing and channel:
+        handoff = rebind_handoff_for(routes, cfg, a.name)
+        record_rebind(a.name, old_binding, binding_str(binding_of(r)), handoff,
+                      getattr(a, "source", "") or "cli:add")
+        print(f"已重绑 {a.name}：{old_binding} → {binding_str(binding_of(r))}（{METHODS[r['methods'][0]]}）")
+    else:
+        print(f"已登记信箱 {a.name}：{METHODS[r['methods'][0]]}")
+    hint = identity_hint(a.name, routes, cfg)
+    if hint:
+        print(hint)          # registration seam, shared by all three harnesses; never re-sent with mail
+    return 0
 
 
 def cmd_remove(a):
@@ -1384,7 +2049,7 @@ def apply_status(name, status):
         r["online_since"] = time.time()   # only a real offline→online transition resets the 20-minute clock
     r["status"] = status
     save_routes(routes)
-    write_contact(name, routes[name])
+    write_contact(name, routes[name], routes, load_config(validate=False)[0] or {})
     return True
 
 
@@ -1448,7 +2113,7 @@ def cmd_config(a):
             return 0
         full = load_routes()
         routes = boxes(full)
-        bad = config_errors(cfg, full)
+        bad = config_errors(cfg, full) + org_errors(cfg, full)
         print(f"配置：{CONFIG}")
         print(f"  groups {len(cfg.get('groups') or {})} 个，aliases {len(cfg.get('aliases') or {})} 个")
         for name, members in (cfg.get("groups") or {}).items():
@@ -1468,7 +2133,8 @@ def cmd_config(a):
             for c in spec["candidates"]:
                 print(f"    - {_box_mark(c, routes)}")
             print(f"    切换通知：{'、'.join(spec['notify']) or '（无）'}")
-            print(f"    交接路径：{spec['handoff'] or '（无，只作元数据，邮局不读这个文件）'}")
+            hpath, hreason = alias_handoff_path(name, spec, cfg)
+            print(f"    交接路径：{hreason or hpath or '（无，只作元数据，邮局不读这个文件）'}")
             a = st["aliases"].get(name) or {}
             if a.get("confirmed") is None and not a.get("seen"):
                 print("    切换记录：还没有基线（邮递员首次看到时登记，不广播）")
@@ -1493,7 +2159,7 @@ def cmd_config(a):
         cfg = json.loads(raw, object_pairs_hook=_reject_dup_keys)
     except ValueError as e:
         sys.exit(f"{src} 不是合法 JSON：{e}（{CONFIG.name} 保持原样）")
-    bad = config_errors(cfg, load_routes())
+    bad = config_errors(cfg, load_routes()) + org_errors(cfg, load_routes())
     if bad:
         sys.exit(f"配置没通过校验（{CONFIG.name} 保持原样）：\n" + "\n".join(f"- {e}" for e in bad))
     bk = None
@@ -2786,11 +3452,12 @@ def process_alias_switches(routes):
                     log("postman.log", f"alias @{name} 交接提醒已存在（{prior.name}）→ {target}，不重投")
                 else:
                     try:
+                        hp, hreason = alias_handoff_path(name, spec, cfg, routes)
                         path = write_letter(target, "postoffice", f"交接：@{name} 现在由你受理", "仅告知",
                                             f"逻辑地址 @{name} 现在由你受理。\n\n"
                                             f"之前：{confirmed or '（无在线候选）'}\n"
                                             f"原因：{reason}\n"
-                                            f"交接路径：{spec.get('handoff') or '（未配置）'}\n\n"
+                                            f"交接路径：{hreason or hp or '（未配置）'}\n\n"
                                             f"这封提醒只报告收件路由变化：不授予你额外权限、不自动开始任务、"
                                             f"已投递的旧信不会搬走。",
                                             extra_headers=[f"切换事件：{ev['id']}"])
@@ -2860,11 +3527,9 @@ def cmd_activity(a):
     identity, _source = resolve_claude_identity(data)
     if not identity:
         return 0
-    routes = boxes(load_routes())
-    hits = [n for n, r in routes.items()
-            if "claude_hook" in (r.get("methods") or []) and str(r.get("claude_session") or "") == identity]
-    if len(hits) == 1:
-        activity_write(hits[0], a.state, "claude_hook", identity)
+    box = claude_hook_box(data)
+    if box:
+        activity_write(box, a.state, "claude_hook", identity)
     return 0
 
 
@@ -3249,7 +3914,8 @@ def backup(path):
 
 def is_ours(cmd):
     return "claude_hook.sh" in cmd \
-        or ("postoffice" in cmd and (cmd.rstrip().endswith(" hook") or " activity " in cmd))
+        or ("postoffice" in cmd and (cmd.rstrip().endswith(" hook") or " activity " in cmd
+                                     or " identity " in cmd))
 
 
 def cmd_install_claude(_a):
@@ -3260,19 +3926,22 @@ def cmd_install_claude(_a):
     # Claude Code docs say async hooks are not timed out, but the settings schema documents a 600 s default
     # for command hooks; set an explicit long timeout so neither reading can kill the watcher after 10 min.
     ours = {"type": "command", "command": f'exec "{SELF}" hook', "asyncRewake": True, "timeout": HOOK_TIMEOUT}
+    # Resume seam: SessionStart prints the short identity hint as additional context (silent when the
+    # session cannot be resolved to exactly one claude_hook box -- then the skill's query path applies).
+    hint = {"type": "command", "command": f'exec "{SELF}" identity --hint', "timeout": 30}
     hooks = cfg.setdefault("hooks", {})
-    entries = [("Stop", {}, ours),
-               ("SessionStart", {"matcher": "startup|resume|clear|compact"}, ours),
+    entries = [("Stop", {}, [ours]),
+               ("SessionStart", {"matcher": "startup|resume|clear|compact"}, [ours, hint]),
                # 每次提交提示前记一次 working：这是 Claude 侧最诚实的「正在干活」信号（同步钩子，失败静默）
-               ("UserPromptSubmit", {}, {**ours, "command": f'exec "{SELF}" activity --state working'})]
-    for event, extra, hook in entries:
+               ("UserPromptSubmit", {}, [{**ours, "command": f'exec "{SELF}" activity --state working'}])]
+    for event, extra, our_hooks in entries:
         groups = []
         for g in hooks.get(event, []):
             g = dict(g)
             g["hooks"] = [h for h in g.get("hooks", []) if not is_ours(h.get("command", ""))]
             if g["hooks"]:
                 groups.append(g)
-        groups.append(dict(extra, hooks=[hook]))
+        groups.append(dict(extra, hooks=our_hooks))
         hooks[event] = groups
     s.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Claude Code 钩子已装入 {s}" + (f"（原文件备份：{bk}）" if bk else ""))
@@ -3718,16 +4387,25 @@ def panel_state():
     full = load_routes()
     routes = boxes(full)
     snap = delivery_snapshot(routes)
+    cfg, cfg_err = load_config()
+    if cfg is None:                 # no usable config: physical facts still show, org stays silent
+        cfg_ok, id_err = False, cfg_err or ""
+    else:
+        id_errs = config_errors(cfg, full) + org_errors(cfg, full)
+        cfg_ok, id_err = (not id_errs), "；".join(id_errs[:4])
     for name, r in routes.items():
         m = r.get("methods", ["notify"])[0]
         letters, counts = mail_state(name, snap)
         act, act_since = activity_state(name, r)
+        # the panel shows the SAME derived identity as CONTACT / CLI / harness hints
+        ident = identity_snapshot(name, full, cfg or {}, ok=cfg_ok, error=id_err)
         rows.append({
-            "name": name, "app": APP.get(m, m), "method": m, "who": r.get("who", ""),
+            "name": name, "app": APP.get(m, m), "method": m, "who": route_display_name(r),
             "online": online(r),
             "ident": r.get("claude_title") or r.get("session_id") or r.get("thread_id") or "",
             "pending": letters, "counts": counts,
             "activity": {"state": act, "since": act_since},
+            "identity": ident,
             "acks": recent_acks(name),
         })
     lines = []
@@ -3747,7 +4425,6 @@ def panel_state():
                         pass
                 lines.append((t, f.split(".")[0], line[20:]))
     lines.sort()
-    cfg, cfg_err = load_config()
     return {"home": str(HOME), "boxes": rows, "broadcasts": broadcast_rows(),
             "groups": group_rows(routes, snap), "aliases": alias_rows(), "switches": switch_rows(),
             "config": str(CONFIG) if cfg is not None else "", "config_error": cfg_err,
@@ -4045,16 +4722,35 @@ def main():
     ap.add_argument("--version", action="version", version=VERSION)
     sp = ap.add_subparsers(dest="cmd")
     sp.add_parser("init", help="建好邮局目录").set_defaults(fn=cmd_init)
-    p = sp.add_parser("add", help="登记/更新一个信箱")
+    p = sp.add_parser("add", help="登记一个信箱；对已登记的信箱只改资料（不给通道就不会改绑）")
     p.add_argument("name")
-    g = p.add_mutually_exclusive_group(required=True)
+    g = p.add_mutually_exclusive_group(required=False)
     g.add_argument("--claude", metavar="会话标题", help="Claude Code 会话（按桌面会话 id 稳定认人，解析不到才退回标题）")
     g.add_argument("--opencode", metavar="会话标题或ID", help="OpenCode 会话")
     g.add_argument("--codex", metavar="THREAD_ID", help="Codex 线程")
     g.add_argument("--notify", action="store_true", help="没有自动通道，只弹通知给人")
     p.add_argument("--claude-session", metavar="LOCAL_ID", help="直接指定 Claude 桌面会话 id（local_…），配合 --claude")
-    p.add_argument("--who", help="一句话说明这是谁")
+    p.add_argument("--who", help="一句话说明这是谁（旧字段；与 --desc 同义，建议用 --desc）")
+    p.add_argument("--display-name", dest="display_name", metavar="名字", help="显示名（只是资料，不改变类别/职责/绑定）")
+    p.add_argument("--kind", choices=("human", "agent", "unspecified"), help="类别（不猜：人类 / 代理 / 未指定）")
+    p.add_argument("--desc", metavar="说明", help="一句话说明（替代旧 --who）")
+    p.add_argument("--source", metavar="来源", help="改绑时如实记下是谁/哪来的操作（不伪造已认证身份）")
     p.set_defaults(fn=cmd_add)
+    p = sp.add_parser("identity", help="查一个信箱当前的组织身份、职责与绑定")
+    p.add_argument("box", nargs="?")
+    p.add_argument("--json", action="store_true", help="输出机器可读的 JSON 快照（同一个导出结果）")
+    p.add_argument("--hint", action="store_true",
+                   help="给注册/恢复接缝用的短身份提示；省略信箱时从 stdin 钩子负载解析")
+    p.set_defaults(fn=cmd_identity)
+    p = sp.add_parser("rebind", help="显式把一个信箱改绑到另一个会话（会记一条交接，不改物理信箱）")
+    p.add_argument("box")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--claude", metavar="会话标题", help="Claude Code 会话")
+    g.add_argument("--opencode", metavar="会话标题或ID", help="OpenCode 会话")
+    g.add_argument("--codex", metavar="THREAD_ID", help="Codex 线程")
+    p.add_argument("--claude-session", metavar="LOCAL_ID", help="直接指定 Claude 桌面会话 id（local_…），配合 --claude")
+    p.add_argument("--source", metavar="来源", help="这次改绑是谁/哪来的操作（如实写，不伪造已认证身份）")
+    p.set_defaults(fn=cmd_rebind)
     p = sp.add_parser("remove", help="从通讯录移除")
     p.add_argument("name")
     p.set_defaults(fn=cmd_remove)

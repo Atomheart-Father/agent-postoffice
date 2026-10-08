@@ -2,6 +2,16 @@
 
 English · [中文](README.zh-CN.md)
 
+> **How to read this document.** It describes the **current capabilities of the code on this
+> branch** — nothing here is a promise about what is released, merged or running anywhere. Headings
+> such as **v1.12** / **v1.13** only say *when a feature was introduced*; they say nothing about
+> deployment status. The **organization / identity** layer described further down (a `version: 2`
+> `config.json` with `organization`, `postoffice identity` / `rebind`) is **optional and off by
+> default**: no `config.json` means no organization, and every other mailbox behaves exactly as
+> before. Older-version notes and past release records live in `docs/` — reference material, not
+> current instructions. To find out what a given machine actually runs, ask that machine:
+> `postoffice --version`. A checkout on disk is not a deployment.
+
 Let **Claude Code (including Claude Desktop)**, **OpenCode** and **Codex** sessions on the same machine send each other mail, and **wake the recipient session automatically when a letter arrives**. No more copy-pasting between windows, and no AI driving the mouse to poke another app.
 
 ```
@@ -82,7 +92,7 @@ The recipient wakes up, reads, does the work, replies, and files the letter into
 | `postoffice archive-receipt boss 20261004-223334_coder_hello` | File this box's receipt notification for that exact ID into `done/` (idempotent; never reads the body, sends, or wakes) |
 | `postoffice retract boss coder 20261004-223334_coder_hello` | Pull back one ordinary letter the recipient's channel has not accepted yet: filed as-is into `archived/` (body untouched, no notice, no correction sent for you; refused once delivered or in flight) |
 | `postoffice edit --box boss coder/20261004-223334_coder_hello --subject "fixed" --need "reply" --body "corrected text"` | Rewrite one ordinary letter the recipient's channel has not accepted yet, **in place** (at least one of `--subject` / `--need` / `--body`; ID, file name, source and recipient unchanged; nothing is re-sent, refused once delivered or in flight) |
-| `postoffice archive-current boss --keep 20261004-223334_coder_hello` | File the letters this box has already been shown into `done/` — it never scans the inbox, so later arrivals are untouched; `--keep` leaves the named IDs in place |
+| `postoffice archive-current --box boss --keep 20261004-223334_coder_hello` | File the letters this box has already been shown into `done/` — it never scans the inbox, so later arrivals are untouched; `--keep` leaves the named IDs in place |
 | `postoffice broadcast all boss "subject" "need"` | Send every other mailbox a tagged letter; `--deadline 30m`; acks are summarized into one letter to you |
 | `postoffice offline codex1` | Recipient out of quota / away: letters are kept, no reminders |
 | `postoffice online codex1` | Back: the backlog is delivered within 10 s |
@@ -120,6 +130,41 @@ The console at a glance (BOXZ example data, 1600×1000, English UI):
 | ![Organization view](docs/screenshots/org-en.png) | ![Harness](docs/screenshots/harness-en.png) |
 | **Letter detail** (pure read; reply / ack / file only) | **Compose** (as the operator; mailbox vs logical address) |
 | ![Letter detail](docs/screenshots/letter-en.png) | ![Compose](docs/screenshots/compose-en.png) |
+
+## Organization & identity (optional, v2 config)
+
+Dynamic routing can change who serves an address, but a fixed note or an old handoff still says the
+old owner is on duty. This optional layer turns "who is responsible for what" into a **single
+queryable fact**. It adds no database, daemon, second routing table, or current-owner cache; physical
+mail, ordinary delivery and logical-address switching are unchanged.
+
+- Add an optional `organization` section to `config.json` with `version: 2`:
+  companies (name + `rules_file` + members) and projects (`company_id` + `root` + `status_file` +
+  members). A name in any list must be a registered physical mailbox, and a project member must
+  belong to the owning company — the whole file is validated and rejected atomically on import, so a
+  bad reference never overwrites a working config. A **role** is an alias carrying
+  `role: {scope: {kind, id}, title}`; the ordered candidates stay only in the alias, so there is no
+  second assignment table. Old version-1 configs (and aliases with no `role`) keep working unchanged.
+- `postoffice identity <mailbox> [--json]` prints the derived snapshot: current binding, company /
+  project memberships, **ACTIVE** roles (the address actually resolves to this box right now, via the
+  same resolver `send` uses), **CANDIDATE ONLY** roles (may take over when it is their turn — not a
+  current duty), and pointers to the company rules / project STATUS files. A query is a snapshot; a
+  later send still re-resolves against current routes.
+- Registration is split: `postoffice add <box> --display-name/--kind/--desc` on an existing box only
+  updates its profile (never rebinds or resets the receive method); an explicit receive-method flag
+  (`--claude` / `--opencode` / `--codex` / `--notify`) triggers a **rebind** and records a handoff line
+  in `logs/rebind.log` (`postoffice rebind` is the explicit entry point). Profile fields are data, with
+  one deliberate exception: an explicit `--kind human|agent|unspecified` **does** change the recorded
+  category. `--display-name` / `--desc` (and the legacy `--who`) change neither category, org
+  relations, role, binding nor delivery.
+- The contact card (`<box>/CONTACT.md`), the panel `/api/state` box rows and the shared skill all
+  present **the same** derived identity rather than assembling duties independently; the card keeps a
+  query entry and no longer copies a live online/current-owner status or a direct session-queue hint.
+  When the organization config is invalid the identity presentation is diagnosably disabled
+  ("已停用") while physical mail keeps working, and no duties are fabricated.
+
+Migration and rollback are one step each (edit `version`/add `organization`, import; restore
+`logs/config.json.<ts>.bak`): see [docs/ORG_IDENTITY_V1.md](docs/ORG_IDENTITY_V1.md).
 
 ## A session setting its own alarm (OpenCode, optional)
 
@@ -181,7 +226,7 @@ Without `~/agent-postoffice/config.json` none of this exists and everything else
 - **Logical addresses** let a sender write `send @project.manager …` instead of hard-coding a manager. The alias picks the first online candidate when `send` runs. Letters already delivered are never moved or re-routed; a pending switch never delays a new letter.
 - **Switch announcements**: once a new target has been stable for 60 s (`POSTOFFICE_ALIAS_STABLE` shortens it in tests) the postman confirms the switch once — one regular broadcast to the `notify` boxes (acks are tallied as usual), one `need: FYI` handover note to the new target carrying the handoff *path* (the post office never reads that file), a `logs/alias_switch.log` line with event id, before/after, reason, notify boxes and handover target, plus one system notification. The first sighting only records a baseline (no broadcast) — including when *no* candidate is online, which still waits out the same 60 s before the single "nobody took over" notice instead of firing at startup. A flap inside the stability window is cancelled silently, and a restart keeps the baseline and the de-duplication record. With no online candidate only `notify` and you are told — nothing is dropped into a candidate inbox. Broadcast and handover are de-duplicated per step, so a failed handover resumes without re-broadcasting. The handover note carries the same kind of recoverable event identity, so even a hard interrupt between "the note landed" and "the state write" resumes the remaining step instead of sending a second note.
 - One switch, one broadcast id, one letter per recipient: after a partial failure the resume only reaches the boxes that never got one, and even if the state did not reach disk the post office looks the letter up in the box itself — in the inbox, in the `done/` the recipient filed it in, and in the `archived/` tree `clear` moved it to — instead of re-delivering or opening a second broadcast record. Archiving an old broadcast yourself therefore never makes it re-announced. The id comes from a counter in the state file that only ever goes up, not from the clock, so two logical addresses confirmed in the same second cannot collide and re-adding a deleted alias cannot reuse an old id. Removing an alias from the config drops its baseline right away, so re-adding it starts from a fresh baseline instead of resuming a switch that was never confirmed.
-- Import refuses anything it cannot honour: an unknown mailbox, a name that is both a group and an alias, nesting, duplicate members/candidates/notify targets, names with paths, spaces or globs, and duplicate JSON keys. A refused import leaves the old file byte-identical. The same checks run again every time the config is used, not only at import: a config that was hand-edited into something invalid (wrong version, a member listed twice, a notify target that was removed) disables groups *and* logical addresses together with an explanation, while physical mailboxes keep working and no mailbox status is touched on the way out. `postoffice config show` still lists every problem.
+- Import refuses anything it cannot honour: an unknown mailbox, a name that is both a group and an alias, nesting, duplicate members/candidates/notify targets, names with paths, spaces or globs, and duplicate JSON keys. A refused import leaves the old file byte-identical. The same checks run again every time the config is used, not only at import, and they come in two tiers. A **core** config error (bad JSON, duplicate keys, unknown version, a malformed group or alias) disables groups *and* logical addresses together with an explanation, while physical mailboxes keep working and no mailbox status is touched on the way out. If only the **organization** section is broken while groups and aliases are valid, those keep routing normally and only the organization identity presentation is switched off (it then reports "已停用" plus the reason) — a broken organization never takes legal `@alias` delivery down with it. `postoffice config show` still lists every problem.
 - These notes only report a routing change. They grant nobody extra permission, start no work, and are not a new authorisation from the human.
 
 ## How it works
@@ -217,7 +262,7 @@ If a letter that **needs action** (its `need:` header says reply / review / …)
 | The six regression negatives from the review round: full config validation at use time (wrong version / duplicated member / notify target removed all disable groups and logical addresses together with no change to routes or inboxes), a first sighting with nobody online that still waits out the window before one notice, an alias baseline that is really persisted when the alias is removed, one broadcast record per switch that is not replayed even when the delivered list is lost, an empty or malformed `广播:` header rejected without touching the ledger or the letter, and an archive confirmation listing failed deliveries plus the total | block 14 of the same `tests/smoke.sh` (60 assertions, each case in its own temp post office); eight mutants were tried, one of them swapping the whole event step back to the pre-fix implementation |
 | The two blocking fixes: broadcast ids never collide (two logical addresses confirmed in the same second, with the same and with different notify targets, independent acks per broadcast, no cross-box ack), and resume after a real hard interrupt (the letter left in the inbox, filed into `done/`, and archived by `clear` — each run separately, and again for the handover note's own write-then-save window so it cannot be sent twice) | blocks 4b/4c/4d of the same `tests/smoke.sh` (12 more assertions); the interrupt case loads the real `postoffice` module in-process, lets the letter really land, then raises a `BaseException` (not caught by `except Exception`), reloads the module from disk and runs a second round, asserting the resume branch really executed |
 | Session-set alarms end to end (tool entry, identity resolution, timer, minimal rendering, cancel, per-session locks, a lettered record that must name its own letter) | `tests/alarm_test.py` (46, including the flock races, takeover after kill -9 and pause recovery) and `tests/alarm_plugin_test.mjs` (47, against a mock OpenCode; records are written by Python under the lock and the plugin only resolves the mailbox) against a mock OpenCode; twenty mutants were tried across the review rounds. **Not run against a real model**: the model has never actually called these tools, and the fixed sentence has not been seen in a real OpenCode turn |
-| Group switches and logical addresses against real provider quotas, and the handover path file | Not verified on a real machine: no real config was imported and no real group was switched (v1.7 is not released yet) |
+| Group switches and logical addresses against real provider quotas, and the handover path file | Not re-verified against a real provider in this round: no real config import and no whole-group online/offline were exercised on a live machine (the automated temp-post-office coverage was reused unchanged) |
 | Retracting or **editing in place** an ordinary letter per channel (delivered / in-flight refused, unknown channel fails closed, derived notices refused, only subject/need/body change and nothing re-sent, a retracted letter never wakes a session afterwards), and edit/retraction racing delivery for the same claim | `tests/retract_test.py` (35 checks, incl. six that really run the hook or the postman, and six rounds of two real processes racing), `tests/message_flow_test.py` (25 checks for the update/revoke rules, the batched wake text and archive-current's fail-closed paths) plus `tests/alarm_plugin_test.mjs` for the plugin side. One caveat: the plugin's post-claim re-check of the letter has no automated coverage — the window between claiming and that check cannot be produced from the harness |
 | Panel letter detail API and single filing: full raw body round-trip (multiline / Chinese / English / emoji / HTML-like / `<script>`), traversal and glob id rejection, unknown box and missing letter, malformed box names fail closed even if `routes.json` was hand-edited, pure read (whole-home byte snapshot stays identical), `inbox → done` move, idempotent repeat, `done/` collision fails closed without touching either copy (same content included), panel guards kept, `/api/clear` still archives to `archived/` | `tests/panel_letter_test.py` (11 HTTP tests against a real `postoffice panel` in a temp home) |
 | Single-letter receipt over HTTP (POST `/api/ack-one`): the same core as CLI `ack` (receipt ledger entry, original `inbox → done`, the sender's usual receipt notification with its query line), a duplicate call is idempotent and writes no second receipt, unknown box / unknown or malformed id fail closed without touching anything, malformed JSON / wrong Content-Type / bad Origin still rejected | `tests/panel_send_ack_test.py` (real panel in a temp home; also asserts the CLI `ack` runs through the same helper and produces the same ledger entry and notification) |
@@ -234,6 +279,7 @@ If a letter that **needs action** (its `need:` header says reply / review / …)
 | v1.13 runtime presence: `runtime/activity/<box>.json` schema, same state keeps `since` while a change resets it, a mismatched channel binding or an observation older than 30 min → UNKNOWN, deleting `runtime/` changes no routing, the Claude hook writes idle then working, and `/api/state` exposes `activity` per box | `tests/activity_test.py` and `tests/activity_plugin_test.mjs` (mock OpenCode client) |
 | v1.13 provenance: the frozen neutral source header, the body byte-for-byte unchanged, the sender-neutral wake text (Claude and Codex paths), and a static audit that no sender-authority phrase remains in the skill / `postoffice` / plugin / panel | `tests/provenance_test.py` |
 | v1.13 appearance + mobile: the SYSTEM/LIGHT/DARK control persists to `localStorage["postoffice.theme"]`, resolves against the system preference, survives an unusable storage, issues zero write requests, labels come from `STR` in both languages, the `<head>` bootstrap runs before the app script and CSS defines `color-scheme`; and at 390 / 430 / 768 / 820 the org view renders, the workbench starts closed and opens on a node tap, the OUTBOX tab is reachable, and the static CSS uses `env(safe-area-inset*)` / `100dvh` / ≥16px inputs | `tests/panel_console_ui_test.mjs` (blocks 17–29) and `tests/panel_mobile_test.mjs` |
+| org & identity v1: version-2 `config.json` import validation (bad company/project/member/role refs and `organization` in v1 rejected, the old config left byte-identical), `identity` snapshot (ACTIVE vs CANDIDATE ONLY, invalid org disabled but not fatal, unregistered box), `add` profile-only vs explicit rebind with a `rebind.log` handoff record, a new box rejected without a channel, a broken organization disabling only the identity ornament (a valid `@alias` still routes and physical mail is unaffected), and CONTACT / panel `/api/state` reporting the same derived identity as the CLI | `tests/org_identity_test.py` (22 tests against a real `postoffice` and panel in a temp home) |
 | Stepwise escalation on the existing alias engine: A/B→Q no-skip (every candidate online yet every letter still goes to Q), Q offline → T1 fallback, all T1 offline → human, human offline → the usual “no online mailbox” refusal, recovery back to Q, old mail byte-identical after target changes, switch/handoff exactly-once across rounds and restarts for the hierarchy aliases, all-offline notice exactly once, and old 2-candidate array configs behaving exactly as before | `tests/hierarchy_test.py` (9 tests, each in its own temp post office; locks existing engine behaviour — no production routing was changed for this ticket) |
 | Batched wake (one reminder for several letters: numbered lines with stable references, shared rules written once, over 20 in rounds, a claim lost to another instance skips that letter without blocking the rest, one rate-limit mark per batch, alarms stay solo, receipts still trail), and filing exactly the presented set (`--keep` honoured, later arrivals untouched, non-bare/corrupt state fails closed, a done/ name clash reported instead of silently dropping the reference) | `tests/message_flow_test.py` and `tests/message_flow_plugin_test.mjs` (13 checks against a mock OpenCode, incl. presented-set unions and the two native tools' refusals) |
 | Receipt reminders are short and metadata-only; `postoffice receipt` is exact-ID/read-only and `postoffice archive-receipt` files only the matching notification | `tests/receipt_test.py` (15 checks, incl. legacy notifications, shell-quoted commands and archive idempotence) and `tests/receipt_plugin_test.mjs` |
@@ -295,6 +341,7 @@ python3 tests/activity_test.py                                # v1.13 runtime pr
 python3 tests/provenance_test.py                              # v1.13 provenance: neutral source header, sender-neutral wake text, static audit
 node --experimental-strip-types tests/activity_plugin_test.mjs # v1.13 OpenCode plugin activity writes (mock client)
 node --experimental-strip-types tests/panel_mobile_test.mjs    # v1.13 mobile: safe-area/dvh/16px, inspector 100vw, workbench closed→open, OUTBOX reachable
+python3 tests/org_identity_test.py                            # org & identity v1: v2 config import validation, identity snapshot, add profile-only vs rebind, CONTACT/panel/CLI consistency
 ```
 
 None of these touches your real config, mailboxes or ledger, and none calls a model.
