@@ -2255,6 +2255,8 @@ function trapTab(e) {
     const items = [];
     for (const r of roots) for (const n of r.querySelectorAll(sel)) if (n.getClientRects().length) items.push(n);
     if (!items.length) return;
+    // the docked letter comes after the inbox window in the page: order by real document position, not by layer
+    items.sort((x, y) => (x === y ? 0 : (x.compareDocumentPosition(y) & 4 /* y follows x */) ? -1 : 1));
     const a = document.activeElement, i = items.indexOf(a);
     const inside = roots.some((r) => r.contains(a));
     if (e.shiftKey) { if (i <= 0) { e.preventDefault(); items[items.length - 1].focus(); } }
