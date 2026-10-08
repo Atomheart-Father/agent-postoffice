@@ -627,6 +627,40 @@ class MessageFlow(unittest.TestCase):
         refs = sorted(x["ref"] for x in po._codex_parse_entries(t2))
         self.assertEqual(refs, sorted([rid1, rid2]), "裸稳定 ID 往返一致")
 
+    def test_codex_old_single_format_letters_survive_merge_with_new_mail(self):
+        # Backward compat: pending items written before the `引用：` line existed must still parse, so
+        # merging a new letter never DROPS an old formal/receipt ref. Two shapes: old single formal,
+        # and old single formal + receipt.
+        old1 = "20260101-000000_ghost_旧单封"
+        old2 = "20260101-000001_ghost_旧单封二"
+        rid = "old-rid-1"
+        old_single = (f"【联络总站新信｜coded】\n== /tmp/x/coded/inbox/{old1}.md\n"
+                      "来源：ghost\n事由：旧单封\n需要：仅告知\n"
+                      "按信件“需要”字段处理；回信/回执/归档规则见 postoffice skill。")
+        old_single_receipt = (f"【联络总站新信｜coded】\n== /tmp/x/coded/inbox/{old2}.md\n"
+                              "来源：ghost\n事由：旧单封二\n需要：仅告知\n"
+                              "按信件“需要”字段处理；回信/回执/归档规则见 postoffice skill。\n"
+                              "【联络总站回执｜coded】来自 ghost 的回执，原事由：旧回执\n"
+                              f"查询：postoffice receipt coded {rid}\n默认不答复")
+        # shape A: old single formal
+        self._seed_fake_state([{"id": "q1", "input": [{"type": "text", "text": old_single}],
+                                "clientUserMessageId": "postoffice:coded"}], busy=True)
+        newA = self.send("coded", subject="新信A")
+        postman(self.home)
+        text = self.fake_pending_text()
+        self.assertIn(f"{old1}.md", text, "旧单封的正式编号必须保全")
+        self.assertIn(f"{newA}.md", text, "新正式编号要追加")
+        self.assertEqual(len(self.fake_pending()), 1, "仍在同一 pending")
+        # shape B: old single formal + receipt
+        self._seed_fake_state([{"id": "q2", "input": [{"type": "text", "text": old_single_receipt}],
+                                "clientUserMessageId": "postoffice:coded"}], busy=True)
+        newB = self.send("coded", subject="新信B")
+        postman(self.home)
+        text = self.fake_pending_text()
+        self.assertIn(f"{old2}.md", text, "旧单封+回执里的正式编号必须保全")
+        self.assertIn(rid, text, "旧回执编号必须保全")
+        self.assertIn(f"{newB}.md", text, "新正式编号要追加")
+
     def test_codex_never_touches_a_user_queued_message(self):
         # 只更新确证归属邮局、且尚未启动的项：用户自己排队的消息原样不动。
         self._seed_fake_state([{"id": "u1", "input": [{"type": "text", "text": "USER-MSG-KEEP",
@@ -974,6 +1008,7 @@ class MessageFlow(unittest.TestCase):
         fresh = self.send("worker", subject="之后新到")
         out = run_po("archive-current", "--box", "worker", home=self.home)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("已归档 3 封", out.stdout, "成功归档要报告真实数量：\n" + out.stdout)
         self.assertEqual(self.inbox("worker"), [f"{fresh}.md"],
                          "presented 之外刚到的信必须原地不动")
         self.assertEqual(self.done("worker"), sorted(f"{i}.md" for i in ids))
@@ -991,6 +1026,8 @@ class MessageFlow(unittest.TestCase):
         self.write_presented("worker", ids)
         out = run_po("archive-current", "--box", "worker", "--keep", ids[1], home=self.home)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("已归档 2 封", out.stdout)
+        self.assertIn("保留 1 封", out.stdout, "要如实报告保留数量：\n" + out.stdout)
         self.assertEqual(self.inbox("worker"), [f"{ids[1]}.md"], "--keep 的信留在 inbox")
         self.assertEqual(self.done("worker"), sorted([f"{ids[0]}.md", f"{ids[2]}.md"]))
         self.assertEqual(self.presented("worker"), {ids[1]},
@@ -1027,6 +1064,7 @@ class MessageFlow(unittest.TestCase):
         d = self.send("worker", subject="没人展示过")
         out = run_po("archive-current", "--box", "worker", home=self.home)
         self.assertEqual(out.returncode, 0, "没有 presented 就是无事可做，退出码为 0：\n" + out.stdout + out.stderr)
+        self.assertIn("没有待归档", out.stdout, "空集合要明确说没有待归档：\n" + out.stdout)
         self.assertEqual(self.inbox("worker"), [f"{d}.md"])
         bad = run_po("archive-current", "--box", "ghost", home=self.home)
         self.assertNotEqual(bad.returncode, 0, "未知信箱必须拒绝")
@@ -1067,6 +1105,7 @@ class MessageFlow(unittest.TestCase):
         out = run_po("archive-current", "--box", "worker", home=self.home)
         self.assertNotEqual(out.returncode, 0, "同名冲突要显式报告，不许静默丢引用")
         self.assertIn("同名", out.stdout + out.stderr, out.stdout + out.stderr)
+        self.assertIn("另有 1 封", out.stdout + out.stderr, "冲突要显式计数（且区分已归档/保留）：\n" + out.stdout + out.stderr)
         self.assertEqual(self.inbox("worker"), [f"{a}.md"], "冲突时 inbox 的信必须原地不动")
         self.assertIn("旧内容", clash.read_text(encoding="utf-8"), "done/ 里的同名文件不许被动")
         self.assertIn(a, self.presented("worker"), "冲突的引用必须留着，下次还能再来")
