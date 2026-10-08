@@ -10,7 +10,6 @@ Data lives in $POSTOFFICE_HOME (default ~/agent-postoffice):
 Run `postoffice --help` for commands. Python 3.9+, standard library only.
 """
 import argparse
-import base64
 import datetime
 import fcntl
 import hashlib
@@ -992,16 +991,13 @@ def _codex_entry(name, p):
             "src": src, "subj": subj, "need": need}
 
 
-_CODEX_TRAILER_RE = re.compile(r"<!--po-batch:v1 ([A-Za-z0-9+/=]+)-->")
-
-
 def _codex_batch_text(entries):
     """Canonical bounded index: the SAME shape reminder() uses (single-letter vs batch by formal
-    count, formal first, receipts merged last), plus a trailing base64 trailer.
+    count, formal first, receipts merged last).
 
-    The trailer carries the SAME entries (id + source + subject + path, never a letter body) so a
-    later merge can recover the exact set and de-duplicate by stable id. It is a machine copy of the
-    visible index, not a second letter-content store.
+    It is ONE readable index that serves human, model and machine alike — no duplicated metadata
+    copy (a base64 mirror of the whole index wasted thousands of context characters per batch). A
+    later merge recovers the exact set by parsing this same visible text (see _codex_parse_entries).
     """
     formal = [e for e in entries if e["k"] == "f"]
     receipts = [e for e in entries if e["k"] == "r"]
@@ -1026,23 +1022,44 @@ def _codex_batch_text(entries):
         parts.append(f"另有 {len(receipts)} 条回执（默认不答复，需要时按 ID 查询）：")
         parts.extend(f"- {e.get('src', '?')}：{e.get('subj', '')}  {e.get('query', '')}"
                      for e in receipts)
-    blob = base64.b64encode(json.dumps(entries, ensure_ascii=False).encode("utf-8")).decode("ascii")
-    parts.append(f"<!--po-batch:v1 {blob}-->")
     return "\n".join(parts)
 
 
+# Parsers for the ONE visible index (no hidden copy). Anchored on the exact shapes _codex_batch_text
+# emits; src/name/ref are whitespace-free, subjects are single-line header fields.
+_CODEX_FORMAL_LINE_RE = re.compile(r"^\d+\. (\S+)/(\S+)  来源：(\S+)  事由：(.*?)  (\S.*)$", re.M)
+_CODEX_SINGLE_FORMAL_RE = re.compile(
+    r"【联络总站新信｜(\S+)】\n== (\S.*)\n来源：(\S+)\n事由：(.*)\n需要：(.*)")
+_CODEX_RECEIPT_LINE_RE = re.compile(
+    r"^- (\S+)：(.*?)  查询：postoffice receipt (\S+) (\S+)$", re.M)
+_CODEX_SINGLE_RECEIPT_RE = re.compile(
+    r"【联络总站回执｜(\S+)】来自 (\S+) 的回执(?:，原事由：(.*))?\n"
+    r"查询：postoffice receipt (\S+) (\S+)\n默认不答复")
+
+
 def _codex_parse_entries(text):
-    """Recover our entries from an item we wrote (trailer); [] if it is not one of ours."""
-    m = _CODEX_TRAILER_RE.search(text or "")
-    if not m:
-        return []
-    try:
-        data = json.loads(base64.b64decode(m.group(1)).decode("utf-8"))
-    except (ValueError, TypeError):
-        return []
-    if not isinstance(data, list):
-        return []
-    return [e for e in data if isinstance(e, dict) and e.get("k") in ("f", "r") and e.get("ref")]
+    """Recover our entries by parsing the ONE visible index; [] if it is not one of ours.
+
+    Formal batch lines carry name/ref/src/subj/path; the single-letter shape carries path (+ the
+    3-line head); receipts carry their stable query id. Never a hidden store — the same bytes the
+    model reads are the ones we parse.
+    """
+    text = text or ""
+    out = []
+    for m in _CODEX_FORMAL_LINE_RE.finditer(text):
+        name, ref, src, subj, path = m.groups()
+        out.append({"k": "f", "ref": ref, "name": name, "src": src, "subj": subj, "path": path})
+    for m in _CODEX_SINGLE_FORMAL_RE.finditer(text):
+        name, path, src, subj, need = m.groups()
+        out.append({"k": "f", "ref": Path(path).stem, "name": name, "src": src,
+                    "subj": subj, "need": need, "path": path})
+    for m in _CODEX_RECEIPT_LINE_RE.finditer(text):
+        src, subj, name, rid = m.groups()
+        out.append({"k": "r", "ref": rid, "name": name, "src": src, "subj": subj})
+    for m in _CODEX_SINGLE_RECEIPT_RE.finditer(text):
+        name, src, subj, rname, rid = m.groups()
+        out.append({"k": "r", "ref": rid, "name": name, "src": src, "subj": subj or ""})
+    return out
 
 
 def _codex_merge_entries(old, new, max_formal, max_receipt):
@@ -1113,6 +1130,28 @@ def _codex_next_cid(box, items):
     return f"{base_cid}#{nxt}"
 
 
+def _codex_add_batches(app, thread_id, box, items, entries):
+    """Add as many bounded batches as needed so EVERY entry lands; returns the cids added.
+
+    One item holds at most CODEX_MAX_FORMAL formal + CODEX_MAX_RECEIPT receipts; anything beyond
+    that continues in a fresh item (base / base#n) instead of being silently dropped. Bounded by
+    CODEX_MAX_PAGES so a pathological input cannot loop forever.
+    """
+    added, known, pending = [], list(items), list(entries)
+    while pending and len(added) < CODEX_MAX_PAGES:
+        batch, overflow = _codex_merge_entries([], pending, CODEX_MAX_FORMAL, CODEX_MAX_RECEIPT)
+        if not batch:
+            break
+        cid = (CODEX_PENDING_PREFIX + box) if not known else _codex_next_cid(box, known)
+        app.call("thread/queue/add", {
+            "threadId": thread_id, "input": _codex_text_input(_codex_batch_text(batch)),
+            "clientUserMessageId": cid})
+        added.append(cid)
+        known = known + [{"clientUserMessageId": cid}]
+        pending = overflow
+    return added
+
+
 def codex_queue_deliver(cli, thread_id, box, files, merge=True, timeout=60):
     """Deliver one round of reminders to a Codex thread, merging while busy.
 
@@ -1161,12 +1200,8 @@ def codex_queue_deliver(cli, thread_id, box, files, merge=True, timeout=60):
                 target = (it, old)
         try:
             if target is None:
-                merged, _ = _codex_merge_entries([], new, CODEX_MAX_FORMAL, CODEX_MAX_RECEIPT)
-                cid = _codex_next_cid(box, items) if items else base_cid
-                app.call("thread/queue/add", {
-                    "threadId": thread_id, "input": _codex_text_input(_codex_batch_text(merged)),
-                    "clientUserMessageId": cid})
-                return "accepted", f"queued {cid}"
+                _codex_add_batches(app, thread_id, box, items, new)
+                return "accepted", "queued"
             it, old = target
             merged, overflow = _codex_merge_entries(old, new, CODEX_MAX_FORMAL, CODEX_MAX_RECEIPT)
             if merged == old:
@@ -1175,10 +1210,7 @@ def codex_queue_deliver(cli, thread_id, box, files, merge=True, timeout=60):
                 "threadId": thread_id, "queuedSubmissionId": it["id"],
                 "input": _codex_text_input(_codex_batch_text(merged))})
             if overflow:
-                extra, _ = _codex_merge_entries([], overflow, CODEX_MAX_FORMAL, CODEX_MAX_RECEIPT)
-                app.call("thread/queue/add", {
-                    "threadId": thread_id, "input": _codex_text_input(_codex_batch_text(extra)),
-                    "clientUserMessageId": _codex_next_cid(box, items)})
+                _codex_add_batches(app, thread_id, box, items, overflow)
             return "accepted", f"merged into {it['id']}"
         except CodexUnknown as e:
             codex_uncertain_save(box, {"ids": [p.stem for p in files],
