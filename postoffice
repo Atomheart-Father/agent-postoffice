@@ -4711,11 +4711,18 @@ def cmd_panel(a):
         else:
             sys.exit(f"旧面板没能关掉，端口 {port} 仍被占用")
     url = f"http://127.0.0.1:{port}/"
-    print(f"联络总站面板：{url}（Ctrl+C 关闭）", flush=True)
     if trusted:
-        print(f"对外公布地址：{PANEL_BASE_URL}（写操作只认同源 Origin：{trusted}）", flush=True)
-    if not a.no_open:
-        webbrowser.open(url)
+        # One canonical entry, so a per-origin browser preference (the colour choice in localStorage) is the
+        # same whether the human opens the printed URL or arrives from a Slack deep link. Without this the
+        # local URL and the public URL are two different origins, i.e. two separate preference buckets.
+        print(f"联络总站面板：{PANEL_BASE_URL}/（Ctrl+C 关闭；本机备用 {url}）", flush=True)
+        print(f"写操作只认同源 Origin：{trusted}", flush=True)
+        if not a.no_open:
+            webbrowser.open(f"{PANEL_BASE_URL}/")
+    else:
+        print(f"联络总站面板：{url}（Ctrl+C 关闭）", flush=True)
+        if not a.no_open:
+            webbrowser.open(url)
     srv.serve_forever()
 
 def group_or_box(a, status):

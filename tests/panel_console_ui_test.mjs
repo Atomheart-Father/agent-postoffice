@@ -127,7 +127,7 @@ function makeEnv({ langs = ["zh-Hans-CN"], state = ACME, letter = { status: 200,
   // top-bar palette group: static buttons, aria-pressed/labels driven by applyLang (mirrors `langs`)
   const thBtn = (c) => ({ dataset: { themeChoice: c }, textContent: "", attrs: {},
     setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } });
-  els["theme"].children = ["system", "paper", "night", "mist", "blueprint", "pine", "ember"].map(thBtn);
+  els["theme"].children = ["paper", "night", "mist", "blueprint", "pine", "ember"].map(thBtn);
 
   const store = storage || new Map();
   const localStorage = {
@@ -215,6 +215,8 @@ const clickIn = (container, matcher) => (e) => e.fire(container, "click", { targ
 const rowClick = clickIn("boxes", (s) => (s === ".clear" || s === ".toggle" ? null
   : { dataset: { box: "director", id: "L1", file: "L1.md" } }));
 const nodeClick = (name) => clickIn("boxes", (s) => (s === "[data-box]" ? { dataset: { box: name } } : null));
+const langClick = (l) => (e) => e.fire("langs", "click", { target: { closest: (s) =>
+  (s.includes("data-lang") ? { dataset: { lang: l } } : null) } });
 const letterAct = (action, disabled = false) => (e) => e.fire("letter", "click", {
   target: { closest: (s) => (s === "[data-letter-action]" ? { dataset: { letterAction: action }, disabled } : null) },
 });
@@ -945,18 +947,17 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
   has(insHTML(en), "Working", "en inspector working");
 }
 
-// ============ 27) Appearance: default system, click persists, no writes, no language change ============
+// ============ 27) Appearance: paper by default (no "system"), click persists, no writes, no language change ============
 {
   const e = makeEnv({ storage: new Map(), matchDark: true }); await settle();
-  is(thBtn(e, "system").getAttribute("aria-pressed"), "true", "默认选中跟随系统");
-  is(thBtn(e, "paper").getAttribute("aria-pressed"), "false", "默认纸白未选中");
+  is(thBtn(e, "paper").getAttribute("aria-pressed"), "true", "默认选中纸白");
   is(thBtn(e, "night").getAttribute("aria-pressed"), "false", "默认夜未选中");
-  is(e.ctx.document.documentElement.dataset.theme, "night", "跟随系统+系统深色 → data-theme=night");
+  is(e.ctx.document.documentElement.dataset.theme, "paper", "无存储值 → paper（系统深浅不影响）");
   is(posts(e).length, 0, "主题初始零写请求");
 
   const storage = new Map();
   const d = makeEnv({ storage, matchDark: false }); await settle();
-  is(d.ctx.document.documentElement.dataset.theme, "paper", "跟随系统+系统浅色 → data-theme=paper");
+  is(d.ctx.document.documentElement.dataset.theme, "paper", "系统浅色也是 paper");
   const title = d.els["title"].textContent;
   d.calls.length = 0;
   themeClick("night")(d); await settle();
@@ -970,16 +971,17 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
     is(d.ctx.document.documentElement.dataset.theme, pal, `点 ${pal} 设置 data-theme=${pal}`);
   }
   themeClick("neon")(d); await settle();
-  is(d.ctx.document.documentElement.dataset.theme, "paper", "未知配色回到跟随系统（此处系统浅色 → paper）");
-  is(storage.get("postoffice.theme"), "system", "未知配色存为 system");
+  is(d.ctx.document.documentElement.dataset.theme, "paper", "未知配色回退 paper");
+  is(storage.get("postoffice.theme"), "paper", "未知配色存为 paper");
 }
 
-// ============ 28) Appearance: persist across reload, system resolves, storage unusable, legacy values ============
+// ============ 28) Appearance: persist across reload, system no longer a choice, storage unusable, legacy ============
 {
   const storage = new Map([["postoffice.theme", "mist"]]);
   const reload = makeEnv({ storage, matchDark: true }); await settle();
   is(thBtn(reload, "mist").getAttribute("aria-pressed"), "true", "重载后沿用已存的 mist");
-  is(reload.ctx.document.documentElement.dataset.theme, "mist", "存了配色时系统深色也被覆盖");
+  is(reload.ctx.document.documentElement.dataset.theme, "mist", "存了配色时不受系统深浅影响");
+  is(storage.get("postoffice.theme"), "mist", "重载不改写已存的有效选择");
 
   // choices saved by the previous two-state switch keep working
   const old = makeEnv({ storage: new Map([["postoffice.theme", "dark"]]), matchDark: false }); await settle();
@@ -988,35 +990,72 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
   const old2 = makeEnv({ storage: new Map([["postoffice.theme", "light"]]), matchDark: true }); await settle();
   is(old2.ctx.document.documentElement.dataset.theme, "paper", "旧版存的 light → paper");
 
+  // the removed option's value is normalised once, so it cannot keep steering the page
+  const s3 = new Map([["postoffice.theme", "system"]]);
+  const gone = makeEnv({ storage: s3, matchDark: true }); await settle();
+  is(gone.ctx.document.documentElement.dataset.theme, "paper", "旧版存的 system → paper");
+  is(s3.get("postoffice.theme"), "paper", "system 归一化为 paper");
+  is(thBtn(gone, "system"), null, "页面不再有跟随系统按钮");
+
   const s2 = new Map();
   const e = makeEnv({ storage: s2, matchDark: true }); await settle();
   themeClick("paper")(e); await settle();
   is(e.ctx.document.documentElement.dataset.theme, "paper", "点纸白");
-  themeClick("system")(e); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "night", "跟随系统解析为 night");
-  is(s2.get("postoffice.theme"), "system", "跟随系统存储 system");
-  is(thBtn(e, "system").getAttribute("aria-pressed"), "true", "系统按钮选中");
+  themeClick("blueprint")(e); await settle();
+  is(e.ctx.document.documentElement.dataset.theme, "blueprint", "点蓝图");
+  is(s2.get("postoffice.theme"), "blueprint", "蓝图存储 blueprint");
 
   const broken = makeEnv({ storageThrows: true, matchDark: true }); await settle();
-  is(thBtn(broken, "system").getAttribute("aria-pressed"), "true", "存储不可用回退 system");
-  is(broken.ctx.document.documentElement.dataset.theme, "night", "存储不可用仍能解析");
+  is(thBtn(broken, "paper").getAttribute("aria-pressed"), "true", "存储不可用回退纸白");
+  is(broken.ctx.document.documentElement.dataset.theme, "paper", "存储不可用仍是 paper");
   themeClick("pine")(broken); await settle();
   is(broken.ctx.document.documentElement.dataset.theme, "pine", "存储不可用仍可切换");
+}
+
+// ============ 28b) Appearance: the choice survives the paths that used to lose it ============
+{
+  // Same-origin reload: exactly what closing the tab and reopening is.
+  const store = new Map();
+  const first = makeEnv({ storage: store, matchDark: false }); await settle();
+  themeClick("pine")(first); await settle();
+  const reopened = makeEnv({ storage: store, matchDark: true }); await settle();
+  is(reopened.ctx.document.documentElement.dataset.theme, "pine", "关闭重开同源仍是你选的配色");
+
+  // Language switch repaints labels; it must not rewrite or reset the choice.
+  const sLang = new Map([["postoffice.theme", "mist"]]);
+  const lz = makeEnv({ storage: sLang, langs: ["zh-Hans-CN"], matchDark: false }); await settle();
+  langClick("en")(lz); await settle();
+  is(lz.ctx.document.documentElement.dataset.theme, "mist", "切语言不改配色");
+  is(sLang.get("postoffice.theme"), "mist", "切语言不重写存储值");
+
+  // A Slack-style deep link into a letter, on the same origin: the colour stays and the letter opens.
+  const sDeep = new Map([["postoffice.theme", "ember"]]);
+  const deep = makeEnv({ storage: sDeep, hash: "#/mail/director/L1", matchDark: false }); await settle();
+  is(deep.ctx.document.documentElement.dataset.theme, "ember", "带深链进入仍保留配色");
+  is(sDeep.get("postoffice.theme"), "ember", "带深链进入不重写存储值");
+  is(deep.els["letter"].hidden, false, "带深链进入照常打开那封信");
+
+  // Polling must never reset the choice either.
+  const sPoll = new Map([["postoffice.theme", "blueprint"]]);
+  const poll = makeEnv({ storage: sPoll, matchDark: false }); await settle();
+  for (let i = 0; i < 3; i++) { await settle(); }
+  is(poll.ctx.document.documentElement.dataset.theme, "blueprint", "多轮轮询后配色不变");
+  is(sPoll.get("postoffice.theme"), "blueprint", "轮询不重写存储值");
 }
 
 // ============ 29) Appearance: labels via STR both languages + head bootstrap + color-scheme ============
 {
   const zh = makeEnv({ langs: ["zh-Hans-CN"], matchDark: true }); await settle();
-  is(thBtn(zh, "system").textContent, "跟随系统", "zh 系统标签");
   is(thBtn(zh, "paper").textContent, "纸白", "zh 纸白标签");
   is(thBtn(zh, "night").textContent, "夜", "zh 夜标签");
   has(String(zh.els["theme"].getAttribute("aria-label") || ""), "外观", "zh 主题组 aria-label=外观");
   const en = makeEnv({ langs: ["en-US"], matchDark: true }); await settle();
-  is(thBtn(en, "system").textContent, "System", "en System 标签");
   is(thBtn(en, "paper").textContent, "Paper", "en Paper 标签");
   is(thBtn(en, "ember").textContent, "Ember", "en Ember 标签");
   has(String(en.els["theme"].getAttribute("aria-label") || ""), "Appearance", "en 主题组 aria-label=Appearance");
   is(thBtn(en, "night").getAttribute("title"), "Night", "色块按钮 title 写明名字（颜色之外也有文字）");
+  hasNot(html, "data-theme-choice=\"system\"", "源码里没有跟随系统按钮");
+  hasNot(html, "prefers-color-scheme", "源码里没有跟随系统的媒体监听");
 
   // source: a head bootstrap script reads postoffice.theme and sets data-theme, before the app script
   const scripts = html.match(/<script(?:\s[^>]*)?>[\s\S]*?<\/script>/g) || [];
@@ -1105,21 +1144,21 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
   is(e.els["edit-subject"].value, "外发", "编辑目标未被改变");
 }
 
-// ============ 33) Appearance: SYSTEM follows live media change; explicit choice is immune ============
+// ============ 33) Appearance: a palette you chose is immune to live media changes ============
 {
   const e = makeEnv({ storage: new Map(), matchDark: false }); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "paper", "初始 system + 系统浅色");
+  is(e.ctx.document.documentElement.dataset.theme, "paper", "初始 paper");
   e.systemDark(true); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "night", "system 时系统转深色 → 实时跟随");
+  is(e.ctx.document.documentElement.dataset.theme, "paper", "系统转深色不改动你的配色");
   e.systemDark(false); await settle();
-  is(e.ctx.document.documentElement.dataset.theme, "paper", "system 时系统转浅色 → 实时跟随");
+  is(e.ctx.document.documentElement.dataset.theme, "paper", "系统转浅色不改动你的配色");
   themeClick("mist")(e); await settle();
   e.systemDark(true); await settle();
   is(e.ctx.document.documentElement.dataset.theme, "mist", "显式配色不受系统变化影响");
   themeClick("night")(e); await settle();
   e.systemDark(false); await settle();
   is(e.ctx.document.documentElement.dataset.theme, "night", "显式夜不受系统变化影响");
-  is(posts(e).length, 0, "系统跟随零写请求");
+  is(posts(e).length, 0, "配色切换零写请求");
 }
 
 // ============ 34) Retract from the detail layer: detail closes, success shown, list refreshed ============
