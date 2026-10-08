@@ -171,12 +171,59 @@ class MessageFlow(unittest.TestCase):
         return tp
 
     def fake_codex(self):
-        """假 codex CLI：每次调用把完整参数写进 capture 文件（`$*`），调用之间用哨兵分隔。"""
-        cap = self.home / "codex.calls"
-        script = self.home / "fake_codex.sh"
-        script.write_text("#!/bin/sh\n"
-                          f"printf '===8<===\\n%s\\n===>8===\\n' \"$*\" >> '{cap}'\n"
-                          "exit 0\n")
+        """假 codex app-server：说 stdio JSON-RPC，维护一个持久 pending 队列并记录每次 add/update 的索引文本。
+
+        忙时 add 留在 pending、update 就地替换；idle 时 add 立即被消费（不入 pending），模拟真实语义。
+        状态与 capture 都存在脚本同目录，跨进程（每轮邮递员各起一次）持久。索引文本仍用哨兵包裹，
+        所以 codex_calls() 与既有断言（稳定引用/批次形态）保持不变。
+        """
+        script = self.home / "fake_codex.py"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "D = os.path.dirname(os.path.abspath(__file__))\n"
+            "STATE = os.path.join(D, 'fake_codex_state.json')\n"
+            "CAP = os.path.join(D, 'codex.calls')\n"
+            "def load():\n"
+            "    try:\n"
+            "        return json.load(open(STATE))\n"
+            "    except Exception:\n"
+            "        return {'busy': True, 'pending': [], 'seq': 0}\n"
+            "def save(s):\n"
+            "    open(STATE, 'w').write(json.dumps(s))\n"
+            "def emit(o):\n"
+            "    sys.stdout.write(json.dumps(o) + '\\n'); sys.stdout.flush()\n"
+            "def text_of(p):\n"
+            "    inp = p.get('input') or []\n"
+            "    return '\\n'.join(x.get('text','') for x in inp if isinstance(x, dict) and x.get('type')=='text')\n"
+            "for line in sys.stdin:\n"
+            "    line = line.strip()\n"
+            "    if not line: continue\n"
+            "    try: msg = json.loads(line)\n"
+            "    except ValueError: continue\n"
+            "    m, rid, p = msg.get('method'), msg.get('id'), (msg.get('params') or {})\n"
+            "    s = load()\n"
+            "    if m == 'initialize':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'userAgent':'fake-codex','codexHome':D,'platformFamily':'unix','platformOs':'macos'}})\n"
+            "    elif m == 'thread/queue/list':\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'data':s['pending'],'nextCursor':None}})\n"
+            "    elif m == 'thread/queue/add':\n"
+            "        open(CAP,'a').write('===8<===\\n' + text_of(p) + '\\n===>8===\\n')\n"
+            "        if s['busy']:\n"
+            "            s['seq'] += 1\n"
+            "            s['pending'].append({'id':'q%d'%s['seq'],'input':p.get('input'),'clientUserMessageId':p.get('clientUserMessageId')})\n"
+            "        save(s)\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'queuedSubmission':None}})\n"
+            "    elif m == 'thread/queue/update':\n"
+            "        open(CAP,'a').write('===8<===\\n' + text_of(p) + '\\n===>8===\\n')\n"
+            "        for it in s['pending']:\n"
+            "            if it['id'] == p.get('queuedSubmissionId'):\n"
+            "                it['input'] = p.get('input')\n"
+            "        save(s)\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'result':{'queuedSubmission':None}})\n"
+            "    else:\n"
+            "        emit({'jsonrpc':'2.0','id':rid,'error':{'code':-32601,'message':'method not found'}})\n",
+            encoding="utf-8")
         script.chmod(0o755)
         return script
 
@@ -186,6 +233,15 @@ class MessageFlow(unittest.TestCase):
             return []
         return re.findall(r"===8<===\n(.*?)\n===>8===",
                           f.read_text(encoding="utf-8", errors="replace"), re.S)
+
+    def fake_pending(self):
+        f = self.home / "fake_codex_state.json"
+        return json.loads(f.read_text(encoding="utf-8"))["pending"] if f.exists() else []
+
+    def fake_pending_text(self):
+        return "\n\n".join("".join(x.get("text", "") for x in (it.get("input") or [])
+                                   if isinstance(x, dict) and x.get("type") == "text")
+                           for it in self.fake_pending())
 
     # ==================================================================== A
     # -- A1: send prints the stable ref -----------------------------------
@@ -395,12 +451,12 @@ class MessageFlow(unittest.TestCase):
         # Python 侧沿用 v1.4 的 shlex.quote 约定（安全串不加引号）；插件侧才是总是加单引号。
         self.assertIn("postoffice receipt " + shlex.quote("coded") + " " + shlex.quote("orig-1"), text)
 
-    def test_codex_postman_caps_a_batch_at_twenty_and_sends_the_rest_next_round(self):
+    def test_codex_postman_caps_a_batch_at_twenty_and_merges_the_rest_into_one_pending(self):
         ids = [self.send("coded", subject=f"超批{i}") for i in range(21)]
         postman(self.home)
         postman(self.home)
         calls = self.codex_calls()
-        self.assertEqual(len(calls), 2, f"21 封应当恰好两轮（20 + 1），实际 {len(calls)} 轮")
+        self.assertEqual(len(calls), 2, f"21 封应当恰好两轮（20 + 1 追加），实际 {len(calls)} 轮")
         first, second = calls
         ordered = sorted(ids)               # the postman queues in file-name order, not send order
         self.assertIn("【联络总站｜20 封新信】", first, "一轮最多 20 封：\n" + first)
@@ -409,7 +465,10 @@ class MessageFlow(unittest.TestCase):
         for lid in ordered[20:]:
             self.assertNotIn(lid, first, "第 21 封留到下一轮，不得挤进这一批")
         self.assertIn(ordered[20], second, "第二轮必须补上剩下那封")
-        self.assertNotIn(ordered[0], second, "已投过的不重复投")
+        # 忙时第二轮是 UPDATE 就地追加同一个 pending，不是新建提交：始终只有一个 postoffice pending
+        self.assertEqual(len(self.fake_pending()), 1, f"忙时应只有一个 postoffice pending：{self.fake_pending()}")
+        for lid in ids:
+            self.assertIn(f"{lid}.md", self.fake_pending_text(), "合并后的索引要含全部精确 ID")
 
     def test_codex_alarm_letter_never_joins_the_formal_batch(self):
         ids = [self.send("coded", subject=f"普通{i}") for i in range(2)]
@@ -423,6 +482,72 @@ class MessageFlow(unittest.TestCase):
         self.assertEqual(len(batch), 1, "两封普通信应当同一批：\n" + "\n---\n".join(calls))
         self.assertIn(ids[1], batch[0], "同一批要带上第二封普通信")
         self.assertNotIn(aid, batch[0], "闹钟信不许混进普通 batch")
+
+    # -- B: cross-round merge (Codex busy → ONE pending index) -------------
+    def _seed_fake_state(self, pending, busy=True, seq=0):
+        (self.home / "fake_codex_state.json").write_text(
+            json.dumps({"busy": busy, "pending": pending, "seq": seq}), encoding="utf-8")
+
+    def test_codex_busy_merges_three_rounds_into_one_pending_index(self):
+        # 验收1：忙时三封正式信分三轮到达 → 只有一个 postoffice pending，索引含全部精确 ID；
+        # 重复扫描不再增加项。
+        l1 = self.send("coded", subject="合并一")
+        postman(self.home)
+        l2 = self.send("coded", subject="合并二")
+        postman(self.home)
+        l3 = self.send("coded", subject="合并三")
+        postman(self.home)
+        calls = self.codex_calls()
+        self.assertEqual(len(calls), 3, f"三轮各一次通道操作（add + update + update）：{len(calls)}")
+        pend = self.fake_pending()
+        self.assertEqual(len(pend), 1, f"忙时只允许一个 postoffice pending：{pend}")
+        self.assertEqual(pend[0]["clientUserMessageId"], "postoffice:coded")
+        text = self.fake_pending_text()
+        for lid in (l1, l2, l3):
+            self.assertIn(f"{lid}.md", text, "合并索引要含全部精确 ID")
+        # 重复扫描不新增
+        postman(self.home)
+        self.assertEqual(len(self.codex_calls()), 3, "没有新信时不许再产生通道操作")
+        self.assertEqual(len(self.fake_pending()), 1)
+
+    def test_codex_never_touches_a_user_queued_message(self):
+        # 只更新确证归属邮局、且尚未启动的项：用户自己排队的消息原样不动。
+        self._seed_fake_state([{"id": "u1", "input": [{"type": "text", "text": "USER-MSG-KEEP",
+                                                       "text_elements": []}],
+                                "clientUserMessageId": None}], seq=1)
+        l1 = self.send("coded", subject="自己的")
+        postman(self.home)
+        pend = self.fake_pending()
+        users = [p for p in pend if p["clientUserMessageId"] is None]
+        self.assertEqual(len(users), 1, "用户项必须还在")
+        self.assertEqual(users[0]["input"][0]["text"], "USER-MSG-KEEP", "用户项内容一字不改")
+        ours = [p for p in pend if p["clientUserMessageId"] == "postoffice:coded"]
+        self.assertEqual(len(ours), 1, "邮局项另立一条，不并进用户项")
+        self.assertIn(f"{l1}.md", "".join(x.get("text", "") for x in ours[0]["input"]))
+
+        l2 = self.send("coded", subject="自己的二")
+        postman(self.home)
+        pend2 = self.fake_pending()
+        self.assertEqual([p for p in pend2 if p["clientUserMessageId"] is None][0]["input"][0]["text"],
+                         "USER-MSG-KEEP", "第二轮合并仍不许碰用户项")
+        self.assertEqual(len([p for p in pend2 if p["clientUserMessageId"] == "postoffice:coded"]), 1,
+                         "合并进邮局项，不新建")
+        self.assertIn(f"{l2}.md", self.fake_pending_text())
+
+    def test_codex_new_mail_after_pending_consumed_is_a_fresh_submission(self):
+        # 验收3：pending 被消费（启动）后再到新信 → 不修改正在运行的内容，另起一条。
+        l1 = self.send("coded", subject="先来")
+        postman(self.home)
+        self.assertEqual(len(self.fake_pending()), 1)
+        # 模拟该 pending 已被会话消费（启动）：从队列消失
+        self._seed_fake_state([], seq=1)
+        l2 = self.send("coded", subject="后来")
+        postman(self.home)
+        pend = self.fake_pending()
+        self.assertEqual(len(pend), 1, "消费后新信另起一条")
+        text = self.fake_pending_text()
+        self.assertIn(f"{l2}.md", text)
+        self.assertNotIn(f"{l1}.md", text, "不得把已消费的旧内容重新并入")
 
     def test_codex_partial_claim_failure_wakes_the_rest_once_and_never_duplicates(self):
         ids = [self.send("coded", subject=f"部分{i}") for i in range(3)]
@@ -446,9 +571,15 @@ class MessageFlow(unittest.TestCase):
         postman(self.home)
         calls2 = self.codex_calls()
         self.assertEqual(len(calls2), 2, "下一轮应当只补抢不到的那封")
-        self.assertIn(ids[1], calls2[1])
-        self.assertNotIn(ids[0], calls2[1], "已经看一眼的内容不得重投")
-        self.assertNotIn(ids[2], calls2[1], "已经看一眼的内容不得重投")
+        self.assertIn(ids[1], calls2[1], "补投的那封要进合并索引")
+        # 忙时是就地追加同一个 pending，不新建提交：合并后仍只有一个 postoffice pending
+        self.assertEqual(len(self.fake_pending()), 1, f"合并后仍只有一个 postoffice pending：{self.fake_pending()}")
+        self.assertIn(ids[0], self.fake_pending_text())
+        self.assertIn(ids[1], self.fake_pending_text())
+        self.assertIn(ids[2], self.fake_pending_text())
+        woken = self.woken()
+        for lid in ids:
+            self.assertIn(str(self.letter_path("coded", lid)), woken, "三封都各记一次账")
 
         # 全部抢不到 → 0 wake、0 空 prompt、0 台账
         extra = [self.send("coded", subject=f"全占{i}") for i in range(2)]
