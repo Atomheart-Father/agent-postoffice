@@ -421,7 +421,7 @@ try_cfg '{"version":1,"groups":{"*":["mgr_a"]}}' && bad "v1.7 通配符未拒绝
 try_cfg '{"version":1,"aliases":{"pm":{"candidates":[]}}}' && bad "v1.7 空 candidates 未拒绝" || ok "v1.7 空 candidates 拒绝"
 try_cfg '{"version":1,"aliases":{"pm":{"notify":["mgr_a"]}}}' && bad "v1.7 alias 缺 candidates 未拒绝" || ok "v1.7 alias 缺 candidates 拒绝"
 try_cfg '{"version":1,' && bad "v1.7 坏 JSON 未拒绝" || ok "v1.7 坏 JSON 拒绝"
-try_cfg '{"version":2,"groups":{}}' && bad "v1.7 错版本未拒绝" || ok "v1.7 错版本拒绝"
+try_cfg '{"version":3,"groups":{}}' && bad "v1.7 错版本未拒绝" || ok "v1.7 错版本拒绝"
 [ "$(cat "$POSTOFFICE_HOME/config.json")" = "$before" ] && ok "v1.7 一串坏配置都没动旧文件" || bad "v1.7 坏配置改动了旧文件"
 
 # 3) 成功导入有备份；show 只读
@@ -718,7 +718,7 @@ po17_on a; po17_on b; po17_round                     # 先建立一个正常基�
 printf '%s' '{"version":1,"groups":{"good":["a"]}}' > "$P2/config.json"   # 一份本身合法的配置
 po17_off @good >/dev/null; po17_on @good >/dev/null
 r_before=$(cat "$P2/routes.json"); i_before=$(po17_n a)
-printf '%s' '{"version":2,"groups":{"g":["a"]},"aliases":{"pm":["a"]}}' > "$P2/config.json"
+printf '%s' '{"version":3,"groups":{"g":["a"]},"aliases":{"pm":["a"]}}' > "$P2/config.json"
 po17_off @g 2>"$T/rt1"; rc=$?
 [ $rc -ne 0 ] && ok "退修1 运行时版本非法时分组停用" || bad "退修1 运行时版本非法仍改了状态"
 grep -q "配置无效" "$T/rt1" && ok "退修1 提示说清配置无效" || bad "退修1 提示不清楚"
