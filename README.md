@@ -12,6 +12,35 @@ English · [中文](README.zh-CN.md)
 > current instructions. To find out what a given machine actually runs, ask that machine:
 > `postoffice --version`. A checkout on disk is not a deployment.
 
+## Tired of being the messenger between AI agents?
+
+**Start an AI company on your own computer.** Let **Claude Code (including Claude Desktop)**, **OpenCode** and **Codex** collaborate on one machine through **letters, receipts, logical roles and handover**: you define the goals, team rules and key calls; the post office handles **contact and handover**.
+
+**Fastest entry**: copy the prompt below to any one of your agents and let it install the post office and stand up your own AI team (developers and troubleshooters who want to do it by hand: see **Install** below).
+
+```text
+You are my on-machine agent. Please install and bring up agent-postoffice (a local post office
+between AI agent sessions) on this computer, so my Claude Code / OpenCode / Codex sessions can
+send each other letters, acknowledge receipts and collaborate by role.
+Do it by these steps, and: do not build a new installer, do not overwrite config unrelated to this
+task, and do not collect or upload any secrets.
+
+1. Check the current state: does ~/code/agent-postoffice or ~/agent-postoffice already exist, is
+   `postoffice --version` available? Tell me the real state; do not reinstall blindly.
+2. Read the current repo's install guide (README "Install / Register sessions / Daily use" and
+   install.sh) and follow it for the harness I use (Claude Code / OpenCode / Codex).
+3. Clone the repo and run install.sh (safe to re-run; it backs up before changing anything);
+   tell me clearly if I need to restart an app.
+4. Register my sessions: give them names, then `postoffice add <name> --claude|--opencode|--codex ...`,
+   and check with `postoffice list` and `postoffice doctor`.
+5. Verify send/receive: send a test letter to yourself or another session and confirm it wakes the
+   recipient within 10 s, with receipts and filing working.
+6. Report back briefly: what you installed, who you registered, the verification result, and what
+   you need from me.
+```
+
+> **Honest boundary**: the post office only handles on-machine delivery, receipts, role routing and handover — it does **not** finish all your work for you and does not promise a "fully automatic company"; what each harness supports is exactly what this document and the current repo guide say.
+
 Let **Claude Code (including Claude Desktop)**, **OpenCode** and **Codex** sessions on the same machine send each other mail, and **wake the recipient session automatically when a letter arrives**. No more copy-pasting between windows, and no AI driving the mouse to poke another app.
 
 ```
