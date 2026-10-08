@@ -354,6 +354,7 @@ const runCLI = (args: string[], timeout = 20_000): Promise<{ code: number; text:
 export const PostofficePlugin: Plugin = async ({ client, directory }) => {
   const recent = new Map<string, number[]>()
   const mine = new Map<string, boolean>() // sessionID → 是否属于本实例目录
+  const hintTried = new Set<string>()    // sessionID → 是否已尝试过一次恢复身份提示
   let scanning = false
 
   const ownsSession = async (id: string) => {
@@ -626,7 +627,29 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
         }
         if (state) {
           const who = await resolveOwnBox(sid)
-          if (who.box) await writeActivity(who.box, sid, state)
+          if (who.box) {
+            await writeActivity(who.box, sid, state)
+            // Resume seam: on the FIRST lifecycle sight of this session, show the short identity
+            // hint once (register/resume only -- never with ordinary mail). Silent when the CLI has
+            // nothing to say (no organization) so a plain install behaves exactly as before.
+            if (!hintTried.has(sid) && state === "idle") {
+              hintTried.add(sid)
+              try {
+                const r = await runCLI(["identity", who.box, "--hint"])
+                const line = r.text.trim()
+                if (r.code === 0 && line) {
+                  // 官方「仅上下文」入口：body.noReply=true 只注入上下文，不请求模型答复；
+                  // 并且只在空闲接缝注入，绝不在 busy 事件里叫起一轮新的回答。
+                  const body = { noReply: true, parts: [{ type: "text", text: line }] }
+                  if (typeof client.session.prompt === "function") {
+                    await client.session.prompt({ path: { id: sid }, body })
+                  } else {
+                    await client.session.promptAsync({ path: { id: sid }, body })
+                  }
+                }
+              } catch { /* a resume hint is best-effort; delivery and presence are unaffected */ }
+            }
+          }
         }
       }
     } catch {}

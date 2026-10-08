@@ -58,7 +58,12 @@ const ACME_BOXES = [
   mkBox("scribe", "opencode_plugin", true, 1),
   mkBox("research-a", "opencode_plugin", true),
   mkBox("research-b", "claude_hook", false),
-  mkBox("lead", "opencode_plugin", true),
+  { ...mkBox("lead", "opencode_plugin", true), identity: {
+      box: "lead", registered: true, org_present: true, config_ok: true, memberships: [],
+      active_roles: [{ alias: "p.owner", title: "开发", active_target: "lead" }],
+      candidate_only_roles: [{ alias: "p.review", title: "审核", active_target: "runner" }],
+      company_rules: [{ company: "boxz", path: "/tmp/rules.md" }],
+      project_status: [{ project: "alpha", path: "/tmp/STATUS.md" }] } },
   mkBox("analyst", "opencode_plugin", true),
   mkBox("runner", "codex_queue", false),
   mkBox("ops-a", "codex_queue", true),
@@ -1106,6 +1111,23 @@ const themeClick = (choice) => (e) => e.fire("theme", "click", { target: { close
   detailAct(e, "retract", { to: "lead", id: "O1" }); await settle();
   is(e.els["letter"].hidden, false, "撤回失败保留详情层");
   has(e.els["letter-status"].textContent, "已送达，不能撤回", "失败显示真实原因");
+}
+
+// ============ 36) Panel consumes the derived identity (ACTIVE / CANDIDATE / RULES / STATUS) ============
+{
+  const e = makeEnv({ state: ACME }); await settle();
+  nodeClick("lead")(e); await settle();
+  const ins = insHTML(e);
+  has(ins, "组织身份", "inspector 有组织身份标签");
+  has(ins, "现职", "inspector 显示现职");
+  has(ins, "p.owner", "inspector 显示现职 alias");
+  has(ins, "可候选", "inspector 显示可候选");
+  has(ins, "/tmp/STATUS.md", "inspector 显示项目进度指针");
+  has(ins, "/tmp/rules.md", "inspector 显示公司规章指针");
+  is(posts(e).length, 0, "身份展示零写请求");
+  const en = makeEnv({ langs: ["en-US"], state: ACME }); await settle();
+  nodeClick("lead")(en); await settle();
+  has(insHTML(en), "ACTIVE", "en inspector 显示 ACTIVE");
 }
 
 console.log(failures ? `FAIL ${failures}` : "PASS");
