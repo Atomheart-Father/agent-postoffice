@@ -108,7 +108,7 @@ Already done in the page:
 
 - Polls `/api/state` every 5 s; **unchanged HTML never touches the DOM**, and changed HTML keeps the window's scroll position and focus.
 - The contour-line canvas draws at most one frame per 50 ms and stops when the tab is hidden; a letter flies every 5.2 s; with a hidden tab or the OS "reduce motion" setting nothing flies or blinks and the background is one still frame.
-- No network requests, no build: one HTML file; the font (Instrument Sans, SIL OFL 1.1, Latin subset ≈ 54 KB) is embedded as base64; Chinese uses system fonts.
+- No requests to external resources (it only talks to the local panel API), no build: one HTML file; the font (Instrument Sans, SIL OFL 1.1, Latin subset ≈ 54 KB) is embedded as base64; Chinese uses system fonts.
 - The server re-reads `panel/index.html` on every request: edit, refresh the browser, no restart.
 
 What you can do:
