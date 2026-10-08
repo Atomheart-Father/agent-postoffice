@@ -66,7 +66,7 @@ REVIEW_ROLE：@postoffice.review
 | harness | 注册/启动/恢复接缝 | 拿不到可靠身份时 |
 |---|---|---|
 | Claude Code | `SessionStart` 钩子运行 `postoffice identity --hint`，把短身份行作为附加上下文；注册时 `add`/`rebind` 也打印同一行 | 钩子负载解析不到唯一 claude_hook 信箱 → 不输出，按 skill 主动 `identity` 查询 |
-| OpenCode | 插件在**首次**看到某会话生命周期事件时，`postoffice identity <box> --hint` 并注入一次；注册时同样打印 | 会话无法唯一映射到本实例信箱 → 不注入，按 skill 查询 |
+| OpenCode | 插件在**首次看到该会话进入 idle（空闲）** 时跑 `postoffice identity <box> --hint`，并用官方「仅上下文」入口注入一次（`body.noReply: true`，不请求模型答复）；busy 时不注入也不请求答复；注册时同样打印 | 会话无法唯一映射到本实例信箱 → 不注入，按 skill 查询 |
 | Codex | 无会话启动/恢复钩子（`~/.codex/config.toml` 只有 `notify=turn-ended`）→ 接缝就是**注册**（`add --codex` 打印短身份行）+ 主动 `identity` 查询 | 没有可靠生命周期 → 明确要求查询，不声称自动 |
 
 三种 harness 的**身份解释来自同一个 CLI 结果**（`postoffice identity`），呈现方式各自不同；

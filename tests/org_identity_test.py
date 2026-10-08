@@ -407,6 +407,26 @@ class OrgIdentity(unittest.TestCase):
         self.assertNotIn("组织配置已停用（）", broken.stdout)
         self.assertRegex(broken.stdout.strip(), r"组织配置已停用（.+）", "停用必须带真实原因")
 
+    def test_org_present_means_the_field_exists_not_that_it_is_a_dict(self):
+        """organization=[] / 字符串也算「配了但坏了」：必须报停用原因，不能当未配置静默。"""
+        for bad_org in ([], "boxz"):
+            cfg = {"version": 2, "groups": {}, "aliases": {}, "organization": bad_org}
+            bad_import = import_config(self.home, cfg)
+            self.assertNotEqual(bad_import.returncode, 0, f"import 应拒绝这种组织：{bad_org!r}")
+            self.assertIn("organization", bad_import.stdout + bad_import.stderr)
+            # 绕过导入直接手放（模拟手改配置）
+            (self.home / "config.json").write_text(json.dumps(cfg, ensure_ascii=False),
+                                                   encoding="utf-8")
+            hint = run_po("identity", "dev", "--hint", home=self.home)
+            self.assertEqual(hint.returncode, 0, hint.stdout + hint.stderr)
+            self.assertIn("组织配置已停用", hint.stdout,
+                          f"organization={bad_org!r} 必须报停用而不是静默：{hint.stdout!r}")
+            self.assertRegex(hint.stdout.strip(), r"组织配置已停用（.+）", "停用必须带真实原因")
+            ident = next(b for b in self._panel_state()["boxes"] if b["name"] == "dev")["identity"]
+            self.assertTrue(ident["org_present"], f"organization={bad_org!r} 面板要露出来")
+            self.assertFalse(ident["config_ok"])
+            self.assertTrue(ident["error"].strip(), "面板必须带真实停用原因")
+
     def _panel_state(self):
         """Boot a real panel in this temp home, read /api/state once, stop it again."""
         port = free_port()

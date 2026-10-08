@@ -92,8 +92,11 @@ postoffice rebind <信箱> --claude ...  # 与上面等价、更直白的入口
   （现职 / 候选 / 规章与进度指针），这是最可靠的公共接缝。
 - **Claude Code 恢复**：`install claude` 在 `SessionStart` 组里加一条 `postoffice identity --hint`
   钩子，把短身份行作为附加上下文；解析不到唯一 claude_hook 信箱时**不输出**，退回 skill 主动查询。
-- **OpenCode 恢复**：插件在**首次**看到某会话生命周期事件时运行 `identity <box> --hint` 并注入一次
-  （`hintTried` 去重）；无组织配置时输出为空、行为与从前完全一致。
+- **OpenCode 恢复**：插件在**首次看到该会话进入 idle（空闲）** 时运行 `identity <box> --hint`，
+  并通过官方「仅上下文」入口注入一次（`client.session.prompt` 且 `body.noReply: true`——只注入上下文、
+  不请求模型答复；旧 SDK 没有 `prompt` 时回退 `promptAsync` 但同样带 `noReply: true`）。**busy
+  （忙碌）事件不注入、也不请求任何答复**，绝不借提示叫起一轮新的回答。`hintTried` 去重保证同一会话
+  只注入一次；无组织配置时输出为空、行为与从前完全一致。
 - **Codex**：没有会话启动/恢复钩子（`~/.codex/config.toml` 只有 `notify=turn-ended`），所以接缝就是
   注册 + 主动 `identity` 查询——这是真实限制，不是「未实现」。
 - **首次读取约定**：规章 / STATUS 首次用到时读一次，之后只在文件变化时重读；邮局不每封信重发。

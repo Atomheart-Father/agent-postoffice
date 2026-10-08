@@ -2,7 +2,9 @@
 
 - 隔离 worktree：`/Users/bozhongxiao/code/po-org-identity`
 - 分支：`org-identity-v1`，基线 = v1.13 PR #5 head `ff9a69172ad89e69ff2be0ade0d2d5ba3bcc34d2`
-- 当前状态：**全部改动未提交**（未 push、未合并、未部署）；真实部署（panel v1.12.4）一字未动
+- **当前冻结提交：本分支 HEAD** = 第 3 轮 `fdd33f8` 之上再叠一个「终审第 4 轮收尾」提交
+  （确切 SHA 见交付信；提交内容不自引 SHA 以免每次改文档都要改 SHA）
+- 状态：已提交、worktree clean；**未 push、未合并、未部署**；本机线上（panel v1.12.4）一字未动
 - 管理者/终审：`postoffice_codex`；实施：`postoffice_lab`
 
 ## 交付内容
@@ -12,7 +14,7 @@
 | `postoffice` | config v2 校验 + org 关系校验（核心/组织两份）、身份模块、`identity` / `rebind` 子命令、`add` 拆分「只改资料 / 显式改绑」、`write_contact` 不再存动态任职、`panel_state` 信箱行新增 `identity`、注册/恢复短身份提示 `identity_hint` + `identity --hint`、`SessionStart` 恢复钩子、稳定 role 切换交接从 scope 派生 |
 | `opencode/postoffice.ts` | 插件恢复接缝：首次看到会话生命周期事件时 `identity <box> --hint` 注入一次（无组织时空操作） |
 | `panel/index.html` | 面板真实消费 `identity`：inspector 最小显示现职 / 可候选 / 规章 / 进度（复用中英文，未新增组织树） |
-| `tests/org_identity_test.py` | 22 项公开 seam 测试（新增，未跟踪） |
+| `tests/org_identity_test.py` | 23 项公开 seam 测试（新增，未跟踪） |
 | `tests/panel_console_ui_test.mjs` | 新增第 36 块：面板消费 identity（现职/可候选/指针，零写请求，中英） |
 | `tests/activity_plugin_test.mjs` | 新增：恢复接缝恰好注入一次身份提示 |
 | `tests/smoke.sh` | 2 处「错版本」样例从 version 2 改为 version 3（version 2 现在是合法配置） |
@@ -68,7 +70,7 @@ $ postoffice rebind dev --claude "我的窗口" --claude-session local_abc --sou
 ## 测试结果（本 worktree，临时 POSTOFFICE_HOME）
 
 - `tests/smoke.sh`：**通过 252，失败 0**
-- `tests/org_identity_test.py`：**22 passed**（新增）
+- `tests/org_identity_test.py`：**23 passed**（新增）
 - 相关回归全绿：activity 12、outbox 15、provenance 9、panel_presentation 11、panel_letter 11、panel_send_ack 13、message_flow 25、retract 35、receipt 15、env_file 12、hierarchy 9、panel_origin 7（Python）；panel_console_ui（含第 36 块）/ panel_i18n / panel_mobile / panel_letter_ui / activity_plugin（7 checks）/ message_flow_plugin（Node）
 - `py_compile postoffice` 通过；`node --check` 通过
 
@@ -186,13 +188,47 @@ fail-closed 拦下（返回「配置无效；分组与逻辑地址已停用」�
   `docs/TICKET_v1.13_human_console_maturity.md`、`docs/DELIVERY_org_identity_v1.md` 等）
   **未做无差别删除**，仅从现行指引中移除。
 
+## 终审第 4 轮：最后一个诊断分支 + 文档收尾
+
+依据 `logs/ORG_IDENTITY_REVIEW4_20261008.md`（fdd33f8 行为主体已通过）。
+
+**代码（一处，不动路由）**：`identity_snapshot` 的 `org_present` 原来用
+`isinstance(cfg.get("organization"), dict)` 判断「配没配组织」，于是 `organization: []` 或写成字符串
+这类「配了但坏了」的情况会当成**未配置**而静默。改为**按字段是否存在**判断
+（`"organization" in cfg`），停用原因仍由既有 `config_errors + org_errors` 给出。
+负例：`test_org_present_means_the_field_exists_not_that_it_is_a_dict`
+（`organization=[]` 与 `organization="boxz"` 两种：import 拒绝；手放后 `identity --hint` 与面板
+都报「已停用」+ 真实原因，面板 `org_present=true/config_ok=false/error` 非空）。
+org_identity 专项 **22 → 23**。
+
+**文档（按清单逐条同步现行文本）**：
+- 双语测试表里「v1.7 尚未发布 / not released yet」这类陈旧说法去掉，改为如实写「本轮未在真机复验
+  哪些生产验证（未导入真实配置、未真的整组上下线）」——不凭有没有实机实验去断言旧功能是否发布。
+- 顶部说明不再把尚未合并的分支/版本号写成「已发布历史」：改成「本文描述本分支代码当前具备的能力」，
+  v1.12 / v1.13 标题只表示特性是哪一版引入、与部署状态无关；历史记录在 `docs/`；某台机器实际跑什么
+  以 `postoffice --version` 为准，磁盘上的 checkout 不等于部署。
+- skill 分组节与 README 规则对齐成**两层**：核心配置错误 → 分组与逻辑地址一起停用（物理信箱照常）；
+  **只有组织语义错误** → 合法 aliases/groups 照常投递，只停用组织身份呈现并说明原因。
+- 双语命令表 `archive-current` 示例补 `--box boss`。
+- 资料修改说明明确：显式 `--kind` **可以**改类别；`--display-name` / `--desc`（及旧 `--who`）
+  不改类别/岗位/绑定/投递。英文 rebind 段删掉「without a channel flag」的误拼，改为按实际收信方式
+  参数（`--claude/--opencode/--codex/--notify`）解释。
+- `docs/ORG_IDENTITY_V1.md` / `docs/ORG_CONTRACT_EXAMPLE.md` 的 OpenCode 接缝改为
+  **首次进入 idle + 官方仅上下文入口（`body.noReply: true`）+ busy 不注入也不请求答复**，
+  不再笼统写「首次生命周期事件」。
+
+**受影响负例**（均已跑，全绿）：`org_identity_test.py` 23 passed（含新增的
+`test_org_present_means_the_field_exists_not_that_it_is_a_dict`、hint/面板停用原因两项）、
+`activity_plugin_test.mjs` 7 checks PASS、`panel_console_ui_test.mjs` PASS；
+`py_compile` / `node --check` / `git diff --check` 干净。本轮为纯收尾，未重跑全量 smoke。
+
 ## 集成基线与顺序（PR5 / PR6 / 本组织票；均未合并、未部署）
 
 | 分支 | PR | 基线 | head SHA | 状态 |
 |---|---|---|---|---|
 | `human-console-maturity` | **#5** | master `ce14581`（v1.12.4） | `ff9a69172ad89e69ff2be0ade0d2d5ba3bcc34d2` | 冻结，已推；未合并 |
 | `slack-grace-timeout` | **#6** | master `ce14581`（v1.12.4） | `98b5451087f0059a4a00f5ab391bdba81308b5ff` | 冻结，已推；未合并 |
-| `org-identity-v1`（本票） | 待开 | **PR #5 的 head `ff9a691`** | 未提交（工作树差异，9 files changed / +964 / -77，另有 4 个未跟踪文件） | 待终审 |
+| `org-identity-v1`（本票） | 待开 | **PR #5 的 head `ff9a691`** | 本分支 HEAD = `fdd33f8` + 第 4 轮收尾（确切 SHA 见交付信，worktree clean） | 待终审 |
 
 建议的合并顺序（每步一次必要回归，不重复全量）：
 
