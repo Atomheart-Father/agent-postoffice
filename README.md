@@ -2,6 +2,16 @@
 
 English · [中文](README.zh-CN.md)
 
+> **Version status.** This repository documents the **current behaviour** of the code on this branch
+> (`VERSION 1.13.0`, PR #5). The **organization / identity** layer described further down (a
+> `version: 2` `config.json` with `organization`, `postoffice identity` / `rebind`) is **optional and
+> off by default** — no `config.json` means no organization, and every other mailbox works exactly as
+> before. Sections labelled **v1.12** and **v1.13** describe those released features (already
+> historical — kept for the record). Older-version notes and past release records live in `docs/`;
+> they are reference material, not current instructions. Nothing here is a claim about any
+> particular running install — what a given post office runs is whatever `postoffice --version`
+> reports on that machine.
+
 Let **Claude Code (including Claude Desktop)**, **OpenCode** and **Codex** sessions on the same machine send each other mail, and **wake the recipient session automatically when a letter arrives**. No more copy-pasting between windows, and no AI driving the mouse to poke another app.
 
 ```
@@ -121,6 +131,39 @@ The console at a glance (BOXZ example data, 1600×1000, English UI):
 | **Letter detail** (pure read; reply / ack / file only) | **Compose** (as the operator; mailbox vs logical address) |
 | ![Letter detail](docs/screenshots/letter-en.png) | ![Compose](docs/screenshots/compose-en.png) |
 
+## Organization & identity (optional, v2 config)
+
+Dynamic routing can change who serves an address, but a fixed note or an old handoff still says the
+old owner is on duty. This optional layer turns "who is responsible for what" into a **single
+queryable fact**. It adds no database, daemon, second routing table, or current-owner cache; physical
+mail, ordinary delivery and logical-address switching are unchanged.
+
+- Add an optional `organization` section to `config.json` with `version: 2`:
+  companies (name + `rules_file` + members) and projects (`company_id` + `root` + `status_file` +
+  members). A name in any list must be a registered physical mailbox, and a project member must
+  belong to the owning company — the whole file is validated and rejected atomically on import, so a
+  bad reference never overwrites a working config. A **role** is an alias carrying
+  `role: {scope: {kind, id}, title}`; the ordered candidates stay only in the alias, so there is no
+  second assignment table. Old version-1 configs (and aliases with no `role`) keep working unchanged.
+- `postoffice identity <mailbox> [--json]` prints the derived snapshot: current binding, company /
+  project memberships, **ACTIVE** roles (the address actually resolves to this box right now, via the
+  same resolver `send` uses), **CANDIDATE ONLY** roles (may take over when it is their turn — not a
+  current duty), and pointers to the company rules / project STATUS files. A query is a snapshot; a
+  later send still re-resolves against current routes.
+- Registration is split: `postoffice add <box> --display-name/--kind/--desc` on an existing box only
+  updates its profile (never rebinds or resets the receive method); an explicit channel flag
+  (`--claude/--opencode/--codex`) without a channel flag triggers a **rebind** and records a handoff
+  line in `logs/rebind.log` (`postoffice rebind` is the explicit entry point). Profile fields are data:
+  they never change kind, org relations, role, binding or delivery.
+- The contact card (`<box>/CONTACT.md`), the panel `/api/state` box rows and the shared skill all
+  present **the same** derived identity rather than assembling duties independently; the card keeps a
+  query entry and no longer copies a live online/current-owner status or a direct session-queue hint.
+  When the organization config is invalid the identity presentation is diagnosably disabled
+  ("已停用") while physical mail keeps working, and no duties are fabricated.
+
+Migration and rollback are one step each (edit `version`/add `organization`, import; restore
+`logs/config.json.<ts>.bak`): see [docs/ORG_IDENTITY_V1.md](docs/ORG_IDENTITY_V1.md).
+
 ## A session setting its own alarm (OpenCode, optional)
 
 Two native tools let a model in an OpenCode session set a one-shot reminder **for that very session**:
@@ -233,6 +276,7 @@ If a letter that **needs action** (its `need:` header says reply / review / …)
 | v1.13 runtime presence: `runtime/activity/<box>.json` schema, same state keeps `since` while a change resets it, a mismatched channel binding or an observation older than 30 min → UNKNOWN, deleting `runtime/` changes no routing, the Claude hook writes idle then working, and `/api/state` exposes `activity` per box | `tests/activity_test.py` and `tests/activity_plugin_test.mjs` (mock OpenCode client) |
 | v1.13 provenance: the frozen neutral source header, the body byte-for-byte unchanged, the sender-neutral wake text (Claude and Codex paths), and a static audit that no sender-authority phrase remains in the skill / `postoffice` / plugin / panel | `tests/provenance_test.py` |
 | v1.13 appearance + mobile: the SYSTEM/LIGHT/DARK control persists to `localStorage["postoffice.theme"]`, resolves against the system preference, survives an unusable storage, issues zero write requests, labels come from `STR` in both languages, the `<head>` bootstrap runs before the app script and CSS defines `color-scheme`; and at 390 / 430 / 768 / 820 the org view renders, the workbench starts closed and opens on a node tap, the OUTBOX tab is reachable, and the static CSS uses `env(safe-area-inset*)` / `100dvh` / ≥16px inputs | `tests/panel_console_ui_test.mjs` (blocks 17–29) and `tests/panel_mobile_test.mjs` |
+| org & identity v1: version-2 `config.json` import validation (bad company/project/member/role refs and `organization` in v1 rejected, the old config left byte-identical), `identity` snapshot (ACTIVE vs CANDIDATE ONLY, invalid org disabled but not fatal, unregistered box), `add` profile-only vs explicit rebind with a `rebind.log` handoff record, a new box rejected without a channel, a broken organization disabling only the identity ornament (a valid `@alias` still routes and physical mail is unaffected), and CONTACT / panel `/api/state` reporting the same derived identity as the CLI | `tests/org_identity_test.py` (22 tests against a real `postoffice` and panel in a temp home) |
 | Stepwise escalation on the existing alias engine: A/B→Q no-skip (every candidate online yet every letter still goes to Q), Q offline → T1 fallback, all T1 offline → human, human offline → the usual “no online mailbox” refusal, recovery back to Q, old mail byte-identical after target changes, switch/handoff exactly-once across rounds and restarts for the hierarchy aliases, all-offline notice exactly once, and old 2-candidate array configs behaving exactly as before | `tests/hierarchy_test.py` (9 tests, each in its own temp post office; locks existing engine behaviour — no production routing was changed for this ticket) |
 | Batched wake (one reminder for several letters: numbered lines with stable references, shared rules written once, over 20 in rounds, a claim lost to another instance skips that letter without blocking the rest, one rate-limit mark per batch, alarms stay solo, receipts still trail), and filing exactly the presented set (`--keep` honoured, later arrivals untouched, non-bare/corrupt state fails closed, a done/ name clash reported instead of silently dropping the reference) | `tests/message_flow_test.py` and `tests/message_flow_plugin_test.mjs` (13 checks against a mock OpenCode, incl. presented-set unions and the two native tools' refusals) |
 | Receipt reminders are short and metadata-only; `postoffice receipt` is exact-ID/read-only and `postoffice archive-receipt` files only the matching notification | `tests/receipt_test.py` (15 checks, incl. legacy notifications, shell-quoted commands and archive idempotence) and `tests/receipt_plugin_test.mjs` |
@@ -294,6 +338,7 @@ python3 tests/activity_test.py                                # v1.13 runtime pr
 python3 tests/provenance_test.py                              # v1.13 provenance: neutral source header, sender-neutral wake text, static audit
 node --experimental-strip-types tests/activity_plugin_test.mjs # v1.13 OpenCode plugin activity writes (mock client)
 node --experimental-strip-types tests/panel_mobile_test.mjs    # v1.13 mobile: safe-area/dvh/16px, inspector 100vw, workbench closed→open, OUTBOX reachable
+python3 tests/org_identity_test.py                            # org & identity v1: v2 config import validation, identity snapshot, add profile-only vs rebind, CONTACT/panel/CLI consistency
 ```
 
 None of these touches your real config, mailboxes or ledger, and none calls a model.

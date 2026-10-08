@@ -55,6 +55,7 @@ await mkdir(DIR_OK, { recursive: true })
 const BOX = 'actbox'
 const OWN_SID = 'ses_act'
 const SECOND_SID = 'ses_act2'
+const THIRD_SID = 'ses_act3'
 const FOREIGN_SID = 'ses_foreign'
 await mkdir(join(root, BOX, 'inbox'), { recursive: true })
 await mkdir(join(root, BOX, 'done'), { recursive: true })
@@ -62,15 +63,16 @@ await writeFile(join(root, 'routes.json'), JSON.stringify({
   [BOX]: { methods: ['opencode_plugin'], session_id: OWN_SID, status: 'online' },
 }))
 
-const state = { prompts: [] }
+const state = { prompts: [], ctxPrompts: [] }
 const client = {
   session: {
     get: async ({ path }) => {
-      if (path.id === OWN_SID || path.id === SECOND_SID) return { data: { directory: DIR_OK } }
+      if (path.id === OWN_SID || path.id === SECOND_SID || path.id === THIRD_SID) return { data: { directory: DIR_OK } }
       throw new Error('no such session')
     },
     status: async () => ({ data: {} }),
     promptAsync: async (p) => { state.prompts.push(p); return { data: {} } },
+    prompt: async (p) => { state.ctxPrompts.push(p); return { data: {} } },
   },
 }
 
@@ -172,6 +174,35 @@ await t('换绑定：同状态也立即写、since 重置、binding 更新（不
   assert.equal(b.state, 'working')
   assert.equal(b.binding, SECOND_SID, 'binding 必须换成新会话')
   assert.ok(b.since > a.since, `换绑定不许继承旧绑定的 since：${a.since} → ${b.since}`)
+})
+
+await t('恢复接缝：官方仅上下文入口注入一次身份提示，busy 不注入、不请求答复', async () => {
+  await writeFile(join(root, 'routes.json'), JSON.stringify({
+    [BOX]: { methods: ['opencode_plugin'], session_id: THIRD_SID, status: 'online' },
+  }))
+  await writeFile(join(root, 'config.json'), JSON.stringify({
+    version: 2, groups: {}, aliases: {
+      'a.owner': { candidates: [BOX], role: { scope: { kind: 'company', id: 'co' }, title: '主持' } } },
+    organization: { companies: { co: { name: 'Co', rules_file: '/tmp/rules.md', members: [BOX] } }, projects: {} },
+  }))
+  const beforeCtx = state.ctxPrompts.length
+  const beforeAsk = state.prompts.length
+  // busy 事件是「正在忙」，绝不在这里叫起一轮新的模型回答
+  await plugin.event(statusEvent(THIRD_SID, 'busy'))
+  await settle(300)
+  assert.equal(state.ctxPrompts.length, beforeCtx, 'busy 事件不注入身份提示')
+  assert.equal(state.prompts.length, beforeAsk, 'busy 事件不请求模型答复')
+  await plugin.event(statusEvent(THIRD_SID, 'idle'))
+  await settle(300)
+  const added = state.ctxPrompts.slice(beforeCtx)
+  assert.equal(added.length, 1, '空闲接缝注入恰好一次提示：' + JSON.stringify(added))
+  assert.ok(added[0].body.parts[0].text.includes(`身份（${BOX}）`), '提示含短身份行')
+  assert.equal(added[0].body.noReply, true, '官方仅上下文入口：body.noReply=true，不请求模型答复')
+  assert.equal(state.prompts.length, beforeAsk, '恢复提示绝不走会请求答复的 promptAsync')
+  await plugin.event(statusEvent(THIRD_SID, 'busy'))
+  await plugin.event(statusEvent(THIRD_SID, 'idle'))
+  await settle(300)
+  assert.equal(state.ctxPrompts.length, beforeCtx + 1, '同一会话不再重复注入')
 })
 
 await plugin.dispose()

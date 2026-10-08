@@ -261,6 +261,11 @@ table.hk td:first-child{width:34px;color:var(--ink2);font-family:var(--mono);fon
 .act-badge[data-activity="working"]{border-color:var(--ok);color:var(--ok)}
 .act-badge[data-activity="idle"]{border-color:var(--rule2);color:var(--ink2)}
 .act-badge[data-activity="human"]{border-color:var(--accent-ink);color:var(--accent-ink)}
+.idbox{margin:2px 0 4px}
+.idrow{font-size:12px;line-height:1.5;padding:1px 0}
+.idrow.muted{color:var(--ink2)}
+.idrow.warn{color:var(--warn,#b23)}
+.idrow .mono{font-family:var(--mono);font-size:10px}
 
 @media (max-width:900px){
   main{padding:12px 12px 120px}
@@ -459,6 +464,8 @@ const STR = {
     retractConfirm: "撤回发给 {to} 的这封信（编号 {id}）吗？原信会原样存档，不会通知对方，也不会补发。",
     retractDone: "已撤回，原信已存档。",
     actWorking: "运行中", actIdle: "空闲", actUnknown: "未知", actLabel: "活动", actHuman: "人类",
+    idTitle: "组织身份", idActive: "现职", idCand: "可候选", idRules: "公司规章", idStatus: "项目进度",
+    idDisabled: "组织配置已停用",
     appearance: "外观", themeSystem: "跟随系统", themeLight: "浅色", themeDark: "深色",
   },
   en: {
@@ -523,6 +530,8 @@ const STR = {
     retractConfirm: "Retract the letter to {to} (id {id})? The original is archived as-is; the recipient is not notified and nothing is resent.",
     retractDone: "Retracted; the original is archived.",
     actWorking: "WORKING", actIdle: "IDLE", actUnknown: "UNKNOWN", actLabel: "ACTIVITY", actHuman: "HUMAN",
+    idTitle: "ORGANIZATION", idActive: "ACTIVE", idCand: "CANDIDATE", idRules: "RULES", idStatus: "STATUS",
+    idDisabled: "ORGANIZATION DISABLED",
     appearance: "Appearance", themeSystem: "SYSTEM", themeLight: "LIGHT", themeDark: "DARK",
   },
 };
@@ -853,6 +862,16 @@ function inspectorHTML() {
   const opNote = !operatorValid() ? `<div class="cerr">${esc(t("operatorBad"))}</div>` : "";
   const actSec = `<div class="sec"><span>${esc(t("actLabel"))}</span><span></span></div>
     <div style="margin:2px 0 4px">${activityBadge(b, isOp)}</div>`;
+  const id = b.identity || null;
+  const idRows = id && id.org_present && !id.config_ok
+    ? `<div class="idrow warn">${esc(t("idDisabled"))}：${esc(id.error || "—")}</div>`
+    : (id && id.org_present && id.config_ok
+    ? id.active_roles.map((r) => `<div class="idrow">${esc(t("idActive"))} · ${esc(r.title)} <span class="mono">${esc(r.alias)}</span> → ${esc(r.active_target || "—")}</div>`).join("")
+      + id.candidate_only_roles.map((r) => `<div class="idrow muted">${esc(t("idCand"))} · ${esc(r.title)} <span class="mono">${esc(r.alias)}</span>（${esc(r.active_target || "—")}）</div>`).join("")
+      + id.company_rules.map((c) => `<div class="idrow muted">${esc(t("idRules"))} · <span class="mono">${esc(c.path)}</span></div>`).join("")
+      + id.project_status.map((c) => `<div class="idrow muted">${esc(t("idStatus"))} · <span class="mono">${esc(c.path)}</span></div>`).join("")
+    : "");
+  const idSec = idRows ? `<div class="sec"><span>${esc(t("idTitle"))}</span><span></span></div><div class="idbox">${idRows}</div>` : "";
   return `<aside class="inspector open" id="ins" aria-label="${esc(b.name)}">
     <button type="button" class="close-x" data-ins-close="1" aria-label="${esc(t("close"))}"
       style="position:absolute;top:10px;right:10px">✕</button>
@@ -860,6 +879,7 @@ function inspectorHTML() {
     ${tabs}
     ${insTab === "outbox" ? outboxHTML() : pending + acks}
     ${actSec}
+    ${idSec}
     ${meta}
     ${opNote}
     <div class="acts">

@@ -2,6 +2,13 @@
 
 [English](README.md) · 中文
 
+> **版本状态。** 本仓库描述的是本分支代码的**当前行为**（`VERSION 1.13.0`，PR #5）。下文提到的
+> **组织 / 身份**这一层（`version: 2` 的 `config.json` + `organization`、`postoffice identity` /
+> `rebind`）是**可选且默认关闭**的——没有 `config.json` 就没有组织，其余信箱行为一字不变。
+> 标注 **v1.12** / **v1.13** 的小节描述的是已发布的特性（属于历史，仅作记录）。旧版本说明与过往
+> 发布记录在 `docs/` 里，属参考资料，不是当前操作指引。这里的任何内容都不是对某台具体运行实例的
+> 断言——某台邮局实际跑的是哪个版本，以那台机器上 `postoffice --version` 的输出为准。
+
 让同一台电脑上的 **Claude Code（含 Claude 桌面版）**、**OpenCode**、**Codex** 会话互相发信，并且**信一到就自动叫醒收件的会话**。不用你在几个窗口之间复制粘贴，也不用让某个 AI 拿鼠标去点别的 App。
 
 ```
@@ -121,6 +128,32 @@ MSG
 | **信件详情**（纯读；回复 / 收到并归档 / 仅归档） | **写信**（以操作员身份，收件人区分信箱 / 逻辑地址） |
 | ![信件详情](docs/screenshots/letter-zh.png) | ![写信](docs/screenshots/compose-zh.png) |
 
+## 组织与身份（可选，version 2 配置）
+
+动态路由会换掉「谁受理某个地址」，但旧笔记、旧交接里的固定任命还在叫人按老职责办事。
+这一层把「谁负责什么」变成**一个可查询的事实**。它不引入数据库、后台进程、第二套路由或
+「当前负责人」缓存；物理收信、普通投递、逻辑地址切换的既有行为一律不变。
+
+- 在 `config.json` 里可选加 `organization` 段并写 `version: 2`：公司（名字 + `rules_file` + 成员）
+  与项目（`company_id` + `root` + `status_file` + 成员）。任何名单里的名字都必须是已登记物理信箱，
+  项目成员还必须属于其所属公司——整份文件导入时一次性校验，任一引用不合法就拒绝整份，绝不覆盖
+  一份还能用的配置。**角色**是一个带 `role: {scope: {kind, id}, title}` 的 alias，候选顺序只存在
+  alias 里，没有第二张任命表。老的 version 1 配置（以及没有 `role` 的 alias）照旧工作。
+- `postoffice identity <信箱> [--json]` 打印推导出的快照：当前绑定、所属公司与项目、
+  **现职（ACTIVE）**（此刻这个地址真正落到你这里，用的是 `send` 同一个解析器）、
+  **可候选（CANDIDATE ONLY）**（轮到才归你，不是现在的职责），以及公司规章 / 项目进度文件指针。
+  查询是快照；之后发信仍按当时路由重新解析。
+- 登记拆成两件事：对已登记信箱跑 `postoffice add <信箱> --display-name/--kind/--desc` 只改资料
+  （绝不改绑、绝不复位收信方式）；显式给通道（`--claude/--opencode/--codex`）才触发**改绑**，
+  并在 `logs/rebind.log` 记一条交接（`postoffice rebind` 是更直白的入口）。资料只是数据：
+  改它不会动类别、组织关系、角色、绑定或投递。
+- 名片（`<信箱>/CONTACT.md`）、面板 `/api/state` 的信箱行、共享 skill 呈现的是**同一份**推导身份，
+  而不是各自拼职责；名片保留查询入口，不再照抄实时在线/当前受理人，也不再直接给会话队列提示。
+  组织配置无效时，身份呈现会明确「已停用」，物理收发信照常，且不捏造职责。
+
+迁移与回滚各一步（改 `version`/加 `organization` 后 import；回滚恢复 `logs/config.json.<时间戳>.bak`）：
+见 [docs/ORG_IDENTITY_V1.md](docs/ORG_IDENTITY_V1.md)。
+
 ## 会话给自己设闹钟（OpenCode，可选）
 
 OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己**设一个一次性提醒：
@@ -231,6 +264,7 @@ OpenCode 会话里有两个原生工具，让模型给**当前这个会话自己
 | 面板 UI：点 pending 行 → 详情显示接口取回的（不是行内的）内容且被转义；仅归档只发一次 `{box,id}` POST，然后关闭并刷新；读取/归档失败的提示；切换语言关闭详情且不发写请求（在途读取也会作废）；新文案两种语言都在 | `tests/panel_letter_ui_test.mjs` 加扩展后的 `tests/panel_i18n_test.mjs` |
 | 逐级升级走现有 alias 引擎：A/B→Q 不跳级（所有候选都在线、每封信仍全进 Q）、Q 离线 → T1、T1 全离线 → 人类、人类离线 → 既有“没有在线信箱”拒绝、恢复回 Q、目标变化后旧信字节不变、层级 alias 的切换/交接在轮次与重启间恰好一次、全离线通知恰好一次、旧版两候选数组配置行为完全不变 | `tests/hierarchy_test.py`（9 项，各自独立临时邮局；锁的是现有引擎行为——本票没有改生产 routing） |
 | 回执提醒精简且只含元数据；`postoffice receipt` 精确 ID 只读，`postoffice archive-receipt` 只归档本箱对应通知 | `tests/receipt_test.py`（15 项，含旧通知文件、shell 引用与归档幂等）和 `tests/receipt_plugin_test.mjs` |
+| 组织与身份 v1：version 2 配置导入校验（公司/项目/成员/角色引用不合法、以及 v1 里出现 `organization` 一律拒绝，旧配置字节不变）、`identity` 快照（现职 vs 可候选、组织无效时停用但不致命、未登记信箱）、`add` 只改资料 vs 显式改绑并写入 `rebind.log` 交接记录、新信箱不给通道被拒、坏 organization 只停用身份呈现（合法 `@alias` 仍投递、物理信箱不受影响）、CONTACT / 面板 `/api/state` 与 CLI 报同一份推导身份 | `tests/org_identity_test.py`（22 项，各自临时邮局 + 真面板） |
 | Claude 桌面版：空闲几分钟后被外部来信叫醒并处理信件 | 真机多次观察到 |
 | Claude 桌面版：不显式设 timeout 时，钩子 10 分钟后被结束 | 真机观察到（v1.0 的缺陷，v1.1 已显式设 7 天） |
 | Claude 桌面版：设了长 timeout 后，空闲 30 分钟以上仍能被叫醒 | 真机实测：监视活过 33 分钟，空闲 33 分钟后来信 3 秒内被叫醒 |
@@ -284,6 +318,7 @@ python3 tests/panel_origin_test.py                             # POSTOFFICE_PANE
 python3 tests/panel_slack_test.py                              # 仅出站的 Slack 操作员提醒（本地假 webhook）
 python3 tests/env_file_test.py                                # $POSTOFFICE_HOME/.env loader: precedence, launchd style, no expansion, secret hygiene
 node --experimental-strip-types tests/panel_console_ui_test.mjs # 人类控制台 UI：组织/Harness/操作员/写信/回复/深链/未分配
+python3 tests/org_identity_test.py                            # 组织与身份 v1：v2 配置导入校验、identity 快照、add 只改资料 vs 改绑、CONTACT/面板/CLI 一致
 ```
 
 都不碰真实配置、信箱和账本，也不调用模型。
