@@ -45,11 +45,11 @@ MSG
 ## OpenCode 会话：改信 / 归档当前消息（v1.10）
 
 - `postoffice_message_edit`：参数 `message_ref`（`<收件信箱>/<信件编号>`）与 `content`。`content` 给 `subject`/`need`/`body` 至少一个字段即原地改；给 `null` 即撤回（等价于 `retract`）。规矩与 `edit`/`retract` 完全一致（见本文件「发错了要改、要撤」一节；仍只在对方通道还没接受时才行）。
-- `postoffice_archive_current`：把**本会话当前已经展示过、但还没归档**的消息一键归档到 `done/`；`keep_unarchived` 列出要继续留在 inbox 的编号。只动已经展示过的那一批，之后新到的信不会被碰。
+- `postoffice_archive_current`：把**已展示、但还没归档**的消息一键归档到 `done/`（已展示记录按信箱保存）；`keep_unarchived` 列出要继续留在 inbox 的编号。只动已经展示过的那一批，之后新到的信不会被碰。
 
 归档统一走邮局：OpenCode 用 `postoffice_archive_current`；其它 harness 用 `{POSTOFFICE} archive-current --box <你的信箱> [--keep <编号>...]`；面板走同一个 core API。不要在 shell 里自己 `mv` 信箱文件，也不要手改 `.presented.json`。
 
-**换会话 / 改绑后的旧信**：`archive-current` 只认**本会话被展示过**的那一批，换绑后新会话看不到旧会话的 presented 集合。要处理旧 `inbox` 里剩下的信，用显式精确编号归档（先读、选定、再逐封操作；它只归档、不是回复，不发信也不叫醒）：
+**换会话 / 改绑后的旧信**：已展示记录当前**按信箱保存**，换绑不清空；`archive-current` 只归档**本箱记录过的**那一批，不碰新到、未展示的信。要逐封选定处理旧 `inbox` 里剩下的信，用显式精确编号归档（先读、选定、再逐封操作；它只归档、不是回复，不发信也不叫醒）：
 
 ```
 {POSTOFFICE} archive <你的信箱> <信件编号>    # inbox/<编号>.md → done/；只认裸编号，不跨箱、不覆盖、幂等
