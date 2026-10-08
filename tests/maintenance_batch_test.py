@@ -191,6 +191,26 @@ class MaintenanceBatch(unittest.TestCase):
         p = self.delivered(self.send("@p.plain", "sbox", "旧语义"))
         self.assertEqual(self.target_of(p), "boss")
 
+    def test_a_org_role_error_disables_identity_not_old_routing(self):
+        # A bad role DEFINITION on the escalation target is org-level: it must disable the identity
+        # presentation only, never the already-legal old routing/groups. (Runtime load gates on
+        # config_errors; config import gates on core+org, so a hand-edited config.json models a
+        # config that was valid at import and later edited.)
+        cfg = anon_config(self.home)
+        self.assertEqual(self.import_config(cfg).returncode, 0)
+        bad = json.loads(json.dumps(cfg))
+        bad["aliases"]["p.design"]["role"]["title"] = 17          # org error, not core
+        (self.home / "config.json").write_text(json.dumps(bad, ensure_ascii=False), encoding="utf-8")
+
+        # old core routing keeps working: an independent plain alias still delivers
+        p = self.delivered(self.send("@p.plain", "sbox", "组织坏但旧路由继续"))
+        self.assertEqual(self.target_of(p), "sup")
+
+        # identity presentation is disabled with a diagnosable reason (not silently "all stopped")
+        ident = self.ident("impl")
+        self.assertFalse(ident["config_ok"])
+        self.assertIn("role", ident["error"])
+
     def test_a_invalid_escalation_rejected_and_old_config_untouched(self):
         self.assertEqual(self.import_config(anon_config(self.home)).returncode, 0)
         before = (self.home / "config.json").read_bytes()
@@ -270,6 +290,19 @@ class MaintenanceBatch(unittest.TestCase):
         self.assertEqual(st["freshness"]["state"], "ok")
         self.assertFalse(st["freshness"]["stale"])
 
+    def test_b_unreadable_pointer_is_a_diagnosable_hint_not_a_crash(self):
+        self.assertEqual(self.import_config(anon_config(self.home)).returncode, 0)
+        # non-UTF-8 STATUS bytes: the freshness hint must fail soft, never break the identity query
+        (self.home / "STATUS.md").write_bytes(b"\xff\xfe bad status")
+        out = run_po("identity", "impl", "--json", home=self.home)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)     # no traceback
+        ident = json.loads(out.stdout)
+        st = ident["project_status"][0]
+        self.assertEqual(st["freshness"]["state"], "unavailable")
+        self.assertIn("无法读取", run_po("identity", "impl", home=self.home).stdout)
+        # the rest of the identity is intact (other pointer still fresh/evaluated)
+        self.assertEqual(ident["company_rules"][0]["freshness"]["state"], "ok")
+
     # ==================================================================== C
     def test_c_new_reference_is_copy_safe(self):
         out = self.send("impl", "sbox", "LONGRUN01裁决分发①报告订正(+补给)")
@@ -327,6 +360,26 @@ class MaintenanceBatch(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn("没有待归档", out.stdout)
         self.assertTrue(a.exists() and b.exists(), "presented 为空时不许碰 inbox 里新到的信")
+
+    def test_d_rebind_keeps_presented_set_per_box_for_successor(self):
+        # Ground-truth for the "rebind orphans the presented set" feedback: the set is per-BOX
+        # (impl/.presented.json), not per-session, so a real rebind does not clear it and the
+        # successor's archive-current still files the old letters. Pin the actual behaviour; the
+        # explicit `archive <box> <id>` entry stays available as the successor's per-letter tool.
+        p = self.delivered(self.send("impl", "sbox", "重绑前的信"))
+        lid = p.stem
+        (self.home / "impl" / ".presented.json").write_text(json.dumps([lid]), encoding="utf-8")
+        r = run_po("rebind", "impl", "--claude", "old_title", "--claude-session", "old_sid",
+                   "--source", "anon-test", home=self.home)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads((self.home / "routes.json").read_text())["impl"]["claude_session"],
+                         "old_sid")
+        self.assertEqual(json.loads((self.home / "impl" / ".presented.json").read_text()), [lid],
+                         "presented 是按箱的，重绑不许清空它")
+        out = run_po("archive-current", "--box", "impl", home=self.home)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(p.exists())
+        self.assertTrue((self.home / "impl" / "done" / f"{lid}.md").is_file())
 
 
 if __name__ == "__main__":
