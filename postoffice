@@ -443,32 +443,51 @@ def needs_action(path):
 
 
 def mail_split(files):
-    """Split pending letters into (formal, receipt-notifications), preserving order."""
-    formal, receipts = [], []
+    """Split pending letters into (formal, receipts, notices), preserving order.
+
+    Notices (pure role/routing switch announcements, 补3) are neither formal nor receipts: they
+    never page the human and never count toward a "work letter" batch on their own.
+    """
+    formal, receipts, notices = [], [], []
     for p in files:
-        (receipts if receipt_query_id(p) else formal).append(p)
-    return formal, receipts
+        k = letter_kind(p)
+        if k == "receipt":
+            receipts.append(p)
+        elif k == "notice":
+            notices.append(p)
+        else:
+            formal.append(p)
+    return formal, receipts, notices
 
 
 def letter_kind(path):
-    """'receipt' | 'alarm' | 'formal' — header block only; a body can never forge either.
+    """'receipt' | 'alarm' | 'notice' | 'formal' — header block only; a body can never forge any.
 
     One non-blocking head read for the whole classification: wake loops call this per letter per
     poll, and the delivery race is decided right after it, so keep the pre-claim work minimal.
+
+    补3（T0 20261009）：`切换事件：` marks a pure role/routing switch notice → "notice" (never
+    wakes alone; rides with a departing formal letter). `升级求助：` marks the escalation variant
+    that really asks the recipient to act → "formal", checked BEFORE the notice header so an
+    action ticket is never suppressed. A subject merely containing 岗位/交接 is NOT evidence —
+    letters without these program headers stay formal.
     """
     head = _read_head(path).split("\n\n", 1)[0].splitlines()
-    has_receipt = any(line.startswith("回执：") for line in head)
-    if has_receipt:
+    if any(line.startswith("回执：") for line in head):
         return "receipt"
     if any(line.startswith("闹钟：") for line in head):
         return "alarm"
+    if any(line.startswith("升级求助：") for line in head):
+        return "formal"
+    if any(line.startswith("切换事件：") for line in head):
+        return "notice"
     return "formal"
 
 
 def wake_plan(items, now, *, quiet=None, max_hold=None, batch=None, pending_exists=False):
     """唯一唤醒选择器（纯函数，无副作用、不认领）：postman / Claude hook / OpenCode 插件三端共用。
 
-    items: [{"id": 稳定引用, "kind": "formal"|"receipt"|"alarm", "mtime": float}]，收件箱顺序。
+    items: [{"id": 稳定引用, "kind": "formal"|"receipt"|"alarm"|"notice", "mtime": float}]，收件箱顺序。
     返回 {"deliver": [id…], "carry_receipts": [id…], "hold_until": float|None,
           "alarm_round": bool, "reason": str}。
     只做选择：claim / rate_mark / presented 仍由调用方在接受后做；结果不是投递授权——
@@ -483,12 +502,14 @@ def wake_plan(items, now, *, quiet=None, max_hold=None, batch=None, pending_exis
     batch = MAX_FORMAL_BATCH if batch is None else batch
     formal = [i for i in items if i.get("kind") == "formal"]
     receipts = [i for i in items if i.get("kind") == "receipt"]
+    notices = [i for i in items if i.get("kind") == "notice"]   # 补3：纯告知与回执同一等待/搭车口径
     alarms = [i for i in items if i.get("kind") == "alarm"]
     plan = {"deliver": [], "carry_receipts": [], "hold_until": None,
             "alarm_round": False, "reason": ""}
     if formal:
         depart = [i["id"] for i in formal[:batch]]
-        carry = [i["id"] for i in receipts[:batch]]
+        ride = receipts + notices                     # 补3：notice 与回执同池、同上限搭车
+        carry = [i["id"] for i in ride[:batch]]
         oldest = min(i["mtime"] for i in formal)
         newest = max(i["mtime"] for i in formal)
         if pending_exists:
@@ -534,6 +555,23 @@ def merged_receipts(name, receipts):
     return "\n".join(lines)
 
 
+def merged_notices(name, notices):
+    """One bounded block standing in for several pure switch notices (补3): metadata only.
+
+    Never wakes anyone by itself — this block only exists inside a batch that already carries a
+    departing formal letter. No query command, no action ask: routing/identity are already up
+    to date; the letter stays archivable like any other inbox file.
+    """
+    if not notices:
+        return ""
+    lines = [f"另有 {len(notices)} 条纯告知（岗位/路由变化，默认无需行动）："]
+    for p in notices:
+        src = letter_sender(p) or "?"
+        subj = header_field(p, "事由：") or "（无）"
+        lines.append(f"- {src}：{subj}  == {p}")
+    return "\n".join(lines)
+
+
 def wake_head(path):
     """Neutral 3-line head for a single-letter wake, rebuilt from parsed fields.
 
@@ -556,7 +594,7 @@ def reminder(name, files):
     reaches this function. A single receipt with no formal letter keeps the compact 3-line shape;
     anything else merges. Receipt bodies are never injected.
     """
-    formal, receipts = mail_split(files)
+    formal, receipts, notices = mail_split(files)
     parts = []
     if len(formal) >= 2:
         parts.append(f"【联络总站｜{len(formal)} 封新信】")
@@ -569,10 +607,11 @@ def reminder(name, files):
         for f in formal:
             parts += [f"【联络总站新信｜{name}】", f"引用：{name}/{f.stem}",
                       f"== {f}", wake_head(f), LETTER_TAIL]
-    if len(receipts) == 1 and not formal:
+    if len(receipts) == 1 and not formal and not notices:
         parts.append(single_receipt_block(name, receipts[0]))
     elif receipts:
         parts.append(merged_receipts(name, receipts))
+    parts.append(merged_notices(name, notices))
     return "\n".join(parts)
 
 
@@ -675,7 +714,7 @@ def letter_sender(path):
 
 # 普通直发信的判定只有一处：CLI edit/retract（mutation_target）与面板发件箱读模型共用。
 # 派生的通知信（回执/广播/闹钟/切换事件）与 postoffice 系统来信都不是可改可撤的普通信。
-DERIVED_HEADERS = ("回执：", "广播：", "闹钟：", "切换事件：")
+DERIVED_HEADERS = ("回执：", "广播：", "闹钟：", "切换事件：", "升级求助：")
 
 
 def derived_headers(path):
@@ -1066,10 +1105,11 @@ def codex_uncertain_clear(box):
 
 
 def _codex_entry(name, p):
-    """One index entry for a letter: {'k':'f'|'r','ref':stable-id, ...metadata...}.
+    """One index entry for a letter: {'k':'f'|'r'|'n','ref':stable-id, ...metadata...}.
 
-    Formal carries {name,path,src,subj,need}; receipt carries {name,src,subj,query}. Only index
-    metadata (never a letter body) so a later merge can re-render the exact visible index.
+    Formal carries {name,path,src,subj,need}; receipt carries {name,src,subj,query}; notice
+    (补3 pure switch announcement) carries {name,path,src,subj}. Only index metadata (never a
+    letter body) so a later merge can re-render the exact visible index.
     """
     rid = receipt_query_id(p)
     if rid:
@@ -1077,6 +1117,8 @@ def _codex_entry(name, p):
         return {"k": "r", "ref": rid, "name": name, "src": src, "subj": subj, "query": query}
     src = letter_sender(p) or "?"
     subj = header_field(p, "事由：") or "（无）"
+    if letter_kind(p) == "notice":
+        return {"k": "n", "ref": p.stem, "name": name, "path": str(p), "src": src, "subj": subj}
     need = header_field(p, "需要：")
     return {"k": "f", "ref": p.stem, "name": name, "path": str(p),
             "src": src, "subj": subj, "need": need}
@@ -1092,6 +1134,7 @@ def _codex_batch_text(entries):
     """
     formal = [e for e in entries if e["k"] == "f"]
     receipts = [e for e in entries if e["k"] == "r"]
+    notices = [e for e in entries if e["k"] == "n"]
     parts = []
     if len(formal) >= 2:
         parts.append(f"【联络总站｜{len(formal)} 封新信】")
@@ -1115,6 +1158,10 @@ def _codex_batch_text(entries):
         parts.append(f"另有 {len(receipts)} 条回执（默认不答复，需要时按 ID 查询）：")
         parts.extend(f"- {e.get('src', '?')}：{e.get('subj', '')}  {e.get('query', '')}"
                      for e in receipts)
+    if notices:
+        parts.append(f"另有 {len(notices)} 条纯告知（岗位/路由变化，默认无需行动）：")
+        parts.extend(f"- {e.get('src', '?')}：{e.get('subj', '')}  == {e.get('path', '')}"
+                     for e in notices)
     return "\n".join(parts)
 
 
@@ -1129,6 +1176,8 @@ _CODEX_SINGLE_FORMAL_RE = re.compile(
     r"【联络总站新信｜(\S+)】\n(?:引用：(\S+)/(\S+)\n)?== (\S.*)\n来源：(\S+)\n事由：(.*)\n需要：(.*)")
 _CODEX_RECEIPT_LINE_RE = re.compile(
     r"^- (\S+)：(.*?)  (查询：postoffice receipt .*)$", re.M)
+_CODEX_NOTICE_LINE_RE = re.compile(          # 补3："- src：subj  == /abs/path"（纯告知，无查询命令）
+    r"^- (\S+)：(.*?)  == (\S.*)$", re.M)
 _CODEX_SINGLE_RECEIPT_RE = re.compile(
     r"【联络总站回执｜(\S+)】来自 (\S+) 的回执(?:，原事由：(.*))?\n"
     r"(查询：postoffice receipt .*)\n默认不答复")
@@ -1179,6 +1228,10 @@ def _codex_parse_entries(text):
             continue
         out.append({"k": "r", "ref": rid, "name": name, "src": src, "subj": subj or "",
                     "query": query})
+    for m in _CODEX_NOTICE_LINE_RE.finditer(text):
+        src, subj, path = m.groups()
+        out.append({"k": "n", "ref": Path(path).stem, "name": Path(path).parent.name,
+                    "src": src, "subj": subj, "path": path})
     return out
 
 
@@ -1188,7 +1241,7 @@ def _codex_merge_entries(old, new, max_formal, max_receipt):
     merged = list(old)
     overflow = []
     fcount = sum(1 for e in merged if e["k"] == "f")
-    rcount = sum(1 for e in merged if e["k"] == "r")
+    rcount = sum(1 for e in merged if e["k"] in ("r", "n"))   # 补3：notice 与回执同一上限池
     for e in new:
         key = (e["k"], e["ref"])
         if key in seen:
@@ -3194,10 +3247,10 @@ def cmd_wake_plan(a):
     if not isinstance(items, list) or any(
             not isinstance(i, dict)
             or not isinstance(i.get("id"), str)
-            or i.get("kind") not in ("formal", "receipt", "alarm")
+            or i.get("kind") not in ("formal", "receipt", "alarm", "notice")
             or not isinstance(i.get("mtime"), (int, float))
             for i in items):
-        sys.exit("wake-plan：candidates 必须是 [{id: str; kind: formal|receipt|alarm; mtime: number}]")
+        sys.exit("wake-plan：candidates 必须是 [{id: str; kind: formal|receipt|alarm|notice; mtime: number}]")
     now = data.get("now", time.time())
     if not isinstance(now, (int, float)) or isinstance(now, bool):
         sys.exit("wake-plan：now 必须是数字（秒）")
@@ -3444,11 +3497,14 @@ def cmd_retract(a):
     return 0
 
 
-def post_broadcast(sender, to, subject, need, body, secs, bid=None, only=None, done_set=None):
+def post_broadcast(sender, to, subject, need, body, secs, bid=None, only=None, done_set=None,
+                   extra_headers=()):
     """Create the broadcast record and drop one letter per recipient. Returns (bid, [(name, path)]).
 
     Recipients are validated by the caller; this is the single place a broadcast is created, so a
     system-initiated switch reuses exactly the same delivery and tallying path as `broadcast`.
+    `extra_headers` lands on every recipient letter (补3: the switch caller tags its copies with
+    `切换事件：<event id>` so they classify as pure notices, never waking anyone alone).
 
     `bid` pins the id (a switch event derives one from its own event id, so a resumed step can
     never mint a second record); an id already on disk is reused rather than suffixed.
@@ -3475,7 +3531,7 @@ def post_broadcast(sender, to, subject, need, body, secs, bid=None, only=None, d
             continue
         text = f"{body.rstrip()}\n\n回执请用：postoffice ack {n} {bid} \"一句话\""
         out.append((n, write_letter(n, sender, subject, clean_need(need), text,
-                                     extra_headers=[f"广播：{bid}"])))
+                                     extra_headers=[f"广播：{bid}", *extra_headers])))
         if done_set is not None:
             # Recorded after the letter really landed, so a caller that dies mid-batch still knows
             # exactly who got it and never re-posts to them.
@@ -4234,7 +4290,8 @@ def process_alias_switches(routes):
                 try:
                     bid, sent = post_broadcast(
                         "postoffice", notify_boxes, bsubj, "仅告知", bbody,
-                        1800, bid=bid, only=pending_boxes, done_set=landed)
+                        1800, bid=bid, only=pending_boxes, done_set=landed,
+                        extra_headers=[f"切换事件：{ev['id']}"])
                     ev["broadcast"] = bid
                     ev["sent"] = sorted(set(ev["sent"]) | landed)
                     log("postman.log", f"alias 切换广播 {bid} → {notify_boxes}"
@@ -4280,8 +4337,11 @@ def process_alias_switches(routes):
                                      f"交接路径：{hreason or hp or '（未配置）'}\n\n"
                                      f"这封提醒只报告收件路由变化：不授予你额外权限、不自动开始任务、"
                                      f"已投递的旧信不会搬走。")
+                        headers = [f"切换事件：{ev['id']}"]
+                        if esc_role:
+                            headers.append(f"升级求助：{ev['id']}")   # 真请行动的票：不得被压成 notice
                         path = write_letter(target, "postoffice", hsubj, "仅告知", hbody,
-                                            extra_headers=[f"切换事件：{ev['id']}"])
+                                            extra_headers=headers)
                         ev["handoff"] = path.stem
                         log("postman.log", f"alias 交接提醒 {path.name} → {target}")
                     except Exception as e:
@@ -4527,7 +4587,7 @@ def slack_alert(name, route, group):
     if not SLACK_WEBHOOK or route.get("methods") != ["notify"] \
             or name != panel_config().get("operator"):
         return
-    formal, _receipts = mail_split(group)
+    formal, _receipts, _notices = mail_split(group)   # 补3：纯告知不作为工作信触发告警
     if not formal:
         return
     link = f"{PANEL_BASE_URL}#/mail/{name}" if PANEL_BASE_URL else f"#/mail/{name}"

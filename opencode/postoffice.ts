@@ -459,6 +459,7 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
         const formal: Formal[] = []   // ordinary letters: batchable
         const alarms: Formal[] = []   // this session's own alarm reminders: never batched
         const receipts: Item[] = []
+        const notices: Item[] = []    // 补3：pure switch announcements — never wake alone
         const cands: (Item & { kind: "formal" | "receipt" | "alarm" })[] = []
         for (const file of todo) {
           const key = `${box}::${file}`
@@ -479,6 +480,9 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           }
           const id = fieldOf("回执：")
           const alarmId = fieldOf("闹钟：")
+          // 补3：纯岗位/路由切换告知（切换事件：头，且没有升级求助：头）= notice，
+          // 不单独唤醒、只随正式信搭车；分类只看程序信头，标题写「岗位/交接」不算。
+          const isNotice = !id && fieldOf("切换事件：") !== "" && fieldOf("升级求助：") === ""
           if (id) {
             receipts.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: receiptSubject(fieldOf), id, mtime })
             cands.push({ file, src: "", subj: "", id, mtime, kind: "receipt" })
@@ -486,6 +490,9 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
             // 闹钟提醒：只渲染那句固定常量，正文一个字节都不读、不注入
             alarms.push({ file, src: "postoffice", subj: "闹钟", id: alarmId, mtime, alarm: true })
             cands.push({ file, src: "postoffice", subj: "闹钟", id: alarmId, mtime, kind: "alarm" })
+          } else if (isNotice) {
+            notices.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: fieldOf("事由："), id: "", mtime })
+            cands.push({ file, src: "", subj: "", id: "", mtime, kind: "notice" })
           } else {
             formal.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: fieldOf("事由："), id: "", mtime })
             cands.push({ file, src: "", subj: "", id: "", mtime, kind: "formal" })
@@ -517,20 +524,22 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           `carry=${(dec.carry_receipts ?? []).length} hold=${dec.hold_until ?? "null"} ` +
           `alarm=${!!dec.alarm_round} reason=${dec.reason ?? "?"}（cands=${cands.length}）`)
         if (!planned.size) continue          // 仍在静默窗内 / 只回执：不叫醒、不认领、不记展示
-        const group: { file: string; isReceipt: boolean }[] =
+        const group: { file: string; kind: string }[] =
           cands.filter((c) => planned.has(c.file))
-            .map((c) => ({ file: c.file, isReceipt: c.kind === "receipt" }))
+            .map((c) => ({ file: c.file, kind: c.kind }))
         // 每次投递前都认领：失败时已释放认领，所以重试照样能拿到；
         // 抢不到说明别的实例正在投这封，跳过（否则多实例会各投一次）
-        const claimed: { file: string; isReceipt: boolean }[] = []
+        const claimed: { file: string; kind: string }[] = []
         for (const g of group) {
           if (!(await claim(box, g.file))) continue
           claimed.push(g)
         }
         if (!claimed.length) continue
-        const claimedFormal = claimed.filter((g) => !g.isReceipt).map((g) => g.file)
-        const claimedReceipts = claimed.filter((g) => g.isReceipt)
+        const claimedFormal = claimed.filter((g) => g.kind !== "receipt" && g.kind !== "notice").map((g) => g.file)
+        const claimedReceipts = claimed.filter((g) => g.kind === "receipt")
           .map((g) => receipts.find((r) => r.file === g.file)!).filter(Boolean)
+        const claimedNotices = claimed.filter((g) => g.kind === "notice")
+          .map((g) => notices.find((r) => r.file === g.file)!).filter(Boolean)
         let text: string
         const alarmFormal = claimedFormal.length === 1 && alarms.some((f) => f.file === claimedFormal[0])
         if (alarmFormal) {
@@ -562,6 +571,11 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           if (claimedReceipts.length) {
             parts.push(`另有 ${claimedReceipts.length} 条回执（默认不答复，需要时按 ID 查询）：\n` +
               claimedReceipts.map((r) => `- ${r.src}：${r.subj}  查询：postoffice receipt ${shq(box)} ${shq(r.id)}`).join("\n"))
+          }
+          if (claimedNotices.length) {
+            // 补3：纯告知只搭车——路由/身份早已即时更新，这里只报事实，不需要行动
+            parts.push(`另有 ${claimedNotices.length} 条纯告知（岗位/路由变化，默认无需行动）：\n` +
+              claimedNotices.map((n) => `- ${n.src}：${n.subj}  == ${ROOT}/${box}/inbox/${n.file}`).join("\n"))
           }
           text = parts.join("\n")
         }
