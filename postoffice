@@ -331,7 +331,9 @@ def notify(title, text):
 def _read_head(path):
     """Header block of a letter, read without ever hanging on a slow/FIFO file.
 
-    Regular files read normally (we stop at the blank line instead of swallowing the body).
+    Regular files read normally, in 64 KiB chunks until the blank line — a malformed letter
+    without one can pull up to 1 MiB, so the read MAY touch body bytes physically; only the
+    header block is ever USED for classification, and no byte of it is re-injected anywhere.
     A FIFO (fixture parking, exotic writer) is probed non-blocking: bytes already there are
     parsed; if the writer has sent nothing yet we judge from what we have and treat the letter
     as ordinary — the real render, after the claim, still reads it the normal way, which is
@@ -1343,8 +1345,9 @@ def codex_pending_exists(r, name, _cache={}):
         app = CodexAppServer(cli, timeout=30)
         try:
             app.initialize()
-            items, _complete = _codex_find_items(app, key[1], CODEX_PENDING_PREFIX + name)
-            found = bool(items)
+            items, complete = _codex_find_items(app, key[1], CODEX_PENDING_PREFIX + name)
+            # 分页不完整＝名单不可信＝按「没有 pending」处理（既有承诺，不新增分页子系统）
+            found = bool(items) and complete
         finally:
             app.close()
     except Exception as e:
@@ -4532,6 +4535,14 @@ def cmd_hook(_a):
                     # 「认领失败也照样唤醒」；限流不放行时连认领都不建，否则唤醒与撤回
                     # 之间就没有互斥，「撤回报成功但已经唤醒」照样会发生。
                     new = [p for p in new if claim_letter(name, p)]
+                    # 窄修（Codex 复检 2842549）：出发信（计划 deliver 里的 formal/闹钟）必须
+                    # 至少一封认领成功，搭车信才有资格走；全失败则释放本轮全部搭车 claim，
+                    # 不唤醒、不写 .seen/presented、不 rate_mark，信留 inbox。
+                    depart_ids = set(plan["deliver"])
+                    if new and not any(p.name in depart_ids for p in new):
+                        for p in new:
+                            release_claim(name, p)
+                        continue          # 只剩搭车信：不唤醒，也不落进下面的「限流暂停」分支
                     if new:
                         sys.stderr.write(reminder(name, new) + "\n")
                         with seenf.open("a") as f:
@@ -4754,6 +4765,14 @@ def cmd_postman(_a):
                 # 同样只投认领成功的：抢不到的那几封这一轮不动，等下一轮
                 group = [p for p in candidates if claim_letter(name, p)]
                 if not group:
+                    continue
+                # 窄修（Codex 复检 2842549）：搭车信（回执/纯告知）只有伴随「计划内出发信」
+                # 一起走才合法。若出发信（formal/闹钟）全部认领失败，本轮搭车 claim 全部
+                # 释放：不投、不 rate_mark、不标展示、信留 inbox——绝不允许只剩回执的批次。
+                depart_ids = set(plan["deliver"])
+                if not alarm_round and not any(p.name in depart_ids for p in group):
+                    for p in group:
+                        release_claim(name, p)
                     continue
                 names = " ".join(p.name for p in group)
                 sig = f"{name}::" + "|".join(p.name for p in group)

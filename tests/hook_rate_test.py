@@ -452,6 +452,33 @@ class HookRateClaim(unittest.TestCase):
         self.assertEqual(len(list((self.home / BOX / "inbox").glob("*.md"))), 1, "原信必须留在原地")
         self.assertEqual(self.claims(), [f"{lid}.md"], "被拒之后认领归属不变")
 
+    def test_ride_bails_out_when_the_departure_claim_is_taken(self):
+        """窄修（Codex 复检 2842549）：出发信（正式信）的认领被占 → 钩子不得只带着搭车信唤醒。
+
+        真入口（postoffice hook）证明：出发信抢不到认领时，同批的回执搭车信必须被释放——
+        不唤醒（rc!=2）、不写 .seen、信留 inbox；认领腾空后下一轮正式信与回执照常一起出发。
+        """
+        lid_out = self.send("boss", sender=BOX, subject="需要回执的信")
+        r = run_po("ack", "boss", lid_out, "copy that", home=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        receipt = next(p for p in (self.home / BOX / "inbox").glob("*.md"))
+        lid = self.send()                                     # 正式信（env QUIET=0：立即出发）
+        claims = self.home / BOX / ".claims"
+        claims.mkdir(parents=True, exist_ok=True)
+        (claims / f"{lid}.md").write_text("99999\n")          # 出发信的认领被「别人」占着
+        hrc, herr = self.run_hook(wait=3)
+        self.assertNotEqual(hrc, 2, "没有出发信可投时钩子不得唤醒")
+        self.assertNotIn(str(self.letter(lid)), herr, "唤醒负载里不得出现任何信")
+        self.assertNotIn(str(receipt), herr, "搭车信也不得出现在唤醒负载里")
+        self.assertEqual(self.seen(), [], "不写 .seen")
+        self.assertTrue(receipt.exists() and self.letter(lid).exists(), "信都留在 inbox")
+        self.assertEqual(self.claims(), [f"{lid}.md"], "占位认领不受影响，搭车认领已释放")
+        (claims / f"{lid}.md").unlink()                       # 认领腾空 → 下一轮照常出发
+        hrc, herr = self.run_hook(wait=10)
+        self.assertEqual(hrc, 2, "认领腾空后照常唤醒")
+        self.assertIn(str(self.letter(lid)), herr, "正式信出发")
+        self.assertIn(lid_out, herr, "回执恢复搭车（元数据块按被回执原信 ID 呈现）")
+
 
 if __name__ == "__main__":
     try:

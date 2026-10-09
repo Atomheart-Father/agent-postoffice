@@ -533,7 +533,7 @@ await t('补3：岗位纯告知单独到达不唤醒（信保留）；与正式�
   assert.ok(existsSync(fp), 'notice 留在 inbox 等搭车')
 
   const lid = '20260101-090001_boss_正式工作信'
-  await putLetter(box, `${lid}.md`, { subject: '正式工作信' })
+  await putLetter(box, lid, { subject: '正式工作信' })
   await scan()
   const got = promptsFor(sid).slice(-1)
   assert.equal(got.length, 1, '正式信照常出发（不被 notice 压住）')
@@ -550,6 +550,33 @@ await t('补3：岗位纯告知单独到达不唤醒（信保留）；与正式�
   const got2 = promptsFor(sid).slice(-1)
   assert.equal(got2.length, 1, '升级求助是行动票，单独即唤醒')
   assert.ok(!textOf(got2[0]).includes('纯告知'), '升级求助不按 notice 渲染')
+})
+
+await t('窄修：出发信认领被占 → 插件不得只带搭车信唤醒；腾空后照常出发', async () => {
+  const box = 'flow_bail'
+  const sid = await addBox(box)
+  const receipt = '20260101-100000_boss_回执：甲事.md'
+  const fr = join(root, box, 'inbox', receipt)
+  await writeFile(fr, '来源：boss\n事由：回执：甲事\n需要：回执（默认不答复）\n回执：rid-1\n原事由：甲事\n\n正文\n')
+  { const old = new Date(Date.now() - 120000); await utimes(fr, old, old) }
+  const lid = '20260101-100001_boss_正式工作信'
+  await putLetter(box, lid, { subject: '正式工作信' })
+  await mkdir(join(root, box, '.claims'), { recursive: true })
+  await writeFile(join(root, box, '.claims', `${lid}.md`), '99999\n')   // 出发信认领被「别人」占着
+  const before = promptsFor(sid).length
+  await scan()
+  assert.equal(promptsFor(sid).length, before, '没有出发信可投时不得唤醒')
+  assert.deepEqual(await claims(box), [`${lid}.md`], '占位认领不受影响，搭车认领已释放')
+  assert.ok(existsSync(join(root, box, 'inbox', `${lid}.md`)), '正式信留在 inbox')
+  assert.ok(existsSync(join(root, box, 'inbox', receipt)), '回执留在 inbox')
+  await rm(join(root, box, '.claims', `${lid}.md`))                      // 认领腾空 → 照常出发
+  await scan()
+  const got = promptsFor(sid).slice(before)
+  assert.equal(got.length, 1, '认领腾空后照常唤醒')
+  const text = textOf(got[0])
+  assert.ok(text.includes('正式工作信'), '正式信出发：\n' + text)
+  assert.ok(text.includes('另有 1 条回执'), '回执恢复搭车：\n' + text)
+  assert.ok(text.includes('rid-1'), '回执块带查询 ID')
 })
 
 console.log(process.exitCode ? 'FAIL' : `PASS (${n} checks)`)

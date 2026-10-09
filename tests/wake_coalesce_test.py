@@ -297,6 +297,30 @@ class WakeCoalesce(unittest.TestCase):
         self.assertNotIn("20 分钟", log_lines(self.home, "postman.log"), "notice 不进人侧兜底")
 
 
+
+    def test_ride_bails_out_when_every_departure_claim_fails(self):
+        """窄修（Codex 复检 2842549）：出发信全部认领失败→本轮搭车 claim 全释放，
+        不投、不 rate_mark、不标展示，信留 inbox；认领腾空后下一轮照常搭车。"""
+        rid_receipts = self.receipt_into_nb()
+        receipt = rid_receipts[0]
+        age(self.home, "nb", receipt.name, 10_000)
+        lid = self.send("nb", subject="正式工作信")
+        age(self.home, "nb", f"{lid}.md", 10_000)
+        claims = self.home / "nb" / ".claims"
+        claims.mkdir(parents=True, exist_ok=True)
+        (claims / f"{lid}.md").write_text("99999\n")     # 出发信的认领被「别人」占着
+        postman_round(self.home, POSTOFFICE_QUIET="0", POSTOFFICE_MAX_HOLD="0")
+        self.assertFalse(is_delivered(self.home, "nb", receipt.name), "只剩搭车信不得投递")
+        self.assertFalse(is_delivered(self.home, "nb", f"{lid}.md"), "被占认领的正式信本轮不投")
+        self.assertEqual(wake_count(self.home, "nb"), 0, "不 rate_mark")
+        self.assertTrue(receipt.exists() and self.letter_path("nb", lid).exists(),
+                        "信都留在 inbox")
+        (claims / f"{lid}.md").unlink()                   # 认领腾空 → 下一轮照常搭车
+        postman_round(self.home, POSTOFFICE_QUIET="0", POSTOFFICE_MAX_HOLD="0")
+        self.assertTrue(is_delivered(self.home, "nb", f"{lid}.md"), "正式信出发")
+        self.assertTrue(is_delivered(self.home, "nb", receipt.name), "回执恢复搭车")
+        self.assertEqual(wake_count(self.home, "nb"), 1, "一批只唤醒一次")
+
     # ---- WakePlan：纯函数 + 只读 CLI，同一黄金表 ----
     GOLDEN = [
         ({"candidates": [
