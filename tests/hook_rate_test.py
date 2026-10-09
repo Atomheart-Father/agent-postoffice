@@ -36,7 +36,11 @@ BOX = "claude"
 def env_for(home, **extra):
     env = dict(os.environ)
     env["POSTOFFICE_HOME"] = str(home)
+    # wake-coalesce：旧夹具按「信随到随投」的旧世界书写；合批/静默窗本身由
+    # tests/wake_coalesce_test.py 专测。这里关掉窗口（0/0），保持旧用例语义不变。
     env["POSTOFFICE_NO_NOTIFY"] = "1"
+    env["POSTOFFICE_QUIET"] = "0"
+    env["POSTOFFICE_MAX_HOLD"] = "0"
     env["POSTOFFICE_POLL"] = "1"
     # 与运行环境的 Claude 桌面变量隔离：认人只认用例显式给的值，否则身份会被带偏。
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
@@ -235,6 +239,13 @@ class HookRateClaim(unittest.TestCase):
             cmd_retract = [sys.executable, PO, "retract", "boss", BOX, lid]
             if i % 2 == 0:
                 h = self.start_hook()
+                # 让先：等钩子真正上岗（进入监视循环）再放撤回起跑。没有这一步，两边进程
+                # 启动耗时几乎相同，「钩子先手」退化成掷硬币，机器一慢 20 轮可能全输。
+                # 竞争本身仍是真的：认领/撤回在毫秒级窗口内互抢，互斥断言照旧逐轮严查。
+                deadline = time.time() + 5
+                while time.time() < deadline and not (self.home / BOX / ".watch_alive").exists():
+                    time.sleep(0.02)
+                time.sleep(0.05)
                 r = subprocess.Popen(cmd_retract, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True, env=env_for(self.home))
                 rerr = r.communicate(timeout=90)[1]
@@ -251,7 +262,7 @@ class HookRateClaim(unittest.TestCase):
             delivered = path in herr or path in self.seen()      # 这封信真的到了会话手里
             self.assertFalse(retract_ok and (hrc == 2 or delivered),
                              f"第 {i} 轮两边都赢了：撤回 rc={rrc}（{rerr.strip()[:120]}），"
-                             f"钩子 rc={hrc}，交付={delivered}")
+                             f"钩子 rc={hrc}，交付={delivered}，钩子STDERR尾：{herr.strip()[-600:]}")
             if retract_ok:                                    # 撤回赢：认领归它，信进归档
                 wins["retract"] += 1
                 self.assertNotEqual(hrc, 2, f"第 {i} 轮撤回赢了，钩子不得唤醒")

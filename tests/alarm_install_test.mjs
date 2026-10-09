@@ -316,9 +316,11 @@ await t('⑥ 拿不到 @opencode-ai/plugin 时闹钟工具不注册，投信照�
     '来源：boss\n事由：试投\n需要：仅告知\n\n这封信不该被工具缺席影响\n')
   await mNoZod.plugin.event({ event: { type: 'session.idle' } })
   await mNoZod.settle(1)
-  assert.equal(mNoZod.prompts.length, 1, 'schema 依赖缺失也照样投信')
-  assert.ok(mNoZod.prompts[0].body.parts[0].text.includes(letter), '提醒里要有这封信')
+  // wake-coalesce 合同：投递选择唯一归 wake-plan CLI；CLI 不在（本夹具没装）→ fail-closed：
+  // 不投递、信保留、留可诊断日志，插件本体照常存活。旧「投信照旧」的回退规则已按票删除。
+  assert.equal(mNoZod.prompts.length, 0, 'CLI 不可用就不得投递（fail-closed，不退回旧规则）')
   assert.match(await mNoZod.logText(), /闹钟工具未注册/, '日志里要写明为什么没注册')
+  assert.match(await mNoZod.logText(), /wake-plan/, '日志里要写明投递选择器不可用')
 })
 
 // =============================================================== ⑦ no CLI -> a diagnosis, not a crash
@@ -346,7 +348,9 @@ await t('⑦ 找不到 CLI 时返回可读的诊断，而不是抛异常，也�
   await writeFile(join(poHomeNoCli, 'noclibox', 'inbox', letter), '来源：boss\n事由：试投\n需要：仅告知\n\n正文\n')
   await mNoCli.plugin.event({ event: { type: 'session.idle' } })
   await mNoCli.settle(1)
-  assert.equal(mNoCli.prompts.length, 1, 'CLI 缺席不该影响投信')
+  // fail-closed：没有 CLI 就没有唤醒选择，信留在 inbox 并留诊断；插件存活（dispose 可用）
+  assert.equal(mNoCli.prompts.length, 0, 'CLI 缺席→不投递（fail-closed），信保留')
+  assert.match(await mNoCli.logText(), /wake-plan/, '诊断要写明 wake-plan 不可用')
 })
 
 // =============================================================== ⑦ (negative) a foreign CLI
@@ -387,7 +391,10 @@ await t('⑦ 负例：邮局目录里那份外来 CLI 不会被调用，只得�
   await writeFile(join(poHomeForeign, boxForeign, 'inbox', letter), '来源：boss\n事由：试投\n需要：仅告知\n\n正文\n')
   await mForeign.plugin.event({ event: { type: 'session.idle' } })
   await mForeign.settle(1)
-  assert.equal(mForeign.prompts.length, 1, '外来 CLI 没被调用也不该影响投信')
+  // fail-closed：不退回任何同级/外来 CLI，唤醒选择器缺席就留信＋诊断；桩必须仍未被调用
+  assert.ok(!existsSync(markerForeign), '投递路径同样绝不能碰外来 CLI 桩')
+  assert.equal(mForeign.prompts.length, 0, '无合法 wake-plan→不投递（fail-closed），信保留')
+  assert.match(await mForeign.logText(), /wake-plan/, '诊断要写明 wake-plan 不可用')
 })
 
 // =============================================================== ① (fail-closed) link failure

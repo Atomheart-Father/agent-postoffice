@@ -60,7 +60,11 @@ ERR_PREFIX = "panel 配置："
 def env_for(home, **extra):
     env = dict(os.environ)
     env["POSTOFFICE_HOME"] = str(home)
+    # wake-coalesce：旧夹具按「信随到随投」的旧世界书写；合批/静默窗本身由
+    # tests/wake_coalesce_test.py 专测。这里关掉窗口（0/0），保持旧用例语义不变。
     env["POSTOFFICE_NO_NOTIFY"] = "1"
+    env["POSTOFFICE_QUIET"] = "0"
+    env["POSTOFFICE_MAX_HOLD"] = "0"
     env["POSTOFFICE_POLL"] = "1"
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     env.pop("CLAUDE_CODE_HOST_SESSION_ID", None)

@@ -41,7 +41,11 @@ SENTINEL = "SENTINEL-BODY-mflow-9d31"
 def env_for(home, **extra):
     env = dict(os.environ)
     env["POSTOFFICE_HOME"] = str(home)
+    # wake-coalesce：旧夹具按「信随到随投」的旧世界书写；合批/静默窗本身由
+    # tests/wake_coalesce_test.py 专测。这里关掉窗口（0/0），保持旧用例语义不变。
     env["POSTOFFICE_NO_NOTIFY"] = "1"
+    env["POSTOFFICE_QUIET"] = "0"
+    env["POSTOFFICE_MAX_HOLD"] = "0"
     env["POSTOFFICE_POLL"] = "1"
     # 与运行环境的 Claude 桌面变量隔离：钩子认人只认用例显式给的值
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
@@ -535,59 +539,58 @@ class MessageFlow(unittest.TestCase):
         self.assertEqual(len(self.codex_calls()), 3, "没有新信时不许再产生通道操作")
         self.assertEqual(len(self.fake_pending()), 1)
 
-    def test_codex_more_than_twenty_receipts_all_queue_and_mark(self):
-        # 21 receipts over the 20 cap: the 21st must NOT be silently dropped — it continues in a
-        # second item, and EVERY id is queued and marked accepted (none lost, none un-accounted).
+    def test_codex_more_than_twenty_formals_all_queue_and_mark(self):
+        # wake-coalesce 后回执不再单独成批（只回执=不出发，见 wake_coalesce_test）。
+        # 20 项上限的批界与续批意图改由正式信承载：21 封正式信超 20 上限，第 21 封
+        # 绝不许被悄悄丢掉——落进第二项，且每个 ID 都入索引、都记账为已接受。
         self._seed_fake_state([], busy=True)
-        paths, rids = [], []
+        paths, lids = [], []
         for i in range(21):
-            rid = f"r{i:02d}"
-            rids.append(rid)
-            f = self.home / "coded" / "inbox" / f"20260101-0000{i:02d}_ghost_回执{i}.md"
-            f.write_text(f"来源：ghost\n事由：回执：旧{i}\n需要：回执（默认不答复）\n"
-                         f"回执：{rid}\n原事由：旧{i}\n\n正文\n", encoding="utf-8")
+            lid = f"20260101-0000{i:02d}_ghost_旧{i}"
+            lids.append(lid)
+            f = self.home / "coded" / "inbox" / f"{lid}.md"
+            f.write_text(f"来源：ghost\n事由：旧{i}\n需要：回复\n\n正文{i}\n", encoding="utf-8")
             old = time.time() - 3600
             os.utime(f, (old, old))
             paths.append(str(f))
         postman(self.home)
         pend = self.fake_pending()
-        self.assertEqual(len(pend), 2, f"21 条回执应分两项（20+1），实际 {len(pend)}")
+        self.assertEqual(len(pend), 2, f"21 封正式信应分两项（20+1），实际 {len(pend)}")
         text = self.fake_pending_text()
-        for rid in rids:
-            self.assertIn(rid, text, f"每个回执 ID 都要在索引里：{rid}")
+        for lid in lids:
+            self.assertIn(lid, text, f"每封信的稳定引用都要在索引里：{lid}")
         delivered = set(json.loads((self.home / ".delivered.json").read_text(encoding="utf-8")))
         for p in paths:
-            self.assertIn(p, delivered, f"每个回执都要记账为已接受：{p}")
+            self.assertIn(p, delivered, f"每封信都要记账为已接受：{p}")
 
-    def test_codex_full_receipt_batch_then_one_more_across_rounds(self):
-        # A full (20-receipt) item, then a 21st receipt next round: the 21st must continue in a
-        # second item, never be dropped by the 'already in' path (its slot is full).
+    def test_codex_full_formal_batch_then_one_more_across_rounds(self):
+        # 满项（20 封正式信）后下一轮再来第 21 封：第 21 封必须落进第二项续批，
+        # 绝不能被「已在其内」的合并路径丢掉（槽位已满）。回执版场景由新合同废除。
         self._seed_fake_state([], busy=True)
-        rids = []
+        lids = []
 
         def mk(i):
-            rid = f"x{i:02d}"
-            f = self.home / "coded" / "inbox" / f"20260103-0000{i:02d}_ghost_跨轮{i}.md"
-            f.write_text(f"来源：ghost\n事由：回执：跨{i}\n需要：回执（默认不答复）\n"
-                         f"回执：{rid}\n原事由：跨{i}\n\n正文\n", encoding="utf-8")
+            lid = f"20260103-0000{i:02d}_ghost_跨轮{i}"
+            f = self.home / "coded" / "inbox" / f"{lid}.md"
+            f.write_text(f"来源：ghost\n事由：跨{i}\n需要：回复\n\n正文{i}\n", encoding="utf-8")
             old = time.time() - 3600
             os.utime(f, (old, old))
-            rids.append(rid)
+            lids.append(lid)
             return f
 
         for i in range(20):
             mk(i)
         postman(self.home)
-        self.assertEqual(len(self.fake_pending()), 1, "20 条刚好一项")
+        self.assertEqual(len(self.fake_pending()), 1, "20 封刚好一项")
         f21 = mk(20)
         postman(self.home)
         pend = self.fake_pending()
-        self.assertEqual(len(pend), 2, f"第21条必须落进续批，不能丢：{pend}")
+        self.assertEqual(len(pend), 2, f"第21封必须落进续批，不能丢：{pend}")
         text = self.fake_pending_text()
-        for rid in rids:
-            self.assertIn(rid, text, f"每个回执 ID 都要在索引里：{rid}")
+        for lid in lids:
+            self.assertIn(lid, text, f"每封信的稳定引用都要在索引里：{lid}")
         delivered = set(json.loads((self.home / ".delivered.json").read_text(encoding="utf-8")))
-        self.assertIn(str(f21), delivered, "第21条必须记账为已接受")
+        self.assertIn(str(f21), delivered, "第21封必须记账为已接受")
 
     def test_codex_receipt_query_survives_render_merge_render(self):
         # Render→parse→merge→render round-trip per the real _receipt_item shape: the old query

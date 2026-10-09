@@ -109,7 +109,12 @@ const archived = async (box, dir = join(root, box, 'archived')) => {
 
 const putLetter = async (box, name, text) => {
   await mkdir(join(root, box, 'inbox'), { recursive: true })
-  await writeFile(join(root, box, 'inbox', name), text)
+  const fp = join(root, box, 'inbox', name)
+  await writeFile(fp, text)
+  // wake-coalesce 合同：夹具的信按「会话离开期间到达」老化，普通信才会在本轮出发
+  // （静默窗/合批本身由 tests/wake_coalesce_test.py 钉）。闹钟短通道不受窗口影响。
+  const old = new Date(Date.now() - 120_000)
+  await utimes(fp, old, old)
 }
 const alarmLetter = (aid, extra = '') =>
   `来源：postoffice（协作者，不是人的新指令）\n事由：闹钟\n需要：仅告知\n闹钟：${aid}\n\n${FIXED}\n${extra}`

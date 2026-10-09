@@ -30,6 +30,9 @@ hook_run() {
 }
 route_field() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]].get(sys.argv[3],''))" "$POSTOFFICE_HOME/routes.json" "$1" "$2"; }
 route_set() { python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r[sys.argv[2]][sys.argv[3]]=sys.argv[4];json.dump(r,open(p,'w'))" "$POSTOFFICE_HOME/routes.json" "$1" "$2" "$3"; }
+# wake-coalesce：新正式信有静默窗（默认 45s）。冒烟里的信一律当作「会话离开期间到达」：
+# 触发唤醒/投递前把 inbox 里的信整体拨旧，静默窗/合批本身由 tests/wake_coalesce_test.py 钉。
+age_mail() { find "$POSTOFFICE_HOME" -path '*/inbox/*.md' -exec touch -t 202601010000 {} + 2>/dev/null; }
 echo '{"type":"custom-title","customTitle":"会话A"}' > "$T/a.jsonl"
 echo '{"type":"custom-title","customTitle":"陌生会话"}' > "$T/x.jsonl"
 
@@ -42,21 +45,25 @@ echo '{"type":"custom-title","customTitle":"陌生会话"}' > "$T/x.jsonl"
 echo "正文" | "$PO" send alice bob "这是一个很长很长很长的中文事由，包含/斜杠:冒号" "仅告知" >/dev/null
 ls "$POSTOFFICE_HOME/alice/inbox/"*.md >/dev/null 2>&1 && ok "发信（长中文事由）" || bad "发信"
 
-out=$(hook_in a | hook_run "$PO" hook); rc=$?
+out=$(age_mail; hook_in a | hook_run "$PO" hook); rc=$?
 [ $rc -eq 2 ] && echo "$out" | grep -q "事由：这是一个" && ok "钩子唤醒并带开头三行" || bad "钩子唤醒 rc=$rc"
 
+age_mail
 hook_in a | "$PO" hook 2>/dev/null & P=$!; sleep 12
 kill -0 $P 2>/dev/null && ok "同一封信不重报" || bad "重复报信"
+age_mail
 hook_in a | "$PO" hook 2>/dev/null & P2=$!; sleep 2
 kill -0 $P 2>/dev/null && bad "旧监视未退场" || ok "新监视接班旧监视"
 kill $P2 2>/dev/null; wait 2>/dev/null
 
-[ $(hook_in x | hook_run "$PO" hook; echo $?) -eq 0 ] && ok "未登记会话直接退出" || bad "未登记会话"
+[ $(age_mail; hook_in x | hook_run "$PO" hook; echo $?) -eq 0 ] && ok "未登记会话直接退出" || bad "未登记会话"
 
 "$PO" offline alice >/dev/null
 echo "离线期间的信" | "$PO" send alice bob "离线测试" "仅告知" >/dev/null
+age_mail
 hook_in a | "$PO" hook 2>"$T/off.err" & P=$!; sleep 12
 kill -0 $P 2>/dev/null && ok "离线时不唤醒" || bad "离线时被唤醒"
+age_mail
 "$PO" online alice >/dev/null; sleep 12
 kill -0 $P 2>/dev/null && bad "上线后没补送" || { grep -q "离线测试" "$T/off.err" && ok "上线后补送" || bad "补送内容不对"; }
 kill -9 $P 2>/dev/null; wait $P 2>/dev/null; P=""
@@ -70,8 +77,10 @@ n=$(grep -c '" hook' "$T/.claude/settings.json"); grep -q '"timeout": 604800' "$
 ! grep -q '" hook' "$T/.claude/settings.json" && grep -q "echo other" "$T/.claude/settings.json" && ok "卸钩子只卸自己的" || bad "卸钩子"
 
 echo "x" | "$POSTOFFICE_HOME/bin/send.sh" bob alice "兼容旧命令" "仅告知" >/dev/null && ok "bin/send.sh 兼容" || bad "send.sh 兼容"
+age_mail
 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM
 grep -q "兼容旧命令" "$POSTOFFICE_HOME/.delivered.json" 2>/dev/null || grep -q "bob" "$POSTOFFICE_HOME/.delivered.json" && ok "邮递员投递通知信箱并记账" || bad "邮递员"
+age_mail
 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM
 [ $(grep -c "notify bob" "$POSTOFFICE_HOME/logs/postman.log") -eq 1 ] && ok "邮递员重启不重投" || bad "邮递员重投"
 
@@ -113,9 +122,11 @@ mkcodex "$T/fakecodex" -   # 假 codex：永远“受理成功”
 "$PO" add carol --codex thread-1 >/dev/null
 python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r['carol']['codex_cli']=sys.argv[2];json.dump(r,open(p,'w'))" "$POSTOFFICE_HOME/routes.json" "$T/fakecodex"
 echo "x" | "$PO" send carol alice "没人处理的信" "回复" >/dev/null
+age_mail
 POSTOFFICE_POLL=1 POSTOFFICE_CONSUME_ALERT=2 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 6; kill $PM
 [ $(grep -c "未处理 carol" "$POSTOFFICE_HOME/logs/postman.log") -eq 1 ] && ok "提醒后久未处理只告诉人一次" || bad "未处理提醒"
 mv "$POSTOFFICE_HOME"/carol/inbox/*.md "$POSTOFFICE_HOME/carol/done/"
+age_mail
 POSTOFFICE_POLL=1 POSTOFFICE_CONSUME_ALERT=2 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM
 ! grep -q carol "$POSTOFFICE_HOME/.woken.json" && ok "信挪进 done 即算处理完" || bad "处理完未清账"
 
@@ -186,10 +197,12 @@ grep -q "回执请用：postoffice ack dave $bid" "$POSTOFFICE_HOME/dave/inbox/"
 # 5. 2 人 ack 后跑邮递员：未到截止、未全员 → 不汇总；全员 ack → 恰好一封；再跑不重复
 "$PO" ack bob "$bid" "收到一号" >/dev/null
 "$PO" ack dave "$bid" "收到二号" >/dev/null
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null
 ! grep -lq "广播汇总" "$POSTOFFICE_HOME/alice/inbox/"*.md 2>/dev/null \
   && ok "未到截止未全员：不汇总" || bad "提前汇总"
 "$PO" ack erin "$bid" "收到三号" >/dev/null
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null
 sum=$(grep -l "广播汇总" "$POSTOFFICE_HOME/alice/inbox/"*.md 2>/dev/null | wc -l | tr -d ' ')
 [ "$sum" -eq 1 ] && ok "全员 ack 后发信方收到恰好一封汇总" || bad "汇总封数 sum=$sum"
@@ -198,6 +211,7 @@ grep -q "已回执 3/3" $sf && grep -q "postoffice receipt alice $bid" $sf && ! 
   && ok "汇总只给人数与查询命令、不含各自的一句话" || bad "汇总内容"
 "$PO" receipt alice "$bid" 2>/dev/null | grep -q "收到一号" \
   && ok "receipt 按广播 ID 返回各人一句话" || bad "广播 receipt"
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null
 [ "$(grep -l "广播汇总" "$POSTOFFICE_HOME/alice/inbox/"*.md 2>/dev/null | wc -l | tr -d ' ')" -eq 1 ] \
   && ok "邮递员重启不重复汇总" || bad "重复汇总"
@@ -207,6 +221,7 @@ out=$(printf '过期正文\n' | POSTOFFICE_BROADCAST_DEADLINE=1 "$PO" broadcast 
 bid2=$(printf '%s\n' "$out" | awk -F'：' '/^广播编号/{print $2}')
 "$PO" ack dave "$bid2" "我回了" >/dev/null
 sleep 2
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null
 s2=$(grep -l "广播汇总" "$POSTOFFICE_HOME/bob/inbox/"*.md 2>/dev/null)
 grep -q "未回执：erin（离线）" $s2 && grep -q "postoffice receipt bob $bid2" $s2 && ! grep -q "我回了" $s2 \
@@ -234,6 +249,7 @@ h = Path(sys.argv[1])
     "id": "B20260101-000001_sys", "from": "postoffice", "subject": "系统广播", "need": "仅告知",
     "to": ["bob"], "deadline": time.time() - 1, "created": "x", "acks": {}, "summarized": False}))
 PY
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
 kill -0 $PM 2>/dev/null && ok "坏广播记录不搞挂邮递员" || bad "邮递员被坏记录搞挂"
 grep -q "广播汇总失败 B20260101-000000_ghost.json" "$POSTOFFICE_HOME/logs/postman.log" \
@@ -245,6 +261,7 @@ grep -q "跳过汇总" "$POSTOFFICE_HOME/logs/postman.log" \
 grep -q '"summarized": true' "$POSTOFFICE_HOME/broadcasts/B20260101-000001_sys.json" \
   && ok "系统广播只处理一次" || bad "系统广播被反复处理"
 kill $PM 2>/dev/null; wait $PM 2>/dev/null
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 [ "$(grep -c "广播汇总失败 B20260101-000000_ghost.json" "$POSTOFFICE_HOME/logs/postman.log")" -eq 1 ] \
   && ok "坏记录不重复重试" || bad "坏记录重复重试"
@@ -264,12 +281,12 @@ clog "2026-10-05 02:00:01" local_L1 cli-L1
 printf '{"type":"custom-title","customTitle":"稳定会话"}\n' > "$T/s1.jsonl"
 "$PO" add sbox --claude "稳定会话" >/dev/null
 echo "正文" | "$PO" send sbox tester "首信" "回复" >/dev/null
-out=$(hook_cli s1 cli-L1 | DHD "$PO" hook); rc=$?
+out=$(age_mail; hook_cli s1 cli-L1 | DHD "$PO" hook); rc=$?
 [ $rc -eq 2 ] && printf '%s' "$out" | grep -q "【联络总站新信" && ok "v1.6 桌面日志反查身份并唤醒" || bad "v1.6 日志认人 rc=$rc"
 [ "$(route_field sbox claude_session)" = "local_L1" ] && ok "v1.6 首次标题匹配自动绑定身份" || bad "v1.6 自动绑定"
 printf '{"type":"custom-title","customTitle":"改过的名字"}\n' > "$T/s1.jsonl"
 echo "正文" | "$PO" send sbox tester "改名后" "回复" >/dev/null
-out=$(hook_cli s1 cli-L1 | DHD "$PO" hook); rc=$?
+out=$(age_mail; hook_cli s1 cli-L1 | DHD "$PO" hook); rc=$?
 [ $rc -eq 2 ] && ok "v1.6 会话改名后仍按身份认人" || bad "v1.6 改名后认人 rc=$rc"
 [ "$(route_field sbox claude_title)" = "改过的名字" ] && ok "v1.6 认人时顺手更新标题" || bad "v1.6 更新标题"
 
@@ -277,14 +294,14 @@ out=$(hook_cli s1 cli-L1 | DHD "$PO" hook); rc=$?
 clog "2026-10-05 02:05:00" local_L1 cli-L2
 printf '{"type":"custom-title","customTitle":"回退后"}\n' > "$T/s1.jsonl"
 echo "正文" | "$PO" send sbox tester "回退后" "回复" >/dev/null
-out=$(hook_cli s1 cli-L2 | DHD "$PO" hook); rc=$?
+out=$(age_mail; hook_cli s1 cli-L2 | DHD "$PO" hook); rc=$?
 [ $rc -eq 2 ] && ok "v1.6 回退换了 CLI id 照样认人" || bad "v1.6 回退认人 rc=$rc"
 clog "2026-10-05 01:00:00" local_OLD cli-L3
 clog "2026-10-05 03:00:00" local_NEW cli-L3
 printf '{"type":"custom-title","customTitle":"时间戳会话"}\n' > "$T/s3.jsonl"
 "$PO" add tbox --claude "时间戳会话" >/dev/null
 echo "正文" | "$PO" send tbox tester "时间戳" "回复" >/dev/null
-out=$(hook_cli s3 cli-L3 | DHD "$PO" hook); rc=$?
+out=$(age_mail; hook_cli s3 cli-L3 | DHD "$PO" hook); rc=$?
 [ $rc -eq 2 ] && [ "$(route_field tbox claude_session)" = "local_NEW" ] \
   && ok "v1.6 多个映射取最新行内时间戳" || bad "v1.6 时间戳映射=$(route_field tbox claude_session)"
 
@@ -292,19 +309,19 @@ out=$(hook_cli s3 cli-L3 | DHD "$PO" hook); rc=$?
 printf '{"type":"custom-title","customTitle":"主机会话"}\n' > "$T/h.jsonl"
 "$PO" add hostbox --claude "主机会话" >/dev/null
 echo "正文" | "$PO" send hostbox tester "主机信" "回复" >/dev/null
-out=$(hook_cli h cli-ignored | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_HOST -- "$PO" hook); rc=$?
+out=$(age_mail; hook_cli h cli-ignored | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_HOST -- "$PO" hook); rc=$?
 [ $rc -eq 2 ] && [ "$(route_field hostbox claude_session)" = "local_HOST" ] \
   && ok "v1.6 优先用 HOST_SESSION_ID 绑定" || bad "v1.6 HOST 绑定 rc=$rc"
 printf '{"type":"custom-title","customTitle":"改个名"}\n' > "$T/h.jsonl"
 echo "正文" | "$PO" send hostbox tester "主机信2" "回复" >/dev/null
-out=$(hook_cli h whatever | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_HOST -- "$PO" hook); rc=$?
+out=$(age_mail; hook_cli h whatever | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_HOST -- "$PO" hook); rc=$?
 [ $rc -eq 2 ] && ok "v1.6 HOST 身份改名后仍认人" || bad "v1.6 HOST 改名 rc=$rc"
 
 # 4) 无映射：桌面版退回标题匹配（未绑定信箱），不臆造绑定，钩子不报错
 printf '{"type":"custom-title","customTitle":"无日志会话"}\n' > "$T/nl.jsonl"
 "$PO" add nolog --claude "无日志会话" >/dev/null
 echo "正文" | "$PO" send nolog tester "无日志" "回复" >/dev/null
-out=$(hook_cli nl cli-NL | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop POSTOFFICE_CLAUDE_MAINLOG="$T/nope.log" -- "$PO" hook); rc=$?
+out=$(age_mail; hook_cli nl cli-NL | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop POSTOFFICE_CLAUDE_MAINLOG="$T/nope.log" -- "$PO" hook); rc=$?
 [ $rc -eq 2 ] && ok "v1.6 日志缺失退回标题匹配" || bad "v1.6 日志缺失 rc=$rc"
 [ -z "$(route_field nolog claude_session)" ] && ok "v1.6 退回标题匹配不臆造绑定" || bad "v1.6 误绑定"
 
@@ -313,14 +330,15 @@ rm -f "$POSTOFFICE_HOME/logs/notify.log"
 "$PO" add twin --claude "撞名标题" >/dev/null; route_set twin claude_session local_TAKEN
 printf '{"type":"custom-title","customTitle":"撞名标题"}\n' > "$T/tw.jsonl"
 echo "正文" | "$PO" send twin tester "撞名信" "回复" >/dev/null
-out=$(hook_cli tw x | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_FRESH -- "$PO" hook); rc=$?
+out=$(age_mail; hook_cli tw x | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_FRESH -- "$PO" hook); rc=$?
 [ $rc -eq 0 ] && ok "v1.6 同名不同身份不接管" || bad "v1.6 撞名接管 rc=$rc"
+age_mail
 hook_cli tw x | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_FRESH -- "$PO" hook >/dev/null 2>&1
 [ "$(grep -c "会话认人诊断" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null)" = "1" ] && ok "v1.6 同名只诊断一次" || bad "v1.6 同名重复诊断"
 "$PO" add dupa --claude "绑定甲" >/dev/null; route_set dupa claude_session local_DUP
 "$PO" add dupb --claude "绑定乙" >/dev/null; route_set dupb claude_session local_DUP
 echo "正文" | "$PO" send dupa tester "多重绑定信" "回复" >/dev/null
-out=$(hook_cli tw x | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_DUP -- "$PO" hook); rc=$?
+out=$(age_mail; hook_cli tw x | hook_run CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_HOST_SESSION_ID=local_DUP -- "$PO" hook); rc=$?
 [ $rc -eq 0 ] && ok "v1.6 身份被多重绑定则不认任何一个" || bad "v1.6 多重绑定认了 rc=$rc"
 "$PO" add n2 --claude "N2" >/dev/null; route_set n2 claude_session local_X
 printf '{"type":"custom-title","customTitle":"N2"}\n' > "$T/n2.jsonl"
@@ -330,7 +348,7 @@ out=$(titleonly n2 | hook_run "$PO" hook); rc=$?
 "$PO" add clibox --claude "命令行会话" >/dev/null
 printf '{"type":"custom-title","customTitle":"命令行会话"}\n' > "$T/cb.jsonl"
 echo "正文" | "$PO" send clibox tester "命令行信" "回复" >/dev/null
-out=$(hook_cli cb cli-CMD | hook_run -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_HOST_SESSION_ID -- "$PO" hook); rc=$?
+out=$(age_mail; hook_cli cb cli-CMD | hook_run -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_HOST_SESSION_ID -- "$PO" hook); rc=$?
 [ $rc -eq 2 ] && [ "$(route_field clibox claude_session)" = "cli-CMD" ] \
   && ok "v1.6 命令行版用 CLI session_id 认人" || bad "v1.6 CLI 身份 rc=$rc"
 [ "$(grep -c "会话认人诊断" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null)" = "3" ] && ok "v1.6 三类认人诊断各一次" || bad "v1.6 诊断计数 $(grep -c "会话认人诊断" "$POSTOFFICE_HOME/logs/notify.log")"
@@ -347,6 +365,7 @@ grep -q "^需要：回复$" "$pf" && ok "v1.6 send 去掉重复的需要前缀" 
 printf '来源：tester\n事由：回执：某事\n需要：回执（默认不答复）\n回执：rid-1\n原事由：某事\n\n正文\n' > "$POSTOFFICE_HOME/alertbox/inbox/20260101-000001_tester_notice.md"
 printf '来源：postoffice\n事由：广播汇总：全员\n需要：回执（默认不答复）\n回执：B999\n原事由：全员\n\n正文\n' > "$POSTOFFICE_HOME/alertbox/inbox/20260101-000002_postoffice_sum.md"
 rm -f "$POSTOFFICE_HOME/logs/notify.log"
+age_mail
 POSTOFFICE_POLL=1 POSTOFFICE_CONSUME_ALERT=2 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 8; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 nudge=$(grep "已提醒但" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null)
 printf '%s' "$nudge" | grep -q "需要回复的" && printf '%s' "$nudge" | grep -q "混合需要" \
@@ -367,9 +386,11 @@ echo "正文" | "$PO" send upbox tester "升级旧信" "回复" >/dev/null
 uf=$(ls "$POSTOFFICE_HOME/upbox/inbox/"*.md); touch -t 202601010000 "$uf"
 [ -z "$(route_field upbox online_since)" ] && ok "v1.6 已在线信箱初始无 online_since" || bad "v1.6 初始就有 online_since"
 rm -f "$POSTOFFICE_HOME/logs/notify.log"
+age_mail
 POSTOFFICE_POLL=1 POSTOFFICE_GRACE=2 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 1; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 grep -q "迟到的信" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null && bad "v1.6 刚上线就误报" || ok "v1.6 刚上线不误报（离线时长不计）"
 [ -n "$(route_field upbox online_since)" ] && ok "v1.6 邮递员给已在线信箱补基线" || bad "v1.6 未补基线"
+age_mail
 POSTOFFICE_POLL=1 POSTOFFICE_GRACE=2 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 4; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 grep -q "迟到的信" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null && ok "v1.6 在线满时限后才告警" || bad "v1.6 满时限未告警"
 
@@ -380,6 +401,7 @@ python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r['mergebox']['co
 for i in 1 2 3; do echo "x" | "$PO" send mergebox tester "正式$i" "回复" >/dev/null; done
 for i in 1 2 3; do printf '来源：tester\n事由：回执：原事由%s\n需要：回执（默认不答复）\n回执：orig-%s\n原事由：原事由%s\n\n正文\n' "$i" "$i" "$i" > "$POSTOFFICE_HOME/mergebox/inbox/20260101-00000${i}_tester_notice.md"; done
 rm -f "$T/merge_cap" "$POSTOFFICE_HOME/logs/notify.log"
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 7; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 [ "$(grep -c "另有 3 条回执" "$T/merge_cap")" = "1" ] && ok "v1.6 回执合并成一条" || bad "v1.6 合并"
 [ "$(grep -c "查询：postoffice receipt mergebox " "$T/merge_cap")" = "3" ] && ok "v1.6 合并块含各条查询 ID" || bad "v1.6 合并块 ID"
@@ -391,24 +413,29 @@ fm=$(grep -n "另有 3 条回执" "$T/merge_cap" | cut -d: -f1); lf=$(grep -n "�
 [ "$(grep -o "mergebox" "$POSTOFFICE_HOME/.delivered.json" | wc -l | tr -d ' ')" = "6" ] && ok "v1.6 每个 ID 都记入账本" || bad "v1.6 账本"
 grep -q "投递暂停" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null && bad "v1.6 合并后仍限流" || ok "v1.6 合并后不触发限流"
 before=$(wc -l < "$T/merge_cap" | tr -d ' ')
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 [ "$(wc -l < "$T/merge_cap" | tr -d ' ')" = "$before" ] && ok "v1.6 重跑不重复投递" || bad "v1.6 重投"
 
-# 9) 回执不饿死：只有回执时也投；超过等待时限就随下一次正式投递带上
+# 9) wake-coalesce：只回执不唤醒（留 inbox、不投、不标展示）；正式信（老化）出发时回执搭车
 mkcap "$T/starve_cap" "$T/fakecodex3"
 "$PO" add starvebox --codex thread-s >/dev/null
 python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r['starvebox']['codex_cli']=sys.argv[2];json.dump(r,open(p,'w'))" "$POSTOFFICE_HOME/routes.json" "$T/fakecodex3"
 printf '来源：tester\n事由：回执：单独\n需要：回执（默认不答复）\n回执：solo-1\n原事由：单独\n\n正文\n' > "$POSTOFFICE_HOME/starvebox/inbox/20260101-000000_tester_solo.md"
+touch -t 202601010000 "$POSTOFFICE_HOME/starvebox/inbox/20260101-000000_tester_solo.md"
 rm -f "$T/starve_cap"
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null
-grep -q "solo-1" "$T/starve_cap" && ok "v1.6 只有回执时也投递" || bad "v1.6 只有回执被饿死"
+if grep -q "solo-1" "$T/starve_cap" 2>/dev/null; then bad "v1.9 只回执竟被投出"; else ok "v1.9 只回执不唤醒（留 inbox 等搭车）"; fi
 echo "x" | "$PO" send starvebox tester "正式信" "回复" >/dev/null
 printf '来源：tester\n事由：回执：旧的\n需要：回执（默认不答复）\n回执：old-1\n原事由：旧的\n\n正文\n' > "$POSTOFFICE_HOME/starvebox/inbox/20260101-000001_tester_old.md"
-touch -t 202601010000 "$POSTOFFICE_HOME/starvebox/inbox/20260101-000001_tester_old.md"
+touch -t 202601010000 "$POSTOFFICE_HOME/starvebox/inbox/"*正式信*.md
 rm -f "$T/starve_cap"
-POSTOFFICE_RECEIPT_WAIT=1 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null
-grep -q "【联络总站新信" "$T/starve_cap" && grep -q "另有 1 条回执" "$T/starve_cap" && grep -q "old-1" "$T/starve_cap" \
-  && ok "v1.6 超时回执随正式信带上（不饿死）" || bad "v1.6 回执饿死"
+age_mail
+POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null
+grep -q "【联络总站新信" "$T/starve_cap" && grep -q "另有 2 条回执" "$T/starve_cap" \
+  && grep -q "old-1" "$T/starve_cap" && grep -q "solo-1" "$T/starve_cap" \
+  && ok "v1.9 回执随正式信搭车（有界尾部块）" || bad "v1.9 回执未搭车"
 
 # 10) 批量投递失败：批内 ID 不记已送达、只通知一次；改回成功后可重试且不重复
 mkfail "$T/fakefail"
@@ -418,10 +445,12 @@ python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r['failbox']['cod
 echo "x" | "$PO" send failbox tester "失败甲" "回复" >/dev/null
 echo "x" | "$PO" send failbox tester "失败乙" "回复" >/dev/null
 rm -f "$POSTOFFICE_HOME/logs/notify.log"
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 [ "$(grep -o "failbox" "$POSTOFFICE_HOME/.delivered.json" 2>/dev/null | wc -l | tr -d ' ')" = "0" ] && ok "v1.6 投递失败不记已送达" || bad "v1.6 失败却记了账"
 [ "$(grep -c "投递失败" "$POSTOFFICE_HOME/logs/notify.log" 2>/dev/null)" = "1" ] && ok "v1.6 失败只通知一次" || bad "v1.6 失败重复通知"
 python3 -c "import json,sys;p=sys.argv[1];r=json.load(open(p));r['failbox']['codex_cli']=sys.argv[2];json.dump(r,open(p,'w'))" "$POSTOFFICE_HOME/routes.json" "$T/fakeok"
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 4; kill $PM 2>/dev/null; wait $PM 2>/dev/null
 [ "$(grep -o "failbox" "$POSTOFFICE_HOME/.delivered.json" 2>/dev/null | wc -l | tr -d ' ')" = "2" ] && ok "v1.6 恢复后重试送达且不重复" || bad "v1.6 重试未送达"
 
@@ -524,11 +553,13 @@ grep -q "未改动任何信箱状态" "$T/rm" && ok "v1.7 拒绝时明说没改�
 
 # 7) 切换广播：首见只记基线；稳定后通知一次；无人 / 恢复 / 主事复归；重启不重复
 ASTABLE=6   # 稳定期放大，抖动窗口才留得住，不靠运气
+age_mail
 POSTOFFICE_ALIAS_STABLE=$ASTABLE POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
 d0=$(n_mail dev_a)
 [ "$d0" = "0" ] && ok "v1.7 首次发现有目标时只记基线不广播" || bad "v1.7 首次发现就广播"
 grep -q "登记初始目标" "$POSTOFFICE_HOME/logs/postman.log" && ok "v1.7 初始基线写进日志" || bad "v1.7 没写基线日志"
 kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
+age_mail
 POSTOFFICE_ALIAS_STABLE=$ASTABLE POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
 [ "$(n_mail dev_a)" = "$d0" ] && ok "v1.7 重启不重复广播基线" || bad "v1.7 重启重复广播"
 d0=$(n_mail dev_a); h0=$(n_mail mgr_b)
@@ -556,11 +587,13 @@ d0=$(n_mail dev_a)
 grep -q "原因=高优先级候选恢复" "$POSTOFFICE_HOME/logs/alias_switch.log" && ok "v1.7 主事复归原因正确" || bad "v1.7 复归原因不对"
 kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
 d0=$(n_mail dev_a)
+age_mail
 POSTOFFICE_ALIAS_STABLE=$ASTABLE POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
 kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
 [ "$(n_mail dev_a)" = "$d0" ] && ok "v1.7 重启不重复广播已确认的切换" || bad "v1.7 重启重复广播"
 
 # 8) 交接失败后恢复：只补交接，不重播广播
+age_mail
 POSTOFFICE_ALIAS_STABLE=$ASTABLE POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 2
 "$PO" offline mgr_a >/dev/null; "$PO" offline mgr_b >/dev/null; sleep $((ASTABLE + 4))
 d0=$(n_mail dev_a); h0=$(n_mail mgr_b)
@@ -605,6 +638,7 @@ grep -q "\"kind\": \"broadcast\", \"note\": \"不该算广播\"" "$POSTOFFICE_HO
 [ "$(grep -c "\"id\": \"$BID2\"" "$POSTOFFICE_HOME/acks.jsonl")" = "1" ] && ok "v1.7 第二种写法账本也只有一条" || bad "v1.7 第二种写法记了两条"
 "$PO" ack dev_a "$BID" "我也回" >/dev/null
 "$PO" ack dev_a "$BID2" "我也回二" >/dev/null
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3; kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
 grep -ql "广播汇总" "$POSTOFFICE_HOME/dev_a/inbox/"*.md \
   && ok "v1.7 全员回执后不等截止就汇总" || bad "v1.7 全员回执后没立即汇总"
@@ -720,6 +754,7 @@ kill $PP 2>/dev/null; wait $PP 2>/dev/null
 
 # 13) 配置坏掉时不拖垮邮递员；功能停用但物理信箱照常
 printf '坏掉的{' > "$POSTOFFICE_HOME/config.json"
+age_mail
 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 3
 kill -0 $PM 2>/dev/null && ok "v1.7 坏配置不搞挂邮递员" || bad "v1.7 坏配置搞挂了邮递员"
 kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
@@ -834,6 +869,7 @@ for k in r:
 json.dump(r, open(p, "w"))
 PY
 po17_on b 2>/dev/null; chmod 555 "$P2/d2/inbox"
+age_mail
 POSTOFFICE_HOME="$P2" POSTOFFICE_ALIAS_STABLE=1 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 2.5
 kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
 recs=$(ls "$P2/broadcasts/"*.json 2>/dev/null | wc -l | tr -d ' ')
@@ -841,6 +877,7 @@ d1n=$(po17_n d1); d2n=$(po17_n d2)
 [ "$d1n" = "1" ] && ok "退修4 部分失败时先到的收件人拿到一封" || bad "退修4 部分失败时第一封没到"
 [ "$d2n" = "0" ] && ok "退修4 部分失败时失败方确实没收到" || bad "退修4 部分失败时竟然都收到了"
 chmod 755 "$P2/d2/inbox"
+age_mail
 POSTOFFICE_HOME="$P2" POSTOFFICE_ALIAS_STABLE=1 POSTOFFICE_POLL=1 "$PO" postman >/dev/null 2>&1 & PM=$!; sleep 2.5
 kill $PM 2>/dev/null; wait $PM 2>/dev/null; unset PM
 recs2=$(ls "$P2/broadcasts/"*.json 2>/dev/null | wc -l | tr -d ' ')

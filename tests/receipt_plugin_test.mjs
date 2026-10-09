@@ -53,7 +53,11 @@ try {
     status: async () => ({ data: busy ? { 'session-1': { type: 'busy' } } : {} }),
     promptAsync: async (p) => { if (boom) throw new Error('mock delivery failure'); prompts.push(p) },
   } } })
-  const scan = async () => {
+  const ageFile = async (fp, ms = 20 * 60 * 1000) => {
+  const old = new Date(Date.now() - ms)
+  await utimes(fp, old, old)
+}
+const scan = async () => {
     await plugin.event({ event: { type: 'session.idle' } })
     await settle() // 事件处理异步起 scan；等它真的做完
   }
@@ -65,34 +69,31 @@ try {
   assert.equal(prompts.length, 0, 'busy: no prompt')
   busy = false
   await scan()
-  assert.equal(prompts.length, 1, 'idle: receipt prompt')
-  const text = prompts[0].body.parts[0].text
-  assert.doesNotMatch(text, new RegExp(SENTINEL), 'receipt body must not be injected')
-  assert.match(text, /【联络总站回执｜alice】/)
-  assert.match(text, /查询：postoffice receipt 'alice' 'original'/, 'command args are POSIX-quoted')
-  assert.match(text, /默认不答复/)
-  assert.equal((text.match(/original/g) || []).length, 1, 'the lookup id appears exactly once')
-  assert.doesNotMatch(text, /归档/, 'archive command is not inlined in the reminder')
-  await scan()
-  assert.equal(prompts.length, 1, 'same receipt never redelivered')
+  // wake-coalesce 合同：普通回执永不单独唤醒——留 inbox、不认领、不标展示
+  assert.equal(prompts.length, 0, 'lone receipt: no wake, letter stays')
+  assert.ok(existsSync(join(root, 'alice/inbox/receipt.md')), 'the receipt is kept for the next ride')
 
-  // v1.6: a pending formal letter goes first and a receipt that has waited too long rides along
-  await writeFile(join(root, 'alice/inbox/20260101-000010_carol_letter.md'),
-    '来源：carol\n事由：正式信\n需要：回复\n\n正文\n')
+  // 一封「会话离开期间到达」的正式信出发时，回执搭车：一个尾部合并块，只有元数据
+  const carol = join(root, 'alice/inbox/20260101-000010_carol_letter.md')
+  await writeFile(carol, '来源：carol\n事由：正式信\n需要：回复\n\n正文\n')
+  await ageFile(carol)
   const lateReceipt = join(root, 'alice/inbox/20260101-000011_dave_notice.md')
   await writeFile(lateReceipt,
     '来源：dave\n事由：回执：另一件\n需要：回执（默认不答复）\n回执：orig2\n原事由：另一件\n\n正文\n')
-  const old = new Date(Date.now() - 20 * 60 * 1000)
-  await utimes(lateReceipt, old, old)
+  await ageFile(lateReceipt)
   await scan()
-  assert.equal(prompts.length, 2, 'formal letter delivered')
-  const merged = prompts[1].body.parts[0].text
+  assert.equal(prompts.length, 1, 'one wake: formal letter departs, receipts ride along')
+  const merged = prompts[0].body.parts[0].text
   assert.match(merged, /【联络总站新信｜alice】/, 'formal letter first')
-  assert.match(merged, /另有 1 条回执（默认不答复，需要时按 ID 查询）：/, 'receipt merged into one trailing block')
+  assert.match(merged, /另有 2 条回执（默认不答复，需要时按 ID 查询）：/, 'receipts merged into one trailing block')
+  assert.match(merged, /postoffice receipt 'alice' 'original'/, 'command args are POSIX-quoted')
   assert.match(merged, /postoffice receipt 'alice' 'orig2'/, 'merged block carries the lookup command')
-  assert.equal((merged.match(/orig2/g) || []).length, 1, 'merged lookup id appears once')
+  assert.doesNotMatch(merged, new RegExp(SENTINEL), 'receipt body must not be injected')
+  assert.match(merged, /默认不答复/)
+  assert.equal((merged.match(/original/g) || []).length, 1, 'the lookup id appears exactly once')
+  assert.doesNotMatch(merged, /postoffice archive/, 'no archive command is inlined in the reminder')
   await scan()
-  assert.equal(prompts.length, 2, 'nothing redelivered')
+  assert.equal(prompts.length, 1, 'nothing redelivered')
 
   // round 2: a retry must re-claim, otherwise two live instances each redeliver
   // 注意：每个实例启动时都会自己 scan 一轮（boot），所以先摆好文件/账本再造实例，
@@ -103,18 +104,19 @@ try {
     plugin2 = await mkInstance(prompts2, () => boom)
     const scan2 = scanner(plugin2)
     await settle() // 两个实例的 boot scan 先跑完（此时没有待投文件）
-    await writeFile(join(root, 'alice/inbox/20260101-000020_frank_letter.md'),
-      '来源：frank\n事由：需要重试的信\n需要：回复\n\n正文\n')
+    const frank = join(root, 'alice/inbox/20260101-000020_frank_letter.md')
+    await writeFile(frank, '来源：frank\n事由：需要重试的信\n需要：回复\n\n正文\n')
+    await ageFile(frank)
     boom = true
     await scan()
-    assert.equal(prompts.length, 2, 'a failed delivery pushes no prompt')
+    assert.equal(prompts.length, 1, 'a failed delivery pushes no prompt')
     const delivered = (await rows()).filter((r) => r.result === 'DELIVERED').length
     boom = false
     await Promise.all([scan(), scan2()])
-    assert.equal(prompts.length + prompts2.length, 3, 'after a failure exactly one instance retries')
+    assert.equal(prompts.length + prompts2.length, 2, 'after a failure exactly one instance retries')
     assert.equal((await rows()).filter((r) => r.result === 'DELIVERED').length, delivered + 1, 'exactly one DELIVERED row for the retried letter')
     await scan(); await scan2()
-    assert.equal(prompts.length + prompts2.length, 3, 'the retried letter is never delivered twice')
+    assert.equal(prompts.length + prompts2.length, 2, 'the retried letter is never delivered twice')
     assert.equal((await rows()).filter((r) => r.result === 'DELIVERED').length, delivered + 1, 'no extra DELIVERED row on a second scan')
   } finally {
     if (plugin2) await plugin2.dispose()
@@ -132,8 +134,9 @@ try {
     await utimes(oldReceipt, stale, stale) // 等过回执等待时限，才会随正式信一起投
     await appendFile(LEDGER, JSON.stringify({ time: new Date().toISOString(), box: 'alice',
       file: '20260101-000030_gina_receipt.md', session: 'session-1', result: 'FAILED_RETRYABLE', attempt: 1 }) + '\n')
-    await writeFile(join(root, 'alice/inbox/20260101-000031_hank_letter.md'),
-      '来源：hank\n事由：新鲜正式信\n需要：回复\n\n正文\n')
+    const hank = join(root, 'alice/inbox/20260101-000031_hank_letter.md')
+    await writeFile(hank, '来源：hank\n事由：新鲜正式信\n需要：回复\n\n正文\n')
+    await ageFile(hank)
     plugin3 = await mkInstance(prompts3, () => boom3)
     const scan3 = scanner(plugin3)
     await settle() // boot scan 触发这一批失败
@@ -159,8 +162,9 @@ try {
   const prompts4 = []
   let plugin4 = null
   try {
-    await writeFile(join(root, 'alice/inbox/20260101-000040_ivy_letter.md'),
-      '来源：ivy\n事由：记账失败测试\n需要：回复\n\n正文\n')
+    const ivy = join(root, 'alice/inbox/20260101-000040_ivy_letter.md')
+    await writeFile(ivy, '来源：ivy\n事由：记账失败测试\n需要：回复\n\n正文\n')
+    await ageFile(ivy)
     await chmod(LEDGER, 0o444) // 账本只读 → append 失败
     plugin4 = await mkInstance(prompts4, () => false)
     const scan4 = scanner(plugin4)
@@ -177,7 +181,7 @@ try {
     if (plugin4) await plugin4.dispose()
   }
 
-  console.log('PASS: offline, busy, idle metadata-only receipt, lookup command, dedup, merged trailing receipt, single-instance retry, per-file attempt counts, no resend when the ledger write fails')
+  console.log('PASS: offline/busy/lone-receipt-no-wake, ride-along metadata-only merged block, lookup command, dedup, single-instance retry, per-file attempt counts, no resend when the ledger write fails')
 } finally {
   if (plugin) await plugin.dispose()
   await rm(root, { recursive: true, force: true })

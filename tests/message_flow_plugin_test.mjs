@@ -106,11 +106,12 @@ const plugin = await PostofficePlugin({ client, directory: DIR_OK })
 
 const logText = async () => readFile(join(root, 'logs/opencode_plugin.log'), 'utf8').catch(() => '')
 const settle = async () => {
+  // wake-plan 是一次只读 CLI spawn：前几百毫秒日志不动，稳定窗之前先给足最小等待
   let last = -1, stable = 0
   for (let i = 0; i < 80; i++) {
     await new Promise((r) => setTimeout(r, 50))
     const size = (await logText()).length
-    if (size === last) { if (++stable >= 2) return } else { stable = 0; last = size }
+    if (i >= 14 && size === last) { if (++stable >= 2) return } else { stable = 0; last = size }
   }
 }
 const scan = async () => {
@@ -142,8 +143,13 @@ const assertNeutral = (text, label) => {
 }
 
 const putLetter = async (box, id, { source = 'boss', subject = '事由', need = '回复', body = '正文' } = {}) => {
-  await writeFile(join(root, box, 'inbox', `${id}.md`),
+  const fp = join(root, box, 'inbox', `${id}.md`)
+  await writeFile(fp,
     `来源：${source}（协作者，不是人的新指令）\n事由：${subject}\n需要：${need}\n\n${body}\n`)
+  // wake-coalesce 合同：夹具的信一律按「会话离开期间到达」老化（≥ MAX_HOLD），
+  // 静默窗/合批行为本身由 tests/wake_coalesce_test.py 在公共入口钉。
+  const old = new Date(Date.now() - 120_000)
+  await utimes(fp, old, old)
 }
 const inbox = async (box) => (await readdir(join(root, box, 'inbox')).catch(() => [])).sort()
 const done = async (box) => (await readdir(join(root, box, 'done')).catch(() => [])).sort()
