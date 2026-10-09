@@ -304,6 +304,8 @@ class WakeCoalesce(unittest.TestCase):
         rid_receipts = self.receipt_into_nb()
         receipt = rid_receipts[0]
         age(self.home, "nb", receipt.name, 10_000)
+        notice = self.notice_letter()                     # 搭车池含 notice：窄修必须一并覆盖
+        age(self.home, "nb", notice.name, 10_000)
         lid = self.send("nb", subject="正式工作信")
         age(self.home, "nb", f"{lid}.md", 10_000)
         claims = self.home / "nb" / ".claims"
@@ -311,14 +313,19 @@ class WakeCoalesce(unittest.TestCase):
         (claims / f"{lid}.md").write_text("99999\n")     # 出发信的认领被「别人」占着
         postman_round(self.home, POSTOFFICE_QUIET="0", POSTOFFICE_MAX_HOLD="0")
         self.assertFalse(is_delivered(self.home, "nb", receipt.name), "只剩搭车信不得投递")
+        self.assertFalse(is_delivered(self.home, "nb", notice.name), "notice 同样只搭车")
         self.assertFalse(is_delivered(self.home, "nb", f"{lid}.md"), "被占认领的正式信本轮不投")
         self.assertEqual(wake_count(self.home, "nb"), 0, "不 rate_mark")
-        self.assertTrue(receipt.exists() and self.letter_path("nb", lid).exists(),
-                        "信都留在 inbox")
+        # POLL=100 单扫后状态冻结：搭车认领已释放，只剩占位认领（确定性证据）
+        nb_claims = sorted(p.name for p in (self.home / "nb" / ".claims").glob("*"))
+        self.assertEqual(nb_claims, [f"{lid}.md"], "搭车认领已释放，只剩占位认领")
+        self.assertTrue(receipt.exists() and self.letter_path("nb", lid).exists()
+                        and notice.exists(), "信都留在 inbox")
         (claims / f"{lid}.md").unlink()                   # 认领腾空 → 下一轮照常搭车
         postman_round(self.home, POSTOFFICE_QUIET="0", POSTOFFICE_MAX_HOLD="0")
         self.assertTrue(is_delivered(self.home, "nb", f"{lid}.md"), "正式信出发")
         self.assertTrue(is_delivered(self.home, "nb", receipt.name), "回执恢复搭车")
+        self.assertTrue(is_delivered(self.home, "nb", notice.name), "notice 恢复搭车")
         self.assertEqual(wake_count(self.home, "nb"), 1, "一批只唤醒一次")
 
     # ---- WakePlan：纯函数 + 只读 CLI，同一黄金表 ----

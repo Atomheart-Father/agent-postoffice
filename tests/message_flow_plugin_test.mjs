@@ -559,6 +559,10 @@ await t('窄修：出发信认领被占 → 插件不得只带搭车信唤醒；
   const fr = join(root, box, 'inbox', receipt)
   await writeFile(fr, '来源：boss\n事由：回执：甲事\n需要：回执（默认不答复）\n回执：rid-1\n原事由：甲事\n\n正文\n')
   { const old = new Date(Date.now() - 120000); await utimes(fr, old, old) }
+  const noticeFp = join(root, box, 'inbox', 'switch_notice.md')
+  await writeFile(noticeFp, '来源：postoffice\n事由：逻辑地址 @dev 改由 w2 受理\n需要：仅告知\n' +
+    '切换事件：SW1\n广播：B1_sw1_dev\n\n这封信只报告路由变化。\n')
+  { const old = new Date(Date.now() - 120000); await utimes(noticeFp, old, old) }
   const lid = '20260101-100001_boss_正式工作信'
   await putLetter(box, lid, { subject: '正式工作信' })
   await mkdir(join(root, box, '.claims'), { recursive: true })
@@ -569,6 +573,7 @@ await t('窄修：出发信认领被占 → 插件不得只带搭车信唤醒；
   assert.deepEqual(await claims(box), [`${lid}.md`], '占位认领不受影响，搭车认领已释放')
   assert.ok(existsSync(join(root, box, 'inbox', `${lid}.md`)), '正式信留在 inbox')
   assert.ok(existsSync(join(root, box, 'inbox', receipt)), '回执留在 inbox')
+  assert.ok(existsSync(noticeFp), 'notice 留在 inbox')
   await rm(join(root, box, '.claims', `${lid}.md`))                      // 认领腾空 → 照常出发
   await scan()
   const got = promptsFor(sid).slice(before)
@@ -577,6 +582,7 @@ await t('窄修：出发信认领被占 → 插件不得只带搭车信唤醒；
   assert.ok(text.includes('正式工作信'), '正式信出发：\n' + text)
   assert.ok(text.includes('另有 1 条回执'), '回执恢复搭车：\n' + text)
   assert.ok(text.includes('rid-1'), '回执块带查询 ID')
+  assert.ok(text.includes('纯告知'), 'notice 恢复搭车：\n' + text)
 })
 
 console.log(process.exitCode ? 'FAIL' : `PASS (${n} checks)`)
