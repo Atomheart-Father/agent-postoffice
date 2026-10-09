@@ -17,7 +17,7 @@
 // （rename 原子重写属于实现细节，不是可观察契约）。
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, utimes, cp, symlink, access } from 'node:fs/promises'
-import { constants } from 'node:fs'
+import { constants, existsSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -518,6 +518,41 @@ await t('FAILURE：prompt 被接受但记账失败，不许自动重投（批）
   }
 })
 
+// ============================================================ 补3：纯告知不单独唤醒、只搭车
+await t('补3：岗位纯告知单独到达不唤醒（信保留）；与正式信同批则一次搭车', async () => {
+  const box = 'notice_a'
+  const sid = await addBox(box)
+  const notice = '20260101-090000_postoffice_切换告知.md'
+  const fp = join(root, box, 'inbox', notice)
+  await mkdir(join(root, box, 'inbox'), { recursive: true })
+  await writeFile(fp, '来源：postoffice\n事由：逻辑地址 @dev 改由 w2 受理\n需要：仅告知\n' +
+    '切换事件：SW1\n\n这封信只报告路由变化。\n')
+  let old = new Date(Date.now() - 120000); await utimes(fp, old, old)
+  await scan()
+  assert.equal(promptsFor(sid).length, 0, '只有纯告知→0 次唤醒')
+  assert.ok(existsSync(fp), 'notice 留在 inbox 等搭车')
+
+  const lid = '20260101-090001_boss_正式工作信'
+  await putLetter(box, `${lid}.md`, { subject: '正式工作信' })
+  await scan()
+  const got = promptsFor(sid).slice(-1)
+  assert.equal(got.length, 1, '正式信照常出发（不被 notice 压住）')
+  const text = textOf(got[0])
+  assert.ok(text.includes('另有 1 条纯告知（岗位/路由变化，默认无需行动）'), 'notice 搭车块：\n' + text)
+  assert.ok(text.includes('逻辑地址 @dev 改由 w2 受理'), '搭车块带来源与事由')
+  assert.ok(!text.includes('这封信只报告路由变化'), 'notice 正文不注入')
+  const esc = '20260101-090002_postoffice_升级求助.md'
+  const fe = join(root, box, 'inbox', esc)
+  await writeFile(fe, '来源：postoffice\n事由：升级：@dev 无人可接\n需要：仅告知\n' +
+    '切换事件：SW1\n升级求助：SW1\n\n这是升级求助，需要你处理。\n')
+  old = new Date(Date.now() - 120000); await utimes(fe, old, old)
+  await scan()
+  const got2 = promptsFor(sid).slice(-1)
+  assert.equal(got2.length, 1, '升级求助是行动票，单独即唤醒')
+  assert.ok(!textOf(got2[0]).includes('纯告知'), '升级求助不按 notice 渲染')
+})
+
+console.log(process.exitCode ? 'FAIL' : `PASS (${n} checks)`)
+
 await plugin.dispose()
 await rm(root, { recursive: true, force: true })
-console.log(process.exitCode ? 'FAIL' : `PASS (${n} checks)`)

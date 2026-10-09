@@ -80,8 +80,8 @@ def is_delivered(home, box, name):
     return str(Path(home) / box / "inbox" / name) in delivered_keys(home)
 
 
-def postman_round(home, seconds=1.5, **extra):
-    """单轮 postman（POLL 调大 → 只扫一次），便于精确数唤醒次数。"""
+def postman_round(home, seconds=3.0, **extra):
+    """单轮 postman（POLL 调大 → 只扫一次），便于精确数唤醒次数。seconds 要盖过解释器冷启动。"""
     return postman(home, seconds=seconds, POSTOFFICE_POLL="100", **extra)
 
 
@@ -237,6 +237,66 @@ class WakeCoalesce(unittest.TestCase):
                      encoding="utf-8")
         self.assertEqual(m.letter_kind(p), "formal", "正文里的「闹钟：」不算闹钟信")
 
+
+    # ---- 补3（T0 20261009）：岗位切换纯告知=notice，不单独唤醒、随工作信有界搭车 ----
+    def letter_path(self, box, lid):
+        return self.home / box / "inbox" / f"{lid}.md"
+
+    def notice_letter(self, name="switch_notice.md", subject="逻辑地址 @dev 改由 w2 受理"):
+        p = self.home / "nb" / "inbox" / name
+        p.write_text(f"来源：postoffice\n事由：{subject}\n需要：仅告知\n切换事件：SW1\n广播：B1_sw1_dev\n"
+                     "\n这封信只报告路由变化。\n", encoding="utf-8")
+        return p
+
+    def escalation_letter(self, name="escalation.md"):
+        p = self.home / "nb" / "inbox" / name
+        p.write_text("来源：postoffice\n事由：升级：@dev 执行岗位无人可接，请你处理\n需要：仅告知\n"
+                     "切换事件：SW1\n升级求助：SW1\n\n这是升级求助，不是纯告知。\n", encoding="utf-8")
+        return p
+
+    def test_notice_classification_is_header_only(self):
+        """分类只看信头：切换事件：→notice；升级求助：优先→formal；标题写「岗位/交接」的普通信仍是 formal。"""
+        m = load_po()
+        self.assertEqual(m.letter_kind(self.notice_letter()), "notice")
+        self.assertEqual(m.letter_kind(self.escalation_letter()), "formal",
+                         "升级求助是真正请行动的票，不得被压成 notice")
+        p = self.send("nb", subject="交接：关于岗位的普通工作信")
+        self.assertEqual(m.letter_kind(self.letter_path("nb", p)), "formal",
+                         "标题含交接/岗位不构成分类依据（伪造负例）")
+
+    def test_notice_alone_never_wakes_and_has_no_fallback_timer(self):
+        p = self.notice_letter()
+        age(self.home, "nb", p.name, 10_000)
+        postman_round(self.home)
+        self.assertFalse(is_delivered(self.home, "nb", p.name), "只有纯告知→0 次唤醒、不投递")
+        self.assertTrue(p.exists(), "notice 留在 inbox")
+        self.assertEqual(wake_count(self.home, "nb"), 0, "notice 不设超时兜底，不惊动人")
+
+    def test_notice_rides_with_a_departing_formal_letter(self):
+        p = self.notice_letter()
+        age(self.home, "nb", p.name, 10_000)
+        lid = self.send("nb", subject="正式工作信")
+        postman_round(self.home, POSTOFFICE_QUIET="0", POSTOFFICE_MAX_HOLD="0")
+        self.assertTrue(is_delivered(self.home, "nb", f"{lid}.md"), "正式信照常出发（不被 notice 压住）")
+        self.assertTrue(is_delivered(self.home, "nb", p.name), "notice 有界搭车随同批送达")
+        self.assertEqual(wake_count(self.home, "nb"), 1, "一批只唤醒一次")
+
+    def test_escalation_handoff_is_a_real_action_letter(self):
+        """③升级求助（切换事件：+升级求助：）保持 formal：单独即唤醒。"""
+        p = self.escalation_letter()
+        age(self.home, "nb", p.name, 10_000)
+        postman_round(self.home, POSTOFFICE_QUIET="0", POSTOFFICE_MAX_HOLD="0")
+        self.assertTrue(is_delivered(self.home, "nb", p.name), "升级求助不被 notice 规则压住")
+        self.assertEqual(wake_count(self.home, "nb"), 1)
+
+    def test_notice_never_pages_the_human(self):
+        """GRACE 兜底只对 formal：纯告知躺在 inbox 也不弹 20 分钟提醒。"""
+        p = self.notice_letter()
+        age(self.home, "nb", p.name, 10_000)
+        postman(self.home, seconds=3.0, POSTOFFICE_POLL="1", POSTOFFICE_GRACE="1")
+        self.assertNotIn("20 分钟", log_lines(self.home, "postman.log"), "notice 不进人侧兜底")
+
+
     # ---- WakePlan：纯函数 + 只读 CLI，同一黄金表 ----
     GOLDEN = [
         ({"candidates": [
@@ -259,6 +319,12 @@ class WakeCoalesce(unittest.TestCase):
             "now": 1091.0}, "alarm"),
         ({"candidates": [{"id": "r.md", "kind": "receipt", "mtime": 900.0}],
             "now": 1091.0}, "receipts_wait"),
+        ({"candidates": [{"id": "n.md", "kind": "notice", "mtime": 900.0}],
+            "now": 1091.0}, "notice_wait"),
+        ({"candidates": [{"id": "a.md", "kind": "formal", "mtime": 900.0},
+                         {"id": "n.md", "kind": "notice", "mtime": 950.0},
+                         {"id": "r.md", "kind": "receipt", "mtime": 960.0}],
+            "now": 1091.0}, "formal_depart_notice_receipts_ride"),
     ]
 
     def test_cli_matches_function_on_golden_table(self):
