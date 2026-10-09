@@ -510,63 +510,69 @@ class HookRateClaim(unittest.TestCase):
         会连续扫描不睡眠。不做长时压测、不改产品结构。
         """
         import threading
+        from unittest import mock
 
-        po = load_po("po_hook_wait_mod")
-        po.HOME = self.home                      # 模块常量在导入时绑定：进程内驱动要指到夹具
-        po.ROUTES = self.home / "routes.json"
-        po.QUIET = 0                             # 同上：关掉静默窗，正式信每轮都在出发集里
-        po.MAX_HOLD = 0
-        lid = self.send()
-        receipt_in = self.home / BOX / "inbox" / "wait_receipt.md"
-        receipt_in.write_text("来源：boss\n事由：回执：等待\n需要：回执（默认不答复）\n"
-                              "回执：wait-1\n原事由：等待\n\n正文\n")
-        claims = self.home / BOX / ".claims"
-        claims.mkdir(parents=True, exist_ok=True)
-        (claims / f"{lid}.md").write_text("99999\n")       # 出发信认领被占：每轮都走退让分支
+        # 测试隔离（终检门）：模块常量（HOME/ROUTES/LOGS/CONFIG/ACTIVITY_DIR/ROOT/COMMIT_LOCK…）
+        # 全部在导入那一刻从 os.environ 派生。必须在夹具 env 的作用域内**导入**，让所有派生
+        # 常量一次性落到临时 home——不逐个补常量（漏一个就会碰真实 ~/agent-postoffice）。
+        # patch.dict 只能加/盖键，弹不掉 CLAUDE_*：显式摘掉并登记恢复，对齐 env_for 的语义。
+        popped = {k: os.environ.pop(k) for k in ("CLAUDE_CODE_ENTRYPOINT",
+                                                 "CLAUDE_CODE_HOST_SESSION_ID") if k in os.environ}
+        self.addCleanup(os.environ.update, popped)
+        with mock.patch.dict(os.environ, env_for(self.home)):
+            po = load_po("po_hook_wait_mod")
+            lid = self.send()
+            receipt_in = self.home / BOX / "inbox" / "wait_receipt.md"
+            receipt_in.write_text("来源：boss\n事由：回执：等待\n需要：回执（默认不答复）\n"
+                                  "回执：wait-1\n原事由：等待\n\n正文\n")
+            claims = self.home / BOX / ".claims"
+            claims.mkdir(parents=True, exist_ok=True)
+            (claims / f"{lid}.md").write_text("99999\n")   # 出发信认领被占：每轮都走退让分支
 
-        class _Stop(Exception):
-            pass
-
-        events = []
-        real_sleep = po.time.sleep
-        real_pending = po.pending
-
-        def rec_sleep(sec):
-            events.append("sleep")
-            if events.count("sleep") >= 2:
-                raise _Stop()
-            real_sleep(0)
-
-        def rec_pending(name):
-            events.append("scan")
-            if len(events) > 40:
-                raise _Stop()
-            return real_pending(name)
-
-        po.time.sleep = rec_sleep
-        po.pending = rec_pending
-        self.addCleanup(setattr, po, "time", po.time)
-        tp = self.home / "t.jsonl"
-        tp.write_text(json.dumps({"type": "custom-title", "customTitle": TITLE}))
-        import io
-        old_stdin = po.sys.stdin
-        po.sys.stdin = io.StringIO(json.dumps({"transcript_path": str(tp)}))
-        err_box = []
-
-        def drive():
-            try:
-                po.cmd_hook([])
-            except _Stop:
+            class _Stop(Exception):
                 pass
-            except BaseException as e:                     # pragma: no cover - 诊断用
-                err_box.append(repr(e))
 
-        th = threading.Thread(target=drive, daemon=True)
-        th.start()
-        th.join(timeout=15)
-        po.sys.stdin = old_stdin
-        po.time.sleep = real_sleep
-        po.pending = real_pending
+            events = []
+            real_sleep = po.time.sleep
+            real_pending = po.pending
+
+            def rec_sleep(sec):
+                events.append("sleep")
+                if events.count("sleep") >= 2:
+                    raise _Stop()
+                real_sleep(0)
+
+            def rec_pending(name):
+                events.append("scan")
+                if len(events) > 40:
+                    raise _Stop()
+                return real_pending(name)
+
+            po.time.sleep = rec_sleep
+            po.pending = rec_pending
+            self.addCleanup(setattr, po, "time", po.time)
+            tp = self.home / "t.jsonl"
+            tp.write_text(json.dumps({"type": "custom-title", "customTitle": TITLE}))
+            import io
+            old_stdin = po.sys.stdin
+            po.sys.stdin = io.StringIO(json.dumps({"transcript_path": str(tp)}))
+            err_box = []
+
+            def drive():
+                try:
+                    po.cmd_hook([])
+                except _Stop:
+                    pass
+                except BaseException as e:                 # pragma: no cover - 诊断用
+                    err_box.append(repr(e))
+
+            th = threading.Thread(target=drive, daemon=True)
+            th.start()
+            th.join(timeout=15)
+            po.sys.stdin = old_stdin
+            po.time.sleep = real_sleep
+            po.pending = real_pending
+        self.assertFalse(th.is_alive(), "驱动线程必须已经退出")
         self.assertFalse(err_box, f"驱动线程不得以其他异常收场：{err_box}")
         self.assertGreaterEqual(events.count("scan"), 2, "至少要观察到两轮扫描才算是证据")
         scans = [i for i, e in enumerate(events) if e == "scan"]
