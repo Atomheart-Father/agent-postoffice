@@ -143,6 +143,11 @@ const claim = async (box: string, file: string) => {
   }
 }
 
+// Release a claim this instance took (narrow-fix ride bail-out and failed deliveries).
+const releaseClaim = async (box: string, file: string) => {
+  await rm(`${ROOT}/${box}/.claims/${file}`, { force: true })
+}
+
 // Neutral single-letter wake head, rebuilt from parsed fields — never echo the raw 来源 line:
 // an old letter may still carry the retired parenthetical identity assertion, and the wake must
 // not re-inject it. The letter file is untouched; only this summary is regenerated.
@@ -535,6 +540,16 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           claimed.push(g)
         }
         if (!claimed.length) continue
+        // 窄修（Codex 复检 2842549）：搭车信（回执/纯告知）只随「计划内出发信」走。
+        // 出发信（formal/闹钟，即 wake-plan 的 deliver 集）全部认领失败时，释放本轮全部
+        // 搭车 claim：不投、不记账、不标展示，信留 inbox——绝不允许只剩回执的批次。
+        if (dec.alarm_round !== true) {
+          const depart = new Set(dec.deliver ?? [])
+          if (!claimed.some((g) => depart.has(g.file))) {
+            for (const g of claimed) await releaseClaim(box, g.file)
+            continue
+          }
+        }
         const claimedFormal = claimed.filter((g) => g.kind !== "receipt" && g.kind !== "notice").map((g) => g.file)
         const claimedReceipts = claimed.filter((g) => g.kind === "receipt")
           .map((g) => receipts.find((r) => r.file === g.file)!).filter(Boolean)
