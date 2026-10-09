@@ -23,20 +23,26 @@ PO = str(Path(__file__).resolve().parent.parent / "postoffice")
 BASE = Path(tempfile.mkdtemp(prefix="po_retract_"))
 
 
+    # wake-coalesce：旧夹具按「信随到随投」书写；静默窗/合批由 wake_coalesce_test 专测，这里关窗。
 def run_po(*args, home=None, stdin=None, timeout=60):
     env = dict(os.environ)
     env["POSTOFFICE_HOME"] = str(home or BASE)
     env["POSTOFFICE_NO_NOTIFY"] = "1"
+    env["POSTOFFICE_QUIET"] = "0"
+    env["POSTOFFICE_MAX_HOLD"] = "0"
     return subprocess.run([sys.executable, PO, *args], capture_output=True, text=True,
                           env=env, input=stdin, timeout=timeout)
 
 
+    # wake-coalesce：旧夹具按「信随到随投」书写；静默窗/合批由 wake_coalesce_test 专测，这里关窗。
 def hook(home, transcript, wait=12):
     """Really run `postoffice hook` and hand back its exit code: 2 = it woke the session,
     0 = it walked away, 124 = it was still watching when we gave up (nothing to wake about)."""
     env = dict(os.environ)
     env["POSTOFFICE_HOME"] = str(home)
     env["POSTOFFICE_NO_NOTIFY"] = "1"
+    env["POSTOFFICE_QUIET"] = "0"
+    env["POSTOFFICE_MAX_HOLD"] = "0"
     payload = json.dumps({"transcript_path": str(transcript)})
     p = subprocess.Popen([sys.executable, PO, "hook"], stdin=subprocess.PIPE,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
@@ -56,6 +62,8 @@ def postman(home, timeout=60):
     env = dict(os.environ)
     env["POSTOFFICE_HOME"] = str(home)
     env["POSTOFFICE_NO_NOTIFY"] = "1"
+    env["POSTOFFICE_QUIET"] = "0"
+    env["POSTOFFICE_MAX_HOLD"] = "0"
     env["POSTOFFICE_POLL"] = "1"
     p = subprocess.Popen([sys.executable, PO, "postman"], env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -499,7 +507,8 @@ class Retract(unittest.TestCase):
             retract = subprocess.Popen(
                 [sys.executable, PO, "retract", "boss", box, lid],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                env=dict(os.environ, POSTOFFICE_HOME=str(self.home), POSTOFFICE_NO_NOTIFY="1"))
+                env=dict(os.environ, POSTOFFICE_HOME=str(self.home), POSTOFFICE_NO_NOTIFY="1",
+                        POSTOFFICE_QUIET="0", POSTOFFICE_MAX_HOLD="0"))
             dout, _ = delivery.communicate(timeout=60)
             _, rerr = retract.communicate(timeout=60)
             claimed = "CLAIM True" in dout

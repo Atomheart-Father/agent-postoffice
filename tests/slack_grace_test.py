@@ -68,6 +68,9 @@ def env_for(home, **extra):
     env["POSTOFFICE_HOME"] = str(home)
     env["POSTOFFICE_NO_NOTIFY"] = "1"
     env["POSTOFFICE_POLL"] = "1"
+    # wake-coalesce：夹具信按「随到随投」书写；静默窗/合批由 wake_coalesce_test 专测，这里关窗。
+    env["POSTOFFICE_QUIET"] = "0"
+    env["POSTOFFICE_MAX_HOLD"] = "0"
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     env.pop("CLAUDE_CODE_HOST_SESSION_ID", None)
     env.pop("POSTOFFICE_SLACK_WEBHOOK", None)

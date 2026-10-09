@@ -73,7 +73,8 @@ POLL = int(os.environ.get("POSTOFFICE_POLL", 10))   # seconds between inbox chec
 RATE_N, RATE_WIN = 6, 600   # at most 6 wakes per mailbox per 10 minutes
 GRACE = int(os.environ.get("POSTOFFICE_GRACE", 1200))  # hook/plugin mailbox not woken within 20 min → tell the human
 CONSUME_ALERT = int(os.environ.get("POSTOFFICE_CONSUME_ALERT", 1800))  # reminded but still in inbox after 30 min → tell the human
-RECEIPT_WAIT = int(os.environ.get("POSTOFFICE_RECEIPT_WAIT", 600))  # a merged receipt block waits at most 10 min before riding along
+QUIET = int(os.environ.get("POSTOFFICE_QUIET", 45))    # 新正式信静默窗：最近一封静默满此秒数才出发（可调初始值）
+MAX_HOLD = int(os.environ.get("POSTOFFICE_MAX_HOLD", 150))  # 主动等待上限：最老一封等到此秒数必出发（可调初始值）
 MAX_FORMAL_BATCH = 20       # at most this many ordinary letters per single wake; the rest go next round
 HOOK_TIMEOUT = 7 * 24 * 3600  # explicit timeout for the async Claude hook (seconds)
 ALIAS_STABLE = int(os.environ.get("POSTOFFICE_ALIAS_STABLE", 60))  # a new alias target must hold this long before a switch is announced
@@ -327,15 +328,42 @@ def notify(title, text):
         pass
 
 
+def _read_head(path):
+    """Header block of a letter, read without ever hanging on a slow/FIFO file.
+
+    Regular files read normally (we stop at the blank line instead of swallowing the body).
+    A FIFO (fixture parking, exotic writer) is probed non-blocking: bytes already there are
+    parsed; if the writer has sent nothing yet we judge from what we have and treat the letter
+    as ordinary — the real render, after the claim, still reads it the normal way, which is
+    where a parked FIFO is meant to stop the delivery side. Wake loops must never stall here.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return ""
+    try:
+        chunks = b""
+        while b"\n\n" not in chunks:
+            try:
+                chunk = os.read(fd, 65536)
+            except (BlockingIOError, OSError):
+                break               # no bytes yet (or raced away): parse what we have
+            if not chunk:
+                break
+            chunks += chunk
+            if len(chunks) > (1 << 20):
+                break               # pathological header: stop, never trust it with more
+        return chunks.decode("utf-8", errors="replace")
+    finally:
+        os.close(fd)
+
+
 def header_field(path, key):
     """Value of a `key：…` line inside the header block only (everything before the blank line).
 
     Never matched from the body, so a letter cannot forge a receipt or broadcast marker.
     """
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
+    text = _read_head(path)
     for line in text.split("\n\n", 1)[0].splitlines():
         if line.startswith(key):
             return line[len(key):].strip()
@@ -348,10 +376,7 @@ def header_field_present(path, key):
     Distinguishes "this letter says nothing about broadcasts" from "this letter claims to be a
     broadcast copy but the value is blank", which must not be treated as an ordinary letter.
     """
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
+    text = _read_head(path)
     return any(line.startswith(key) for line in text.split("\n\n", 1)[0].splitlines())
 
 
@@ -423,6 +448,66 @@ def mail_split(files):
     for p in files:
         (receipts if receipt_query_id(p) else formal).append(p)
     return formal, receipts
+
+
+def letter_kind(path):
+    """'receipt' | 'alarm' | 'formal' — header block only; a body can never forge either.
+
+    One non-blocking head read for the whole classification: wake loops call this per letter per
+    poll, and the delivery race is decided right after it, so keep the pre-claim work minimal.
+    """
+    head = _read_head(path).split("\n\n", 1)[0].splitlines()
+    has_receipt = any(line.startswith("回执：") for line in head)
+    if has_receipt:
+        return "receipt"
+    if any(line.startswith("闹钟：") for line in head):
+        return "alarm"
+    return "formal"
+
+
+def wake_plan(items, now, *, quiet=None, max_hold=None, batch=None, pending_exists=False):
+    """唯一唤醒选择器（纯函数，无副作用、不认领）：postman / Claude hook / OpenCode 插件三端共用。
+
+    items: [{"id": 稳定引用, "kind": "formal"|"receipt"|"alarm", "mtime": float}]，收件箱顺序。
+    返回 {"deliver": [id…], "carry_receipts": [id…], "hold_until": float|None,
+          "alarm_round": bool, "reason": str}。
+    只做选择：claim / rate_mark / presented 仍由调用方在接受后做；结果不是投递授权——
+    消费前 adapter 仍要重核绑定、信存在与认领。资格过滤属于 adapter（本函数只对传入集合做选择）。
+    规则：新正式信出发=最近一封静默 ≥ quiet，或最老已等 ≥ max_hold，或 adapter 报告已有可更新
+    pending（及时并入，不因窗口错过忙碌合并）；未满足→hold_until，本轮不认领不记限流不标展示。
+    回执永不单独出发、无兜底计时，只在正式信出发时搭车（有界，超量留下轮）。
+    闹钟只在没有正式信出发（或正式信仍在窗内）时独占一轮，不与正式信同轮，不受窗口拖延。
+    """
+    quiet = QUIET if quiet is None else quiet
+    max_hold = MAX_HOLD if max_hold is None else max_hold
+    batch = MAX_FORMAL_BATCH if batch is None else batch
+    formal = [i for i in items if i.get("kind") == "formal"]
+    receipts = [i for i in items if i.get("kind") == "receipt"]
+    alarms = [i for i in items if i.get("kind") == "alarm"]
+    plan = {"deliver": [], "carry_receipts": [], "hold_until": None,
+            "alarm_round": False, "reason": ""}
+    if formal:
+        depart = [i["id"] for i in formal[:batch]]
+        carry = [i["id"] for i in receipts[:batch]]
+        oldest = min(i["mtime"] for i in formal)
+        newest = max(i["mtime"] for i in formal)
+        if pending_exists:
+            return {**plan, "deliver": depart, "carry_receipts": carry,
+                    "reason": "pending_merge"}
+        if now - newest >= quiet:
+            return {**plan, "deliver": depart, "carry_receipts": carry,
+                    "reason": "quiet_elapsed"}
+        if now - oldest >= max_hold:
+            return {**plan, "deliver": depart, "carry_receipts": carry,
+                    "reason": "max_hold"}
+        if alarms:
+            return {**plan, "deliver": [alarms[0]["id"]], "alarm_round": True,
+                    "reason": "alarm_bypass"}
+        return {**plan, "hold_until": min(oldest + max_hold, newest + quiet),
+                "reason": "quiet"}
+    if alarms:
+        return {**plan, "deliver": [alarms[0]["id"]], "alarm_round": True, "reason": "alarm"}
+    return {**plan, "reason": "receipts_wait"}   # 只回执（或空集）：不唤醒、无兜底计时
 
 
 def _receipt_item(name, p):
@@ -1185,6 +1270,35 @@ def _codex_add_batches(app, thread_id, box, items, entries):
         known = known + [{"clientUserMessageId": cid}]
         pending = overflow
     return added
+
+
+def codex_pending_exists(r, name, _cache={}):
+    """该 Codex 线程是否还有本箱可更新的 pending 提醒（只读查询；结果缓存 30 秒）。
+
+    供 postman 在 WakePlan 判 hold 时作为 pending_exists 输入：已有可更新项就绕过静默窗
+    及时并入。查询失败或分页不完整一律按「没有」处理——宁可多等一个静默窗，也不在未知
+    状态下绕窗触发写操作。
+    """
+    cli = r.get("codex_cli") or find_codex()
+    key = (cli, r.get("thread_id") or "", name)
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit[0] < 30:
+        return hit[1]
+    found = False
+    try:
+        app = CodexAppServer(cli, timeout=30)
+        try:
+            app.initialize()
+            items, _complete = _codex_find_items(app, key[1], CODEX_PENDING_PREFIX + name)
+            found = bool(items)
+        finally:
+            app.close()
+    except Exception as e:
+        log("postman.log", f"codex pending 查询失败 {name}：{str(e)[:120]}（按没有处理）")
+        found = False
+    _cache[key] = (now, found)
+    return found
 
 
 def codex_queue_deliver(cli, thread_id, box, files, merge=True, timeout=60):
@@ -3065,6 +3179,32 @@ def cmd_archive(a):
     return 0
 
 
+def cmd_wake_plan(a):
+    """只读唤醒决策：候选集由 adapter（postman/hook/插件）过滤后经 stdin 传入。
+
+    正文 {"now": 秒, "candidates": [{"id","kind","mtime"}…], "pending_exists": bool?}。
+    不读信件、不初始化文件、不 claim/rate_mark/presented——输出是纯决策，不是投递授权；
+    消费前调用方仍要重核绑定、信存在与认领。输入不合法 exit 非零并给一行原因。
+    """
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        sys.exit("wake-plan：stdin 不是合法 JSON")
+    items = data.get("candidates")
+    if not isinstance(items, list) or any(
+            not isinstance(i, dict)
+            or not isinstance(i.get("id"), str)
+            or i.get("kind") not in ("formal", "receipt", "alarm")
+            or not isinstance(i.get("mtime"), (int, float))
+            for i in items):
+        sys.exit("wake-plan：candidates 必须是 [{id: str; kind: formal|receipt|alarm; mtime: number}]")
+    now = data.get("now", time.time())
+    if not isinstance(now, (int, float)) or isinstance(now, bool):
+        sys.exit("wake-plan：now 必须是数字（秒）")
+    print(json.dumps(wake_plan(items, now, pending_exists=bool(data.get("pending_exists"))),
+                     ensure_ascii=False))
+
+
 def retract_refusal(name, path, method, skip_claim=False):
     """(code, text) for one channel; code "" means that channel has not accepted the letter yet.
 
@@ -4312,7 +4452,19 @@ def cmd_hook(_a):
         activity_touch(name, "claude_hook", act_binding)
         if online(r):
             seen = read_lines(seenf)
-            new = [p for p in pending(name) if str(p) not in seen]
+            allnew = [p for p in pending(name) if str(p) not in seen]
+            # 唤醒选择走唯一 WakePlan：回执不单独叫醒；新正式信静默窗合批（闹钟独占轮除外）。
+            # 撤回/收信可能在 listing 之后、取属性之前把信拿走：逐封容错跳过，绝不让监视进程崩掉。
+            plan_items = []
+            for p in allnew:
+                try:
+                    plan_items.append({"id": p.name, "kind": letter_kind(p),
+                                       "mtime": p.stat().st_mtime})
+                except OSError:
+                    continue
+            plan = wake_plan(plan_items, time.time())
+            ids = set(plan["deliver"]) | set(plan.get("carry_receipts") or [])
+            new = [p for p in allnew if p.name in ids]
             if new:
                 if rate_ok(name):
                     # 只有「限流放行」并且「抢到认领」的那些才唤醒，两个条件缺一不可：
@@ -4497,9 +4649,8 @@ def cmd_postman(_a):
                         start = max(p.stat().st_mtime, float(r.get("online_since", 0) or 0))
                         if done:
                             log("postman.log", f"{method} {name} {p.name} 已送达")
-                        elif field(p, "闹钟："):
-                            continue        # an alarm ringing while the session is legitimately busy
-                                              # is normal; it waits in inbox/ without paging anyone
+                        elif letter_kind(p) != "formal":
+                            continue        # 闹钟响着忙、回执等待搭车都是常态，不为它们惊动人
                         elif time.time() - start > GRACE:
                             notify(f"联络总站：{name} 20 分钟未被唤醒", field(p, "事由") or p.name)
                             log("postman.log", f"{method} {name} {p.name} 超 20 分钟未送达，已通知人")
@@ -4510,25 +4661,29 @@ def cmd_postman(_a):
                             continue
                         mark(key)
                     continue
-                # codex_queue / notify: one batch of ordinary letters (≤ MAX_FORMAL_BATCH) per wake,
-                # receipts merge into one trailing block; an alarm letter keeps its own single round
+                # codex_queue / notify：唤醒选择走唯一 WakePlan（三端同一规则）。
+                # 回执永不单独出发、无兜底计时；新正式信静默窗合批；闹钟独占一轮。
                 leftovers = [p for p in pending(name) if str(p) not in delivered]
-                formal, receipts = mail_split(leftovers)
-                ordinary = [p for p in formal if not field(p, "闹钟：")]
-                alarms = [p for p in formal if field(p, "闹钟：")]
-                if ordinary:
-                    # with letters: only receipts that have waited long enough ride along
-                    candidates = ordinary[:MAX_FORMAL_BATCH] \
-                        + [p for p in receipts if time.time() - p.stat().st_mtime > RECEIPT_WAIT]
-                    alarm_round = False
-                elif alarms:
-                    candidates = [alarms[0]]      # the alarm reminder stays a lone round, no receipts
-                    alarm_round = True
-                else:
-                    candidates = list(receipts)   # no letters: receipts go on their own
-                    alarm_round = False
+                by_id = {}
+                items = []
+                for p in leftovers:
+                    try:
+                        mt = p.stat().st_mtime
+                    except OSError:
+                        continue
+                    by_id[p.name] = p
+                    items.append({"id": p.name, "kind": letter_kind(p), "mtime": mt})
+                plan = wake_plan(items, time.time())
+                if plan.get("hold_until") and method == "codex_queue" \
+                        and any(i["kind"] == "formal" for i in items) \
+                        and codex_pending_exists(r, name):
+                    # Codex 已有可更新 pending：adapter 显式交给选择器，绕过合批等待及时并入
+                    plan = wake_plan(items, time.time(), pending_exists=True)
+                candidates = [by_id[i] for i in plan["deliver"] + plan["carry_receipts"]
+                              if i in by_id]
+                alarm_round = bool(plan.get("alarm_round"))
                 if not candidates:
-                    continue
+                    continue                  # 窗内/只回执：本轮不认领、不记限流、不标展示
                 if not rate_ok(name):
                     if name not in throttled:
                         notify("联络总站：投递暂停", f"{name} 10 分钟内信件过多")
@@ -5523,6 +5678,9 @@ def main():
     p.add_argument("box", help="本信箱")
     p.add_argument("id", metavar="信件编号", help="完整编号（文件名去掉 .md）；不接受路径、通配符或前缀")
     p.set_defaults(fn=cmd_archive)
+    p = sp.add_parser("wake-plan", help="只读：给出该箱此刻的唤醒计划（JSON）。候选集经 stdin 传入，不读信、不认领、不落任何文件")
+    p.add_argument("box", help="信箱名（只作计划标识，不做任何写操作）")
+    p.set_defaults(fn=cmd_wake_plan)
     p = sp.add_parser("alarm-set", help="给一个 OpenCode 会话设一次性闹钟（由插件工具调用；在内核锁内改记录）")
     p.add_argument("--box", required=True, help="该会话绑定的信箱")
     p.add_argument("--session", required=True, help="OpenCode 会话 ID")

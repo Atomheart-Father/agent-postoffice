@@ -76,7 +76,11 @@ class FakeSlack(http.server.BaseHTTPRequestHandler):
 def env_for(home, **extra):
     env = dict(os.environ)
     env["POSTOFFICE_HOME"] = str(home)
+    # wake-coalesce：旧夹具按「信随到随投」的旧世界书写；合批/静默窗本身由
+    # tests/wake_coalesce_test.py 专测。这里关掉窗口（0/0），保持旧用例语义不变。
     env["POSTOFFICE_NO_NOTIFY"] = "1"
+    env["POSTOFFICE_QUIET"] = "0"
+    env["POSTOFFICE_MAX_HOLD"] = "0"
     env["POSTOFFICE_POLL"] = "1"
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
     env.pop("CLAUDE_CODE_HOST_SESSION_ID", None)
@@ -202,7 +206,9 @@ class SlackAlert(unittest.TestCase):
                      encoding="utf-8")
         self.round_(webhook=self.webhook_url)
         self.assertEqual(self.slack_requests(), [], "回执通知不是正式信，不许触发告警")
-        self.assertIn(str(p), self.delivered(), "正面对照：回执通知本身照常投递入账")
+        # wake-coalesce 合同：只回执不出发——信留在 inbox、不入账（不投不叫醒），等正式信搭车
+        self.assertTrue(p.exists(), "回执通知留在 inbox 等搭车")
+        self.assertNotIn(str(p), self.delivered(), "只回执不投递、不记账")
 
     def test_webhook_secret_never_leaks(self):
         lid = self.send("chief", "coder", "机密卫生")

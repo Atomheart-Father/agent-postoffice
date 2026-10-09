@@ -242,7 +242,12 @@ class Behavior(unittest.TestCase):
     def send(self, to, sender="coder", subject="测试信", need="回复", body="正文\n"):
         out = run_po("send", to, sender, subject, need, home=self.home, stdin=body)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        return re.search(r"编号：(\S+)", out.stdout).group(1)
+        lid = re.search(r"编号：(\S+)", out.stdout).group(1)
+        # wake-coalesce 合同：夹具信按「会话离开期间到达」老化；静默窗本身由 wake_coalesce_test 专测
+        fp = self.home / to / "inbox" / f"{lid}.md"
+        old = fp.stat().st_mtime - 1000
+        os.utime(fp, (old, old))
+        return lid
 
     def write_dotenv(self, text):
         (self.home / ".env").write_text(text, encoding="utf-8")

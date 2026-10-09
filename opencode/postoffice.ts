@@ -45,8 +45,8 @@ const POLL_MS = 10_000
 const RATE_N = 6
 const RATE_WIN_MS = 600_000
 const MAX_ATTEMPTS = 2
-const MAX_FORMAL_BATCH = 20   // ordinary letters per single wake; the rest go out next round
-const RECEIPT_WAIT_MS = Number(process.env.POSTOFFICE_RECEIPT_WAIT || 600) * 1000
+// 唤醒选择规则唯一实现在 postoffice CLI（`wake-plan`，纯函数 WakePlan）；本插件只做资格过滤
+// （ledger 终态、本会话归属、自己的闹钟 id）与投递动作，不再自带批上限/回执等待等重复常量。
 const ALARM_MIN = 1
 const ALARM_MAX = 1440
 const ALARM_TEXT = "你设的闹钟到了，请检查刚才安排的任务。"
@@ -324,7 +324,7 @@ const loadZod = async (): Promise<Zod | null> => {
   }
 }
 
-const runCLI = (args: string[], timeout = 20_000): Promise<{ code: number; text: string }> =>
+const runCLI = (args: string[], timeout = 20_000, input?: string): Promise<{ code: number; text: string }> =>
   new Promise((resolve) => {
     // 找不到可执行文件是一种要如实回答的状态，不是抛给模型的异常：下面 execute() 会把它
     // 变成一句中文说明。spawn 对空/不可执行的 file 会同步抛，那会让整个工具 reject。
@@ -345,6 +345,10 @@ const runCLI = (args: string[], timeout = 20_000): Promise<{ code: number; text:
       const timer = setTimeout(() => child.kill("SIGKILL"), timeout)
       child.stdout.on("data", (d) => (out += d))
       child.stderr.on("data", (d) => (out += d))
+      if (input !== undefined) {
+        child.stdin.write(input)
+        child.stdin.end()
+      }
       child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, text: String(e) }) })
       child.on("close", (code) => { clearTimeout(timer); resolve({ code: code ?? -1, text: out.trim() }) })
     } catch (e) {
@@ -455,6 +459,7 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
         const formal: Formal[] = []   // ordinary letters: batchable
         const alarms: Formal[] = []   // this session's own alarm reminders: never batched
         const receipts: Item[] = []
+        const cands: (Item & { kind: "formal" | "receipt" | "alarm" })[] = []
         for (const file of todo) {
           const key = `${box}::${file}`
           if ((ledger.failed.get(key) ?? 0) >= MAX_ATTEMPTS) continue
@@ -474,27 +479,47 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           }
           const id = fieldOf("回执：")
           const alarmId = fieldOf("闹钟：")
-          if (id) receipts.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: receiptSubject(fieldOf), id, mtime })
-          else if (alarmId && ownAlarm && ownAlarm.id === alarmId && file === `${alarmId}.md`) {
+          if (id) {
+            receipts.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: receiptSubject(fieldOf), id, mtime })
+            cands.push({ file, src: "", subj: "", id, mtime, kind: "receipt" })
+          } else if (alarmId && ownAlarm && ownAlarm.id === alarmId && file === `${alarmId}.md`) {
             // 闹钟提醒：只渲染那句固定常量，正文一个字节都不读、不注入
             alarms.push({ file, src: "postoffice", subj: "闹钟", id: alarmId, mtime, alarm: true })
-          } else formal.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: fieldOf("事由："), id: "", mtime })
+            cands.push({ file, src: "postoffice", subj: "闹钟", id: alarmId, mtime, kind: "alarm" })
+          } else {
+            formal.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: fieldOf("事由："), id: "", mtime })
+            cands.push({ file, src: "", subj: "", id: "", mtime, kind: "formal" })
+          }
         }
-        // 一批普通正式信（≤ MAX_FORMAL_BATCH）优先；没有普通信时，本会话自己的闹钟提醒独占一轮；
-        // 再没有才轮到回执。抢不到认领的那几封这一轮不投，但不会挡住后面的信（跳过继续收集）。
-        const quota = formal.slice(0, MAX_FORMAL_BATCH)
-        const alarmRound = quota.length === 0 && alarms.length > 0
-        const due = quota.length
-          ? receipts.filter((r) => Date.now() - r.mtime > RECEIPT_WAIT_MS)
-          : (alarmRound ? [] : receipts)
-        const group: { file: string; isReceipt: boolean }[] = (quota.length
-          ? quota.map((f) => ({ file: f.file, isReceipt: false }))
-          : alarmRound ? [{ file: alarms[0].file, isReceipt: false }] : [])
-          .concat(due.map((r) => ({ file: r.file, isReceipt: true })))
-        if (!group.length) continue
+        // 唤醒选择走唯一 WakePlan（`postoffice wake-plan`，只读纯函数）：本插件只做资格过滤
+        // （ledger 终态 / 本会话归属 / 自己的闹钟 id 已在上面完成）与投递动作，不再自带
+        // 批上限/回执等待/闹钟独占等第二份规则。只传头部元数据，不传正文，不扫全局。
         const now = Date.now()
         const win = (recent.get(box) ?? []).filter((t) => now - t < RATE_WIN_MS)
         if (win.length >= RATE_N) continue
+        const planRes = await runCLI(["wake-plan", box], 20_000, JSON.stringify({
+          now: now / 1000,
+          candidates: cands.map((c) => ({ id: c.file, kind: c.kind, mtime: c.mtime / 1000 })),
+        }))
+        if (planRes.code !== 0) {
+          await log(`wake-plan 不可用（code=${planRes.code}）：${planRes.text.slice(0, 160)}；信件保留，不投递、不标已展示、不悄悄退回旧规则`)
+          continue
+        }
+        let dec: { deliver?: string[]; carry_receipts?: string[]; alarm_round?: boolean; hold_until?: number | null }
+        try {
+          dec = JSON.parse(planRes.text)
+        } catch {
+          await log(`wake-plan 输出不是 JSON：${planRes.text.slice(0, 160)}；信件保留，不投递`)
+          continue
+        }
+        const planned = new Set([...(dec.deliver ?? []), ...(dec.carry_receipts ?? [])])
+        await log(`wake-plan ${box} deliver=${(dec.deliver ?? []).length} ` +
+          `carry=${(dec.carry_receipts ?? []).length} hold=${dec.hold_until ?? "null"} ` +
+          `alarm=${!!dec.alarm_round} reason=${dec.reason ?? "?"}（cands=${cands.length}）`)
+        if (!planned.size) continue          // 仍在静默窗内 / 只回执：不叫醒、不认领、不记展示
+        const group: { file: string; isReceipt: boolean }[] =
+          cands.filter((c) => planned.has(c.file))
+            .map((c) => ({ file: c.file, isReceipt: c.kind === "receipt" }))
         // 每次投递前都认领：失败时已释放认领，所以重试照样能拿到；
         // 抢不到说明别的实例正在投这封，跳过（否则多实例会各投一次）
         const claimed: { file: string; isReceipt: boolean }[] = []

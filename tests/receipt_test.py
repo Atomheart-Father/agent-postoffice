@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import re
 import subprocess
 import tempfile
 import time
@@ -37,7 +38,9 @@ class ReceiptFlow(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / 'po'
-        self.env = dict(os.environ, POSTOFFICE_HOME=str(self.home), POSTOFFICE_NO_NOTIFY='1')
+        # wake-coalesce：非回执用例关掉静默窗保持旧语义；纯回执不出发的合同由 wake_coalesce_test 钉
+        self.env = dict(os.environ, POSTOFFICE_HOME=str(self.home), POSTOFFICE_NO_NOTIFY='1',
+                        POSTOFFICE_QUIET='0', POSTOFFICE_MAX_HOLD='0')
         self.run_po('init')
         self.run_po('add', 'alice', '--notify')
         self.run_po('add', 'bob', '--notify')
@@ -68,6 +71,24 @@ class ReceiptFlow(unittest.TestCase):
         t.write_text(json.dumps({'type': 'custom-title', 'customTitle': title}))
         return t
 
+
+    def formal_companion(self, box, sender='carol', subject='需要回复的正事'):
+        """wake-coalesce 合同下的夹具伴随：一封老化的正式信让回执得以搭车出发。"""
+        out = self.run_po('send', box, sender, subject, '回复', body='正式事由')
+        fp = next(p for p in (self.home / box / 'inbox').glob('*.md')
+                  if '回执' not in p.name and '汇总' not in p.name and p.name.endswith(f'{subject}.md') is False) \
+            if False else None
+        lid = re.search(r"编号：(\S+)", out.stdout).group(1)
+        fp = self.home / box / 'inbox' / f'{lid}.md'
+        old = fp.stat().st_mtime - 1000
+        os.utime(fp, (old, old))
+        return fp
+
+    def ride_block(self, stderr):
+        """取回执搭车块（「另有 N 条回执」行到末尾）——断言只对该块做，不掺正式信自身内容。"""
+        i = stderr.find('另有 ')
+        return stderr[i:] if i >= 0 else ''
+
     def hook(self, transcript):
         return self.run_po('hook', body=json.dumps({'transcript_path': str(transcript)}), check=False)
 
@@ -82,16 +103,18 @@ class ReceiptFlow(unittest.TestCase):
         self.run_po('ack', 'bob', original.stem, SENTINEL)
         receipt = next((self.home / 'alice/inbox').glob('*.md'))
         t = self.as_claude('alice', 'Receipt Slice')
+        self.formal_companion('alice')
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn(SENTINEL, result.stderr)
-        self.assertIn('【联络总站回执', result.stderr)
-        self.assertIn('查询：' + query_cmd('alice', original.stem), result.stderr)
-        self.assertIn('默认不答复', result.stderr)
-        # receipt reminder: 3 lines, the lookup id appears exactly once, no path/archive/body
-        self.assertEqual(result.stderr.count(original.stem), 1)
-        self.assertNotIn(str(receipt), result.stderr)
-        self.assertNotIn('归档', result.stderr)
+        ride = self.ride_block(result.stderr)
+        self.assertIn('另有 1 条回执', ride, ride)
+        self.assertIn('查询：' + query_cmd('alice', original.stem), ride)
+        self.assertIn('默认不答复', ride)
+        # 搭车块内：lookup id 恰好一次、无路径/归档/正文
+        self.assertEqual(ride.count(original.stem), 1)
+        self.assertNotIn(str(receipt), ride)
+        self.assertNotIn('归档', ride)
         got = self.run_po('receipt', 'alice', original.stem)
         self.assertIn(SENTINEL, got.stdout)
         self.assertIn('来源：bob', got.stdout)
@@ -228,12 +251,13 @@ class ReceiptFlow(unittest.TestCase):
         # 邮递员跑，否则邮递员会先用默认的 notify 通道把这封汇总信认领掉，钩子就永远叫不醒它。
         t = self.as_claude('alice', 'Broadcast Receipt')
         self.run_postman()
-        summaries = list((self.home / 'alice/inbox').glob('*.md'))
+        summaries = [p for p in (self.home / 'alice/inbox').glob('*.md') if '汇总' in p.name or '回执' in p.name]
         self.assertEqual(len(summaries), 1, summaries)
         summary = summaries[0].read_text()
         self.assertNotIn('B-NOTE-1', summary)
         self.assertNotIn('B-NOTE-2', summary)
         self.assertIn(query_cmd('alice', bid), summary)
+        self.formal_companion('alice')          # 回执不单独出发：伴随正式信搭车
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn('B-NOTE-1', result.stderr)
@@ -254,6 +278,7 @@ class ReceiptFlow(unittest.TestCase):
                         'kind': 'letter', 'note': SENTINEL, 'to': 'alice'}, ensure_ascii=False) + '\n' +
             json.dumps({'time': '2026-01-01 00:00:00', 'by': 'bob', 'id': 'old-id-2',
                         'kind': 'letter', 'to': 'alice'}, ensure_ascii=False) + '\n')
+        self.formal_companion('alice')          # 回执不单独出发：伴随正式信搭车
         result = self.hook(t)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn(SENTINEL, result.stderr)
@@ -314,14 +339,19 @@ class ReceiptFlow(unittest.TestCase):
         original = next((home / 'bob/inbox').glob('*.md'))
         run('ack', 'bob', original.stem, SENTINEL)
         run('add', 'alice', '--claude', 'Quote Test')
+        # 回执不单独出发：补一封老化的正式信作搭车伴随
+        run('send', 'alice', 'carol', '正式事由', '回复', body='正式')
+        formal = next(p for p in (home / 'alice/inbox').glob('*_carol_*.md'))
+        old = formal.stat().st_mtime - 1000
+        os.utime(formal, (old, old))
         t = Path(self.tmp.name) / 'quote.jsonl'
         t.write_text(json.dumps({'type': 'custom-title', 'customTitle': 'Quote Test'}))
         res = subprocess.run([os.sys.executable, str(PO), 'hook'],
                              input=json.dumps({'transcript_path': str(t)}),
                              text=True, capture_output=True, env=env, timeout=HOOK_TIMEOUT)
         self.assertEqual(res.returncode, 2)
-        line = lambda p: next(l[len(p):] for l in res.stderr.splitlines() if l.startswith(p))
-        query = line('查询：')
+        # 搭车形态里查询挂在条目行尾（"- src：subj  查询：…"），按行内切分提取
+        query = next(l.split('查询：', 1)[1] for l in res.stderr.splitlines() if '查询：' in l)
         shell_env = dict(env, PATH=str(PO.parent) + os.pathsep + env.get('PATH', ''))
         got = subprocess.run(['sh', '-c', query], text=True, capture_output=True,
                              env=shell_env, timeout=HOOK_TIMEOUT)
@@ -330,7 +360,9 @@ class ReceiptFlow(unittest.TestCase):
         # archive is now a CLI call, not an inlined shell line: it moves only this box's notification
         (home / 'alice/done').mkdir(parents=True, exist_ok=True)
         run('archive-receipt', 'alice', original.stem)
-        self.assertEqual(list((home / 'alice/inbox').glob('*.md')), [])
+        # 归档只动回执那封：搭车伴随的正式信按合同留下
+        left = list((home / 'alice/inbox').glob('*.md'))
+        self.assertEqual([p.name for p in left], [formal.name], left)
         self.assertTrue(list((home / 'alice/done').glob('*.md')))
 
     # --- codex queue mock: the third reminder path ---------------------------------
@@ -370,9 +402,12 @@ class ReceiptFlow(unittest.TestCase):
         self.run_po('send', 'bob', 'carol', '需要回复的核查', '回复', body='请核查')
         original = next((self.home / 'bob/inbox').glob('*.md'))
         self.run_po('ack', 'bob', original.stem, SENTINEL)
+        # 回执不单独出发：补一封老化的正式信作搭车伴随
+        self.formal_companion('carol')
         self.run_postman()
         text = cap.read_text()
         self.assertNotIn(SENTINEL, text)
+        self.assertIn('另有 1 条回执', text, text)
         self.assertIn(query_cmd('carol', original.stem), text)
 
 
