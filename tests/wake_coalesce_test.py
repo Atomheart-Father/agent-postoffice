@@ -229,6 +229,33 @@ class WakeCoalesce(unittest.TestCase):
         self.assertFalse(is_delivered(self.home, "nb", alarm.name), "闹钟不与正式信同轮")
         self.assertTrue(alarm.exists(), "闹钟留下轮独占")
 
+    def test_alarm_round_carries_neither_notices_nor_receipts(self):
+        """主管口径校准（终检补充①）：闹钟轮既不携 notice 也不气回执——独占、固定极短句。
+
+        用例钉死 alarm+notice → deliver=[alarm]、carry=[]；真入口同样验证：notice 留箱等
+        下一封普通 formal，闹钟照常单独出发。报告口径：补3 的 notice 只随普通 formal 搭车。
+        """
+        m = load_po()
+        notice = self.notice_letter()
+        now = time.time()
+        plan = m.wake_plan([
+            {"id": "alarmtest.md", "kind": "alarm", "mtime": now},
+            {"id": notice.name, "kind": "notice", "mtime": now},
+            {"id": "r.md", "kind": "receipt", "mtime": now},
+        ], now)
+        self.assertEqual(plan["deliver"], ["alarmtest.md"], "闹钟独占出发")
+        self.assertEqual(plan["carry_receipts"], [], "闹钟轮不携任何搭车信（notice/回执都不带）")
+        self.assertTrue(plan["alarm_round"])
+
+        alarm = self.alarm_letter()
+        age(self.home, "nb", notice.name, 10_000)
+        age(self.home, "nb", alarm.name, 0)          # 闹钟到期以信件 mtime 计（与既有闹钟用例同口径）
+        postman_round(self.home)
+        self.assertEqual(wake_count(self.home, "nb"), 1, "只闹钟一轮")
+        self.assertTrue(is_delivered(self.home, "nb", alarm.name), "闹钟单独出发")
+        self.assertTrue(notice.exists() and not is_delivered(self.home, "nb", notice.name),
+                        "notice 留箱，等下一封普通 formal 搭车")
+
     # ---- 第0步：信头分类只认信头块，正文伪造「闹钟」无效 ----
     def test_forged_alarm_in_body_is_formal(self):
         m = load_po()
