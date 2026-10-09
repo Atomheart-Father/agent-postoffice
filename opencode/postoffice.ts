@@ -487,7 +487,11 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           const alarmId = fieldOf("闹钟：")
           // 补3：纯岗位/路由切换告知（切换事件：头，且没有升级求助：头）= notice，
           // 不单独唤醒、只随正式信搭车；分类只看程序信头，标题写「岗位/交接」不算。
-          const isNotice = !id && fieldOf("切换事件：") !== "" && fieldOf("升级求助：") === ""
+          // 终检②：notice 是双条件——还必须是系统来源（来源：postoffice），否则任何
+          // peer 都能借一个伪造信头把自己的信压成永不出发的纯告知；非系统来源留 formal。
+          const isNotice = !id
+            && fieldOf("来源：").split("（")[0].trim() === "postoffice"
+            && fieldOf("切换事件：") !== "" && fieldOf("升级求助：") === ""
           if (id) {
             receipts.push({ file, src: fieldOf("来源：").split("（")[0].trim(), subj: receiptSubject(fieldOf), id, mtime })
             cands.push({ file, src: "", subj: "", id, mtime, kind: "receipt" })

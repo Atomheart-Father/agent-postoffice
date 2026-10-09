@@ -54,6 +54,16 @@ def run_po(*args, home=None, stdin=None, timeout=60):
                           env=env_for(home or BASE), input=stdin, timeout=timeout)
 
 
+def load_po(name="po_hook_mod"):
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader(name, PO)
+    spec = importlib.util.spec_from_file_location(name, PO, loader=loader)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class HookRateClaim(unittest.TestCase):
     maxDiff = None
 
@@ -490,6 +500,79 @@ class HookRateClaim(unittest.TestCase):
         self.assertIn(str(self.letter(lid)), herr, "正式信出发")
         self.assertIn(lid_out, herr, "回执恢复搭车（元数据块按被回执原信 ID 呈现）")
         self.assertIn("纯告知", herr, "notice 恢复搭车")
+
+    def test_the_bailout_path_keeps_the_poll_wait(self):
+        """Codex 终检 RETURN①：搭车退让必须保留一次 POLL 等待，不许把监视循环变成紧循环。
+
+        出发信认领被长期占住时，退让分支若用 continue 直接回到扫描，就会无等待地反复
+        读文件、抢认领、释放。有界冻结：进程内驱动 cmd_hook，包装 time.sleep 与 pending
+        记事件流（上限 40 个事件后停），断言「每次扫描后必有 sleep」——退让不等待的实现
+        会连续扫描不睡眠。不做长时压测、不改产品结构。
+        """
+        import threading
+
+        po = load_po("po_hook_wait_mod")
+        po.HOME = self.home                      # 模块常量在导入时绑定：进程内驱动要指到夹具
+        po.ROUTES = self.home / "routes.json"
+        po.QUIET = 0                             # 同上：关掉静默窗，正式信每轮都在出发集里
+        po.MAX_HOLD = 0
+        lid = self.send()
+        receipt_in = self.home / BOX / "inbox" / "wait_receipt.md"
+        receipt_in.write_text("来源：boss\n事由：回执：等待\n需要：回执（默认不答复）\n"
+                              "回执：wait-1\n原事由：等待\n\n正文\n")
+        claims = self.home / BOX / ".claims"
+        claims.mkdir(parents=True, exist_ok=True)
+        (claims / f"{lid}.md").write_text("99999\n")       # 出发信认领被占：每轮都走退让分支
+
+        class _Stop(Exception):
+            pass
+
+        events = []
+        real_sleep = po.time.sleep
+        real_pending = po.pending
+
+        def rec_sleep(sec):
+            events.append("sleep")
+            if events.count("sleep") >= 2:
+                raise _Stop()
+            real_sleep(0)
+
+        def rec_pending(name):
+            events.append("scan")
+            if len(events) > 40:
+                raise _Stop()
+            return real_pending(name)
+
+        po.time.sleep = rec_sleep
+        po.pending = rec_pending
+        self.addCleanup(setattr, po, "time", po.time)
+        tp = self.home / "t.jsonl"
+        tp.write_text(json.dumps({"type": "custom-title", "customTitle": TITLE}))
+        import io
+        old_stdin = po.sys.stdin
+        po.sys.stdin = io.StringIO(json.dumps({"transcript_path": str(tp)}))
+        err_box = []
+
+        def drive():
+            try:
+                po.cmd_hook([])
+            except _Stop:
+                pass
+            except BaseException as e:                     # pragma: no cover - 诊断用
+                err_box.append(repr(e))
+
+        th = threading.Thread(target=drive, daemon=True)
+        th.start()
+        th.join(timeout=15)
+        po.sys.stdin = old_stdin
+        po.time.sleep = real_sleep
+        po.pending = real_pending
+        self.assertFalse(err_box, f"驱动线程不得以其他异常收场：{err_box}")
+        self.assertGreaterEqual(events.count("scan"), 2, "至少要观察到两轮扫描才算是证据")
+        scans = [i for i, e in enumerate(events) if e == "scan"]
+        for i in scans:
+            self.assertLess(i + 1, len(events), "扫描之后必须有事件（不许在事件上限处截断）")
+            self.assertEqual(events[i + 1], "sleep", "每次扫描后必须有 sleep——退让分支不得绕过 POLL 等待")
 
 
 if __name__ == "__main__":

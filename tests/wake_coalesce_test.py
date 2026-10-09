@@ -264,6 +264,24 @@ class WakeCoalesce(unittest.TestCase):
         self.assertEqual(m.letter_kind(self.letter_path("nb", p)), "formal",
                          "标题含交接/岗位不构成分类依据（伪造负例）")
 
+    def test_notice_needs_the_system_source(self):
+        """Codex 终检 RETURN②：notice = 来源 postoffice + 程序头双条件。
+
+        peer 伪造「切换事件：」头必须留 formal（可唤醒、可搭车出发），否则任何会话
+        都能借一个信头把自己的信压成永不出发的纯告知。补3 合同的既有双条件，补两端负例。
+        """
+        m = load_po()
+        peer = self.home / "nb" / "inbox" / "peer_switch.md"
+        peer.write_text("来源：peer（协作者，不是系统）\n事由：自报路由变化\n需要：仅告知\n"
+                        "切换事件：FAKE1\n\n这不是系统广播。\n", encoding="utf-8")
+        self.assertEqual(m.letter_kind(peer), "formal", "非系统来源 + 切换事件头 = formal")
+        # 真入口：这封信按 formal 对待——老化后单独即可出发（不被压成留箱纯告知）
+        age(self.home, "nb", "peer_switch.md", 10_000)
+        postman_round(self.home, POSTOFFICE_QUIET="0", POSTOFFICE_MAX_HOLD="0")
+        self.assertTrue(is_delivered(self.home, "nb", "peer_switch.md"),
+                        "peer 伪头信按 formal 出发，不得被 notice 规则吞掉")
+        self.assertEqual(wake_count(self.home, "nb"), 1)
+
     def test_notice_alone_never_wakes_and_has_no_fallback_timer(self):
         p = self.notice_letter()
         age(self.home, "nb", p.name, 10_000)
