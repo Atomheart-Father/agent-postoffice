@@ -34,7 +34,9 @@ task, and do not collect or upload any secrets.
 4. Register my sessions: give them names, then `postoffice add <name> --claude|--opencode|--codex ...`,
    and check with `postoffice list` and `postoffice doctor`.
 5. Verify send/receive: send a test letter to yourself or another session and confirm it wakes the
-   recipient within 10 s, with receipts and filing working.
+   recipient within 10 s, with receipts and filing working (10 s is the observed normal idle path;
+   busy, offline or not-loaded sessions are not covered — a busy session is delivered when its turn
+   ends, as measured in v1.14).
 6. Report back briefly: what you installed, who you registered, the verification result, and what
    you need from me.
 ```
@@ -321,6 +323,7 @@ This section corresponds to version **v1.14** (2026-10-08); the scope is the pos
 | Claude Desktop: without an explicit timeout the hook is killed after 10 minutes | Observed (a v1.0 bug; v1.1 sets 7 days) |
 | Claude Desktop: with the long timeout, still wakes after 30+ minutes idle | Measured: watcher alive 33 min, woken 3 s after mail arrived |
 | Claude Desktop: Stop or rewind in the app kills the session's background process and its watcher | Observed (see "Known limitations") |
+| Claude Desktop (v1.14 isolated integration, 2026-10-09): during a busy ~90 s tool turn all 3 letters were delivered without interrupting the turn, none lost or duplicated, receipt bodies not injected, default no-reply; the actual reminder payload count was 2 — the first letter arriving mid-turn produced one queued wake (absorbed when the turn ended) plus one Stop-hook reminder batching the remaining 2. "Three letters → one payload" and "zero early wake while busy" are NOT proven and not claimed | One real isolated integration (isolated test env + temp post office; evidence kept privately) |
 | OpenCode: idle session gets the reminder within 10 s | Observed repeatedly |
 | Codex cross-round batching: while busy, notifications from several rounds merge into ONE pending item (`clientUserMessageId=postoffice:<box>`) so the session receives one index with every ID in a single round; `rejected` (explicit refusal) and `unknown` (lost response) are kept apart and unknown is never blindly retried; bounded pagination locates this box's item; full-batch overflow continues without dropping letters; a single formal reminder also carries a copyable reference | `tests/message_flow_test.py` (35 checks via a protocol-level fake channel) plus ONE real isolated desktop integration: the T0 test window actually consumed a batch containing three IDs, verbatim identical to the pending-side result |
 | v1.14 org escalation and exact filing: `escalation_role` separates execution backups from a single-level escalation acceptor (the acceptor never gets the original role's ACTIVE, and recovery never re-sends already-delivered mail); `postoffice archive <box> <id>` files one exact ID (idempotent / rejects path·glob·cross-box / collision never overwrites); the STATUS freshness hint is read-only and fails soft when a pointer is unreadable | `tests/maintenance_batch_test.py` (13 checks) and `tests/hierarchy_test.py` (9 checks, old candidate semantics unchanged) |
