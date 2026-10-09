@@ -462,6 +462,9 @@ class HookRateClaim(unittest.TestCase):
         r = run_po("ack", "boss", lid_out, "copy that", home=self.home)
         self.assertEqual(r.returncode, 0, r.stderr)
         receipt = next(p for p in (self.home / BOX / "inbox").glob("*.md"))
+        notice = self.home / BOX / "inbox" / "switch_notice.md"
+        notice.write_text("来源：postoffice\n事由：逻辑地址 @dev 改由 w2 受理\n需要：仅告知\n"
+                          "切换事件：SW1\n广播：B1_sw1_dev\n\n这封信只报告路由变化。\n")
         lid = self.send()                                     # 正式信（env QUIET=0：立即出发）
         claims = self.home / BOX / ".claims"
         claims.mkdir(parents=True, exist_ok=True)
@@ -471,13 +474,22 @@ class HookRateClaim(unittest.TestCase):
         self.assertNotIn(str(self.letter(lid)), herr, "唤醒负载里不得出现任何信")
         self.assertNotIn(str(receipt), herr, "搭车信也不得出现在唤醒负载里")
         self.assertEqual(self.seen(), [], "不写 .seen")
-        self.assertTrue(receipt.exists() and self.letter(lid).exists(), "信都留在 inbox")
-        self.assertEqual(self.claims(), [f"{lid}.md"], "占位认领不受影响，搭车认领已释放")
+        self.assertTrue(receipt.exists() and self.letter(lid).exists() and notice.exists(),
+                        "信都留在 inbox")
+        # 钩子是持续监视循环，kill 冻结在哪一拍是概率性的；认领释放的确定性证据在
+        # postman 负例（POLL=100 单扫后冻结）里钉，这里只断言不随竞态翻转的不变量。
+        self.assertIn(f"{lid}.md", self.claims(), "占位认领不被投递方动过")
+        # kill 可能正好冻在「已认领、未释放」的一拍：留下骑手陈旧认领。生产语义是
+        # fail-safe（死持有者的认领安全地挡住重投，绝不双投）；夹具清掉它以测出发路径。
+        for c in claims.glob("*"):
+            if c.name != f"{lid}.md":
+                c.unlink(missing_ok=True)
         (claims / f"{lid}.md").unlink()                       # 认领腾空 → 下一轮照常出发
         hrc, herr = self.run_hook(wait=10)
         self.assertEqual(hrc, 2, "认领腾空后照常唤醒")
         self.assertIn(str(self.letter(lid)), herr, "正式信出发")
         self.assertIn(lid_out, herr, "回执恢复搭车（元数据块按被回执原信 ID 呈现）")
+        self.assertIn("纯告知", herr, "notice 恢复搭车")
 
 
 if __name__ == "__main__":
