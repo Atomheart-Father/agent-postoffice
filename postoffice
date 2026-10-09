@@ -469,10 +469,12 @@ def letter_kind(path):
     poll, and the delivery race is decided right after it, so keep the pre-claim work minimal.
 
     补3（T0 20261009）：`切换事件：` marks a pure role/routing switch notice → "notice" (never
-    wakes alone; rides with a departing formal letter). `升级求助：` marks the escalation variant
-    that really asks the recipient to act → "formal", checked BEFORE the notice header so an
-    action ticket is never suppressed. A subject merely containing 岗位/交接 is NOT evidence —
-    letters without these program headers stay formal.
+    wakes alone; rides with a departing formal letter) — but ONLY from the system source
+    (来源：postoffice): notice is a dual condition (system source + program header), so a peer
+    cannot suppress its own letter into a never-departing pure notice by forging the header.
+    `升级求助：` marks the escalation variant that really asks the recipient to act → "formal",
+    checked BEFORE the notice header so an action ticket is never suppressed. A subject merely
+    containing 岗位/交接 is NOT evidence — letters without these program headers stay formal.
     """
     head = _read_head(path).split("\n\n", 1)[0].splitlines()
     if any(line.startswith("回执：") for line in head):
@@ -481,7 +483,9 @@ def letter_kind(path):
         return "alarm"
     if any(line.startswith("升级求助：") for line in head):
         return "formal"
-    if any(line.startswith("切换事件：") for line in head):
+    source = next((line[len("来源："):].split("（", 1)[0].strip() for line in head
+                   if line.startswith("来源：")), "")
+    if source == "postoffice" and any(line.startswith("切换事件：") for line in head):
         return "notice"
     return "formal"
 
@@ -4542,7 +4546,11 @@ def cmd_hook(_a):
                     if new and not any(p.name in depart_ids for p in new):
                         for p in new:
                             release_claim(name, p)
-                        continue          # 只剩搭车信：不唤醒，也不落进下面的「限流暂停」分支
+                        # 只剩搭车信：不唤醒，也不落进下面的「限流暂停」分支。退让必须保留
+                        # 一次 POLL 等待——出发信认领可能被长期占用（投递方慢、死持有者的
+                        # fail-safe 认领），continue 直回扫描会把监视循环变成无等待紧循环。
+                        time.sleep(POLL)
+                        continue
                     if new:
                         sys.stderr.write(reminder(name, new) + "\n")
                         with seenf.open("a") as f:
