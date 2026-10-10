@@ -23,6 +23,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -331,9 +332,11 @@ def atomic_write(path, data, *, mode=None):
     Promises ONLY the whole-file swap: the temp file is unique to this call (pid + random), so
     concurrent writers — different processes, or the same process racing itself — never share
     one; the swap is `os.replace` (atomic on the same filesystem); a failed attempt removes its
-    own temp and re-raises the original error. `mode` (e.g. 0o600) is applied to the temp before
-    the swap, so the published file never carries wider permissions than asked, even in the
-    window before it. The parent directory must already exist (callers own that).
+    own temp and re-raises the original error. Permissions: an explicit `mode` (e.g. 0o600)
+    wins and is applied to the temp before the swap, so the published file never carries wider
+    permissions than asked, even in the window before it. Without an explicit `mode` an existing
+    target keeps its old permissions (inherited onto the temp), and a brand-new file keeps the
+    old default (umask). The parent directory must already exist (callers own that).
 
     This is deliberately NOT a read-modify-write guarantee: a caller doing read-merge-write
     still needs its business lock (presented_update's per-box flock, commit_lock for routes);
@@ -344,12 +347,20 @@ def atomic_write(path, data, *, mode=None):
     tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
     fd = None
     try:
+        effective = mode
+        if effective is None:
+            try:
+                # 票面合同：已有文件默认保留旧权限（umask 022 下更新 0600 文件不得变 0644）；
+                # 显式 mode 优先；新文件走旧默认（umask 决定）。权限在发布（replace）前设置。
+                effective = stat.S_IMODE(os.stat(p).st_mode)
+            except OSError:
+                effective = None                     # 新文件：不给 chmod，维持原默认行为
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             fd = None                       # fdopen owns the fd now
             f.write(data)
-            if mode is not None:
-                os.fchmod(f.fileno(), mode)
+            if effective is not None:
+                os.fchmod(f.fileno(), effective)
         os.replace(str(tmp), str(p))
     except BaseException:
         if fd is not None:
