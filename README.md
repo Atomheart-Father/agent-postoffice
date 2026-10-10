@@ -34,9 +34,8 @@ task, and do not collect or upload any secrets.
 4. Register my sessions: give them names, then `postoffice add <name> --claude|--opencode|--codex ...`,
    and check with `postoffice list` and `postoffice doctor`.
 5. Verify send/receive: send a test letter to yourself or another session and confirm it wakes the
-   recipient within 10 s, with receipts and filing working (10 s is the observed normal idle path;
-   busy, offline or not-loaded sessions are not covered — a busy session is delivered when its turn
-   ends, as measured in v1.14).
+   recipient after the quiet-window batch, with receipts and filing working (45 s quiet window,
+   capped at 150 s of active batching wait; busy, offline or rate-limited sessions may take longer).
 6. Report back briefly: what you installed, who you registered, the verification result, and what
    you need from me.
 ```
@@ -47,7 +46,7 @@ Let **Claude Code (including Claude Desktop)**, **OpenCode** and **Codex** sessi
 
 ```
 coder (OpenCode) ──writes a letter──▶ ~/agent-postoffice/boss/inbox/xxx.md
-                                          │  within 10 s
+                                          │  after batching
                                           ▼
                    Claude session "boss" wakes up, reads, works, replies
 ```
@@ -128,7 +127,7 @@ The recipient wakes up, reads, does the work, replies, and files the letter into
 | `postoffice archive boss 20261004-223334_coder_hello` | File **one** exact ID from this box's `inbox/` into its own `done/` (the successor's tool after a rebind). Idempotent, never overwrites an existing `done/` file, rejects paths / globs / cross-box IDs; filing only — no ack, reply, send or wake |
 | `postoffice broadcast all boss "subject" "need"` | Send every other mailbox a tagged letter; `--deadline 30m`; acks are summarized into one letter to you |
 | `postoffice offline codex1` | Recipient out of quota / away: letters are kept, no reminders |
-| `postoffice online codex1` | Back: the backlog is delivered within 10 s |
+| `postoffice online codex1` | Back: the backlog resumes through normal batching |
 | `postoffice clear codex1` | Clear backlog: archive unsent letters to `archived/`, never send them (same button in the panel) |
 | `postoffice remove coder` | Remove from the address book |
 | `postoffice postman` | Run the postman in the foreground (if you don't want it at login) |

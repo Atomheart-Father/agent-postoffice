@@ -37,7 +37,7 @@
 
 ```
 小A（OpenCode）──写一封信──▶ ~/agent-postoffice/boss/inbox/xxx.md
-                                   │  10 秒内
+                                   │  合批后
                                    ▼
                     Claude 会话「总负责」被叫醒，读信、干活、回信
 ```
@@ -118,7 +118,7 @@ MSG
 | `postoffice archive boss 20261004-223334_coder_hello` | 按本箱**精确编号**归档一封：`inbox/ → done/`；只认裸编号（不接受路径、通配符或 `.md`），不跨箱、不覆盖、不回执、不发信、不叫醒——换绑后的接任者用它逐封处理旧 `inbox` 信 |
 | `postoffice broadcast <信箱列表\|all> <我的信箱> "<事由>" "<需要>"` | 广播：每人一封带编号的信，`--deadline 30m` 设截止，回执汇总成一封 |
 | `postoffice offline codex1` | 对方没额度/下线：信照收，不提醒 |
-| `postoffice online codex1` | 恢复：积压的信 10 秒内补送 |
+| `postoffice online codex1` | 恢复：积压的信按正常合批规则补送 |
 | `postoffice clear codex1` | 清空积压：把还没送出的信存档到 `archived/`，不再发（面板上有同名按钮） |
 | `postoffice remove coder` | 从通讯录移除 |
 | `postoffice postman` | 前台运行邮递员（不想用开机自启时） |
