@@ -224,6 +224,42 @@ await t('恢复接缝：官方仅上下文入口注入一次身份提示，busy 
   assert.equal(state.ctxPrompts.length, beforeCtx + 1, '同一会话不再重复注入')
 })
 
+await t('终检②：归属查询慢不翻转到达顺序（busy→idle 乱序复现，终态=idle）', async () => {
+  // 真实公共 event 入口：busy 事件的归属查询慢 150ms、idle 事件 0ms——顺序必须按「到达」登记，
+  // 终态=最后到达的事件（f0feb89 曾把终态翻转成 working）。先恢复 BOX→OWN_SID 绑定
+  //（上一例把它改成了 THIRD_SID）。
+  await writeFile(join(root, 'routes.json'), JSON.stringify({
+    [BOX]: { methods: ['opencode_plugin'], session_id: OWN_SID, status: 'online' },
+  }))
+  await settle(60)
+  let gets = 0
+  const slow = {
+    ...client,
+    session: {
+      ...client.session,
+      get: async ({ path }) => {
+        if (path.id !== OWN_SID) throw new Error('no such session')
+        gets += 1
+        if (gets === 1) await new Promise((r) => setTimeout(r, 150))   // 首查（busy）慢
+        return { data: { directory: DIR_OK } }
+      },
+    },
+  }
+  const p2 = await PostofficePlugin({ client: slow, directory: DIR_OK })
+  // 并发发射：busy 起跑但不等（它的归属查询要 150ms），idle 先处理完——
+  // 只有真并发才暴露「先到后被查询延迟反超」的乱序；逐个 await 的话旧代码也顺序成立。
+  const busyRun = p2.event(statusEvent(OWN_SID, 'busy'))
+  await p2.event(idleEvent(OWN_SID))
+  await busyRun
+  await settle(400)
+  const act = await readActivity()
+  assert.ok(act, '活动文件必须存在')
+  assert.equal(act.state, 'idle',
+    `终态必须是最后到达的事件（busy 的慢归属查询不得翻转顺序）：${JSON.stringify(act)}`)
+  assert.equal(act.binding, OWN_SID, JSON.stringify(act))
+  await p2.dispose()
+})
+
 await plugin.dispose()
 await rm(root, { recursive: true, force: true })
 console.log(process.exitCode ? 'FAIL' : `PASS (${n} checks)`)
