@@ -260,6 +260,40 @@ await t('终检②：归属查询慢不翻转到达顺序（busy→idle 乱序�
   await p2.dispose()
 })
 
+// 窄复检 RETURN（1335d27）：身份 hint 曾在活动链内 await prompt——挂起的 hint 拖住整条链，
+// 后到事件（跨箱也一样）的 presence 被扣住。合同：链只串「归属核验+presence」，hint 在链外。
+await t('窄复检：pending 的身份 hint 不挡后续活动更新', async () => {
+  await writeFile(join(root, 'routes.json'), JSON.stringify({
+    [BOX]: { methods: ['opencode_plugin'], session_id: OWN_SID, status: 'online' },
+  }))
+  await settle(60)
+  let releaseHint
+  const gate = new Promise((r) => { releaseHint = r })
+  let hintStarted = false
+  const stuck = {
+    ...client,
+    session: {
+      ...client.session,
+      prompt: async (p) => { hintStarted = true; state.ctxPrompts.push(p); await gate; return { data: {} } },
+    },
+  }
+  const p3 = await PostofficePlugin({ client: stuck, directory: DIR_OK })
+  void p3.event(idleEvent(OWN_SID))            // 首次 idle：触发 hint，prompt 挂起不返回
+  await settle(150)
+  assert.ok(hintStarted, '夹具：hint 已走到 prompt 并挂起')
+  try {
+    void p3.event(statusEvent(OWN_SID, 'busy')) // 后到事件：不 await——旧代码它会挂在链内 gate 上
+    await settle(150)
+    const act = await readActivity()
+    assert.equal(act?.state, 'working',
+      `挂起的 hint 不得挡住后续活动更新：${JSON.stringify(act)}`)
+  } finally {
+    releaseHint()                              // 旧代码会让 event() 挂在链内 prompt 上：必须放行才能收尾
+    await settle(50)
+    await p3.dispose()
+  }
+})
+
 await plugin.dispose()
 await rm(root, { recursive: true, force: true })
 console.log(process.exitCode ? 'FAIL' : `PASS (${n} checks)`)
