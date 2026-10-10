@@ -15,6 +15,7 @@ import fcntl
 import hashlib
 import json
 import os
+import uuid
 import platform
 import re
 import select
@@ -116,9 +117,7 @@ def load_routes():
 
 
 def save_routes(routes):
-    tmp = ROUTES.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(routes, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(ROUTES)
+    atomic_write(ROUTES, json.dumps(routes, ensure_ascii=False, indent=2) + "\n")
 
 
 def boxes(routes):
@@ -212,9 +211,7 @@ def activity_lock(name):
 
 
 def _activity_commit(name, rec):
-    tmp = activity_path(name).with_name(f"{name}.json.tmp-{os.getpid()}")
-    tmp.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(activity_path(name))
+    atomic_write(activity_path(name), json.dumps(rec, ensure_ascii=False))
 
 
 def activity_write(name, state, source, binding):
@@ -326,6 +323,45 @@ def notify(title, text):
             subprocess.run(["notify-send", title, text], capture_output=True, timeout=10)
     except Exception:
         pass
+
+
+def atomic_write(path, data, *, mode=None):
+    """Replace `path` with `data` as one whole-file step — the single entry for content writes.
+
+    Promises ONLY the whole-file swap: the temp file is unique to this call (pid + random), so
+    concurrent writers — different processes, or the same process racing itself — never share
+    one; the swap is `os.replace` (atomic on the same filesystem); a failed attempt removes its
+    own temp and re-raises the original error. `mode` (e.g. 0o600) is applied to the temp before
+    the swap, so the published file never carries wider permissions than asked, even in the
+    window before it. The parent directory must already exist (callers own that).
+
+    This is deliberately NOT a read-modify-write guarantee: a caller doing read-merge-write
+    still needs its business lock (presented_update's per-box flock, commit_lock for routes);
+    this function only makes each published version appear whole. Symlink swaps and mode-plain
+    copies are intentionally out of scope.
+    """
+    p = Path(path)
+    tmp = p.with_name(f".{p.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    fd = None
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None                       # fdopen owns the fd now
+            f.write(data)
+            if mode is not None:
+                os.fchmod(f.fileno(), mode)
+        os.replace(str(tmp), str(p))
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        raise
 
 
 def _read_head(path):
@@ -688,9 +724,7 @@ def write_letter(to, sender, subject, need, body, extra_headers=(), name=None):
              f"事由：{subject}", f"需要：{need}"] + list(extra_headers)
     text = "\n".join(lines) + f"\n\n{body.rstrip()}\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write(path, text)
     return path
 
 
@@ -842,27 +876,39 @@ def read_presented(name):
 
 
 def presented_update(name, add=(), remove=()):
-    """Union `add`, drop `remove`, atomically rewrite. Best effort: a lost update is safe.
+    """Union `add`, drop `remove`, atomically rewrite under the per-box presented lock.
 
     The common path is: a channel accepted a wake → union the ids in; archive-current → drop the
-    ones it filed. A per-box O_EXCL lock keeps concurrent read-modify-writes from losing each
-    other; if the lock cannot be had we still write (last writer wins). Losing an add only means
-    the letter will not be auto-archived (it stays in inbox, visible); losing a remove only leaves
-    a stale id that a later run cleans up. Neither direction loses or re-delivers mail.
+    ones it filed. This is a read-modify-write, so it holds a per-box `flock` on
+    `<box>/.presented.lock` for the WHOLE section (read → merge → publish): concurrent updaters
+    serialize instead of losing each other. If the lock cannot be had within ~2s we DO NOT write
+    (no lockless fallback — a fallback write is exactly how an update gets lost under a slow
+    holder); we log and return False. Failing to record `add` only means the letter will not be
+    auto-archived (it stays in inbox, visible); failing to record `remove` leaves a stale id a
+    later run cleans up. Neither direction loses or re-delivers mail. The lock FILE itself is
+    kept (never unlinked): the kernel releases the flock when the fd dies, so there is no stale
+    lock to clean and no unlink/create race.
     """
     d = HOME / name
     try:
         d.mkdir(parents=True, exist_ok=True)
     except OSError:
         return False
-    lock = d / ".presented.lock"
+    lock_path = d / ".presented.lock"
     fd = None
     try:
-        for _ in range(40):                      # ~2s, then write anyway
+        deadline = time.time() + 2.0             # bounded wait, then give up WITHOUT writing
+        while True:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
             try:
-                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except FileExistsError:
+            except OSError:
+                os.close(fd)
+                fd = None
+                if time.time() >= deadline:
+                    log("postman.log", f"presented 锁被长期占用，本次不写（不影响投递）：{name}")
+                    return False
                 time.sleep(0.05)
         ids, err = read_presented(name)
         if err:
@@ -872,20 +918,18 @@ def presented_update(name, add=(), remove=()):
         for x in add:
             if bare_presented_id(x) and x not in merged:
                 merged.append(x)
-        tmp = d / f".presented.json.tmp-{os.getpid()}"
-        tmp.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(presented_path(name))
+        atomic_write(presented_path(name), json.dumps(merged, ensure_ascii=False))
         return True
     except OSError as e:
         log("postman.log", f"presented 更新失败（不影响投递）：{e}")
         return False
     finally:
         if fd is not None:
-            os.close(fd)
             try:
-                lock.unlink()
+                fcntl.flock(fd, fcntl.LOCK_UN)
             except OSError:
                 pass
+            os.close(fd)
 
 
 def presented_add(name, ids):
@@ -1096,9 +1140,7 @@ def codex_uncertain_save(box, rec):
     p = codex_uncertain_path(box)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.parent / (CODEX_UNCERTAIN + f".tmp-{os.getpid()}")
-        tmp.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(p)
+        atomic_write(p, json.dumps(rec, ensure_ascii=False))
     except OSError:
         pass
 
@@ -2945,9 +2987,7 @@ def cmd_config(a):
         LOGS.mkdir(parents=True, exist_ok=True)
         bk = LOGS / f"config.json.{time.strftime('%Y%m%d-%H%M%S')}.bak"
         shutil.copy2(CONFIG, bk)
-    tmp = CONFIG.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(CONFIG)                       # whole-file replace, never a merge
+    atomic_write(CONFIG, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
     print(f"已导入配置：{CONFIG}" + (f"（旧文件备份：{bk}）" if bk else ""))
     print(f"  groups {len(cfg.get('groups') or {})} 个，aliases {len(cfg.get('aliases') or {})} 个")
     return 0
@@ -3239,6 +3279,18 @@ def cmd_archive(a):
     return 0
 
 
+def cmd_presented_update(a):
+    """已展示记录的唯一写入口（票1 atomic-write）：插件不再自写 presented.json。
+
+    走 presented_update 同一把 per-box flock、同一个原子发布。任何失败都 exit 非零并给一行
+    原因——调用方（插件）只记日志、不影响投递，绝不能退回自写。
+    """
+    ok = presented_update(a.box, add=tuple(a.add), remove=tuple(a.remove))
+    if not ok:
+        sys.exit(f"presented-update：{a.box} 本次未写入（锁被占用或记录读取失败；不影响投递）")
+    print("OK")
+
+
 def cmd_wake_plan(a):
     """只读唤醒决策：候选集由 adapter（postman/hook/插件）过滤后经 stdin 传入。
 
@@ -3450,9 +3502,7 @@ def rewrite_letter(path, subject=None, need=None, body=None):
     new_body = rest if body is None else body
     if new_body and not new_body.endswith("\n"):
         new_body += "\n"
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    tmp.write_text("\n".join(out) + "\n\n" + new_body, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write(path, "\n".join(out) + "\n\n" + new_body)
 
 
 def cmd_edit(a):
@@ -3619,13 +3669,7 @@ def read_alarm(session):
 def write_alarm(rec, path=None):
     p = path or alarm_file(rec.get("session") or "")
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)      # runtime ledger: owner only
-    except OSError:
-        pass
-    tmp.replace(p)
+    atomic_write(p, json.dumps(rec, ensure_ascii=False) + "\n", mode=0o600)  # runtime ledger: owner only
 
 
 def list_alarms():
@@ -4079,9 +4123,7 @@ def summarize_broadcasts(routes):
             if not (HOME / rec.get("from", "") / "inbox").is_dir():
                 # a system-initiated broadcast has no mailbox to summarise back to; record it once, never retry
                 rec["summarized"] = True
-                tmp = f.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                tmp.replace(f)
+                atomic_write(f, json.dumps(rec, ensure_ascii=False, indent=2) + "\n")
                 log("postman.log", f"广播 {rec.get('id')} 由系统发出、无收件信箱，跳过汇总")
                 continue
             acks = broadcast_acks(rec.get("id"))
@@ -4102,9 +4144,7 @@ def summarize_broadcasts(routes):
                                 "回执（默认不答复）", "\n".join(lines),
                                 extra_headers=[f"回执：{rec.get('id')}", f"原事由：{rec.get('subject', '')}"])
             rec["summarized"] = True
-            tmp = f.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            tmp.replace(f)
+            atomic_write(f, json.dumps(rec, ensure_ascii=False, indent=2) + "\n")
             log("postman.log", f"广播汇总 {rec.get('id')} → {rec.get('from')}：{path.name}")
         except Exception as e:
             # a broken record must never take the postman down (or retry forever): log, tell the human once, mark done
@@ -4113,9 +4153,7 @@ def summarize_broadcasts(routes):
             try:
                 bad = read_json(f) or {}
                 bad["summarized"] = "error"
-                tmp = f.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps(bad, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                tmp.replace(f)
+                atomic_write(f, json.dumps(bad, ensure_ascii=False, indent=2) + "\n")
             except Exception as e2:
                 log("postman.log", f"广播 {f.name} 标记 error 也失败：{e2}")
 
@@ -4133,9 +4171,7 @@ def alias_state():
 
 
 def save_alias_state(st):
-    tmp = ALIAS_STATE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(ALIAS_STATE)
+    atomic_write(ALIAS_STATE, json.dumps(st, ensure_ascii=False, indent=2) + "\n")
 
 
 def notify_once(key, title, text, store=".notify_once.json"):
@@ -5768,6 +5804,11 @@ def main():
     p = sp.add_parser("wake-plan", help="只读：给出该箱此刻的唤醒计划（JSON）。候选集经 stdin 传入，不读信、不认领、不落任何文件")
     p.add_argument("box", help="信箱名（只作计划标识，不做任何写操作）")
     p.set_defaults(fn=cmd_wake_plan)
+    p = sp.add_parser("presented-update", help="已展示记录的唯一写入口：OpenCode 插件经此进同一把 per-box presented 锁（不直接自写 presented.json）")
+    p.add_argument("box", help="信箱名")
+    p.add_argument("--add", action="append", default=[], metavar="编号", help="要并入的已展示编号（可重复）")
+    p.add_argument("--remove", action="append", default=[], metavar="编号", help="要移除的编号（可重复）")
+    p.set_defaults(fn=cmd_presented_update)
     p = sp.add_parser("alarm-set", help="给一个 OpenCode 会话设一次性闹钟（由插件工具调用；在内核锁内改记录）")
     p.add_argument("--box", required=True, help="该会话绑定的信箱")
     p.add_argument("--session", required=True, help="OpenCode 会话 ID")
