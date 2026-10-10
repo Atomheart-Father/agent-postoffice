@@ -32,7 +32,7 @@ import { homedir, platform } from "node:os"
 import { readdir, readFile, writeFile, appendFile, mkdir, open, rm, stat, chmod, rename } from "node:fs/promises"
 import { accessSync, constants, existsSync } from "node:fs"
 import { spawn } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { realpathSync } from "node:fs"
 import { join, dirname } from "node:path"
@@ -179,54 +179,77 @@ const letterHead = async (box: string, file: string) => {
 }
 
 // presented set: which ids this box was actually shown. Only written after the channel accepted
-// the wake, union-only, atomic rewrite. It is an archive hint, not a second delivery truth —
-// delivery truth stays in the ledger / .seen / .woken.json / the claims.
-const presentedPath = (box: string) => `${ROOT}/${box}/.presented.json`
+// the wake, union-only. It is an archive hint, not a second delivery truth — delivery truth
+// stays in the ledger / .seen / .woken.json / the claims. The plugin NEVER writes
+// presented.json itself: a read-merge-write against the Python side without a shared lock is
+// exactly how updates get lost, so this goes through the same locked CLI entry
+// (`postoffice presented-update`, per-box flock + atomic publish). Failure = log only; the
+// archive hint must never affect delivery.
 const presentedAdd = async (box: string, ids: string[]) => {
   const clean = ids.filter(Boolean)
   if (!clean.length) return
-  const p = presentedPath(box)
-  let cur: string[] = []
-  try {
-    const v = JSON.parse(await readFile(p, "utf8"))
-    if (Array.isArray(v)) cur = v.filter((x): x is string => typeof x === "string")
-  } catch {}
-  const merged = cur.slice()
-  for (const id of clean) if (!merged.includes(id)) merged.push(id)
-  const tmp = `${p}.tmp-${process.pid}`
-  await writeFile(tmp, JSON.stringify(merged), "utf8")
-  await rename(tmp, p)
+  const res = await runCLI(["presented-update", box, ...clean.flatMap((id) => ["--add", id])])
+  if (res.code !== 0) {
+    await log(`presented 记录未写入（不影响投递）${box}: ${res.text.trim().split("\n")[0]}`)
+  }
 }
 
 // ---------------------------------------------------------------- 运行态活动（runtime presence）
 // 纯展示的旁路：只回答「这个信箱此刻是忙还是空着」，永远不是投递真相 —— 投递真相仍在
-// 账本 / 认领 / .presented.json 里。路径 <HOME>/runtime/activity/<box>.json，原子写
-// （tmp + rename），任何错误都吞掉，绝不影响投递或唤醒。
+// 账本 / 认领 / .presented.json 里。路径 <HOME>/runtime/activity/<box>.json，经 atomicWrite
+// 整文件替换（本调用唯一 tmp），任何错误都只记日志，绝不影响投递或唤醒。
 // 同状态保留 since、推进 observed；状态一变就重置 since；同状态重写节流到 60s 一次。
+// 同一信箱的事件按「收到/入队顺序」串行落盘（per-box 队列）：并发 busy/idle 交错不再
+// 自撞同名 tmp（RED-C 的 19/20 ENOENT），终态=最后入队的事件；单次失败不阻塞后继。
 const activityPath = (box: string) => `${ACTIVITY_DIR}/${box}.json`
 
-const writeActivity = async (box: string, sessionID: string, state: "working" | "idle") => {
+const atomicWrite = async (path: string, data: string) => {
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`
   try {
-    const observed = Date.now() / 1000
-    const p = activityPath(box)
-    let prev: Activity | null = null
-    try {
-      const v = JSON.parse(await readFile(p, "utf8"))
-      if (v && typeof v === "object") prev = v as Activity
-    } catch {}
-    if (prev && prev.state === state && prev.binding === sessionID) {
-      const seen = typeof prev.observed === "number" ? prev.observed : 0
-      if (observed - seen < ACTIVITY_THROTTLE_MS / 1000) return   // 同会话同状态：60s 内不重写
-    }
-    const since = prev && prev.state === state && prev.binding === sessionID && typeof prev.since === "number" ? prev.since : observed
-    const rec: Activity = { state, since, observed, source: "opencode_plugin", binding: sessionID }
-    await mkdir(ACTIVITY_DIR, { recursive: true })
-    const tmp = `${p}.tmp-${process.pid}`
-    await writeFile(tmp, JSON.stringify(rec), "utf8")
-    await rename(tmp, p)
+    await writeFile(tmp, data, "utf8")
+    await rename(tmp, path)
   } catch (e) {
-    await log(`activity 写入失败（已忽略）${box}: ${e}`)
+    try { await rm(tmp, { force: true }) } catch {}
+    throw e
   }
+}
+
+const writeActivityOnce = async (box: string, sessionID: string, state: "working" | "idle") => {
+  const observed = Date.now() / 1000
+  const p = activityPath(box)
+  let prev: Activity | null = null
+  try {
+    const v = JSON.parse(await readFile(p, "utf8"))
+    if (v && typeof v === "object") prev = v as Activity
+  } catch {}
+  if (prev && prev.state === state && prev.binding === sessionID) {
+    const seen = typeof prev.observed === "number" ? prev.observed : 0
+    if (observed - seen < ACTIVITY_THROTTLE_MS / 1000) return   // 同会话同状态：60s 内不重写
+  }
+  const since = prev && prev.state === state && prev.binding === sessionID && typeof prev.since === "number" ? prev.since : observed
+  const rec: Activity = { state, since, observed, source: "opencode_plugin", binding: sessionID }
+  await mkdir(ACTIVITY_DIR, { recursive: true })
+  await atomicWrite(p, JSON.stringify(rec))
+}
+
+const activityQueues = new Map<string, Promise<void>>()
+const writeActivity = (box: string, sessionID: string, state: "working" | "idle"): Promise<void> => {
+  const prev = activityQueues.get(box) ?? Promise.resolve()
+  const job = prev
+    .catch(() => {})                       // 前一次失败不阻塞后继事件
+    .then(async () => {
+      try {
+        await writeActivityOnce(box, sessionID, state)
+      } catch (e) {
+        await log(`activity 写入失败（已忽略）${box}: ${e}`)
+      }
+    })
+  activityQueues.set(box, job)
+  const settle = () => {
+    if (activityQueues.get(box) === job) activityQueues.delete(box)
+  }
+  job.then(settle, settle)
+  return job
 }
 
 // ---------------------------------------------------------------- 闹钟记录

@@ -98,6 +98,25 @@ const t = async (name, fn) => {
   catch (e) { console.log('FAIL -', name, '::', e.message); process.exitCode = 1 }
 }
 
+await t('票1 atomic-write：真入口并发 busy/idle 不自撞 tmp，终态=最后事件，无残留', async () => {
+  // 修前红（RED_EVIDENCE_ATOMIC_WRITE.md RED-C）：同名 tmp-{pid} 自撞 → 19/20 写入失败 ENOENT。
+  // 修后：per-box 队列按收到顺序串行落盘；busy/idle 交替绕开 60s 同状态节流。
+  const evs = []
+  for (let i = 0; i < 10; i++) {
+    evs.push(plugin.event(statusEvent(OWN_SID, 'busy')))
+    evs.push(plugin.event(idleEvent(OWN_SID)))
+  }
+  await Promise.allSettled(evs)
+  await settle(300)
+  const logText = await readFile(join(root, 'logs/opencode_plugin.log'), 'utf8').catch(() => '')
+  assert.doesNotMatch(logText, /activity 写入失败/, '并发下不得再有 activity 写入失败')
+  const rec = await readActivity()
+  assert.equal(rec.state, 'idle', `终态=最后入队事件（idle）：${JSON.stringify(rec)}`)
+  assert.equal(rec.binding, OWN_SID)
+  const files = await readdir(join(root, 'runtime', 'activity'))
+  assert.ok(!files.some((f) => f.includes('.tmp-')), `不留 tmp：${files}`)
+})
+
 await t('session.status busy → working / opencode_plugin / binding=session_id', async () => {
   await plugin.event(statusEvent(OWN_SID, 'busy'))
   await settle()
