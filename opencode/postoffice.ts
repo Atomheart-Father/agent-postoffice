@@ -239,10 +239,12 @@ const writeActivityOnce = async (box: string, sessionID: string, state: "working
 }
 
 const activityQueues = new Map<string, Promise<void>>()
-// 事件到达顺序的唯一登记点：归属查询也放进这条链，先到先查、先到先入队。
-// 终检②复现（busy→idle 两次事件、首次归属查询慢 150ms）曾把终态翻转成 working——
-// 登记必须发生在任何 await 之前。这是顺序处理，不是全局锁；归属/binding/节流/失败续跑不变。
-let activityArrival: Promise<void> = Promise.resolve()
+// 活动到达顺序按 session 局部登记：归属核验 + presence 落盘在这条链里，先到先核、先到先写
+// （终检②复现：busy 的慢归属查询不得翻转 busy→idle 的到达顺序，登记必须发生在任何 await 之前）。
+// 窄复检 RETURN（1335d27）合同收紧：链只串「归属核验+presence」——身份 hint（identity CLI +
+// prompt）移出链外，挂起的 hint 不得拖住本 session 或别的 session 的后到事件；这是每 session
+// 一条局部顺序链，不是全局锁。终态=最后到达的事件、节流/binding/单失败续跑不变。
+const activityArrivals = new Map<string, Promise<void>>()
 const writeActivity = (box: string, sessionID: string, state: "working" | "idle"): Promise<void> => {
   const prev = activityQueues.get(box) ?? Promise.resolve()
   const job = prev
@@ -718,35 +720,41 @@ const resolveOwnBox = async (sessionID: string): Promise<{ box?: string; why?: s
           state = "idle"
         }
         if (state) {
-          // 到达即登记：归属查询与入队都放进 activityArrival 链，任何 await 之前先占住顺序。
-          const step = activityArrival.then(async () => {
+          // 到达即登记（任何 await 之前）：归属核验+presence 进本 session 的局部链。
+          const prev = activityArrivals.get(sid) ?? Promise.resolve()
+          const step = prev.catch(() => {}).then(async () => {
             const who = await resolveOwnBox(sid)
-            if (who.box) {
-              await writeActivity(who.box, sid, state)
-              // Resume seam: on the FIRST lifecycle sight of this session, show the short identity
-              // hint once (register/resume only -- never with ordinary mail). Silent when the CLI has
-              // nothing to say (no organization) so a plain install behaves exactly as before.
-              if (!hintTried.has(sid) && state === "idle") {
-                hintTried.add(sid)
-                try {
-                  const r = await runCLI(["identity", who.box, "--hint"])
-                  const line = r.text.trim()
-                  if (r.code === 0 && line) {
-                    // 官方「仅上下文」入口：body.noReply=true 只注入上下文，不请求模型答复；
-                    // 并且只在空闲接缝注入，绝不在 busy 事件里叫起一轮新的回答。
-                    const body = { noReply: true, parts: [{ type: "text", text: line }] }
-                    if (typeof client.session.prompt === "function") {
-                      await client.session.prompt({ path: { id: sid }, body })
-                    } else {
-                      await client.session.promptAsync({ path: { id: sid }, body })
-                    }
-                  }
-                } catch { /* a resume hint is best-effort; delivery and presence are unaffected */ }
-              }
-            }
+            if (who.box) await writeActivity(who.box, sid, state)
           })
-          activityArrival = step.catch(() => {})   // 单次失败不阻塞后继事件
-          await step
+          const tail = step.catch(() => {})      // 单次失败不阻塞后继事件
+          activityArrivals.set(sid, tail)
+          void tail.finally(() => {              // 尾部已结算则回收，Map 不随 session 无界增长
+            if (activityArrivals.get(sid) === tail) activityArrivals.delete(sid)
+          })
+          // Resume seam（链外，尽力而为）：首次 idle 时注入一次短身份提示（register/resume only，
+          // 绝不夹带普通邮件；CLI 无话可说就静默）。绝不因它阻塞或推迟 presence：挂起的 prompt
+          // 只属于这里，activity 顺序链完全不等它（窄复检 RETURN 负例钉住此边界）。
+          if (!hintTried.has(sid) && state === "idle") {
+            hintTried.add(sid)
+            void (async () => {
+              try {
+                const who = await resolveOwnBox(sid)
+                if (!who.box) return
+                const r = await runCLI(["identity", who.box, "--hint"])
+                const line = r.text.trim()
+                if (r.code === 0 && line) {
+                  // 官方「仅上下文」入口：body.noReply=true 只注入上下文，不请求模型答复；
+                  // 并且只在空闲接缝注入，绝不在 busy 事件里叫起一轮新的回答。
+                  const body = { noReply: true, parts: [{ type: "text", text: line }] }
+                  if (typeof client.session.prompt === "function") {
+                    await client.session.prompt({ path: { id: sid }, body })
+                  } else {
+                    await client.session.promptAsync({ path: { id: sid }, body })
+                  }
+                }
+              } catch { /* a resume hint is best-effort; delivery and presence are unaffected */ }
+            })()
+          }
         }
       }
     } catch {}
