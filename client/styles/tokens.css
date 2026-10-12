@@ -1,0 +1,45 @@
+@font-face{font-family:"Instrument";src:url(../fonts/instrument-sans-subset.woff2) format("woff2");font-weight:400 700;font-stretch:75% 100%;font-display:swap}
+/* ==========================================================================
+   BOXZ OFFICE client tokens: the panel's colour roles, six palettes, one typeface.
+   Every colour is one of the role variables below; a theme is a set of values for the same roles,
+   so a new theme is one block and no component needs to change. The accent (--red) means exactly one thing:
+   a letter is waiting. Errors use --bad, nothing else uses either.
+   ========================================================================== */
+:root{
+  --font:"Instrument","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  /* dialog geometry is shared with the docked letter, so the two always line up */
+  --hh:72px;--bar:64px;--pane:468px;
+  color-scheme:light;
+}
+:root,[data-theme=paper]{
+  --paper:#ecebe7;--paper-2:#e2e1dc;--ink:#141414;--ink-2:#46453f;--ink-3:#686660;
+  --wire:#9a9891;--rule:rgba(20,20,20,.14);--line:20,20,20;--line-a:.062;
+  --red:#d5381a;--on-red:#fff;--bad:#b3261e;
+  --key-on:#141414;--on-key:#ecebe7;--on-key-2:rgba(236,235,231,.68);--scrim:rgba(20,20,20,.42)}
+[data-theme=night]{color-scheme:dark;
+  --paper:#131312;--paper-2:#1d1d1b;--ink:#edece7;--ink-2:#bdbbb4;--ink-3:#8f8d86;
+  --wire:#56554f;--rule:rgba(237,236,231,.13);--line:237,236,231;--line-a:.06;
+  --red:#f0502e;--on-red:#131312;--bad:#ff8a7a;
+  --key-on:#edece7;--on-key:#131312;--on-key-2:rgba(19,19,18,.66);--scrim:rgba(0,0,0,.6)}
+[data-theme=mist]{
+  --paper:#dfe4e8;--paper-2:#d2d9df;--ink:#0e1a26;--ink-2:#39485a;--ink-3:#566577;
+  --wire:#8c98a5;--rule:rgba(14,26,38,.14);--line:14,26,38;--line-a:.066;
+  --red:#2445d4;--on-red:#fff;--bad:#b3261e;
+  --key-on:#0e1a26;--on-key:#dfe4e8;--on-key-2:rgba(223,228,232,.68);--scrim:rgba(14,26,38,.42)}
+[data-theme=blueprint]{color-scheme:dark;
+  --paper:#1b3d9a;--paper-2:#21479f;--ink:#f3f5fc;--ink-2:#cbd5f2;--ink-3:#a3b3e2;
+  --wire:#6f88d4;--rule:rgba(243,245,252,.18);--line:243,245,252;--line-a:.085;
+  --red:#ffd23f;--on-red:#14213d;--bad:#ffb4a8;
+  --key-on:#f3f5fc;--on-key:#1b3d9a;--on-key-2:rgba(27,61,154,.72);--scrim:rgba(6,14,44,.62)}
+[data-theme=pine]{color-scheme:dark;
+  --paper:#123c30;--paper-2:#184838;--ink:#eef3ec;--ink-2:#c4d4c8;--ink-3:#97ae9f;
+  --wire:#4f7b67;--rule:rgba(238,243,236,.15);--line:238,243,236;--line-a:.07;
+  --red:#ffad2e;--on-red:#12261e;--bad:#ffb4a8;
+  --key-on:#eef3ec;--on-key:#123c30;--on-key-2:rgba(18,60,48,.72);--scrim:rgba(4,16,12,.6)}
+[data-theme=ember]{color-scheme:dark;
+  --paper:#2a2622;--paper-2:#35302b;--ink:#f1ebe3;--ink-2:#cfc5b9;--ink-3:#a2978a;
+  --wire:#6b6158;--rule:rgba(241,235,227,.14);--line:241,235,227;--line-a:.06;
+  --red:#ff6a3d;--on-red:#1c1916;--bad:#ff9a85;
+  --key-on:#f1ebe3;--on-key:#2a2622;--on-key-2:rgba(42,38,34,.7);--scrim:rgba(0,0,0,.58)}
+
