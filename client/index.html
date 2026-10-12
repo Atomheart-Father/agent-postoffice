@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en" data-theme="paper">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>BOXZ OFFICE</title>
+<meta name="description" content="BOXZ OFFICE client: the company, its roles, their threads, work and mail, in one place.">
+<script>
+// Set the palette before the first paint so a reload never flashes the wrong one (reads storage, never writes).
+try { var p = localStorage.getItem("boxz.office.theme"); document.documentElement.dataset.theme = ["paper","night","mist","blueprint","pine","ember"].indexOf(p) >= 0 ? p : "paper"; } catch (e) {}
+</script>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="styles/tokens.css">
+<link rel="stylesheet" href="styles/base.css">
+<link rel="stylesheet" href="styles/office.css">
+</head>
+<body>
+<canvas id="ground" aria-hidden="true"></canvas>
+<div id="app"></div>
+<div id="toasts" class="toast" role="status" aria-live="polite"></div>
+<noscript><p style="padding:32px">BOXZ OFFICE needs JavaScript.</p></noscript>
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
