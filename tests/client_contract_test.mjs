@@ -62,10 +62,13 @@ const mk = (sc) => createMockAdapter({ scenario: sc, latency: 0 });
   let es = startEdit(role);
   is(editBlocker(role), "", "a position with candidates and a known escalation role is editable");
   is(isDirty(es), false, "a fresh draft is not dirty");
-  is(Object.keys(buildRequest(es)).join(), "name,candidates,escalation_role", "an untouched draft sends no duties and no resources (key absent = unchanged)");
+  is(Object.keys(buildRequest(es)).join(), "name,candidates", "an untouched draft sends only the name and the candidates (every other key absent = unchanged)");
   is(buildRequest(es).name, "analyst", "name is the logical role name");
   es = reduce(es, { type: "input", field: "duties", value: role.duties.concat("Cite every figure").join("\n") });
-  is(Object.keys(buildRequest(es)).join(), "name,candidates,escalation_role,duties", "only the changed list is sent");
+  is(Object.keys(buildRequest(es)).join(), "name,candidates,duties", "only the changed list is sent");
+  const esc2 = reduce(startEdit(role), { type: "input", field: "escalation", value: "" });
+  is(JSON.stringify(buildRequest(esc2).escalation_role), '""', "a cleared escalation is sent as an empty string, not dropped");
+  is("escalation_role" in buildRequest(startEdit(role)), false, "an untouched escalation is never sent");
   is(buildRequest(es).duties.length, role.duties.length + 1, "a changed list is sent whole (replace semantics)");
   const cleared = reduce(startEdit(role), { type: "input", field: "resources", value: "" });
   is(JSON.stringify(buildRequest(cleared).resources), "[]", "an emptied list is sent as [] (clear), never dropped");
@@ -156,7 +159,8 @@ const mk = (sc) => createMockAdapter({ scenario: sc, latency: 0 });
   is(normalizeApplied({ saved: true, projection: "weird" }).projection, "unknown", "an unrecognised projection state is unknown");
   is(normalizeApplied({}).saved, false, "saved is never assumed");
   const nd = normalizeDiff({ name: "x", change: ["a"], expected: { k: 1 }, facts: "one" });
-  is(nd.baseline, "", "a diff without a baseline has none (nothing can be applied)"); is(nd.expected.join(), "k: 1", "an object under expected is printed as key: value"); is(nd.facts.join(), "one", "a string under facts stays a string");
+  is(nd.baseline, "", "a diff without a baseline has none (nothing can be applied)"); is(JSON.stringify(nd.expected), '[{"k":"k","v":"1"}]', "an object under expected is kept key by key"); is(JSON.stringify(nd.facts), '[{"k":"","v":"one"}]', "a string under facts stays a string");
+  is(nd.changes.length, 1, "a change the client does not recognise is kept and shown raw"); is(nd.changes[0].raw, true, "…marked raw");
 }
 {
   const a = mk("denied"); const role = (await a.getSnapshot()).data.roles.find((r) => r.id === "analyst");
@@ -238,10 +242,12 @@ const mk = (sc) => createMockAdapter({ scenario: sc, latency: 0 });
   is(flat.consistency, "degraded", "a broken organization config is degraded"); is(flat.roles.filter((r) => r.kind === "position").length, 4, "every mailbox is still listed");
   const h = createHttpAdapter({ fetchImpl: async () => { throw new Error("x"); } });
   is((await h.getSnapshot()).error.code, ERR.NETWORK, "an unreachable backend is a network error");
-  is((await h.previewRoleChange({})).error.code, ERR.MISSING, "role editing is capability_missing on master (no guessed payload)");
-  is((await h.applyRoleChange({}, "b")).error.code, ERR.MISSING, "…and so is apply");
-  const h2 = createHttpAdapter({ fetchImpl: async () => ({ ok: false, status: 403 }) });
-  is((await h2.getSnapshot()).error.code, ERR.DENIED, "a 403 is denied");
+  const hm = createHttpAdapter({ fetchImpl: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ boxes: [], panel: { ok: false } }) }) });
+  await hm.getSnapshot();
+  is((await hm.previewRoleChange({})).error.code, ERR.MISSING, "once the state shows master (no role_cards) role editing is capability_missing: no guessed payload");
+  is((await hm.applyRoleChange({}, "b")).error.code, ERR.MISSING, "…and so is apply");
+  const h2 = createHttpAdapter({ fetchImpl: async () => ({ ok: false, status: 403, text: async () => "nope" }) });
+  const r403 = await h2.getSnapshot(); is(r403.error.code, ERR.DENIED, "a 403 is denied"); is(r403.error.message.includes("nope"), true, "…and an unknown 403 body is shown as written, not explained");
 }
 // ---- capability sources are named for what they are ----
 {
@@ -277,7 +283,7 @@ const mk = (sc) => createMockAdapter({ scenario: sc, latency: 0 });
   is(parseHash("#/threads/t-1").threadId, "t-1", "route: thread"); is(parseHash("#/work?role=builder").workRole, "builder", "route: work filter");
   is(parseHash("#/nonsense").view, "office", "an unknown route falls back to office");
   is(formatHash({ view: "office", roleId: "a b", roleTab: "edit", workFilter: {} }), "#/office/a%20b/edit", "route round-trips with escaping");
-  is(compact(14686000), "14.7M", "compact keeps one decimal"); is(SCENARIOS.length, 8, "eight sample scenarios");
+  is(compact(14686000), "14.7M", "compact keeps one decimal"); is(SCENARIOS.length, 9, "nine sample scenarios");
 }
 console.log(failures ? `FAIL ${failures}` : "PASS");
 process.exit(failures ? 1 : 0);

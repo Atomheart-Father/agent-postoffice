@@ -2,23 +2,25 @@
 // its mail and work, and the guarded edit flow. A docked pane on wide screens, a full-screen sheet on narrow ones.
 import { esc, fmt, ago } from "../util.js";
 import { t, getLang, has } from "../i18n.js";
-import { lamp, presenceWord, proto, note, seg, deliveryBadge, workBadge, controlBadge, roleById, mockChip, mailOf, mailMeta } from "./ui.js";
+import { lamp, presenceWord, proto, note, seg, deliveryBadge, workBadge, controlBadge, roleById, mockChip, mailOf, mailMeta, roleLabel } from "./ui.js";
 import { treeIndex } from "./office.js";
 import { standbys } from "../contract.js";
 import { editTab } from "./roleEdit.js";
+import { mailRow } from "./mail.js";
 
 export const ROLE_TABS = ["overview", "threads", "work", "edit"];
 
 function pathOf(snap, r) {
   const idx = treeIndex(snap), byId = new Map(snap.roles.map((x) => [x.id, x]));
   const out = []; let c = byId.get(r.parentId);
-  while (c) { out.unshift(c.title); c = c.parentId ? byId.get(c.parentId) : null; }
+  while (c) { out.unshift(roleLabel(c)); c = c.parentId ? byId.get(c.parentId) : null; }
   void idx; return out.join(" › ");
 }
 
 // Delivery switch, session binding and activity: three facts shown beside presence, never merged into it.
 function facts(o, now) {
-  const parts = [o.switch !== "unknown" ? `<span>${esc(t("sw." + o.switch))}</span>` : "", o.binding ? `<span>${esc(t("bind"))} ${esc(o.binding)}</span>` : "", o.activity ? activity(o.activity, now) : ""].filter(Boolean);
+  const parts = [o.switch !== "unknown" ? `<span>${esc(t("sw." + o.switch))}</span>` : "", o.binding ? `<span>${esc(t("bind"))} ${esc(o.binding)}</span>` : "", o.activity ? activity(o.activity, now) : "",
+    o.state ? `<span>${esc(t("rp.holderState"))} <code>${esc(o.state)}</code></span>` : "", o.registered === false ? `<span>${esc(t("rp.notRegistered"))}</span>` : ""].filter(Boolean);
   return parts.length ? `<div class="l3 facts-l">${parts.join(" · ")}</div>` : "";
 }
 
@@ -42,7 +44,20 @@ function escalation(snap, r) {
   if (r.escalationRole == null) return `<p class="fine">${esc(t("unknown"))}</p>`;
   if (r.escalationRole === "") return `<p class="fine">${esc(t("ed.none"))}</p>`;
   const up = roleById(snap, r.escalationRole);
-  return `<p><b>${esc(up ? up.title : r.escalationRole)}</b>${r.escalationAcceptor ? ` <span class="dim">${esc(t("rp.acceptor"))} ${esc(r.escalationAcceptor)}</span>` : ""}</p>`;
+  return `<p><b>${esc(up ? up.title : r.escalationTitle || r.escalationRole)}</b>${r.escalationTarget ? ` <span class="dim">${esc(t("rp.escTarget"))} ${esc(r.escalationTarget)}</span>` : ""}${r.escalationAcceptor ? ` <span class="dim">${esc(t("rp.acceptor"))} ${esc(r.escalationAcceptor)}</span>` : ""}</p>`;
+}
+
+// What the role card says about itself, as written: the project, the config check, the status file, `confirmed`.
+// Anything the backend did not send is left out, not filled in.
+function cardFacts(r) {
+  if (r.origin !== "role" || r.kind !== "position") return "";
+  const rows = [
+    r.project && [t("rp.project"), r.project],
+    r.configOk !== null && [t("rp.cfgOk"), t("rp.cfgOk." + r.configOk)],
+    r.statusFile && [t("rp.statusFile"), r.statusFile.pathExists === false ? t("rp.statusFile.missing") : r.statusFile.updated ? `${t("rp.statusFile.updated")} ${r.statusFile.updated}` : t("unknown")],
+    r.confirmed !== undefined && [t("rp.confirmed"), r.confirmed === null ? t("unknown") : String(r.confirmed)],
+  ].filter(Boolean);
+  return rows.length ? `<section><ul class="bul facts">${rows.map(([k, v]) => `<li><b>${esc(k)}</b> ${esc(v)}</li>`).join("")}</ul></section>` : "";
 }
 
 function overview(snap, r, now) {
@@ -53,22 +68,25 @@ function overview(snap, r, now) {
       ${standbys(r).length ? standbys(r).map((c) => occ(c, t("tag.candidate"), now)).join("") : `<p class="fine">${esc(t("rp.noCandidates"))}</p>`}</section>
     <section><h3>${esc(t("rp.escalation"))}</h3>${escalation(snap, r)}</section>`;
   const duties = r.duties.length ? `<ul class="bul">${r.duties.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>` : `<p class="fine">${esc(t(r.kind === "team" ? "rp.teamNoDuties" : "rp.noDuties"))}</p>`;
-  const res = r.resources.length ? `<ul class="chips">${r.resources.map((x) => `<li><span class="rk">${esc(x.kind)}</span>${esc(x.ref)}${x.note ? `<small class="rn">${esc(x.note)}</small>` : ""}</li>`).join("")}</ul>` : `<p class="fine">${esc(t("rp.noResources"))}</p>`;
+  const res = r.resources.length ? `<ul class="chips">${r.resources.map((x) => `<li><span class="rk">${esc(x.kind)}</span>${esc(x.ref)}${x.note ? `<small class="rn">${esc(x.note)}</small>` : ""}${x.exists === false ? `<small class="rn">${esc(t("rp.resMissing"))}</small>` : ""}</li>`).join("")}</ul>` : `<p class="fine">${esc(t("rp.noResources"))}</p>`;
   const q = r.qualification
     ? `<p><b class="big">${r.qualification.level != null ? esc(r.qualification.level) : "—"}</b> <span class="dim">${esc(r.qualification.note || "")}</span></p>`
     : `<p class="fine">${esc(t("unknown"))}</p>`;
   return `${r.summary ? `<p class="lead">${esc(r.summary)}</p>` : ""}${holder}
     <section><h3>${esc(t("rp.duties"))}</h3>${duties}</section>
     <section><h3>${esc(t("rp.resources"))}</h3>${res}</section>
+    ${cardFacts(r)}
     ${r.kind === "team" ? "" : `<section><h3>${esc(t("rp.qual"))} ${proto()}</h3>${q}<p class="fine">${esc(t("rp.qualHint"))}</p></section>`}`;
 }
+
+const capOn = (snap, k) => { const c = snap.capabilities[k]; return !!c && c.status !== "missing"; };
 
 function threadsTab(snap, r, now) {
   const L = getLang();
   const ts = snap.threads.filter((x) => x.roleId === r.id).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   return `<section><div class="sec-h"><h3>${esc(t("tab.threads"))}</h3>
-      ${r.kind === "position" ? `<button type="button" class="btn" data-act="newthread" data-role="${esc(r.id)}" data-fk="newthread">${esc(t("th.new"))}</button>` : ""}</div>
-    ${ts.length ? `<ul class="rows">${ts.map((x) => `<li><button type="button" class="row" data-act="thread" data-thread="${esc(x.id)}" data-fk="thr:${esc(x.id)}">
+      ${r.kind === "position" && capOn(snap, "thread.control") ? `<button type="button" class="btn" data-act="newthread" data-role="${esc(r.id)}" data-fk="newthread">${esc(t("th.new"))}</button>` : ""}</div>
+    ${!capOn(snap, "thread.list") ? note("missing", t("th.missing")) : ts.length ? `<ul class="rows">${ts.map((x) => `<li><button type="button" class="row" data-act="thread" data-thread="${esc(x.id)}" data-fk="thr:${esc(x.id)}">
         <span class="t1"><b>${esc(x.title)}</b>${controlBadge(x.control)}</span>
         <span class="t2">${esc(x.harness || t("noHarness"))} · ${esc(t("src." + x.source))} · ${esc(ago(x.updatedAt, now, L) || t("unknown"))}</span></button></li>`).join("")}</ul>`
       : note("empty", t("rp.noThreads"))}</section>`;
@@ -80,10 +98,9 @@ function workTab(snap, r, now) {
   const wCap = snap.capabilities["work.state"];
   return `<section><div class="sec-h"><h3>${esc(t("tab.work"))} ${wCap && wCap.status === "mock" ? mockChip() : ""}</h3>
       <button type="button" class="btn ghost" data-act="go" data-view="work" data-role="${esc(r.id)}" data-fk="gowork">${esc(t("rp.openWork"))}</button></div>
-    ${ws.length ? `<ul class="rows">${ws.map((w) => `<li class="row static"><span class="t1"><b>${esc(w.title)}</b>${workBadge(w.state)}</span><span class="t2">${esc(ago(w.updatedAt, now, L) || t("unknown"))}</span></li>`).join("")}</ul>` : note("empty", t("rp.noWork"))}</section>
+    ${!capOn(snap, "work.state") ? note("missing", t("work.missing")) : ws.length ? `<ul class="rows">${ws.map((w) => `<li class="row static"><span class="t1"><b>${esc(w.title)}</b>${workBadge(w.state)}</span><span class="t2">${esc(ago(w.updatedAt, now, L) || t("unknown"))}</span></li>`).join("")}</ul>` : note("empty", t("rp.noWork"))}</section>
     <section><h3>${esc(t("work.mail"))}</h3>
-    ${ms.length ? `<ul class="rows">${ms.map((m) => `<li class="row static"><span class="t1"><b>${esc(m.subject)}</b>${deliveryBadge(m.delivery)}</span>
-        <span class="t2">${esc(mailMeta(m, ago(m.at, now, L)))}</span></li>`).join("")}</ul>` : note("empty", t("rp.noMail"))}
+    ${ms.length ? `<ul class="rows">${ms.map((m) => mailRow(m, mailMeta(m, ago(m.at, now, L)))).join("")}</ul>` : note("empty", t("rp.noMail"))}
     <p class="fine">${esc(t("work.mailNotWork"))}</p></section>`;
 }
 

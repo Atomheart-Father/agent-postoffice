@@ -129,6 +129,11 @@ export function demoSnapshot(now = Date.now() / 1000) {
     { id: "m9", roleId: "archivist", threadId: null, workId: null, dir: "out", from: "Owner", to: "Archivist", subject: "File the Q2 report", at: ago(2 * D), delivery: "retracted" },
   ];
 
+  // each sample letter sits in the mailbox of the role it is attributed to; the sender is the role whose title the
+  // `from` carries (a canonical mailbox name, as the real letter header has)
+  const idOfTitle = (title) => (roles.find((r) => r.title === title) || { id: "" }).id;
+  mail.forEach((m) => { m.box = m.roleId; m.letterId = `20261013-${m.id}`; m.sender = idOfTitle(m.from); });
+
   const work = [
     { id: "w-summary", roleId: "research-lead", title: "Weekly research summary", state: "submitted", difficulty: 2, updatedAt: ago(12 * M), note: "The mail was accepted by the Owner's mailbox. Nobody has verified the figures yet.", history: [{ state: "open", at: ago(2 * D), by: "Owner" }, { state: "submitted", at: ago(12 * M), by: "Research Lead" }] },
     { id: "w-import", roleId: "builder", title: "Fix the import pipeline", state: "open", difficulty: 3, updatedAt: ago(35 * M), note: "The Builder consumed the mail and is working. That is not completion.", history: [{ state: "open", at: ago(35 * M), by: "Owner" }] },
@@ -145,7 +150,13 @@ export function demoSnapshot(now = Date.now() / 1000) {
 
   return {
     contract: CONTRACT_VERSION, asOf: Math.round(now), consistency: "consistent", degraded: [],
-    company: { name: "Northwind Studio", operatorRoleId: "owner" },
+    company: { name: "Northwind Studio", operatorRoleId: "owner", operatorBox: "owner" },
+    // sample "To" suggestions: the mock treats a position id as its mailbox name and offers two logical addresses
+    addresses: [
+      ...roles.filter((r) => r.kind === "position").map((r) => ({ kind: "box", name: r.id, label: r.title, target: null, online: r.incumbent ? r.incumbent.presence === "connected" || r.incumbent.presence === "busy" : null, error: "" })),
+      { kind: "alias", name: "@researcher", label: "", target: "analyst", online: true, error: "" },
+      { kind: "alias", name: "@builders", label: "", target: "builder", online: true, error: "" },
+    ],
     capabilities: {},   // filled by the adapter
     roles, threads, mail, work, approvals,
     usage: { ...full, total: 14686000, input: 1696000, output: 300000, cacheRead: 12400000, cacheWrite: 320000, context: null, source: "sum reported by each Harness", coverage: "partial" },

@@ -1,7 +1,7 @@
 // The edit tab. One screen per phase of flows/roleEdit.js; the words say what happened and what did not.
 // Two facts are kept apart on purpose: "the configuration is saved" and "the derived cards are fresh".
 import { esc, fmt, deepEqual } from "../util.js";
-import { t } from "../i18n.js";
+import { t, has } from "../i18n.js";
 import { RESOURCE_KINDS } from "../contract.js";
 import { note, proto } from "./ui.js";
 import { startEdit, isDirty, movedUpstream, errorKind, validateDraft, threeWay, editBlocker, resourceText, baseOf, draftOf } from "../flows/roleEdit.js";
@@ -30,10 +30,21 @@ function rows(field, from, to, cls = "") {
 const row = (op, f, val, cls, html) => `<li data-op="${esc(op)}" ${cls ? `class="${cls}"` : ""}><span class="op">${esc(t("df." + op))}</span><span class="fld">${esc(label(f))}</span><span class="val">${html ? val : esc(val)}</span></li>`;
 
 function diffList(p) {
-  const body = p.changes.map((c) => (c.raw ? row("change", c.field, `${itemText(c.field, c.to)}`, "") : rows(c.field, c.from, c.to))).join("");
+  const body = p.changes.map((c) => {
+    if (c.raw) return row("change", c.field, `${itemText(c.field, c.to)}`, "");
+    // the escalation's new title comes with the diff (escalation_to_title): shown next to the new role name, not instead of it
+    const title = (c.notes || []).find((n) => n.k === "title");
+    return rows(c.field, c.from, title && typeof c.to === "string" && c.to ? `${c.to} (${title.v})` : c.to);
+  }).join("");
   return `<ul class="diff">${body}</ul>`;
 }
-const textList = (title, xs) => (xs.length ? `<section class="sub"><h4>${esc(title)}</h4><ul class="bul">${xs.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></section>` : "");
+// expected / facts: the backend's own keys, one line each. A key the client has words for gets them; any other key, and
+// the note code, are shown as written. null is "unknown" (the backend said nothing), "" is "none", never a made-up value.
+const kvValue = (v) => (v === null ? t("unknown") : v === "" ? t("ed.none") : v === true ? t("yes") : v === false ? t("no") : String(v));
+const textList = (title, xs) => (xs.length ? `<section class="sub"><h4>${esc(title)}</h4><ul class="bul facts">${xs.map((x) => {
+  const k = x.k ? (has("ex." + x.k) ? t("ex." + x.k) : x.k) : "";
+  return `<li>${k ? `<b>${esc(k)}</b> ` : ""}${esc(kvValue(x.v))}${x.k === "note_key" ? ` <small class="dim">${esc(t("ed.noteKey"))}</small>` : ""}</li>`;
+}).join("")}</ul></section>` : "");
 
 function issueText(i) {
   return fmt(t("iss." + i.key), { n: i.n ?? "", at: i.at ?? "", kinds: i.kinds ?? "" });
@@ -47,7 +58,7 @@ export const issuesHtml = (es) => {
 function form(snap, es, role, locked) {
   const dis = locked ? "disabled" : "";
   const issues = validateDraft(es);
-  const esc_opts = snap.roles.filter((r) => r.kind === "position" && r.id !== role.id);
+  const esc_opts = snap.roles.filter((r) => r.kind === "position" && r.origin === "role" && r.id !== role.id);   // an escalation target is a role, never a mailbox
   const cur = es.text.escalation;
   const known = esc_opts.some((r) => r.id === cur);
   return `<form class="edform" data-form="role" novalidate>
@@ -80,11 +91,13 @@ function errorBlock(es, role) {
         <button type="button" class="btn" data-act="ed-reset" data-fk="ed-reset">${esc(t("ed.startOver"))}</button>
         <button type="button" class="btn ghost" data-act="ed-back" data-fk="ed-back">${esc(t("ed.keepEditing"))}</button></div>`;
   }
-  // a lost reply to an apply: the config may or may not have been saved, so look again instead of sending it twice
-  if (k === "network" && e.during === "apply") {
-    const same = deepEqual(baseOf(role), draftOf(es));
-    return `${note("error", t("ed.unknownOutcome"))}${same ? note("unknown", t("ed.looksSaved")) : ""}
-      <div class="actions"><button type="button" class="btn primary" data-act="ed-refresh" data-fk="ed-refresh">${esc(t("ed.refresh"))}</button>
+  // a lost reply to an apply (or a 5xx that did not say "nothing saved"): the config may or may not have been written. The
+  // client never sends it again. A fresh role-diff shows the truth (the backend diffs against the current config); the state
+  // read cannot, because it carries no whole-config baseline.
+  if (e.during === "apply" && (e.outcomeUnknown || k === "network")) {
+    return `${note("error", t("ed.unknownOutcome"))}
+      <div class="actions"><button type="button" class="btn primary" data-act="ed-preview" data-fk="ed-preview">${esc(t("ed.previewAgain"))}</button>
+        <button type="button" class="btn" data-act="ed-refresh" data-fk="ed-refresh">${esc(t("ed.refresh"))}</button>
         <button type="button" class="btn ghost" data-act="ed-back" data-fk="ed-back">${esc(t("ed.keepEditing"))}</button></div>`;
   }
   const kind = k === "denied" ? "denied" : k === "capability_missing" ? "missing" : "error";
@@ -104,9 +117,9 @@ function resultBlock(r) {
 
 export function editTab(snap, role, S) {
   const cap = snap.capabilities["role.edit"];
-  const can = role.can && role.can.edit;
+  const can = role.can && role.can.edit;   // undefined = the read model says nothing about rights (the candidate sends no can.*): the backend decides on write
   if (cap && cap.status === "missing" && !(S.edits && S.edits[role.id])) return `<section>${note("missing", t("ed.missing"))}</section>`;
-  if (!can || !can.allowed) return `<section>${note("denied", (can && can.reason) || t("ed.noRight"))}<p class="fine">${esc(t("ed.denyHint"))}</p></section>`;
+  if (can && !can.allowed) return `<section>${note("denied", can.reason || t("ed.noRight"))}<p class="fine">${esc(t("ed.denyHint"))}</p></section>`;
   const block = editBlocker(role);
   if (block) return `<section>${note("missing", t("ed.block." + block))}</section>`;
   const es = (S.edits && S.edits[role.id]) || startEdit(role);
@@ -134,5 +147,5 @@ export function editTab(snap, role, S) {
     case "error": body = `${errorBlock(es, role)}${es.preview || errorKind(es.error) === "stale" || (es.error.during === "apply" && errorKind(es.error) === "network") ? "" : form(snap, es, role, false)}`; break;
     default: body = form(snap, es, role, false);
   }
-  return `<section>${head}${stepper}${moved}${body}</section>`;
+  return `<section>${head}${stepper}${can ? "" : `<p class="fine">${esc(t("ed.authUnknown"))}</p>`}${moved}${body}</section>`;
 }

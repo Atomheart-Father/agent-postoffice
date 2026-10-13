@@ -13,7 +13,7 @@ export function capsDialog(snap, S, adapter) {
   const body = GROUPS.map(([g, label]) => {
     const fs = FEATURES.filter((f) => f.group === g);
     return `<section><h3>${esc(label[L])}</h3><table class="captbl"><thead><tr><th>${esc(t("cap.feature"))}</th><th>${esc(t("cap.now"))}</th>${SRC.map((k) => `<th>${esc(sourceLabel(k, L))}</th>`).join("")}</tr></thead><tbody>
-      ${fs.map((f) => { const c = snap && snap.capabilities[f.key]; return `<tr><td><b>${esc(f[L])}</b><span class="fine">${esc(f.note[L])}</span><span class="fine needs">${esc(t("cap.needs"))}: ${esc(f.needs)}</span></td>
+      ${fs.map((f) => { const c = snap && snap.capabilities[f.key]; return `<tr><td><b>${esc(f[L])}</b><span class="fine">${esc(f.note[L])}</span>${f.needs ? `<span class="fine needs">${esc(t("cap.needs"))}: ${esc(f.needs)}</span>` : ""}</td>
         <td data-l="${esc(t("cap.now"))}">${chipS(g === "planned" ? "planned" : c ? c.status : "missing")}</td>${SRC.map((k) => `<td data-l="${esc(sourceLabel(k, L))}">${chipS(f.src[k])}</td>`).join("")}</tr>`; }).join("")}</tbody></table></section>`;
   }).join("");
   const scen = adapter && adapter.kind === "mock"

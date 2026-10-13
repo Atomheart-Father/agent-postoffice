@@ -1,0 +1,41 @@
+{
+  "ok": true,
+  "outbox": [
+    {
+      "to": "box_c",
+      "id": "20261013-044311_panelop_样例已失败",
+      "ref": "box_c/20261013-044311_panelop_样例已失败",
+      "subject": "样例·已失败",
+      "need": "回复",
+      "body": "这是 failed 样例：OpenCode 插件通道 FAILED_FINAL。",
+      "alias": "",
+      "mtime": 1791862991,
+      "status": "unknown",
+      "reason": "投递失败/无法确认对方是否收到（插件台账 FAILED_FINAL）"
+    },
+    {
+      "to": "box_a",
+      "id": "20261013-044210_panelop_样例已提醒",
+      "ref": "box_a/20261013-044210_panelop_样例已提醒",
+      "subject": "样例·已提醒",
+      "need": "仅告知",
+      "body": "这是 reminded 样例：notify 通道已受理提醒（.woken.json 有记录）。",
+      "alias": "",
+      "mtime": 1791862930,
+      "status": "locked",
+      "reason": "已送达（邮递员接受记录 notify）"
+    },
+    {
+      "to": "box_a",
+      "id": "20261013-044210_panelop_样例待唤醒",
+      "ref": "box_a/20261013-044210_panelop_样例待唤醒",
+      "subject": "样例·待唤醒",
+      "need": "仅告知",
+      "body": "这是 waiting 样例：投递资格在线但未被任何通道提醒。",
+      "alias": "",
+      "mtime": 1791862930,
+      "status": "pending",
+      "reason": ""
+    }
+  ]
+}

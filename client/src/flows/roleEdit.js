@@ -1,11 +1,12 @@
 // Role editing as an explicit state machine: draft -> preview (diff) -> confirm -> result.
 // Pure functions only, so every state can be tested without a browser.
 //
-// The write contract is the backend's, not the client's (office local candidate e819f0e: POST role-diff / role-apply):
-//   request  { name, candidates[], escalation_role, duties?, resources?[{kind, ref, note?}] }
+// The write contract is the backend's, not the client's (local candidate e819f0e, pack 9cd53d5: POST role-diff / role-apply):
+//   request  { name, candidates[], escalation_role?, duties?, resources?[{kind, ref, note?}] }
 //            `name` is the logical role name. candidates is required, ordered, non-empty, without duplicates.
-//            duties / resources: key ABSENT = leave as is, [] = clear, a list = replace the whole list.
-//   preview  -> { diff: { name, change, expected, facts, baseline } }       baseline = SHA-256 of the whole config
+//            escalation_role / duties / resources: key ABSENT = leave as is, [] (or "" for the escalation) = clear,
+//            a list = replace the whole list.
+//   preview  -> { diff: { name, change{<field>_from/_to}, expected, facts, baseline } }   baseline = SHA-256 of the whole config
 //   apply    = the same request + baseline -> { saved, projection: fresh | pending | not_applicable, ... }
 //   a stale baseline is refused (409) WITHOUT returning the current role; the client refetches and compares itself.
 // Nothing else goes into the payload: qualification, policy and capability assignment are design, not contract.
@@ -64,10 +65,11 @@ const FIELDS = ["candidates", "escalation", "duties", "resources"];
 export const changedFields = (es) => { const d = draftOf(es); return FIELDS.filter((f) => !deepEqual(d[f], es.base[f])); };
 export const isDirty = (es) => changedFields(es).length > 0;
 
-// The request body. Candidates and the escalation role are always part of it; duties / resources only when the
-// draft changed them, so an untouched list is never sent as "clear". An emptied list is sent as [] on purpose.
+// The request body. Candidates are always part of it; the escalation role, duties and resources only when the draft
+// changed them, so an untouched field is never sent as "clear". An emptied list is sent as [] on purpose.
 export function buildRequest(es) {
-  const d = draftOf(es), req = { name: es.roleId, candidates: d.candidates, escalation_role: d.escalation };
+  const d = draftOf(es), req = { name: es.roleId, candidates: d.candidates };
+  if (d.escalation !== es.base.escalation) req.escalation_role = d.escalation;
   if (!deepEqual(d.duties, es.base.duties)) req.duties = d.duties;
   if (!deepEqual(d.resources, es.base.resources)) req.resources = d.resources;
   return req;

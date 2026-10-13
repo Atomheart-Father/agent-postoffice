@@ -1,0 +1,12 @@
+Anonymous fixtures of the local candidate backend e819f0e, copied unchanged from the contract pack
+  https://github.com/Atomheart-Father/agent-postoffice/tree/9cd53d5ea47c3dfc37b7ae7d402705762ca02803/docs/cloud-client-api-e819
+  (fixtures-data/*.json), contract commit 9cd53d5.
+sha256 (as listed in the pack's SHA256SUMS.txt; checked by tests/client_fixture_test.mjs):
+fea52b89a6740828a26182b9d2e4e6743e8c884927af4cb1dee8c15217b156a9  http_cases.json
+9e60a4b342bf79fcf95fdd36786b3e6c07a43418f38468d384609ad5184e67b2  letter_ok.json
+e9f3387b58a85f928d9c6dcd57dad37c414635c2e91463733d4ae5128f156698  outbox_ok.json
+fdd124362e84d6ee4e39f85fec8ee5ff23306d0839f392b0ea0b5e0f022dbb5a  role_diff_ok_response.json
+9ebfed73158acc54db0dbc9b4aa205d569da21a1306181023b87ef2e92f87ded  state_ok.json
+Note: the candidate is NOT deployed and these files are not captures of a running candidate by this client; they are the
+pack's own captures. role_diff_ok_response.json is an in-process call of the candidate's role_diff_payload, not curl.
+The data is anonymous (boxes panelop, box_a, box_b, box_unlisted, box_c; roles office.design / office.worker / office.missing).
