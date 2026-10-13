@@ -4,7 +4,7 @@
 // write shows the backend's own reason when it refuses.
 import { esc, fmt, ago } from "../util.js";
 import { t, getLang } from "../i18n.js";
-import { note, deliveryBadge, badge, mockChip, proto } from "./ui.js";
+import { note, deliveryBadge, badge, mockChip, proto, rawCode, needWord } from "./ui.js";
 import { NEEDS, composeIssues, canSend, canEdit, editRequest, hasContent } from "../flows/mail.js";
 
 const capOn = (snap, key) => { const c = snap && snap.capabilities[key]; return !!c && c.status !== "missing"; };
@@ -13,7 +13,8 @@ export const mailCaps = (snap) => ({ read: capOn(snap, "mail.read"), send: capOn
 // ---------- one row of mail, in the work page and in a role's mail tab ----------
 export function mailRow(m, meta, extra = "") {
   const open = m.letterId && m.box;
-  const inner = `<span class="t1"><b>${esc(m.subject || t("noSubject"))}</b>${deliveryBadge(m.delivery)}</span><span class="t2">${esc(meta)}</span>`;
+  const kind = m.kind ? `<span class="t3" title="${esc(t("mail.kindHint"))}">${esc(t("mail.kind"))} ${rawCode(m.kind)}</span>` : "";
+  const inner = `<span class="t1"><b>${esc(m.subject || t("noSubject"))}</b>${deliveryBadge(m.delivery, m.sourceStatus)}</span><span class="t2">${esc(meta)}</span>${kind}`;
   return open
     ? `<li class="row wrow"><button type="button" class="t1b" data-act="letter" data-box="${esc(m.box)}" data-id="${esc(m.letterId)}" data-mail="${esc(m.id)}" data-fk="ml:${esc(m.id)}">${inner}</button>${extra}</li>`
     : `<li class="row static">${inner}${extra}</li>`;
@@ -63,7 +64,7 @@ function editForm(l) {
     <div class="actions"><button type="button" class="btn primary" data-act="letter-save" data-fk="le-save" ${!req || busy ? "disabled" : ""}>${esc(t("ml.save"))}</button>
       <button type="button" class="btn ghost" data-act="letter-edit-close" data-fk="le-close">${esc(t("cancel"))}</button></div></form>${needList()}`;
 }
-const needList = () => `<datalist id="need-list">${NEEDS.map((n) => `<option value="${esc(n)}">`).join("")}</datalist>`;
+const needList = () => `<datalist id="need-list">${NEEDS.map((n) => `<option value="${esc(n)}" label="${esc(needWord(n))}">`).join("")}</datalist>`;
 
 export function letterDialog(snap, S, now) {
   const l = S.letter, L = getLang(), caps = mailCaps(snap), sent = l.src === "sent";
@@ -74,8 +75,8 @@ export function letterDialog(snap, S, now) {
   const meta = d ? `<dl class="meta">
       <dt>${esc(t("ml.from"))}</dt><dd>${esc(d.sender || l.sender || "—")}</dd>
       <dt>${esc(t("ml.in"))}</dt><dd>${esc(l.box)}${row && row.alias ? ` <span class="fine">(${esc(row.alias)})</span>` : ""}</dd>
-      <dt>${esc(t("cp.need"))}</dt><dd>${esc(d.need || "—")}</dd>
-      <dt>${esc(t("ml.state"))}</dt><dd>${sent && row ? sentBadge(row.status) : l.delivery ? deliveryBadge(l.delivery) : esc(t("unknown"))}${acted ? ` <span class="fine">${esc(t("ml.before"))}</span>` : ""}</dd>
+      <dt>${esc(t("cp.need"))}</dt><dd>${esc(needWord(d.need) || "—")}</dd>
+      <dt>${esc(t("ml.state"))}</dt><dd>${sent && row ? sentBadge(row.status) : l.delivery ? deliveryBadge(l.delivery, l.rawStatus) : esc(t("unknown"))}${acted ? ` <span class="fine">${esc(t("ml.before"))}</span>` : ""}</dd>
       <dt>${esc(t("ml.ref"))}</dt><dd><code>${esc(l.box)}/${esc(l.id)}</code></dd></dl>` : "";
   const body = l.phase === "loading" ? note("loading", t("loading"))
     : l.phase === "error" ? errBlock(l.error, "read") + `<div class="actions"><button type="button" class="btn" data-act="letter-reload" data-fk="ml-reload">${esc(t("retry"))}</button></div>`

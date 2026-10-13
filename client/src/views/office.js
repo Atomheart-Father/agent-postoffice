@@ -2,7 +2,7 @@
 // on a wire. Everything is drawn from the snapshot; nothing about a company is written into this file.
 import { esc, fmt } from "../util.js";
 import { t } from "../i18n.js";
-import { lamp, presenceWord, note, mockChip, roleLabel } from "./ui.js";
+import { lamp, presenceWord, note, mockChip, roleLabel, appWord } from "./ui.js";
 import { standbys } from "../contract.js";
 
 export const NODES = {};   // wire graph for the current paint: id -> {parent, kind, role}
@@ -31,7 +31,7 @@ function seat(snap, r, selected) {
   const w = waitingFor(snap, r);
   const cands = standbys(r).length;
   const word = inc ? presenceWord(inc.presence) : t("vacant");
-  const l2 = [`<span class="pw">${esc(word)}</span>`, inc ? `<span>${esc(inc.label)}</span>` : "", inc && inc.harness ? `<span>${esc(inc.harness)}</span>` : "", cands ? `<span>${esc(fmt(t(cands === 1 ? "cand1" : "candN"), { n: cands }))}</span>` : ""].filter(Boolean).join("");
+  const l2 = [`<span class="pw">${esc(word)}</span>`, inc ? `<span>${esc(inc.label)}</span>` : "", inc && inc.harness ? `<span>${esc(appWord(inc.harness))}</span>` : "", cands ? `<span>${esc(fmt(t(cands === 1 ? "cand1" : "candN"), { n: cands }))}</span>` : ""].filter(Boolean).join("");
   return `<button type="button" class="item seat${st === "offline" || st === "vacant" || st === "unconnected" ? " dead" : ""}" data-act="role" data-role="${esc(r.id)}" data-id="${esc(sid(r.id))}"
     data-fk="seat:${esc(r.id)}" data-st="${esc(st)}" ${selected ? 'aria-current="true"' : ""}>
     ${lamp(kind, st)}<span class="tx"><span class="l1"><span class="nm">${esc(r.title)}</span></span><span class="l2">${l2}</span></span>

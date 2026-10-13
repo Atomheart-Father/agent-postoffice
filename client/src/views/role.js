@@ -2,11 +2,12 @@
 // its mail and work, and the guarded edit flow. A docked pane on wide screens, a full-screen sheet on narrow ones.
 import { esc, fmt, ago } from "../util.js";
 import { t, getLang, has } from "../i18n.js";
-import { lamp, presenceWord, proto, note, seg, deliveryBadge, workBadge, controlBadge, roleById, mockChip, mailOf, mailMeta, roleLabel } from "./ui.js";
+import { lamp, presenceWord, proto, note, seg, deliveryBadge, workBadge, controlBadge, roleById, mockChip, mailOf, mailMeta, roleLabel, appWord } from "./ui.js";
 import { treeIndex } from "./office.js";
 import { standbys } from "../contract.js";
 import { editTab } from "./roleEdit.js";
 import { mailRow } from "./mail.js";
+import { mailboxSection } from "./mailbox.js";
 
 export const ROLE_TABS = ["overview", "threads", "work", "edit"];
 
@@ -29,7 +30,7 @@ function occ(o, tag, now) {
   const upd = o.presenceAt != null ? ago(o.presenceAt, now, L) : null;
   return `<div class="occ" data-st="${esc(o.presence)}">${lamp(o.kind === "human" ? "human" : "agent", o.presence)}
     <div class="tx"><div class="l1"><b>${esc(o.label)}</b><span class="tag">${esc(tag)}</span></div>
-      <div class="l2"><span class="pw">${esc(presenceWord(o.presence))}</span>${o.harness ? `<span>${esc(o.harness)}</span>` : `<span>${esc(t("noHarness"))}</span>`}${o.model ? `<span>${esc(o.model)}</span>` : ""}${upd ? `<span>${esc(fmt(t("updatedAgo"), { s: upd }))}</span>` : `<span>${esc(t("noSignal"))}</span>`}</div>
+      <div class="l2"><span class="pw">${esc(presenceWord(o.presence))}</span>${o.harness ? `<span>${esc(appWord(o.harness))}</span>` : `<span>${esc(t("noHarness"))}</span>`}${o.model ? `<span>${esc(o.model)}</span>` : ""}${upd ? `<span>${esc(fmt(t("updatedAgo"), { s: upd }))}</span>` : `<span>${esc(t("noSignal"))}</span>`}</div>
       ${o.note ? `<div class="l3">${esc(o.note)}</div>` : ""}${facts(o, now)}</div></div>`;
 }
 
@@ -60,7 +61,7 @@ function cardFacts(r) {
   return rows.length ? `<section><ul class="bul facts">${rows.map(([k, v]) => `<li><b>${esc(k)}</b> ${esc(v)}</li>`).join("")}</ul></section>` : "";
 }
 
-function overview(snap, r, now) {
+function overview(snap, r, now, S) {
   const inc = r.incumbent;
   const holder = r.kind === "team" ? "" : `${r.origin === "mailbox" ? note("unknown", t("rp.mailboxNode")) : ""}<section><h3>${esc(t("rp.incumbent"))}</h3>
       ${inc ? occ(inc, t(inc.kind === "human" ? "tag.human" : "tag.holder"), now) : note("empty", t("rp.vacant"))}</section>
@@ -72,7 +73,7 @@ function overview(snap, r, now) {
   const q = r.qualification
     ? `<p><b class="big">${r.qualification.level != null ? esc(r.qualification.level) : "—"}</b> <span class="dim">${esc(r.qualification.note || "")}</span></p>`
     : `<p class="fine">${esc(t("unknown"))}</p>`;
-  return `${r.summary ? `<p class="lead">${esc(r.summary)}</p>` : ""}${holder}
+  return `${r.summary ? `<p class="lead">${esc(r.summary)}</p>` : ""}${holder}${mailboxSection(snap, r, S, now)}
     <section><h3>${esc(t("rp.duties"))}</h3>${duties}</section>
     <section><h3>${esc(t("rp.resources"))}</h3>${res}</section>
     ${cardFacts(r)}
@@ -111,7 +112,7 @@ export function rolePane(snap, S, now) {
   const inc = r.incumbent;
   const tab = ROLE_TABS.includes(S.roleTab) ? S.roleTab : "overview";
   const tabs = seg(ROLE_TABS.filter((k) => r.kind === "position" || k === "overview" || k === "work").map((k) => [k, t("tab." + k)]), tab, "data-roletab", t("rp.tabs"));
-  const body = tab === "threads" ? threadsTab(snap, r, now) : tab === "work" ? workTab(snap, r, now) : tab === "edit" ? editTab(snap, r, S) : overview(snap, r, now);
+  const body = tab === "threads" ? threadsTab(snap, r, now) : tab === "work" ? workTab(snap, r, now) : tab === "edit" ? editTab(snap, r, S) : overview(snap, r, now, S);
   return `<aside class="rolepane" id="rolepane" aria-label="${esc(t("rp.label"))}: ${esc(r.title)}">
     <header class="rp-h"><div class="tt"><span class="k">${esc(pathOf(snap, r) || t("rp.top"))}</span><h2>${esc(r.title)}</h2>
       <span class="st" data-st="${esc(inc ? inc.presence : "vacant")}">${lamp(inc && inc.kind === "human" ? "human" : "agent", inc ? inc.presence : "vacant")}${esc(inc ? presenceWord(inc.presence) : t("vacant"))}${inc ? ` · ${esc(inc.label)}` : ""}</span></div>

@@ -12,9 +12,11 @@ write contracts and exactly what is wired, fixture-only, mock or missing.
 cd client && python3 -m http.server 8790      # then http://127.0.0.1:8790/?backend=mock
 
 node tests/client_contract_test.mjs && node tests/client_render_test.mjs && node tests/client_candidate_render_test.mjs \
-  && node tests/client_fixture_test.mjs && node tests/client_master_integration_test.mjs
+  && node tests/client_fixture_test.mjs && node tests/client_ops_test.mjs && node tests/client_master_integration_test.mjs
 ```
 
 The backend has no CORS and a Host / Origin / Content-Type guard (`403 {"ok":false}`), so a page on another port cannot
-read or write it; there is no token and no `can.*`. The page never holds credentials. Real-device Chinese IME testing is
+read or write it; there is no token and no `can.*`. The page never holds credentials. Status (online/offline) and whole-mailbox clear are wired (live on master, fixture on the candidate); every write has a
+local one-off request id and is never auto-resent (a lost reply shows as "may have been sent"). The client opens in
+English by default; Chinese is optional. Real-device Chinese IME testing is
 still pending (steps in the docs, §10).

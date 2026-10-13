@@ -384,3 +384,22 @@ input:disabled,textarea:disabled,select:disabled{opacity:.55}
 .ml>.seg{margin:0 0 12px}
 .ml .t3{overflow-wrap:anywhere}
 @media (max-width:900px){ .meta{grid-template-columns:minmax(0,1fr)} .meta dt{margin-top:6px} .letter-body{max-height:none} }
+
+/* ---- delivery switches, whole-mailbox clear, request ledger ---- */
+code.raw{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em;padding:0 5px;margin-right:6px;border:1px solid var(--rule);color:var(--ink-2);background:transparent;overflow-wrap:anywhere}
+.badge code.raw{font-weight:600}
+.sw{font-weight:650}
+.sw[data-sw=on]::before,.sw[data-sw=off]::before,.sw[data-sw=unknown]::before{content:"";display:inline-block;width:9px;height:9px;margin-right:7px;border:1.5px solid var(--ink);vertical-align:baseline}
+.sw[data-sw=on]::before{background:var(--ink)}
+.sw[data-sw=unknown]::before{border-style:dotted}
+.btn.danger{border-color:var(--bad);color:var(--bad)}
+.btn.danger:hover:not(:disabled){background:var(--bad);color:var(--paper);border-color:var(--bad)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+section.danger{border-top:1px solid var(--bad);padding-top:12px}
+section.danger h3{color:var(--bad)}
+.act.warn .counter{background:var(--ink);color:var(--paper)}
+.dl-res{margin:10px 0}
+.badge[data-b^="write:"]::before{border-style:solid}
+.badge[data-b="write:unknown"]::before,.badge[data-b="write:pending"]::before{border-style:dotted}
+.badge[data-b="write:accepted"]::before{background:var(--ink)}
+.row.wr .actions{margin-top:6px}

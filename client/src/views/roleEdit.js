@@ -3,7 +3,7 @@
 import { esc, fmt, deepEqual } from "../util.js";
 import { t, has } from "../i18n.js";
 import { RESOURCE_KINDS } from "../contract.js";
-import { note, proto } from "./ui.js";
+import { note, proto, rawCode } from "./ui.js";
 import { startEdit, isDirty, movedUpstream, errorKind, validateDraft, threeWay, editBlocker, resourceText, baseOf, draftOf } from "../flows/roleEdit.js";
 
 const FIELD = { candidates: "ed.candidates", escalation: "ed.escalation", escalation_role: "ed.escalation", duties: "ed.duties", resources: "ed.resources" };
@@ -112,7 +112,8 @@ function resultBlock(r) {
   const saved = `<div class="ok-b" role="status"><b>${esc(t("ed.saved"))}</b><span>${esc(t("ed.savedText"))}</span></div>`;
   const proj = { fresh: `<p class="fine">${esc(t("ed.projFresh"))}</p>`, not_applicable: "", pending: note("warn", t("ed.projPending")), unknown: note("warn", t("ed.projUnknown")) }[r.projection];
   const more = r.projection === "pending" || r.projection === "unknown" ? `<button type="button" class="btn" data-act="ed-refresh" data-fk="ed-refresh">${esc(t("ed.refresh"))}</button>` : "";
-  return `${saved}${proj}${factsHtml}<div class="actions"><button type="button" class="btn primary" data-act="ed-reset" data-fk="ed-reset">${esc(t("ed.done"))}</button>${more}</div>`;
+  const raw = `<p class="fine">${esc(t("ed.rawSaved"))}: ${rawCode("saved: " + String(r.saved))} ${rawCode("projection: " + (r.projectionRaw != null ? r.projectionRaw : "—"))}</p>`;
+  return `${saved}${proj}${raw}${factsHtml}<div class="actions"><button type="button" class="btn primary" data-act="ed-reset" data-fk="ed-reset">${esc(t("ed.done"))}</button>${more}</div>`;
 }
 
 export function editTab(snap, role, S) {

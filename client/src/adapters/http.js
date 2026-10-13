@@ -10,10 +10,16 @@
 //            GET  /api/letter   one letter from a recipient's inbox (the id is percent-encoded)
 //            GET  /api/outbox   the operator's sent mail that is still observable, with the backend's verdict on edit / retract
 //   writes   POST /api/send /api/ack-one /api/archive-one /api/edit-one /api/retract-one
+//            POST /api/status (delivery switch: one mailbox, several, or a named group)   POST /api/clear (the WHOLE inbox of one mailbox)
 //            POST /api/role-diff (preview, writes nothing) -> user confirms -> POST /api/role-apply (candidate only)
 //
 // Everything else (threads, work, approvals, usage, thread control, secretary) has no backend: it answers capability_missing
-// instead of guessing a payload. Not wired in this client although the backend has them: /api/status, /api/clear (not asked for).
+// instead of guessing a payload.
+//
+// Writes are never retried by this adapter. A send / edit / retract / status / clear / role-apply whose reply is lost comes
+// back as `outcomeUnknown`; whoever called decides, after looking at /api/state or /api/outbox. (A browser or a proxy may
+// resend a POST on a reused keep-alive connection by itself; JavaScript cannot see or stop that. The real backend answers
+// HTTP/1.0 and closes every connection, which is why nothing here sets a retry or an idempotency key it cannot honour.)
 //
 // What this mapping refuses to do, on purpose:
 //   * treat a mailbox as a role: role_cards become role positions (id = the role's logical name), mailboxes stay mailbox
@@ -145,13 +151,14 @@ export function mapMasterState(st, now = Date.now() / 1000) {
   const mail = [];
   for (const b of boxes) for (const p of b.pending || []) {
     mail.push({ id: `${b.name}/${p.file}`, letterId: String(p.file || "").replace(/\.md$/, ""), roleId: "", box: b.name, threadId: null, workId: null, dir: "in", from: p.from || "", to: b.name, subject: p.subject || "",
-      at: num(p.mtime), delivery: MAIL[p.status] || "unknown", sourceStatus: typeof p.status === "string" ? p.status : null });
+      at: num(p.mtime), delivery: MAIL[p.status] || "unknown", sourceStatus: typeof p.status === "string" ? p.status : null, kind: typeof p.kind === "string" && p.kind ? p.kind : null });
   }
   const src = candidate ? "candidate" : "master";
   return normalizeSnapshot({
     contract: CONTRACT_VERSION, source: src, asOf: now, rev: 0, consistency: degraded.length ? "degraded" : "consistent", degraded,
     company: { name: panel.label || "", operatorRoleId: panel.operator ? `box:${panel.operator}` : "", operatorBox: panel.operator || "" },
     addresses: addressesOf(st),
+    groups: Array.isArray(st && st.groups) ? st.groups : [],
     capabilities: capabilityMap((f) => ({ status: ["live", "fixture", "partial"].includes(f.src[src]) ? f.src[src] : "missing", note: f.note ? f.note.en : "" })),
     roles, threads: [], mail, work: [], approvals: [], usage: null,
   });
@@ -249,6 +256,36 @@ export function createHttpAdapter({ baseUrl = "", fetchImpl = (typeof fetch === 
     async archiveMail({ box, id }) { return done("archive")(await post("/api/archive-one", { box, id })); },
     async editMail({ to, id, subject, need, body }) { return done("edit")(await post("/api/edit-one", { to, id, subject, need, body })); },
     async retractMail({ to, id }) { return done("retract")(await post("/api/retract-one", { to, id })); },
+
+    // ---- delivery switch and whole-mailbox clear ----
+    // status: POST /api/status {name,status} | {names:[...],status} (candidate only) | {group,status} (group name WITHOUT "@").
+    // The backend answers {ok:true,error:""}; an unknown mailbox is 400 {ok:false,error:""} with no reason; an unknown group is 400
+    // with a reason. The reply says nothing about the resulting state: the caller re-reads /api/state, which is the truth.
+    // Several names on master (it has no `names`): one request per mailbox, in order, stopping at the first that fails; the error
+    // then lists what was applied and what was not tried, and nothing is resent.
+    async setDelivery({ name, names, group, status }) {
+      if (!["online", "offline"].includes(status)) return fail(ERR.INVALID, "status must be online or offline.");
+      const hit = (b) => post("/api/status", b, { wordsOf: {} });
+      if (typeof group === "string" && group) { const g = group.replace(/^@/, ""); const r = await hit({ group: g, status }); return r.ok ? ok({ status, group: g, names: [] }) : r; }
+      const list = [...new Set((Array.isArray(names) ? names : name ? [name] : []).filter((x) => typeof x === "string" && x))];
+      if (!list.length) return fail(ERR.INVALID, "No mailbox was chosen.");
+      if (list.length === 1) { const r = await hit({ name: list[0], status }); return r.ok ? ok({ status, names: list }) : r; }
+      if (source === "candidate") { const r = await hit({ names: list, status }); return r.ok ? ok({ status, names: list }) : r; }
+      const applied = [];
+      for (const n of list) {
+        const r = await hit({ name: n, status });
+        if (!r.ok) return fail(r.error.code, `${r.error.message}${applied.length ? ` Applied before this: ${applied.join(", ")}.` : ""}`, { ...r.error, applied: [...applied], notTried: list.slice(applied.length + 1), failedAt: n });
+        applied.push(n);
+      }
+      return ok({ status, names: applied });
+    },
+    // clear: POST /api/clear {name} moves EVERY letter in that inbox to archived/<time>/ (kept on disk, never delivered). It is not
+    // archive-one, which files one letter into done/. The reply carries no count; the caller re-reads the state.
+    async clearMailbox({ name }) {
+      if (typeof name !== "string" || !name) return fail(ERR.INVALID, "No mailbox was chosen.");
+      const r = await post("/api/clear", { name }, { wordsOf: {} });
+      return r.ok ? ok({ name }) : r;
+    },
 
     ...roleOps,
     createThread: missing("Starting a thread"), sendToThread: missing("Sending to a thread"), decideApproval: missing("Approvals"),

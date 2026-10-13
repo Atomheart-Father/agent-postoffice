@@ -75,7 +75,7 @@ export function createMockAdapter({ scenario = "default", latency = 140, now = (
 
   function view() {
     const d = clone(data);
-    d.capabilities = capabilityMap((f) => ({ status: sc === "missing" && ["role.edit", "thread.control", "mail.send", "mail.outbox"].includes(f.key) ? "missing" : "mock", note: "Sample data from the anonymous fixture." }));
+    d.capabilities = capabilityMap((f) => ({ status: sc === "missing" && ["role.edit", "thread.control", "mail.send", "mail.outbox", "mailbox.status", "mailbox.clear"].includes(f.key) ? "missing" : "mock", note: "Sample data from the anonymous fixture." }));
     if (sc === "empty") { d.roles = []; d.threads = []; d.mail = []; d.work = []; d.approvals = []; d.usage = null; d.company.name = "Empty Office"; }
     if (sc === "degraded") {
       d.consistency = "degraded"; d.degraded = ["Presence feed is unavailable, so every status is unknown.", "Usage reader is unavailable."];
@@ -243,6 +243,10 @@ export function createMockAdapter({ scenario = "default", latency = 140, now = (
       done.add(k); data.mail = data.mail.filter((m) => m.id !== l.mailId); bump(); emit();
       return reply(ok(normalizeMailResult("retract", { state: "retracted", id, to })));
     },
+
+    // the sample world has no mailbox nodes; these two are not simulated, so no screen can show a switch or a clear that did nothing
+    async setDelivery() { return fail(ERR.MISSING, "The sample world has no mailboxes to switch."); },
+    async clearMailbox() { return fail(ERR.MISSING, "The sample world has no mailboxes to clear."); },
 
     sameData(other) { return deepEqual(data, other); },
     stop() { if (timer) clearInterval(timer); timer = null; listeners.clear(); },
