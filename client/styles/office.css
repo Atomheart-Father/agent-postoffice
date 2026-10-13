@@ -114,6 +114,8 @@ button.row:hover{background:var(--paper-2)}
 .badge::before{content:"";width:9px;height:9px;border:1.5px solid var(--ink);flex:none;background:var(--paper)}
 .badge[data-b$=":consumed"]::before,.badge[data-b$=":released"]::before,.badge[data-b$=":controllable"]::before{background:var(--ink)}
 .badge[data-b$=":accepted"]::before,.badge[data-b$=":pending_approval"]::before{background:linear-gradient(90deg,var(--ink) 50%,var(--paper) 50%)}
+.badge[data-b="delivery:waiting"]::before{background:linear-gradient(to top,var(--ink) 25%,var(--paper) 25%)}
+.badge[data-b="delivery:reminded"]::before{background:linear-gradient(to top,var(--ink) 40%,var(--paper) 40%);border-style:double}
 .badge[data-b="work:submitted"]::before{background:linear-gradient(to top,var(--ink) 30%,var(--paper) 30%)}
 .badge[data-b="work:verified"]::before{background:linear-gradient(to top,var(--ink) 55%,var(--paper) 55%)}
 .badge[data-b="work:accepted"]::before{background:linear-gradient(to top,var(--ink) 80%,var(--paper) 80%)}
@@ -129,7 +131,7 @@ button.row:hover{background:var(--paper-2)}
 .note-b span{color:var(--ink-2);overflow-wrap:anywhere}
 .note-b[data-k=error],.note-b[data-k=denied]{border-left-color:var(--bad)}
 .note-b[data-k=error] b,.note-b[data-k=denied] b{color:var(--bad)}
-.note-b[data-k=pending],.note-b[data-k=stale],.note-b[data-k=degraded]{border-left-color:var(--ink)}
+.note-b[data-k=pending],.note-b[data-k=stale],.note-b[data-k=degraded],.note-b[data-k=warn]{border-left-color:var(--ink)}
 .note-b[data-k=loading]{border-left-style:dashed}
 .note-b[data-k=loading] b::after{content:"";display:inline-block;width:8px;height:8px;margin-left:8px;background:var(--ink);animation:blink 1.4s ease-in-out infinite}
 .ok-b{display:grid;gap:3px;border:1px solid var(--ink);border-left-width:4px;padding:10px 14px;margin:8px 0}
@@ -160,6 +162,12 @@ input:disabled,textarea:disabled,select:disabled{opacity:.55}
 .diff li[data-op=remove] .val{text-decoration:line-through;text-decoration-color:var(--ink-3)}
 .diff .fld{color:var(--ink-3);font-weight:600}
 .diff .val{overflow-wrap:anywhere}
+.diff li.warn{background:var(--paper-2)}.diff li.warn .op{color:var(--bad)}.diff li.warn .op::before{content:"! "}
+.subh,.sub h4{margin:14px 0 4px;font-size:13px;font-weight:700;letter-spacing:.02em}
+.sub .bul{margin:0}.facts b{font-weight:650;margin-right:6px}
+.issues{list-style:none;margin:0;padding:8px 12px;border-left:3px solid var(--bad);font-size:13.5px;display:grid;gap:3px}.issues b{font-weight:700}
+.chips .rn{display:block;color:var(--ink-3);font-size:12.5px}
+.act{margin-top:6px}
 
 /* ---------- Token HUD ---------- */
 .hud{position:relative}
@@ -247,15 +255,24 @@ input:disabled,textarea:disabled,select:disabled{opacity:.55}
 .captbl{width:100%;border-collapse:collapse;margin-bottom:22px;font-size:14px}
 .captbl th{text-align:left;font-size:12.5px;color:var(--ink-3);font-weight:600;padding:4px 8px;border-bottom:1px solid var(--ink)}
 .captbl td{padding:10px 8px;border-bottom:1px solid var(--rule);vertical-align:top}
-.captbl td:nth-child(2),.captbl td:nth-child(3){width:96px}
+.captbl td:nth-child(n+2){width:92px}
 .captbl .fine{display:block;margin-top:2px;font-size:12.5px}
 .captbl .needs{color:var(--ink-3)}
+@media (max-width:760px){
+  .captbl thead{position:absolute;left:-9999px}
+  .captbl,.captbl tbody,.captbl tr{display:block}
+  .captbl tr{padding:10px 0;border-bottom:1px solid var(--rule);display:flex;flex-wrap:wrap;gap:6px 14px}
+  .captbl td{display:block;border:0;padding:0}
+  .captbl td:first-child{flex:1 0 100%}
+  .captbl td:nth-child(n+2){width:auto;display:inline-flex;align-items:center;gap:6px}
+  .captbl td:nth-child(n+2)::before{content:attr(data-l);font-size:12px;color:var(--ink-3);font-weight:600}
+}
 .cap{font-size:12.5px;font-weight:650;border:1px solid var(--ink-3);padding:1px 7px;color:var(--ink-2);white-space:nowrap}
 .cap[data-s=live]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
 .cap[data-s=partial]{border-color:var(--ink);color:var(--ink)}
 .cap[data-s=mock]{border-style:dashed;color:var(--ink)}
 .cap[data-s=missing]{color:var(--bad);border-color:var(--bad)}
-.cap[data-s=planned]{border-style:dotted}
+.cap[data-s=planned],.cap[data-s=unverified]{border-style:dotted}
 .scen{display:flex;gap:16px;align-items:center;justify-content:space-between;border:1px dashed var(--ink-3);padding:10px 14px;margin:12px 0 22px;flex-wrap:wrap}
 .scen label{display:grid;gap:2px}
 .scen select{width:200px}

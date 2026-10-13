@@ -13,7 +13,8 @@ import { t, setLang, getLang } from "./i18n.js";
 import { ERR } from "./contract.js";
 import { parseHash, formatHash } from "./router.js";
 import { drawWires, hoverPath } from "./fx.js";
-import { startEdit, patchOf, isDirty, reduce as editReduce } from "./flows/roleEdit.js";
+import { startEdit, buildRequest, isDirty, movedUpstream, validateDraft, reduce as editReduce } from "./flows/roleEdit.js";
+import { issuesHtml } from "./views/roleEdit.js";
 import { saveTheme, paintTheme, cleanTheme, saveLang } from "./theme.js";
 import { roleById } from "./views/ui.js";
 
@@ -90,7 +91,7 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
       const role = roleById(S.snap, id);
       if (!role) { delete S.edits[id]; continue; }
       const es = S.edits[id];
-      if (es.phase === "idle" && !isDirty(es) && role.rev !== es.baseRev) S.edits[id] = startEdit(role);   // nothing to lose: follow the role
+      if (es.phase === "idle" && !isDirty(es) && movedUpstream(es, role)) S.edits[id] = startEdit(role);   // nothing to lose: follow the role
     }
   }
   function apply(res) {
@@ -121,16 +122,19 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
   const setEdit = (id, ev) => { S.edits[id] = editReduce(S.edits[id], ev); };
   async function edPreview() {
     const role = roleById(S.snap, S.roleId), es = editOf(); if (!role || !es || es.phase === "previewing" || es.phase === "applying") return;
-    const patch = patchOf(es); if (!Object.keys(patch).length) return;
+    if (!isDirty(es) || validateDraft(es).length) return;
     setEdit(role.id, { type: "preview:start" }); render();
-    const res = await adapter.previewRoleChange(role.id, patch, es.baseRev);
-    setEdit(role.id, res.ok ? { type: "preview:ok", data: res.data } : { type: "preview:fail", error: res.error }); render();
+    const res = await adapter.previewRoleChange(buildRequest(es));
+    setEdit(role.id, res.ok ? { type: "preview:ok", data: res.data.diff } : { type: "preview:fail", error: res.error }); render();
   }
+  // Apply sends the request that was previewed plus the baseline the preview returned, untouched. It is never
+  // retried automatically: a lost reply can mean the config WAS saved, so the only follow-up is to look again.
   async function edApply() {
-    const role = roleById(S.snap, S.roleId), es = editOf(); if (!role || !es || es.phase !== "preview") return;
+    const role = roleById(S.snap, S.roleId), es = editOf(); if (!role || !es || es.phase !== "preview" || !es.preview.baseline) return;
     setEdit(role.id, { type: "apply:start" }); render();
-    const res = await adapter.applyRoleChange(role.id, patchOf(es), es.baseRev, es.preview.token);
-    if (res.ok) { setEdit(role.id, { type: "apply:ok", data: res.data }); await load(); } else setEdit(role.id, { type: "apply:fail", error: res.error });
+    const res = await adapter.applyRoleChange(buildRequest(es), es.preview.baseline);
+    if (res.ok) { setEdit(role.id, { type: "apply:ok", data: res.data }); await load(); }
+    else { setEdit(role.id, { type: "apply:fail", error: res.error }); await load(); }   // the snapshot is refetched either way: a stale or lost reply is judged against the latest
     render();
   }
 
@@ -178,15 +182,9 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     "ed-back"() { const r = roleById(S.snap, S.roleId); if (r) { setEdit(r.id, { type: "back" }); render(); } },
     "ed-discard"() { const r = roleById(S.snap, S.roleId); if (r) { S.edits[r.id] = startEdit(r); render(); } },
     "ed-reset"() { const r = roleById(S.snap, S.roleId); if (r) { S.edits[r.id] = startEdit(r); render(); } },
-    async "ed-rebase"() { const r = roleById(S.snap, S.roleId); if (!r) return; await load(); setEdit(r.id, { type: "rebase" }); render(); return edPreview(); },
-    "ed-retry"() { const es = editOf(); return es && es.preview ? edApply() : edPreview(); },
-    async "ed-retryproj"() {
-      const r = roleById(S.snap, S.roleId), es = editOf(); if (!r || !es || !es.result) return;
-      const names = (es.result.projections || []).filter((p) => !p.ok).map((p) => p.name);
-      const res = await adapter.retryProjections(r.id, names);
-      if (res.ok) setEdit(r.id, { type: "retry:ok", projections: (es.result.projections || []).map((p) => ({ ...p, ok: true, error: "" })) }); else toast(errText(res.error), "error");
-      render();
-    },
+    async "ed-rebase"() { const r = roleById(S.snap, S.roleId); if (!r) return; await load(); const latest = roleById(S.snap, r.id); if (!latest) return; setEdit(r.id, { type: "rebase", role: latest }); render(); return edPreview(); },
+    "ed-retry"() { return edPreview(); },
+    async "ed-refresh"() { await load(); render(); },
   };
 
   function click(target) {
@@ -205,7 +203,11 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     try {
       const es = S.snap && roleById(S.snap, S.roleId) ? S.edits[S.roleId] : null;
       const pv = root.querySelector('[data-fk="ed-preview"]'), ds = root.querySelector('[data-fk="ed-discard"]');
-      if (es && pv) { pv.disabled = !isDirty(es); if (ds) ds.disabled = !isDirty(es); }
+      if (es && pv) {
+        const bad = validateDraft(es).length > 0;
+        pv.disabled = !isDirty(es) || bad; if (ds) ds.disabled = !isDirty(es);
+        const box = root.querySelector("[data-issues]"); if (box) box.innerHTML = issuesHtml(es);   // a sibling of the field, so typing and IME are untouched
+      }
       const sub = root.querySelector('[data-fk="nt-submit"]');
       if (sub) sub.disabled = S.newThread.busy || !S.newThread.roleId || !S.newThread.title.trim();
     } catch { /* stub */ }
