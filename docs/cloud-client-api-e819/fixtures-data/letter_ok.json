@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "id": "20261013-044210_panelop_样例待唤醒",
+  "box": "box_a",
+  "sender": "panelop",
+  "subject": "样例·待唤醒",
+  "need": "仅告知",
+  "body": "这是 waiting 样例：投递资格在线但未被任何通道提醒。"
+}

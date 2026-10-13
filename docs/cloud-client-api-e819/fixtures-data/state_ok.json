@@ -1,0 +1,576 @@
+{
+  "home": "<HOME>",
+  "boxes": [
+    {
+      "name": "panelop",
+      "app": "手动",
+      "method": "notify",
+      "who": "",
+      "online": true,
+      "ident": "",
+      "pending": [],
+      "counts": {
+        "waiting": 0,
+        "reminded": 0,
+        "failed": 0,
+        "ride": 0
+      },
+      "activity": {
+        "state": "unknown",
+        "since": null
+      },
+      "identity": {
+        "box": "panelop",
+        "registered": true,
+        "profile": {
+          "display_name": "",
+          "kind": "unspecified",
+          "description": "",
+          "legacy_note": ""
+        },
+        "binding": null,
+        "status": "online",
+        "method": "notify",
+        "as_of": 1791863763.602307,
+        "memberships": [],
+        "active_roles": [],
+        "candidate_only_roles": [],
+        "company_rules": [],
+        "project_status": [],
+        "org_present": true,
+        "config_ok": true,
+        "error": "",
+        "fingerprint": "fc5a0a6e8f841db1"
+      },
+      "acks": []
+    },
+    {
+      "name": "box_a",
+      "app": "手动",
+      "method": "notify",
+      "who": "",
+      "online": true,
+      "ident": "",
+      "pending": [
+        {
+          "file": "20261013-044210_panelop_样例已提醒.md",
+          "status": "reminded",
+          "kind": "formal",
+          "subject": "样例·已提醒",
+          "from": "panelop",
+          "mtime": 1791862930
+        },
+        {
+          "file": "20261013-044210_panelop_样例待唤醒.md",
+          "status": "waiting",
+          "kind": "formal",
+          "subject": "样例·待唤醒",
+          "from": "panelop",
+          "mtime": 1791862930
+        }
+      ],
+      "counts": {
+        "waiting": 1,
+        "reminded": 1,
+        "failed": 0,
+        "ride": 0
+      },
+      "activity": {
+        "state": "unknown",
+        "since": null
+      },
+      "identity": {
+        "box": "box_a",
+        "registered": true,
+        "profile": {
+          "display_name": "",
+          "kind": "unspecified",
+          "description": "",
+          "legacy_note": ""
+        },
+        "binding": null,
+        "status": "online",
+        "method": "notify",
+        "as_of": 1791863763.603193,
+        "memberships": [],
+        "active_roles": [
+          {
+            "alias": "office.design",
+            "title": "匿名设计岗",
+            "scope": {
+              "kind": "project",
+              "id": "anonproj"
+            },
+            "candidates": [
+              "box_a"
+            ],
+            "active_target": "box_a",
+            "duties": [
+              "拟契约样例"
+            ],
+            "resources": [
+              {
+                "kind": "doc",
+                "ref": "pack/契约",
+                "note": "",
+                "path": "<HOME>/pack/契约",
+                "exists": false
+              }
+            ]
+          }
+        ],
+        "candidate_only_roles": [],
+        "company_rules": [
+          {
+            "company": "anonco",
+            "path": "rules/anon.md",
+            "freshness": {
+              "state": "missing",
+              "as_of_text": "",
+              "stale": false,
+              "sources": []
+            }
+          }
+        ],
+        "project_status": [
+          {
+            "project": "anonproj",
+            "path": "<HOME>/STATUS.md",
+            "freshness": {
+              "state": "ok",
+              "as_of_text": "",
+              "stale": false,
+              "sources": []
+            }
+          }
+        ],
+        "org_present": true,
+        "config_ok": true,
+        "error": "",
+        "fingerprint": "fc5a0a6e8f841db1"
+      },
+      "acks": []
+    },
+    {
+      "name": "box_b",
+      "app": "手动",
+      "method": "notify",
+      "who": "",
+      "online": true,
+      "ident": "",
+      "pending": [],
+      "counts": {
+        "waiting": 0,
+        "reminded": 0,
+        "failed": 0,
+        "ride": 0
+      },
+      "activity": {
+        "state": "unknown",
+        "since": null
+      },
+      "identity": {
+        "box": "box_b",
+        "registered": true,
+        "profile": {
+          "display_name": "",
+          "kind": "unspecified",
+          "description": "",
+          "legacy_note": ""
+        },
+        "binding": null,
+        "status": "online",
+        "method": "notify",
+        "as_of": 1791863763.603463,
+        "memberships": [],
+        "active_roles": [
+          {
+            "alias": "office.worker",
+            "title": "匿名执行岗",
+            "scope": {
+              "kind": "project",
+              "id": "anonproj"
+            },
+            "candidates": [
+              "box_b"
+            ],
+            "active_target": "box_b",
+            "duties": [
+              "跑样例"
+            ],
+            "resources": []
+          }
+        ],
+        "candidate_only_roles": [],
+        "company_rules": [
+          {
+            "company": "anonco",
+            "path": "rules/anon.md",
+            "freshness": {
+              "state": "missing",
+              "as_of_text": "",
+              "stale": false,
+              "sources": []
+            }
+          }
+        ],
+        "project_status": [
+          {
+            "project": "anonproj",
+            "path": "<HOME>/STATUS.md",
+            "freshness": {
+              "state": "ok",
+              "as_of_text": "",
+              "stale": false,
+              "sources": []
+            }
+          }
+        ],
+        "org_present": true,
+        "config_ok": true,
+        "error": "",
+        "fingerprint": "fc5a0a6e8f841db1"
+      },
+      "acks": []
+    },
+    {
+      "name": "box_unlisted",
+      "app": "手动",
+      "method": "notify",
+      "who": "",
+      "online": true,
+      "ident": "",
+      "pending": [],
+      "counts": {
+        "waiting": 0,
+        "reminded": 0,
+        "failed": 0,
+        "ride": 0
+      },
+      "activity": {
+        "state": "unknown",
+        "since": null
+      },
+      "identity": {
+        "box": "box_unlisted",
+        "registered": true,
+        "profile": {
+          "display_name": "",
+          "kind": "unspecified",
+          "description": "",
+          "legacy_note": ""
+        },
+        "binding": null,
+        "status": "online",
+        "method": "notify",
+        "as_of": 1791863763.603688,
+        "memberships": [],
+        "active_roles": [
+          {
+            "alias": "office.missing",
+            "title": "未登记候选岗",
+            "scope": {
+              "kind": "project",
+              "id": "anonproj"
+            },
+            "candidates": [
+              "box_unlisted"
+            ],
+            "active_target": "box_unlisted",
+            "duties": [],
+            "resources": []
+          }
+        ],
+        "candidate_only_roles": [],
+        "company_rules": [
+          {
+            "company": "anonco",
+            "path": "rules/anon.md",
+            "freshness": {
+              "state": "missing",
+              "as_of_text": "",
+              "stale": false,
+              "sources": []
+            }
+          }
+        ],
+        "project_status": [
+          {
+            "project": "anonproj",
+            "path": "<HOME>/STATUS.md",
+            "freshness": {
+              "state": "ok",
+              "as_of_text": "",
+              "stale": false,
+              "sources": []
+            }
+          }
+        ],
+        "org_present": true,
+        "config_ok": true,
+        "error": "",
+        "fingerprint": "fc5a0a6e8f841db1"
+      },
+      "acks": []
+    },
+    {
+      "name": "box_c",
+      "app": "OpenCode",
+      "method": "opencode_plugin",
+      "who": "",
+      "online": true,
+      "ident": "",
+      "pending": [
+        {
+          "file": "20261013-044311_panelop_样例已失败.md",
+          "status": "failed",
+          "kind": "formal",
+          "subject": "样例·已失败",
+          "from": "panelop",
+          "mtime": 1791862991
+        }
+      ],
+      "counts": {
+        "waiting": 0,
+        "reminded": 0,
+        "failed": 1,
+        "ride": 0
+      },
+      "activity": {
+        "state": "unknown",
+        "since": null
+      },
+      "identity": {
+        "box": "box_c",
+        "registered": true,
+        "profile": {
+          "display_name": "",
+          "kind": "unspecified",
+          "description": "",
+          "legacy_note": ""
+        },
+        "binding": null,
+        "status": "online",
+        "method": "opencode_plugin",
+        "as_of": 1791863763.60405,
+        "memberships": [],
+        "active_roles": [],
+        "candidate_only_roles": [],
+        "company_rules": [],
+        "project_status": [],
+        "org_present": true,
+        "config_ok": true,
+        "error": "",
+        "fingerprint": "fc5a0a6e8f841db1"
+      },
+      "acks": []
+    }
+  ],
+  "broadcasts": [],
+  "groups": [
+    {
+      "name": "notify",
+      "members": [
+        "panelop",
+        "box_a",
+        "box_b",
+        "box_unlisted"
+      ],
+      "total": 4,
+      "online": 4,
+      "counts": {
+        "waiting": 1,
+        "reminded": 1,
+        "failed": 0,
+        "ride": 0
+      }
+    }
+  ],
+  "aliases": [
+    {
+      "name": "office.design",
+      "target": "box_a",
+      "confirmed": null,
+      "kind": "execution",
+      "escalation_role": "office.worker",
+      "escalation": null,
+      "pending": null,
+      "pending_in": 0,
+      "notify": [],
+      "handoff": "",
+      "has_role": true,
+      "duties": [
+        "拟契约样例"
+      ],
+      "resources": [
+        {
+          "kind": "doc",
+          "ref": "pack/契约",
+          "note": ""
+        }
+      ],
+      "candidates": [
+        {
+          "name": "box_a",
+          "known": true,
+          "online": true
+        }
+      ]
+    },
+    {
+      "name": "office.worker",
+      "target": "box_b",
+      "confirmed": null,
+      "kind": "execution",
+      "escalation_role": "",
+      "escalation": null,
+      "pending": null,
+      "pending_in": 0,
+      "notify": [],
+      "handoff": "",
+      "has_role": true,
+      "duties": [
+        "跑样例"
+      ],
+      "resources": [],
+      "candidates": [
+        {
+          "name": "box_b",
+          "known": true,
+          "online": true
+        }
+      ]
+    },
+    {
+      "name": "office.missing",
+      "target": "box_unlisted",
+      "confirmed": null,
+      "kind": "execution",
+      "escalation_role": "",
+      "escalation": null,
+      "pending": null,
+      "pending_in": 0,
+      "notify": [],
+      "handoff": "",
+      "has_role": true,
+      "duties": [],
+      "resources": [],
+      "candidates": [
+        {
+          "name": "box_unlisted",
+          "known": true,
+          "online": true
+        }
+      ]
+    }
+  ],
+  "switches": [],
+  "role_cards": [
+    {
+      "name": "office.design",
+      "title": "匿名设计岗",
+      "project": "anonproj",
+      "active": "box_a",
+      "kind": "execution",
+      "escalation_acceptor": "",
+      "holder_state": "online_notify",
+      "candidates": [
+        {
+          "name": "box_a",
+          "state": "online_notify"
+        }
+      ],
+      "escalation_role": "office.worker",
+      "escalation_title": "匿名执行岗",
+      "escalation_target": "box_b",
+      "duties": [
+        "拟契约样例"
+      ],
+      "resources": [
+        {
+          "kind": "doc",
+          "ref": "pack/契约",
+          "note": "",
+          "path": "<HOME>/pack/契约",
+          "exists": false
+        }
+      ],
+      "confirmed": null,
+      "config_ok": true,
+      "status_file": {
+        "path_exists": true,
+        "updated": "2026-10-13 04:56"
+      }
+    },
+    {
+      "name": "office.worker",
+      "title": "匿名执行岗",
+      "project": "anonproj",
+      "active": "box_b",
+      "kind": "execution",
+      "escalation_acceptor": "",
+      "holder_state": "online_notify",
+      "candidates": [
+        {
+          "name": "box_b",
+          "state": "online_notify"
+        }
+      ],
+      "escalation_role": "",
+      "escalation_title": "",
+      "escalation_target": "",
+      "duties": [
+        "跑样例"
+      ],
+      "resources": [],
+      "confirmed": null,
+      "config_ok": true,
+      "status_file": {
+        "path_exists": true,
+        "updated": "2026-10-13 04:56"
+      }
+    },
+    {
+      "name": "office.missing",
+      "title": "未登记候选岗",
+      "project": "anonproj",
+      "active": "box_unlisted",
+      "kind": "execution",
+      "escalation_acceptor": "",
+      "holder_state": "online_notify",
+      "candidates": [
+        {
+          "name": "box_unlisted",
+          "state": "online_notify"
+        }
+      ],
+      "escalation_role": "",
+      "escalation_title": "",
+      "escalation_target": "",
+      "duties": [],
+      "resources": [],
+      "confirmed": null,
+      "config_ok": true,
+      "status_file": {
+        "path_exists": true,
+        "updated": "2026-10-13 04:56"
+      }
+    }
+  ],
+  "config": "<HOME>/config.json",
+  "config_error": "",
+  "panel": {
+    "ok": true,
+    "label": "ANON-LABEL",
+    "operator": "panelop",
+    "organization": {
+      "label": "匿名团队",
+      "children": [],
+      "members": [
+        "box_a",
+        "box_b"
+      ]
+    }
+  },
+  "log": []
+}
