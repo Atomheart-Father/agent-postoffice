@@ -57,8 +57,8 @@ node tests/client_master_integration_test.mjs   # 起一个真实 master 后端�
 
 ```
 client/
-  index.html                入口（无构建，原生 ES module）
-  styles/                   tokens.css · base.css · office.css
+  index.html                入口（无构建，原生 ES module；页面里没有内联脚本，也没有 data: 链接，兼容 script-src 'self'）
+  styles/                   tokens.css · base.css · office.css（字体用系统字体栈，不带字体文件，宿主不需要 woff2 的 MIME）
   src/
     contract.js             数据契约：枚举都带 unknown；数字是 number|null；normalize* 从不猜
     capabilities.js         “能做什么”的唯一登记表（live/fixture/partial/mock/missing…），应用内「能力」弹窗与本文 §8 都从它生成
@@ -74,7 +74,7 @@ client/
     flows/writer.js         单写者：Web Locks 锁的获取 / 排队接管 / 释放；测试用的内存锁（可模拟标签页崩溃）
     flows/mailbox.js        上下线与整箱清理的状态机（纯函数）
     views/                  纯函数 (状态)→HTML 字符串
-    app.js · paint.js · router.js · theme.js · i18n.js · strings.js · fx.js · host.js · main.js
+    app.js · paint.js · router.js · theme.js · theme-boot.js（首帧前设置主题的外部经典脚本，代替原来的内联脚本）· i18n.js · strings.js · fx.js · host.js · main.js
 ```
 
 - **一个数据适配器**：视图只认 `getSnapshot / readLetter / listOutbox / sendMail / ackMail / archiveMail / editMail / retractMail / previewRoleChange / applyRoleChange / …`。返回 `{ok:true,data}` 或 `{ok:false,error:{code,message,retryable,…}}`；`outcomeUnknown:true` 表示写入的回复丢了，**绝不自动重发**。

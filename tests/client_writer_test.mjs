@@ -449,12 +449,58 @@ const putV1 = (w, items) => w.storage.setItem(v1key(w), JSON.stringify({ v: 1, s
   is(L.posts().length, 0, "…nothing is sent");
   is(L.view.writes, 0, "…and nothing is stored");
   const reads = L.log.length; await L.app.load(); yes(L.log.length > reads, "…reading still works");
-  // the default (no lock manager given) in a place without navigator.locks behaves the same
-  const root = { innerHTML: "", querySelectorAll() { return []; }, querySelector() { return null; }, contains() { return false; } };
-  const b = backend({ "/api/state": [200, state], "/api/send": OKSEND() });
-  const app = createApp({ root, toastRoot: { textContent: "" }, adapter: createHttpAdapter({ fetchImpl: b.fetchImpl }), win: { location: { hash: "#/work" }, innerWidth: 1440, setTimeout: () => 0, clearTimeout() {} }, doc: null, storage: memStorage(), ledgerBase: "x" });
-  await app.load(); await settle();
-  is(app.S.ledger.writer, "unsupported", "the default in a Node environment (no navigator.locks) is 'unsupported', not 'allowed'");
+  // The default (no lock manager passed in) looks at win.navigator.locks, then at the global navigator.locks. Whether THIS Node has
+  // one differs by version (Node 22: no; newer: yes), so each case below sets the environment it is about instead of assuming it.
+  const defaultApp = async (win2) => {
+    const root2 = { innerHTML: "", querySelectorAll() { return []; }, querySelector() { return null; }, contains() { return false; } };
+    const b2 = backend({ "/api/state": [200, state], "/api/send": OKSEND() });
+    const app2 = createApp({ root: root2, toastRoot: { textContent: "" }, adapter: createHttpAdapter({ fetchImpl: b2.fetchImpl }), win: { location: { hash: "#/work" }, innerWidth: 1440, setTimeout: () => 0, clearTimeout() {}, ...win2 }, doc: null, storage: memStorage(), ledgerBase: "x" });
+    await app2.load(); await settle();
+    return app2;
+  };
+  const withNavigator = async (value, fn) => {
+    const had = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    Object.defineProperty(globalThis, "navigator", { value, configurable: true, writable: true });
+    try { return await fn(); } finally { if (had) Object.defineProperty(globalThis, "navigator", had); else delete globalThis.navigator; }
+  };
+  // 1. unsupported path, injected: a global navigator without locks (and none on the window)
+  await withNavigator({}, async () => {
+    const app2 = await defaultApp({});
+    is(app2.S.ledger.writer, "unsupported", "no navigator.locks anywhere (injected environment): 'unsupported', not 'allowed'");
+    app2.destroy();
+  });
+  await withNavigator(undefined, async () => {
+    const app2 = await defaultApp({});
+    is(app2.S.ledger.writer, "unsupported", "no navigator at all (injected): 'unsupported'");
+    app2.destroy();
+  });
+  // 2. a runtime that brings its own locks (as newer Node versions do), injected: the default uses them
+  {
+    const mgr = createMemoryLocks();
+    await withNavigator({ locks: mgr.tab() }, async () => {
+      const app2 = await defaultApp({});
+      is(app2.S.ledger.writer, "holder", "a global navigator.locks (injected) is used by default: the page is the writer");
+      yes(mgr.holders().some((n) => n.startsWith("boxz.office.writer|")), "…and the scope lock is really taken on it");
+      app2.destroy(); await settle();
+      is(mgr.holders(), [], "…and destroy() lets all of them go");
+    });
+    const mgr2 = createMemoryLocks(), mgr3 = createMemoryLocks();
+    await withNavigator({ locks: mgr2.tab() }, async () => {
+      const app2 = await defaultApp({ navigator: { locks: mgr3.tab() } });
+      is([mgr2.holders().length, mgr3.holders().length > 0], [0, true], "the window's navigator.locks wins over the global one");
+      app2.destroy();
+    });
+  }
+  // 3. this Node's own navigator.locks, when it has one (not injected; reported as skipped when it has none)
+  if (globalThis.navigator && globalThis.navigator.locks && typeof globalThis.navigator.locks.request === "function") {
+    const app2 = await defaultApp({});
+    is(app2.S.ledger.writer, "holder", `Node's own navigator.locks (Node ${process.versions.node}) is used: the page is the writer`);
+    const q = await globalThis.navigator.locks.query();
+    yes(q.held.some((l) => l.name.startsWith("boxz.office.writer|")), "…and the lock is held in the runtime's lock manager");
+    app2.destroy(); await settle();
+    const q2 = await globalThis.navigator.locks.query();
+    yes(!q2.held.some((l) => l.name.startsWith("boxz.office.writer")), "…and destroy() releases it");
+  } else console.log(`skip - this Node (${process.versions.node}) has no navigator.locks; the injected cases above cover the default path`);
   // a lock manager that throws
   const gate = []; const g = createWriterGate({ locks: { request() { throw new Error("SecurityError"); } }, onChange: (s) => gate.push(s) });
   g.claim("x"); is(gate, ["checking", "unsupported"], "a lock manager that throws means unsupported, never writer");
