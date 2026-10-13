@@ -266,5 +266,7 @@ export function normalizeMailResult(kind, raw) {
   const d = raw && typeof raw === "object" ? raw : {};
   const state = kind === "send" ? "sent" : pick(d.state, MAIL_STATES[kind] || []);
   const ref = str(d.ref);
-  return { kind, state, id: str(d.id), to: str(d.to) || (ref.includes("/") ? ref.split("/")[0] : ""), ref };
+  // deduped: the backend says this request repeated an earlier one with the same key, and id / ref then name the ORIGINAL letter.
+  // Only a literal true counts; nothing is inferred.
+  return { kind, state, id: str(d.id), to: str(d.to) || (ref.includes("/") ? ref.split("/")[0] : ""), ref, deduped: d.deduped === true };
 }

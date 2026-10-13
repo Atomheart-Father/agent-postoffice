@@ -8,7 +8,7 @@ import { esc, fmt, ago } from "../util.js";
 import { t, getLang } from "../i18n.js";
 import { note, rawCode, mockChip } from "./ui.js";
 import { mailboxesOf, mailboxOf, lettersIn, canClear } from "../flows/mailbox.js";
-import { unconfirmed } from "../flows/writes.js";
+import { unconfirmed, ledgerFull, LIMIT } from "../flows/writes.js";
 
 const capOn = (snap, k) => { const c = snap && snap.capabilities[k]; return !!c && c.status !== "missing"; };
 export const deliveryOn = (snap) => capOn(snap, "mailbox.status") && mailboxesOf(snap).length > 0;
@@ -118,25 +118,42 @@ export function clearDialog(snap, S, now) {
     <footer class="df">${foot}<button type="button" class="btn ghost" data-act="close-dialog" data-fk="close-dialog2">${esc(c.phase === "idle" ? t("cancel") : t("close"))}</button></footer></div></div>`;
 }
 
-// ---------- the ledger ----------
+// ---------- the request log ----------
 export const writesChip = (S) => {
   if (!S.writes.length) return "";
-  const n = unconfirmed(S.writes).length;
-  return `<button type="button" class="act${n ? " warn" : ""}" data-act="writes" data-fk="writes">${esc(t("wr.open"))}${n ? ` <span class="counter" aria-label="${esc(fmt(t("wr.chip"), { n }))}">${n}</span>` : ""}</button>`;
+  const n = unconfirmed(S.writes).length, full = ledgerFull(S.writes);
+  return `<button type="button" class="act${n || full ? " warn" : ""}" data-act="writes" data-fk="writes">${esc(t(full ? "wr.openFull" : "wr.open"))}${n ? ` <span class="counter" aria-label="${esc(fmt(t("wr.chip"), { n }))}">${n}</span>` : ""}</button>`;
 };
+const shortKey = (k) => (k ? `${k.slice(0, 8)}…` : "");
 export function writesDialog(S, now) {
-  const L = getLang(), un = unconfirmed(S.writes);
-  const rows = S.writes.map((w) => `<li class="row static wr" data-phase="${esc(w.phase)}"><span class="t1"><b>${esc(t(`wr.kind.${w.kind}`) === `wr.kind.${w.kind}` ? w.kind : t(`wr.kind.${w.kind}`))}</b>
-      <span class="badge" data-b="write:${esc(w.phase)}">${esc(t(`wr.phase.${w.phase}`))}</span></span>
-      <span class="t2">${esc(w.target || "—")} · ${esc(ago(w.at, now, L) || t("unknown"))} · ${esc(t("wr.id"))} ${rawCode(w.id)}</span>
+  const L = getLang(), un = unconfirmed(S.writes), full = ledgerFull(S.writes), off = S.ledger && S.ledger.store === "off", bad = S.ledger && S.ledger.store === "unusable";
+  const rows = S.writes.map((w) => {
+    const kind = t(`wr.kind.${w.kind}`) === `wr.kind.${w.kind}` ? w.kind : t(`wr.kind.${w.kind}`);
+    const open = w.phase === "unknown" || w.phase === "pending";
+    const bits = [w.target || "", ago(w.at, now, L) || t("unknown")].filter(Boolean);
+    const lines = [
+      `${esc(bits.join(" · "))} · ${esc(t("wr.id"))} ${rawCode(w.id)}`,
+      w.clientRequestId ? `${esc(t("wr.key"))} ${rawCode(shortKey(w.clientRequestId))}` : "",
+      w.ref ? `${esc(t("wr.ref"))} ${rawCode(w.ref)}` : "",
+      typeof w.checkedAt === "number" ? esc(fmt(t("wr.checkedAt"), { s: ago(w.checkedAt, now, L) || t("unknown") })) : "",
+    ].filter(Boolean).join(" · ");
+    return `<li class="row static wr" data-phase="${esc(w.phase)}"${w.dismissed ? ' data-dismissed="1"' : ""}><span class="t1"><b>${esc(kind)}</b>
+      <span class="badge" data-b="write:${esc(w.phase)}">${esc(t(`wr.phase.${w.phase}`))}</span>${w.dismissed ? ` <span class="badge" data-b="write:dismissed">${esc(t("wr.dismissed"))}</span>` : ""}</span>
+      <span class="t2">${lines}</span>
+      ${w.deduped ? `<span class="t3">${esc(t("wr.deduped"))}</span>` : ""}
       ${w.message ? `<span class="t3">${esc(w.message)}</span>` : ""}
-      ${w.phase === "unknown" || w.phase === "pending" ? `<span class="actions"><button type="button" class="btn ghost" data-act="writes-dismiss" data-write="${esc(w.id)}" data-fk="wr-d:${esc(w.id)}">${esc(t("wr.dismiss"))}</button></span>` : ""}</li>`).join("");
+      ${open ? `<span class="t3">${esc(t(w.restored ? "wr.noRetryRestored" : w.kind === "send" ? "wr.noRetrySend" : "wr.noRetry"))}</span>` : ""}
+      ${w.phase === "unknown" && !w.dismissed ? `<span class="actions"><button type="button" class="btn ghost" data-act="writes-dismiss" data-write="${esc(w.id)}" data-fk="wr-d:${esc(w.id)}">${esc(t("wr.dismiss"))}</button></span>` : ""}</li>`;
+  }).join("");
   return `<div class="layer" data-layer="writes"><div class="scrim" data-act="close-dialog"></div>
     <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="dlg-t"><header class="dh"><h2 id="dlg-t">${esc(t("wr.title"))}</h2>
       <button type="button" class="close-x" data-act="close-dialog" data-fk="close-dialog">${esc(t("close"))}</button></header>
     <div class="sb pad" data-keep="dlg"><p class="lead">${esc(t("wr.lead"))}</p>
+      ${full ? note("warn", fmt(t("wr.full"), { n: LIMIT })) : ""}
       ${un.length ? note("warn", fmt(t("wr.warn"), { n: un.length })) : ""}
-      ${rows ? `<ul class="rows">${rows}</ul>` : note("empty", t("wr.none"))}</div>
+      ${off ? note("warn", t("wr.storeOff")) : ""}${bad ? note("warn", t("wr.storeBad")) : ""}
+      ${rows ? `<ul class="rows">${rows}</ul>` : note("empty", t("wr.none"))}
+      <p class="fine">${esc(t("wr.scope"))}</p></div>
     <footer class="df"><button type="button" class="btn primary" data-act="writes-check" data-fk="wr-check">${esc(t("wr.check"))}</button>
       <button type="button" class="btn ghost" data-act="close-dialog" data-fk="close-dialog2">${esc(t("close"))}</button></footer></div></div>`;
 }

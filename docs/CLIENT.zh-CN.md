@@ -48,6 +48,7 @@ node tests/client_render_test.mjs
 node tests/client_candidate_render_test.mjs
 node tests/client_fixture_test.mjs              # 合同包 fixture + 错误路径
 node tests/client_ops_test.mjs                  # 上下线 / 整箱清理 / 写入台账 / 英文默认与原词
+node tests/client_requests_test.mjs             # 发信去重键 / 请求状态 / 有界保留 / 刷新恢复与存储隐私
 node tests/client_master_integration_test.mjs   # 起一个真实 master 后端做邮件读写端到端
 ```
 
@@ -67,7 +68,8 @@ client/
     fixtures/demo-company.js  匿名样例公司
     flows/roleEdit.js       岗位编辑状态机与请求构造（纯函数）
     flows/mail.js           邮件写入流（发信 / 回复 / 收执 / 归档 / 改 / 撤）
-    flows/writes.js         写入台账：每个写请求一个一次性本地 request 标识与阶段（待确认 / 已受理 / 已拒绝 / 未知 / 已核对）
+    flows/writes.js         请求记录：一次操作一条（pending / acknowledged / rejected / unknown + dismissed 标记）、client_request_id、30 条有界保留、存储摘要的纯函数
+    ledgerStore.js          请求摘要的 localStorage 存取（按后端地址 + 操作者分开，版本化，失败不崩）
     flows/mailbox.js        上下线与整箱清理的状态机（纯函数）
     views/                  纯函数 (状态)→HTML 字符串
     app.js · paint.js · router.js · theme.js · i18n.js · strings.js · fx.js · host.js · main.js
@@ -108,11 +110,38 @@ client/
 - 未知的信箱 / 组：master 回 400，客户端显示后端的话；403 `{"ok":false}` 仍只解释为 Host/Origin/Content-Type 保护。
 - 在 mock 下两项都是“缺失”，不冒充。
 
-### 5.2 写入台账：不自动重试，丢回复 = 可能已发出
+### 5.2 发信去重键与请求记录（不自动重试，丢回复 = 可能已发出）
 
-- 每个写请求（send / apply / edit / retract / ack / archive / status / clear）在发出前生成一个**一次性本地 request 标识**（`w-…`），进入台账，顶栏出现「待确认请求 N」。标识**只在本地**：后端没有幂等键，所以**不发送**，也不能靠它去重。
-- 阶段：待确认（pending）→ 已受理 / 已拒绝 / **未知（unknown，可能已发出）** → 已核对。断网 / 超时 = unknown：界面写「可能已发出」，让用户先看已发信 / 状态再决定，**不静默重发**；适配器没有任何自动重试。
-- **客户端看不见的一种重发：** 浏览器或代理（keep-alive）可能自动重送“已发出但回复丢失”的 POST，这在 JS 里既看不到也拦不住；真实后端是 HTTP/1.0 无 keep-alive，我这边只用 route.abort 测过 UI 状态，**不是真实断连测试**，由本地真实浏览器链路补。
+**发信去重键 `client_request_id`**
+
+- 用户每次明确点「发送」，在请求发出前生成一个 `crypto.randomUUID()`（没有就用 `getRandomValues` 拼 UUID v4；两者都没有则**不带键**，绝不用 `Math.random`），放进请求体：`{from,to,subject,need,body,client_request_id}`。这个键**不是**界面上显示的本地编号 `w-…`。
+- 同一次操作只有一个键：双击只发出一个请求（发送中按钮不可用）；适配器原样传递调用方给的键，从不自造、从不替换；没有任何自动重试。**用户明确再发一次（哪怕内容完全相同，或改了草稿再发）就是新操作、新键**，原来的 unknown 记录保留，不被覆盖，客户端也不按「内容 + 时间窗」合并信件。
+- **客户端不声称“已具备去重保护”。** `SEND_DEDUPE.contract` 现在是 `null`：在更新后的固定版本合同（能力标记 `features.send_request_id`、保留窗口、同键异参数的错误响应）和 fixture 到达并被本地确认之前，即使后端在 `/api/state` 里带了这个标记，客户端也不开放「同键重试」，**不新增任何“安全重试”按钮**。unknown 的发信只提供：看「我发出的」/ 刷新状态 / 明确关闭提示 / 「作为新信发送」（文案明确写着这是一封新的、独立的信，可能与上一封重复）。
+- 旧后端（master v1.14.1）会忽略这个字段：集成测试里同一个键发两次，真实 master 确实归了**两封**信。所以带键不等于去重。
+- 后端回复 `deduped:true` 时，界面显示“后端认出这是之前发送的重复请求，没有创建另一封信”和原信引用，不当作又一次发送结果。同键异参数的冲突（具体响应形状等合同）：不自动换键、不自动重发，保留原操作与草稿，显示后端原话。
+
+**请求记录（一次客户端操作一条，不是公司的正式工作账，也不是审计记录）**
+
+| 状态 | 含义 |
+|---|---|
+| pending 待确认 | 请求已发出，还没有可靠结果 |
+| acknowledged 后端已确认 | 后端在可读的回复里明确说了这次操作的结果；发信的确认只说明它收下了，不说明对方读过、更不说明工作完成 |
+| rejected 后端拒绝 | 后端明确拒绝，**且回复本身能证明没有执行**（见下）|
+| unknown 结果未知 | 超时、断连、读不懂的回复，或证明不了“没执行”的错误：**可能已执行** |
+
+- **HTTP 错误码本身不能证明“未执行”**（代理的 502 可能发生在后端已保存之后）。只有两种回复算“拒绝”：后端自己的拒绝形状（4xx、JSON、`ok:false`；发信只认 `bad_request` / `not_found` / `refused`，`conflict` 等在合同确定前一律 unknown）和合同明写的 `saved:false`（role-apply，任何状态码）。5xx、HTML、空 / 读不懂的响应体、`200 + ok:false`、其它形状的 401/403（`{"ok":false}` 的 403 保护除外）都是 unknown。role-apply 的 409 是基线冲突，不是首次响应的恢复；首次响应丢失后出现 409 也不能断言第一次没有保存。
+- **关闭提示**（`dismissed`）只是“我不再关注这条提示”，是单独的标记：结果状态保持原样，不会把 unknown 改成成功。
+
+**有界保留**：最多 30 条。满了以后，只淘汰“已确认 / 已拒绝 / 用户已关闭提示”的历史，最旧的先走；**pending / unknown（未关闭）永不被自动淘汰**。30 条全是未决时，顶栏显示“请求（已满）”，**新的写操作暂停**（发信、改、撤、收执、归档、上下线、整箱清理、岗位保存都在发出之前被拒，界面写明原因），读取、刷新和核对仍可用；用户核对后关闭一条提示即可腾出位置。服务端去重窗口过期只表示不能再依赖同键重试，不表示失败。
+
+**刷新恢复与隐私**
+
+- 只在 `localStorage` 保存最小摘要：`local_id、client_request_id（仅发信）、operation、started_at、result_state、dismissed、result_ref（后端确实返回时）、last_checked_at`。**不保存**信件正文、主题、岗位草稿、收件人、完整请求体或任何凭据。
+- **注意：`result_ref` 是后端返回的信件引用，而真实 master 的信件 id 里带有「发件人 + 主题的缩写」**（如 `bob/20261013-154020_owner_Heldsend`）。按要求保存了它，但这意味着摘要里间接含有一段主题缩写；如果不接受，改为只存信箱名即可，需要产品决定。
+- 存储按（后端地址、操作者）分开：键、载荷内的 scope 都带两者，载荷里 scope 不符、版本不符、不是 JSON、记录不合格的一律不使用（并提示）；操作者在页面里切换时列表跟着换，互不可见。存储版本在键里（`boxz.office.requests.v1`）。
+- 刷新后：旧 pending 变 unknown；**不自动发送任何恢复记录**；不从已发信里“找相似内容”判定成功；没有保存请求体，所以刷新后的未决发送**只能核对，不能重试**。
+- 存储缺失 / 被禁止 / 满 / 读不回时页面正常工作，请求列表提示“未决记录仅在当前页面保留，刷新后无法恢复”。多标签页：写入时合并别的标签页存下的记录，但**不是**多标签页同步，同一条记录在两个标签页里各自改动时以最后写入为准。
+- **浏览器或代理（keep-alive）自动重送已发出但回复丢失的 POST，JS 看不到也拦不住**；去重是否真的在承载链上生效，必须由本地用真实浏览器链路验证。客户端测试里用 fake 数一数调用次数**不能**说明这个问题已解决。
 
 ### 5.3 邮件里的原词与未明字段
 
@@ -215,6 +244,7 @@ client/
 
 **不支持 / 未接：** 上述各项在真实后端下显示「能力缺失」。
 
+- 发信键 / 请求记录 / 刷新恢复在 Chromium 对真实 master 跑过：每次发信带自己的 UUID、存储里没有主题、刷新不发请求、丢回复后刷新变 unknown 且无重试、关闭提示不改状态；**这些只验证客户端行为，不验证服务端去重**。
 - 上下线 / 整箱清理 / 台账 / 中英文切换在 Chromium（zh-CN 区域设置）对真实 master 跑过：英文首次打开、批量与按组各发了预期的 POST、clear 只发 1 个 `/api/clear` 且没有 archive-one、丢回复后不自动重发（route.abort，只验证 UI 状态）。
 - 键盘、窄屏、草稿保留：在 Chromium 里测过（Tab 顺序、Escape、窄屏全屏岗位页、刷新时不丢草稿、HUD 芯片 Tab 移出不丢焦点——这是一个原有的键盘陷阱，已修并加了回归测试）。**这不是视觉最终验收，也不替老板宣布审美通过。**
 - **中文输入法没有被验证。** 自动化只用 CDP 的 `Input.imeSetComposition` 模拟了“组合输入期间不重绘”，这**不是**真实输入法测试。需要真机（macOS Safari + Chrome，Windows 微软拼音至少一个）按下面步骤：

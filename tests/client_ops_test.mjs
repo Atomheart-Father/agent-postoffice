@@ -125,9 +125,9 @@ const LANGS = ["en", "zh"];
   is([l[0].phase, unconfirmed(l).length], ["pending", 1], "a started write is awaiting confirmation");
   l = writesReduce(l, { type: "fail", id: "w-1", error: { outcomeUnknown: true, message: "m" }, at: 2 });
   is([l[0].phase, unconfirmed(l).length], ["unknown", 1], "no usable reply -> possibly sent, still unconfirmed");
-  l = writesReduce(l, { type: "dismiss", id: "w-1" }); is([l[0].phase, unconfirmed(l).length], ["checked", 0], "the user's dismissal closes it");
+  l = writesReduce(l, { type: "dismiss", id: "w-1" }); is([l[0].phase, l[0].dismissed, unconfirmed(l).length], ["unknown", true, 0], "the user's dismissal stops the reminder and does not change the state");
   l = writesReduce(writesReduce([], { type: "start", id: "w-2", kind: "send", at: 1 }), { type: "ok", id: "w-2", at: 2 });
-  is(writesReduce(l, { type: "dismiss", id: "w-2" })[0].phase, "accepted", "an accepted write cannot be 'dismissed' into something else");
+  is(writesReduce(l, { type: "dismiss", id: "w-2" })[0].phase, "acknowledged", "an acknowledged write cannot be 'dismissed' into something else");
 }
 for (const lang of LANGS) {
   setLang(lang);
@@ -146,7 +146,7 @@ for (const lang of LANGS) {
   hasS(t.root.innerHTML, "Check sent list" === "" ? "" : 'data-act="compose-check"', `[${lang}] the compose dialog points at the sent list`);
   t.S.dialog = "writes"; t.app.render();
   hasS(t.root.innerHTML, 'data-phase="unknown"', `[${lang}] the request list shows the unconfirmed entry`);
-  hasS(t.root.innerHTML, lang === "en" ? "Possibly sent" : "可能已发出", `[${lang}] …in plain words`);
+  hasS(t.root.innerHTML, lang === "en" ? "Unknown: possibly sent" : "结果未知，可能已发出", `[${lang}] …in plain words`);
   hasS(t.root.innerHTML, 'class="raw"', `[${lang}] …with its local id`);
   hasNot(t.root.innerHTML, 'data-act="compose-send"', `[${lang}] …and no 'send again' there`);
   await t.app.act("writes-check");
@@ -154,7 +154,7 @@ for (const lang of LANGS) {
   is(t.log.filter((l) => l.path === "/api/state").length >= 2, true, `[${lang}] …it re-reads the state`);
   t.app.act("writes-dismiss", { write: t.S.writes[0].id });
   is(unconfirmed(t.S.writes).length, 0, `[${lang}] dismissing closes it`);
-  is(Object.keys(posts(t, "/api/send")[0].body).sort(), ["body", "from", "need", "subject", "to"], `[${lang}] the request carries only the contract's keys (the local id is not sent)`);
+  is(Object.keys(posts(t, "/api/send")[0].body).sort(), ["body", "client_request_id", "from", "need", "subject", "to"], `[${lang}] the request carries the contract's keys plus the one-off client_request_id (the local display id is not sent)`);
 }
 setLang("en");
 
@@ -247,7 +247,7 @@ for (const lang of LANGS) {
   h = t.root.innerHTML;
   hasS(h, lang === "en" ? "The backend accepted the clear" : "后端接受了整箱清理", `[${lang}] the result is reported`);
   hasS(h, lang === "en" ? "now lists 0 letters" : "现在有 0 封", `[${lang}] …with the re-read count (the reply has none)`);
-  is(t.S.writes.map((w) => [w.kind, w.phase]), [["clear", "accepted"]], `[${lang}] …and the ledger has it as accepted`);
+  is(t.S.writes.map((w) => [w.kind, w.phase]), [["clear", "acknowledged"]], `[${lang}] …and the ledger has it as accepted`);
   t.app.act("close-dialog"); is(t.S.clear, null, `[${lang}] closing the dialog drops the flow`);
 }
 setLang("en");
@@ -304,7 +304,7 @@ setLang("en");
   const t = boot({ "/api/role-diff": [200, diffBody], "/api/role-apply": [200, resp("role_apply_pending")] }, { hash: "#/office/office.design/edit" }); await t.app.load();
   t.app.input({ closest: () => ({ dataset: { edit: "duties" }, value: "x" }) }, false); await t.app.act("ed-preview"); await t.app.act("ed-apply");
   hasS(t.root.innerHTML, ">saved: true</code>", "role-apply: 'saved: true' is shown as the backend wrote it"); hasS(t.root.innerHTML, ">projection: pending</code>", "…and 'projection: pending'");
-  is(t.S.writes.map((w) => [w.kind, w.phase]), [["role-apply", "accepted"]], "…and the apply is in the ledger");
+  is(t.S.writes.map((w) => [w.kind, w.phase]), [["role-apply", "acknowledged"]], "…and the apply is in the ledger");
   is(posts(t, "/api/role-apply").length, 1, "…sent once");
 }
 is([...missing].join(","), "", "no wording key is missing in either language");

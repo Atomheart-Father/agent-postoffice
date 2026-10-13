@@ -4,7 +4,7 @@
 // accepted by master and master's replies map onto the contract as the UI expects. What it does not prove: anything about
 // the local candidate e819f0e, a browser, or real data. Skips (exit 0) when python3 is not available.
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,8 +72,15 @@ try {
   ok(existsSync(join(home, "carol", "inbox", s1.data.ref.split("/")[1] + ".md")), "the letter really is in carol's inbox");
   const s2 = await a.sendMail({ from: "owner", to: "@helpers", subject: "Sent to a logical address", need: "回复", body: "Who takes this?" });
   ok(s2.ok, "send to @helpers is accepted", JSON.stringify(s2));
+  // the one-off key: master ignores it (it has no such field), so two sends with the SAME key are two letters - the client must not read the key as protection
+  const KEY = "3f2b8c1e-4d5a-4e6f-8a7b-9c0d1e2f3a4b", keyedBefore = readdirSync(join(home, "carol", "inbox")).length;
+  const kk1 = await a.sendMail({ from: "owner", to: "carol", subject: "Keyed", need: "仅告知", body: "k", client_request_id: KEY });
+  const kk2 = await a.sendMail({ from: "owner", to: "carol", subject: "Keyed", need: "仅告知", body: "k", client_request_id: KEY });
+  ok(kk1.ok && kk2.ok && kk1.data.deduped === false && kk2.data.deduped === false, "master accepts a send that carries client_request_id and does not report deduped");
+  is(readdirSync(join(home, "carol", "inbox")).length - keyedBefore, 2, "…and files BOTH: master v1.14.1 does not de-duplicate, so the key proves nothing on it");
   const s3 = await a.sendMail({ from: "owner", to: "ghost", subject: "x", need: "", body: "" });
   is([s3.ok, s3.error && s3.error.code], [false, "refused"], "an unknown recipient is refused");
+  ok(s3.error && !s3.error.outcomeUnknown, "…and that refusal proves nothing was filed (not 'may have been sent')");
   ok(s3.error && /ghost/.test(s3.error.message), "…with the backend's own reason", s3.error && s3.error.message);
   const s4 = await a.sendMail({ from: "nobody", to: "carol", subject: "x", need: "", body: "" });
   is([s4.ok, s4.error && s4.error.code], [false, "not_found"], "an unknown sender is not_found");

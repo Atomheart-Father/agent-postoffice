@@ -172,6 +172,21 @@ const ERR_WORDS = { bad_request: ERR.INVALID, not_found: ERR.NOT_FOUND, refused:
 export const GUARD = "403 {\"ok\":false}: the backend's Host / Origin / Content-Type protection refused this request (as documented for e819f0e). It accepts a page only from its own origin (or the one origin set in POSTOFFICE_PANEL_BASE_URL) and POST only as application/json. Open this client from the backend's own address; there is no token to add.";
 const isGuardBody = (d) => !!d && typeof d === "object" && !Array.isArray(d) && d.ok === false && Object.keys(d).length === 1;
 
+// Does this error reply PROVE that the write was not applied? An HTTP status alone never does: a proxy can answer 502 (or
+// 504) after the backend already saved, and a body can be lost on the way back. What does prove it:
+//   * the backend's own refusal shape - a 4xx whose body is a JSON object with ok:false - because validation and permission
+//     checks run before anything is written; except for send, where only bad_request / not_found / refused count (master's own validation words) until the pinned
+//     contract says what a key conflict or any other 4xx on a keyed send means;
+//   * the contract's explicit `saved:false` (role-apply), at any status.
+// Everything else (5xx, an HTML page, an empty or unreadable body, a 2xx that says ok:false) is "unknown: it may have run".
+function provesNotApplied(status, data, path) {
+  if (!data || typeof data !== "object" || Array.isArray(data) || data.ok !== false) return false;
+  if (data.saved === false) return true;
+  if (status < 400 || status >= 500) return false;
+  if (path === "/api/send") return data.error === "bad_request" || data.error === "not_found" || data.error === "refused";
+  return true;
+}
+
 export function createHttpAdapter({ baseUrl = "", fetchImpl = (typeof fetch === "function" ? fetch : null), timeoutMs = 8000, writeTimeoutMs = 15000, pollMs = 5000 } = {}) {
   const base = String(baseUrl || "").replace(/\/+$/, "");
   const listeners = new Set();
@@ -199,13 +214,17 @@ export function createHttpAdapter({ baseUrl = "", fetchImpl = (typeof fetch === 
       // A refusal happens before the request is looked at, so nothing was saved. Only the one body e819f0e documents is explained;
       // any other 401 / 403 is shown exactly as the backend wrote it.
       if (res.status === 403 && isGuardBody(data)) return fail(ERR.DENIED, GUARD, { status: 403, saved: false, guard: true });
-      return fail(ERR.DENIED, `The backend answered ${res.status}: ${raw ? raw.slice(0, 400) : "(empty body)"}`, { status: res.status, saved: false, raw: raw.slice(0, 400) });
+      // Any other 401 / 403 is shown as written. Nothing documents what else could answer that way (a proxy in front, say), so a
+      // write refused like this is not claimed to be "not applied".
+      return fail(ERR.DENIED, `The backend answered ${res.status}: ${raw ? raw.slice(0, 400) : "(empty body)"}`, { status: res.status, raw: raw.slice(0, 400), ...(write ? { outcomeUnknown: true, retryable: false } : { saved: false }) });
     }
     if (!res.ok || (data && data.ok === false)) {
       const word = data && typeof data.error === "string" ? data.error : "";
       const code = wordsOf[word] || (res.status === 404 ? ERR.NOT_FOUND : res.status >= 500 ? ERR.SERVER : ERR.INVALID);
       const msg = (data && typeof data.message === "string" && data.message) || (data && typeof data.error === "string" && !wordsOf[data.error] ? data.error : "") || `The backend answered ${res.status}${word ? ` (${word})` : ""}.`;
-      return fail(code, msg, { status: res.status, word, ...(data && data.stale === true ? { stale: true } : {}), ...(data && typeof data.saved === "boolean" ? { saved: data.saved } : {}), ...(data && typeof data.projection === "string" ? { projection: data.projection } : {}) });
+      // For a WRITE, an error is only "not applied" when the reply itself proves it. Otherwise it may have run (see provesNotApplied).
+      const unproven = write && !provesNotApplied(res.status, data, path);
+      return fail(code, msg, { status: res.status, word, ...(unproven ? { outcomeUnknown: true, retryable: false } : {}), ...(data && data.stale === true ? { stale: true } : {}), ...(data && typeof data.saved === "boolean" ? { saved: data.saved } : {}), ...(data && typeof data.projection === "string" ? { projection: data.projection } : {}) });
     }
     if (data == null) return write ? unknownOutcome(`The backend answered ${res.status} without a readable body. The request may have been applied; look before trying again.`) : fail(ERR.NETWORK, `The backend answered ${res.status} without a readable body.`);
     return ok(data);
@@ -251,7 +270,12 @@ export function createHttpAdapter({ baseUrl = "", fetchImpl = (typeof fetch === 
     // ---- mail ----
     async readLetter({ box, id }) { const r = await call("GET", `/api/letter?${q({ box, id })}`); return r.ok ? ok(normalizeLetter(r.data)) : r; },
     async listOutbox() { const r = await call("GET", "/api/outbox"); return r.ok ? ok({ rows: (Array.isArray(r.data.outbox) ? r.data.outbox : []).map(normalizeOutboxRow) }) : r; },
-    async sendMail({ from, to, subject, need, body }) { return done("send")(await post("/api/send", { from, to, subject, need, body })); },
+    // client_request_id: the one-off key of THIS send operation (made by the caller before the first attempt). It is sent as given and
+    // never invented or replaced here. An old backend ignores it; that is not de-duplication and nothing here treats it as such.
+    async sendMail({ from, to, subject, need, body, client_request_id }) {
+      const key = typeof client_request_id === "string" && client_request_id ? { client_request_id } : {};
+      return done("send")(await post("/api/send", { from, to, subject, need, body, ...key }));
+    },
     async ackMail({ box, id, note = "" }) { return done("ack")(await post("/api/ack-one", { box, id, note })); },
     async archiveMail({ box, id }) { return done("archive")(await post("/api/archive-one", { box, id })); },
     async editMail({ to, id, subject, need, body }) { return done("edit")(await post("/api/edit-one", { to, id, subject, need, body })); },
