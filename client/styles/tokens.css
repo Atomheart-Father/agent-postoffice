@@ -1,12 +1,11 @@
-@font-face{font-family:"Instrument";src:url(../fonts/instrument-sans-subset.woff2) format("woff2");font-weight:400 700;font-stretch:75% 100%;font-display:swap}
 /* ==========================================================================
-   BOXZ OFFICE client tokens: the panel's colour roles, six palettes, one typeface.
+   BOXZ OFFICE client tokens: the panel's colour roles, six palettes; type is the system stack (no font file, so no font MIME or font-src is needed).
    Every colour is one of the role variables below; a theme is a set of values for the same roles,
    so a new theme is one block and no component needs to change. The accent (--red) means exactly one thing:
    a letter is waiting. Errors use --bad, nothing else uses either.
    ========================================================================== */
 :root{
-  --font:"Instrument","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font:"PingFang SC","Hiragino Sans GB","Noto Sans CJK SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
   /* dialog geometry is shared with the docked letter, so the two always line up */
   --hh:72px;--bar:64px;--pane:468px;
