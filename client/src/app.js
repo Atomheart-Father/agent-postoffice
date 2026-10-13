@@ -20,7 +20,8 @@ import { roleById } from "./views/ui.js";
 import { openLetter, letterReduce, editRequest, newCompose, composeReduce, canSend, sendRequest, hasContent } from "./flows/mail.js";
 import { composeIssuesHtml } from "./views/mail.js";
 import { normalizeLetter } from "./contract.js";
-import { newRequestId, newClientRequestId, writesReduce, ledgerFull, LIMIT } from "./flows/writes.js";
+import { newRequestId, newClientRequestId, writesReduce, ledgerFull, LIMIT, SEND_KEY } from "./flows/writes.js";
+import { createWriterGate } from "./flows/writer.js";
 import { createLedgerStore, defaultStorage } from "./ledgerStore.js";
 import { fmt } from "./util.js";
 import { newDelivery, deliveryReduce, verifyAgainst, newClear, clearReduce, canClear, lettersIn, mailboxOf, mailboxesOf } from "./flows/mailbox.js";
@@ -28,7 +29,7 @@ import { newDelivery, deliveryReduce, verifyAgainst, newClear, clearReduce, canC
 // The display id of a log record only needs to differ from its neighbours; the CSPRNG is used when there is one.
 const cryptoRand = () => { try { const a = new Uint32Array(1); globalThis.crypto.getRandomValues(a); return a[0] / 2 ** 32; } catch { return Math.random(); } };
 
-export function createApp({ root, toastRoot = null, adapter, now = () => Date.now() / 1000, win = globalThis, doc = globalThis.document, host = null, theme = "paper", lang = "en", storage, ledgerBase, newKey = newClientRequestId }) {
+export function createApp({ root, toastRoot = null, adapter, now = () => Date.now() / 1000, win = globalThis, doc = globalThis.document, host = null, theme = "paper", lang = "en", storage, ledgerBase, locks, newKey = newClientRequestId }) {
   const r0 = parseHash(win.location && win.location.hash);
   const S = {
     lang, theme, view: r0.view, roleId: r0.roleId, roleTab: r0.roleTab, threadId: r0.threadId,
@@ -43,8 +44,10 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     // writes: the local ledger of every POST (id, kind, phase) - see flows/writes.js; delivery: switch dialog + last result; clear: whole-mailbox clear flow
     writes: [], delivery: newDelivery(), clear: null,
     // ledger: where the request log is kept. store = "unset" until the first snapshot names the operator, then "ok" | "empty" |
-    // "unusable" (stored data not read) | "off" (storage missing or failing: the log lives on this page only)
-    ledger: { scope: null, store: "unset", seen: new Set() },
+    // "unusable" (stored data not read) | "off" (storage missing or failing: the log lives on this page only).
+    // writer: this page's role for the scope (backend address + operator): "none" (scope not known yet) | "checking" | "holder" |
+    // "reader" | "unsupported" - only the holder sends writes and saves the summary (flows/writer.js).
+    ledger: { scope: null, store: "unset", writer: "none", dropped: 0 },
   };
   const ledgerStore = createLedgerStore({
     storage: storage === undefined ? defaultStorage(win) : storage,
@@ -133,24 +136,51 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
   async function loadFresh() { if (inflight) { try { await inflight; } catch { /* the next read decides */ } } return load(); }
 
   // ---------- the request log ----------
-  // The records of one (backend, operator) scope are restored from storage when the first snapshot says who the operator is.
-  // Restoring only fills the list: it sends nothing, and a record that was pending is shown as unknown (its reply is gone).
+  // The summary of one (backend, operator) scope is read from storage when the first snapshot says who the operator is. Reading
+  // only fills the list: it sends nothing, and a record that was pending shows as unknown (its reply is gone). Exactly one page
+  // per scope is the writer (a Web Locks lock); the others are read-only and take over when the holder goes away.
+  const operatorNow = () => (S.snap ? S.snap.company.operatorBox : "");
+  const lockName = () => ledgerStore.lockNameOf(ledgerStore.scopeOf(operatorNow()));
+  function readSummary() {
+    const got = ledgerStore.load(operatorNow());
+    S.writes = got.items;
+    S.ledger = { ...S.ledger, store: got.state, dropped: got.dropped };
+    return got;
+  }
+  function onWriter(state, name) {
+    if (!S.snap || name !== lockName()) return;   // an answer about a scope this page has left
+    S.ledger = { ...S.ledger, writer: state };
+    if (state === "holder") {
+      // Taking over (first claim, or the previous holder closed or crashed): what is stored NOW is the truth, not what this page
+      // read earlier. Whatever the old holder left pending is unknown. Nothing is sent. A summary of the previous schema is
+      // rewritten once (and its old key removed) so no letter reference stays behind.
+      const got = readSummary();
+      if (got.legacy) persist();
+    }
+    render();
+  }
+  const gate = createWriterGate({ locks: locks !== undefined ? locks : (win.navigator && win.navigator.locks) || (globalThis.navigator && globalThis.navigator.locks), onChange: onWriter });
   function adoptScope() {
     if (!S.snap) return;
-    const sc = ledgerStore.scopeOf(S.snap.company.operatorBox), key = ledgerStore.keyOf(sc);
+    const key = ledgerStore.keyOf(ledgerStore.scopeOf(operatorNow()));
     if (S.ledger.scope === key) return;
-    const got = ledgerStore.load(S.snap.company.operatorBox);
-    // Records made on this page before the scope was known (none today) stay on top; stored ones follow, without duplicates.
-    const here = S.ledger.scope === null ? S.writes : [];
-    const ids = new Set(here.map((w) => w.id));
-    S.writes = [...here, ...got.items.filter((w) => !ids.has(w.id))];
-    S.ledger = { scope: key, store: got.state, seen: new Set(S.writes.map((w) => w.id)) };
+    // A new scope (first snapshot, or the operator changed): this page lets go of the old scope's lock first, shows what is
+    // stored for the new one read-only, and asks for the new lock.
+    S.ledger = { scope: key, store: "unset", writer: "checking", dropped: 0 };
+    readSummary();
+    gate.claim(lockName());
   }
+  // Another page (the holder) saved: a read-only page shows the new summary. The holder never reacts to this.
+  function syncLedger() {
+    if (!S.snap || S.ledger.writer === "holder" || S.ledger.writer === "none") return;
+    readSummary(); render();
+  }
+  if (win.addEventListener) win.addEventListener("storage", (e) => { if (!e || e.key == null || String(e.key).startsWith("boxz.office.requests.")) syncLedger(); });
   function persist() {
-    if (S.ledger.scope === null || !S.snap) return;
-    for (const w of S.writes) S.ledger.seen.add(w.id);
-    const r = ledgerStore.save(S.snap.company.operatorBox, S.writes, S.ledger.seen);
-    S.ledger = { ...S.ledger, store: r };
+    if (S.ledger.scope === null || !S.snap || S.ledger.writer !== "holder") return;   // a page that is not the writer never writes
+    // "off" stays off: a store that could not be read (or written) once is not promised to bring the records back after a reload
+    const r = ledgerStore.save(operatorNow(), S.writes);
+    S.ledger = { ...S.ledger, store: r === "off" || S.ledger.store === "off" ? "off" : "ok" };
   }
   const logEv = (ev) => { S.writes = writesReduce(S.writes, ev); persist(); };
 
@@ -158,12 +188,17 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
   // or an unreadable reply is "unknown", never "failed". Nothing is retried. `opts.key` = a send operation: it gets ONE fresh
   // client_request_id here, passed to `run(id, key)`; the key belongs to this operation and to no other.
   // A full log (LIMIT records, none of them resolvable by the client) refuses new writes before anything is sent.
+  const refuseLocally = (message) => ({ ok: false, error: { code: ERR.REFUSED, message, retryable: false, blockedLocally: true } });
   async function tracked(kind, target, run, opts = {}) {
-    if (ledgerFull(S.writes)) {
-      return { ok: false, error: { code: ERR.REFUSED, message: fmt(t("wr.fullMsg"), { n: LIMIT }), retryable: false, blockedLocally: true } };
-    }
+    // Only the writing page of this scope sends writes. Every other state says why, before anything leaves.
+    const w = S.ledger.writer;
+    if (w !== "holder") return refuseLocally(t(w === "reader" ? "wr.readonly" : w === "unsupported" ? "wr.noLocks" : "wr.checking"));
+    if (ledgerFull(S.writes)) return refuseLocally(fmt(t("wr.fullMsg"), { n: LIMIT }));
     const id = newRequestId(++wseq, cryptoRand);
     const key = opts.key ? newKey() : null;
+    // A send whose request key cannot be made goes out bare only while no de-duplication is promised (SEND_KEY.required false);
+    // once it is promised it is refused here, never sent unprotected.
+    if (opts.key && !key && SEND_KEY.required) return refuseLocally(t("wr.noKeyRefuse"));
     logEv({ type: "start", id, kind, target, at: now(), clientRequestId: key });
     render();   // the top bar shows "awaiting confirmation" from the moment the request leaves
     let res;
@@ -380,9 +415,10 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     "outbox-refresh"() { return loadOutbox(); },
     writes(d, el) { remember(el); S.dialog = "writes"; render(); },
     "writes-check"() {
-      return loadFresh().then(() => (S.outbox.phase === "ok" ? loadOutbox() : null)).then(() => { if (!S.err) { logEv({ type: "checked", at: now() }); render(); } });
+      return loadFresh().then(() => (S.outbox.phase === "ok" ? loadOutbox() : null)).then(() => { if (!S.err && S.ledger.writer === "holder") { logEv({ type: "checked", at: now() }); render(); } });
     },
-    "writes-dismiss"(d) { logEv({ type: "dismiss", id: d.write }); render(); },
+    "ledger-sync"() { syncLedger(); },
+    "writes-dismiss"(d) { if (S.ledger.writer !== "holder") return; logEv({ type: "dismiss", id: d.write }); render(); },
     delivery(d, el) { remember(el); S.delivery = deliveryReduce(S.delivery, { type: "reset" }); S.dialog = "delivery"; render(); },
     "dl-pick"(d, el) { S.delivery = deliveryReduce(S.delivery, { type: "select", box: d.box, on: !!(el && el.checked) }); render(); },
     "dl-all"() { S.delivery = deliveryReduce(S.delivery, { type: "select:set", boxes: mailboxesOf(S.snap).map((m) => m.box) }); render(); },
@@ -501,5 +537,7 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
   }
   function hover(target, on) { try { hoverPath(on && target && target.closest ? (target.closest(".seat") || { dataset: {} }).dataset.id || "" : ""); } catch { /* stub */ } }
 
-  return { S, render, redraw: () => { after(); }, load, act: (name, d = {}) => A[name](d), click, input, key, hudIn, hudOut, hover, onHash, syncHash, toast, setComposing(on) { S.composing = on; if (!on && pendingRender) render(); }, setLang(l) { S.lang = setLang(l); render(); } };
+  // This page is going away (tests; a browser needs no call: it releases the lock itself when the page closes or crashes).
+  const destroy = () => { gate.release(); S.ledger = { ...S.ledger, writer: "none" }; };
+  return { S, destroy, render, redraw: () => { after(); }, load, act: (name, d = {}) => A[name](d), click, input, key, hudIn, hudOut, hover, onHash, syncHash, toast, setComposing(on) { S.composing = on; if (!on && pendingRender) render(); }, setLang(l) { S.lang = setLang(l); render(); } };
 }

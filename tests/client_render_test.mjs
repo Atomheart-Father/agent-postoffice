@@ -1,6 +1,7 @@
 // Client views and controller under Node (no browser): every state renders, every data-act is wired, both languages
 // are complete, drafts survive, and a missing number is never drawn as 0.
 import { createApp } from "../client/src/app.js";
+import { createMemoryLocks } from "../client/src/flows/writer.js";
 import { createMockAdapter, SCENARIOS } from "../client/src/adapters/mock.js";
 import { setLang, missing, has } from "../client/src/i18n.js";
 import { STR } from "../client/src/strings.js";
@@ -22,7 +23,7 @@ function boot({ hash = "", scenario = "default", width = 1440 } = {}) {
   const root = { innerHTML: "", querySelectorAll() { return []; }, querySelector() { return null; }, contains() { return false; } };
   const win = { location: { hash }, innerWidth: width, setTimeout: () => 0, clearTimeout() {} };
   const adapter = createMockAdapter({ scenario, latency: 0 });
-  const app = createApp({ root, toastRoot: { textContent: "" }, adapter, win, doc: null });
+  const app = createApp({ root, toastRoot: { textContent: "" }, adapter, win, doc: null, locks: createMemoryLocks().tab() });
   return { app, root, adapter, S: app.S };
 }
 const target = (dataset, extra = {}) => ({ closest: (sel) => (dataset ? { dataset, getAttribute: () => null, ...extra } : null), ...extra });
@@ -209,7 +210,7 @@ const spyApply = (adapter) => { const calls = []; const f = adapter.applyRoleCha
   // (a repaint inside focusout replaced the element about to be focused and dropped focus to <body>).
   const timers = []; const root = { innerHTML: "", querySelectorAll() { return []; }, querySelector() { return null; }, contains() { return false; } };
   const win = { location: { hash: "" }, innerWidth: 1440, setTimeout: (f) => { timers.push(f); return 1; }, clearTimeout() {} };
-  const app = createApp({ root, toastRoot: { textContent: "" }, adapter: createMockAdapter({ latency: 0 }), win, doc: null }); await app.load();
+  const app = createApp({ root, toastRoot: { textContent: "" }, adapter: createMockAdapter({ latency: 0 }), win, doc: null, locks: createMemoryLocks().tab() }); await app.load();
   app.hudIn(target({ x: 1 })); hasS(root.innerHTML, 'aria-expanded="true"', "the HUD opened on focus");
   app.hudOut({ closest: () => null }, null); is(timers.length, 1, "leaving toward another element defers the repaint");
   hasS(root.innerHTML, 'aria-expanded="true"', "…nothing is replaced while the focus move is under way"); timers[0](); hasS(root.innerHTML, 'aria-expanded="false"', "…and the repaint follows once it has landed");

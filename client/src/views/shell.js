@@ -12,7 +12,7 @@ import { workView } from "./work.js";
 import { needsYou } from "./office.js";
 import { capsDialog, newThreadDialog } from "./dialogs.js";
 import { letterDialog, composeDialog } from "./mail.js";
-import { deliveryDialog, clearDialog, writesDialog, writesChip, deliveryOn } from "./mailbox.js";
+import { deliveryDialog, clearDialog, writesDialog, writesChip, deliveryOn, writerNote } from "./mailbox.js";
 
 const TABS = [["office", "tab.office"], ["threads", "tab.threads"], ["work", "tab.work2"]];
 
@@ -39,7 +39,8 @@ function page(snap, S, adapter, now) {
   if (S.view === "threads") main = threadsView(snap, S, now);
   else if (S.view === "work") main = workView(snap, S, now);
   else main = `<div class="office${S.roleId ? " with-pane" : ""}">${officeView(snap, S)}${S.roleId ? rolePane(snap, S, now) : ""}</div>`;
-  return `${strip}${stale ? `<div class="stale">${stale}</div>` : ""}${main}`;
+  const wr = S.ledger && (S.ledger.writer === "reader" || S.ledger.writer === "unsupported") ? `<div class="stale" data-writer="${esc(S.ledger.writer)}">${writerNote(S)}</div>` : "";
+  return `${strip}${wr}${stale ? `<div class="stale">${stale}</div>` : ""}${main}`;
 }
 
 export function shell(snap, S, adapter, now) {
