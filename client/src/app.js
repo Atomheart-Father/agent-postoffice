@@ -10,7 +10,7 @@
 import { shell } from "./views/shell.js";
 import { paint } from "./paint.js";
 import { t, setLang, getLang } from "./i18n.js";
-import { ERR } from "./contract.js";
+import { ERR, unknownOutcome } from "./contract.js";
 import { parseHash, formatHash } from "./router.js";
 import { drawWires, hoverPath } from "./fx.js";
 import { startEdit, buildRequest, isDirty, movedUpstream, validateDraft, reduce as editReduce } from "./flows/roleEdit.js";
@@ -20,6 +20,8 @@ import { roleById } from "./views/ui.js";
 import { openLetter, letterReduce, editRequest, newCompose, composeReduce, canSend, sendRequest, hasContent } from "./flows/mail.js";
 import { composeIssuesHtml } from "./views/mail.js";
 import { normalizeLetter } from "./contract.js";
+import { newRequestId, writesReduce } from "./flows/writes.js";
+import { newDelivery, deliveryReduce, verifyAgainst, newClear, clearReduce, canClear, lettersIn, mailboxOf, mailboxesOf } from "./flows/mailbox.js";
 
 export function createApp({ root, toastRoot = null, adapter, now = () => Date.now() / 1000, win = globalThis, doc = globalThis.document, host = null, theme = "paper", lang = "en" }) {
   const r0 = parseHash(win.location && win.location.hash);
@@ -33,7 +35,10 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     // mail: the open letter, compose drafts (one per target, kept when the dialog is closed), the operator's sent list
     mailPane: "in", letter: null, compose: null, composeKey: "", composes: {}, editDrafts: {},
     outbox: { phase: "idle", rows: [], error: null, at: null },
+    // writes: the local ledger of every POST (id, kind, phase) - see flows/writes.js; delivery: switch dialog + last result; clear: whole-mailbox clear flow
+    writes: [], delivery: newDelivery(), clear: null,
   };
+  let wseq = 0;
   let pendingRender = false, inflight = null, ret = null, lastLayer = null, toastTimer = null, hashSelf = "";
   const narrow = () => (win.innerWidth || 1440) <= 900;
   const $ = (id) => (doc && doc.getElementById ? doc.getElementById(id) : null);
@@ -111,6 +116,22 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     return inflight.then(() => { if (S.view === "work" && S.mailPane === "sent") return loadOutbox(); });
   }
 
+  // A read that STARTS after now. load() joins a read already in flight, which began before the write that just finished and so
+  // can still show the old state; anything that compares "what we asked" with "what the server says" must not use that one.
+  async function loadFresh() { if (inflight) { try { await inflight; } catch { /* the next read decides */ } } return load(); }
+
+  // Every write goes through here: it gets a one-off local request id and a ledger entry (awaiting confirmation) before it is
+  // sent, and the entry is closed by the reply. A throw or an unreadable reply is "unknown", never "failed". Nothing is retried.
+  async function tracked(kind, target, run) {
+    const id = newRequestId(++wseq);
+    S.writes = writesReduce(S.writes, { type: "start", id, kind, target, at: now() });
+    render();   // the top bar shows "awaiting confirmation" from the moment the request leaves
+    let res;
+    try { res = await run(id); } catch (e) { res = unknownOutcome(`The request ended without a usable answer (${String((e && e.message) || e)}). It may have been sent.`); }
+    S.writes = writesReduce(S.writes, res.ok ? { type: "ok", id, at: now() } : { type: "fail", id, error: res.error, at: now() });
+    return res.ok ? { ...res, data: { ...(res.data && typeof res.data === "object" ? res.data : {}), reqId: id } } : { ...res, error: { ...res.error, reqId: id } };
+  }
+
   // ---------- hash ----------
   function syncHash() {
     try { const h = formatHash(S); if (win.location && win.location.hash !== h) { hashSelf = h; win.location.hash = h; } } catch { /* stub */ }
@@ -138,9 +159,9 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
   async function edApply() {
     const role = roleById(S.snap, S.roleId), es = editOf(); if (!role || !es || es.phase !== "preview" || !es.preview.baseline) return;
     setEdit(role.id, { type: "apply:start" }); render();
-    const res = await adapter.applyRoleChange(buildRequest(es), es.preview.baseline);
-    if (res.ok) { setEdit(role.id, { type: "apply:ok", data: res.data }); await load(); }
-    else { setEdit(role.id, { type: "apply:fail", error: res.error }); await load(); }   // the snapshot is refetched either way: a stale or lost reply is judged against the latest
+    const res = await tracked("role-apply", role.id, () => adapter.applyRoleChange(buildRequest(es), es.preview.baseline));
+    if (res.ok) { setEdit(role.id, { type: "apply:ok", data: res.data }); await loadFresh(); }
+    else { setEdit(role.id, { type: "apply:fail", error: res.error }); await loadFresh(); }   // the snapshot is refetched either way: a stale or lost reply is judged against the latest
     render();
   }
 
@@ -166,7 +187,7 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
   function openInbox(d, el) {
     remember(el);
     const m = S.snap && S.snap.mail.find((x) => x.id === d.mail);
-    S.letter = openLetter({ src: "inbox", box: d.box, id: d.id, subject: m ? m.subject : "", sender: m ? m.from : "", delivery: m ? m.delivery : null, mailId: d.mail || "" });
+    S.letter = openLetter({ src: "inbox", box: d.box, id: d.id, subject: m ? m.subject : "", sender: m ? m.from : "", delivery: m ? m.delivery : null, rawStatus: m ? m.sourceStatus : null, mailId: d.mail || "" });
     S.dialog = "letter"; return readLetter();
   }
   function openSent(d, el) {
@@ -181,10 +202,10 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     const l = S.letter; if (!l || (l.act && l.act.phase === "busy")) return;
     const { box, id } = l;
     setLetter({ type: "act:start", kind }); render();
-    const res = await run();
+    const res = await tracked(kind, `${box}/${id}`, run);
     if (sameLetter(box, id)) setLetter(res.ok ? { type: "act:ok", result: res.data } : { type: "act:fail", error: res.error });
     render();
-    await load(); if (l.src === "sent" || S.outbox.phase === "ok") await loadOutbox();
+    await loadFresh(); if (l.src === "sent" || S.outbox.phase === "ok") await loadOutbox();
   }
   const doLetter = (kind) => {
     const l = S.letter; if (!l) return;
@@ -196,6 +217,7 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
   function closeDialog() {
     if (S.dialog === "letter") { stashEdit(); S.letter = null; }
     if (S.dialog === "compose") { if (S.compose && S.compose.phase === "sent") delete S.composes[S.composeKey]; S.compose = null; S.composeKey = ""; }
+    if (S.dialog === "clear") S.clear = null;
     S.dialog = null; render();
   }
   function openCompose(key, make, el) {
@@ -209,19 +231,53 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     const c = S.compose; if (!c || !c.replyOf) return;
     const key = S.composeKey, { box, id } = c.replyOf;
     setCompose({ type: "archive:start" }); render();
-    const res = await adapter.archiveMail({ box, id });
+    const res = await tracked("archive", `${box}/${id}`, () => adapter.archiveMail({ box, id }));
     if (S.composeKey === key && S.composes[key]) setCompose(res.ok ? { type: "archive:ok", result: res.data } : { type: "archive:fail", error: res.error });
-    render(); await load();
+    render(); await loadFresh();
   }
   async function sendCompose() {
     const c = S.compose; if (!c || !canSend(c, operatorBox())) return;
     const key = S.composeKey;
     setCompose({ type: "send:start" }); render();
-    const res = await adapter.sendMail(sendRequest(c));
-    if (!S.composes[key]) { await load(); return; }   // discarded while the request was out: the letter was still sent, so only refresh
+    const req = sendRequest(c);
+    const res = await tracked("send", req.to, () => adapter.sendMail(req));
+    if (!S.composes[key]) { await loadFresh(); return; }   // discarded while the request was out: the letter was still sent, so only refresh
     S.composeKey = key; setCompose(res.ok ? { type: "send:ok", result: res.data } : { type: "send:fail", error: res.error }); render();
-    if (res.ok) { await load(); if (S.compose && S.compose.mode === "reply" && S.compose.fileOriginal) await fileOriginal(); else if (S.outbox.phase === "ok") await loadOutbox(); }
-    else if (res.error.outcomeUnknown) await load();   // look at the mailboxes now: the letter may be there
+    if (res.ok) { await loadFresh(); if (S.compose && S.compose.mode === "reply" && S.compose.fileOriginal) await fileOriginal(); else if (S.outbox.phase === "ok") await loadOutbox(); }
+    else if (res.error.outcomeUnknown) await loadFresh();   // look at the mailboxes now: the letter may be there
+  }
+
+  // ---------- delivery switches ----------
+  // The buttons never flip by themselves: a request is sent, the snapshot is read again, and the result is shown as "asked vs
+  // what the server now says". `req` is { status, names } or { status, group } (group without "@").
+  const deliveryCapOn = () => mailCapOn("mailbox.status");
+  async function doDelivery(req) {
+    if (!deliveryCapOn() || S.delivery.phase === "busy") return;
+    if (req.group ? !req.group : !(req.names && req.names.length)) return;
+    S.delivery = deliveryReduce(S.delivery, { type: "start", req }); render();
+    const target = req.group ? `@${req.group}` : req.names.join(", ");
+    const res = await tracked("status", `${req.status} · ${target}`, () => adapter.setDelivery(req.group ? { group: req.group, status: req.status } : { names: req.names, status: req.status }));
+    S.delivery = deliveryReduce(S.delivery, res.ok ? { type: "ok", reqId: res.data.reqId } : { type: "fail", error: res.error }); render();
+    await loadFresh();
+    S.delivery = deliveryReduce(S.delivery, { type: "verify", verify: S.err || !S.snap ? null : verifyAgainst(S.snap, req) }); render();
+  }
+
+  // ---------- clear the whole mailbox ----------
+  function openClear(box, el) {
+    if (!mailCapOn("mailbox.clear") || !S.snap) return;
+    const n = lettersIn(S.snap, box);
+    remember(el);
+    S.clear = newClear(box, n ? n.n : null); S.dialog = "clear"; render();
+  }
+  async function doClear() {
+    const c = S.clear; if (!c || !canClear(c)) return;
+    const box = c.box;
+    S.clear = clearReduce(c, { type: "start" }); render();
+    const res = await tracked("clear", box, () => adapter.clearMailbox({ name: box }));
+    if (S.clear && S.clear.box === box) S.clear = clearReduce(S.clear, res.ok ? { type: "ok", reqId: res.data.reqId } : { type: "fail", error: res.error });
+    render();
+    await loadFresh();
+    if (S.clear && S.clear.box === box) { const n = S.err ? null : lettersIn(S.snap, box); S.clear = clearReduce(S.clear, { type: "after", count: n ? n.n : null }); render(); }
   }
 
   // ---------- other requests ----------
@@ -278,6 +334,22 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     "compose-discard"() { delete S.composes[S.composeKey]; S.compose = null; S.composeKey = ""; S.dialog = null; render(); },
     "mail-refresh"() { return load().then(() => (S.outbox.phase === "ok" ? loadOutbox() : null)); },
     "outbox-refresh"() { return loadOutbox(); },
+    writes(d, el) { remember(el); S.dialog = "writes"; render(); },
+    "writes-check"() { return loadFresh().then(() => (S.outbox.phase === "ok" ? loadOutbox() : null)); },
+    "writes-dismiss"(d) { S.writes = writesReduce(S.writes, { type: "dismiss", id: d.write }); render(); },
+    delivery(d, el) { remember(el); S.delivery = deliveryReduce(S.delivery, { type: "reset" }); S.dialog = "delivery"; render(); },
+    "dl-pick"(d, el) { S.delivery = deliveryReduce(S.delivery, { type: "select", box: d.box, on: !!(el && el.checked) }); render(); },
+    "dl-all"() { S.delivery = deliveryReduce(S.delivery, { type: "select:set", boxes: mailboxesOf(S.snap).map((m) => m.box) }); render(); },
+    "dl-none"() { S.delivery = deliveryReduce(S.delivery, { type: "select:set", boxes: [] }); render(); },
+    "dl-group-pick"(d) { const g = (S.snap.groups || []).find((x) => x.name === d.group); S.delivery = deliveryReduce(S.delivery, { type: "select:set", boxes: g ? g.members : [] }); render(); },
+    "dl-sel"(d) { return doDelivery({ status: d.status, names: S.delivery.sel.slice() }); },
+    "dl-group"(d) { return doDelivery({ status: d.status, group: d.group }); },
+    "dl-one"(d) { return doDelivery({ status: d.status, names: [d.box] }); },
+    "clear-ask"(d, el) { return openClear(d.box, el); },
+    "clear-next"() { if (S.clear) { S.clear = clearReduce(S.clear, { type: "next" }); render(); } },
+    "clear-back"() { if (S.clear) { S.clear = clearReduce(S.clear, { type: "back" }); render(); } },
+    "clear-ack"(d, el) { if (S.clear) { S.clear = clearReduce(S.clear, { type: "ack", on: !!(el && el.checked) }); render(); } },
+    "clear-do"() { return doClear(); },
     newthread(d, el) { remember(el); S.newThread = { roleId: d.role || S.roleId || "", harness: "", title: "", instruction: "", busy: false, result: null }; S.dialog = "newthread"; render(); },
     "nt-submit"() { return submitNewThread(); },
     send(d) { return sendThread(d.thread); },

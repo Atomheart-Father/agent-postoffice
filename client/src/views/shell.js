@@ -12,6 +12,7 @@ import { workView } from "./work.js";
 import { needsYou } from "./office.js";
 import { capsDialog, newThreadDialog } from "./dialogs.js";
 import { letterDialog, composeDialog } from "./mail.js";
+import { deliveryDialog, clearDialog, writesDialog, writesChip, deliveryOn } from "./mailbox.js";
 
 const TABS = [["office", "tab.office"], ["threads", "tab.threads"], ["work", "tab.work2"]];
 
@@ -23,8 +24,9 @@ function bar(snap, S, adapter, now) {
     <nav class="tabs" aria-label="${esc(t("nav"))}">${TABS.map(([k, label]) => `<button type="button" data-act="go" data-view="${k}" data-fk="tab:${k}" aria-pressed="${S.view === k ? "true" : "false"}">${esc(t(label))}${k === "work" && need ? `<span class="counter">${need}</span>` : ""}</button>`).join("")}</nav>
     <span class="sp"></span>
     <div class="aux">${snap ? hudChip(snap.usage, S.hud, now) : ""}
+      ${snap && deliveryOn(snap) ? `<button type="button" class="act" data-act="delivery" data-fk="delivery">${esc(t("dl.open"))}</button>` : ""}${writesChip(S)}
       <button type="button" class="act" data-act="caps" data-fk="caps">${esc(t("cap.open"))}${mock ? ` ${mockChip()}` : ""}</button>
-      <span class="langs" role="group" aria-label="${esc(t("lang"))}">${["zh", "en"].map((l) => `<button type="button" data-lang="${l}" aria-pressed="${L === l ? "true" : "false"}" data-fk="lang:${l}">${l === "zh" ? "中文" : "EN"}</button>`).join("")}</span>
+      <span class="langs" role="group" aria-label="${esc(t("lang"))}">${["en", "zh"].map((l) => `<button type="button" data-lang="${l}" aria-pressed="${L === l ? "true" : "false"}" data-fk="lang:${l}">${l === "zh" ? "中文" : "EN"}</button>`).join("")}</span>
       <span class="themes" role="group" aria-label="${esc(t("appearance"))}">${PALETTES.map((p) => `<button type="button" data-theme-choice="${p}" aria-pressed="${S.theme === p ? "true" : "false"}" data-fk="theme:${p}" title="${esc(t("pal." + p))}" aria-label="${esc(t("pal." + p))}">${esc(t("pal." + p))}</button>`).join("")}</span></div></header>`;
 }
 
@@ -42,6 +44,7 @@ function page(snap, S, adapter, now) {
 
 export function shell(snap, S, adapter, now) {
   const layer = S.dialog === "caps" ? capsDialog(snap, S, adapter) : S.dialog === "newthread" && snap ? newThreadDialog(snap, S)
-    : S.dialog === "letter" && snap && S.letter ? letterDialog(snap, S, now) : S.dialog === "compose" && snap && S.compose ? composeDialog(snap, S) : "";
+    : S.dialog === "letter" && snap && S.letter ? letterDialog(snap, S, now) : S.dialog === "compose" && snap && S.compose ? composeDialog(snap, S)
+    : S.dialog === "delivery" && snap ? deliveryDialog(snap, S) : S.dialog === "clear" && snap && S.clear ? clearDialog(snap, S, now) : S.dialog === "writes" ? writesDialog(S, now) : "";
   return `${bar(snap, S, adapter, now)}<main id="main" tabindex="-1" class="view-${esc(S.view)}">${page(snap, S, adapter, now)}</main>${layer}`;
 }

@@ -13,7 +13,12 @@ export function note(kind, text, extra = "") {
 }
 
 export const badge = (cls, key, word) => `<span class="badge" data-b="${esc(cls)}:${esc(key)}">${esc(word)}</span>`;
-export const deliveryBadge = (d) => badge("delivery", d, t("d." + d));
+// A backend word is shown as the backend wrote it (in <code>) beside the plain-language gloss, so neither hides the other.
+export const rawCode = (raw) => (raw ? `<code class="raw" title="${esc(t("raw.tip"))}">${esc(raw)}</code>` : "");
+export const deliveryBadge = (d, raw) => `<span class="badge" data-b="delivery:${esc(d)}">${rawCode(raw)}${esc(t("d." + d))}</span>`;
+// The backend's own vocabulary that is Chinese on the wire (the post office protocol): the gloss is for reading, the raw word is kept.
+export const appWord = (raw) => (raw && has("app." + raw) ? t("app." + raw) : raw || "");
+export const needWord = (raw) => (raw && has("need." + raw) ? `${t("need." + raw)} (${raw})` : raw || "");
 export const workBadge = (s) => badge("work", s, t("w." + s));
 export const controlBadge = (c) => badge("control", c, t("c." + c));
 

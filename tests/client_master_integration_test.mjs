@@ -28,7 +28,7 @@ const done = (code) => { if (proc) proc.kill(); try { rmSync(home, { recursive: 
 
 try {
   for (const b of ["owner", "alice", "bob", "carol", "dave"]) { const r = po(["add", b, "--notify", "--who", `Synthetic ${b}`]); if (r.status !== 0) throw new Error(r.stdout + r.stderr); }
-  writeFileSync(join(home, "config.json"), JSON.stringify({ version: 1, groups: {}, aliases: { helpers: ["alice", "bob"] },
+  writeFileSync(join(home, "config.json"), JSON.stringify({ version: 1, groups: { team: ["alice", "bob"] }, aliases: { helpers: ["alice", "bob"] },
     panel: { label: "Synthetic Office", operator: "owner", organization: { mailbox: "owner", children: [{ label: "Team", members: ["alice", "bob"] }] } } }));
   const send = (to, from, subject, need, body) => { const r = po(["send", to, from, subject, need], body); if (r.status !== 0) throw new Error(r.stdout + r.stderr); return /编号：(\S+)/.exec(r.stdout)[1]; };
   const fromAlice = send("owner", "alice", "Question from Alice", "回复", "Where is the file?\n");
@@ -57,6 +57,7 @@ try {
   is(mOwner.delivery, "waiting", "a fresh letter is waiting, not accepted");
   is(S.capabilities["mail.send"].status, "live", "mail.send is live against master");
   is(S.capabilities["role.edit"].status, "missing", "role.edit is missing against master");
+  is([S.capabilities["mailbox.status"].status, S.capabilities["mailbox.clear"].status], ["live", "live"], "mailbox.status and mailbox.clear are live against master");
 
   // ---------- read a letter ----------
   const rl = await a.readLetter({ box: "owner", id: fromAlice });
@@ -124,6 +125,47 @@ try {
   ok(f2.ok && f2.data.state === "already", "archiving again is 'already', nothing moves");
   const f3 = await a.archiveMail({ box: "owner", id: "missing-one" });
   ok(!f3.ok && f3.error.code === "not_found", "archiving an unknown letter is not_found");
+
+  // ---------- delivery switch (POST /api/status) and whole-mailbox clear (POST /api/clear), against the real master ----------
+  const sw = async (box) => { const r = await a.getSnapshot(); const x = r.data.roles.find((n) => n.box === box); return x && x.incumbent ? x.incumbent.switch : "gone"; };
+  is(await sw("alice"), "on", "alice's switch is on to start with (read from the server)");
+  is((await a.getSnapshot()).data.groups.map((g) => g.name), ["team"], "the group the backend lists comes through, without an @");
+  const w1 = await a.setDelivery({ name: "alice", status: "offline" });
+  ok(w1.ok, "status: one mailbox offline is accepted", JSON.stringify(w1));
+  is(await sw("alice"), "off", "…and the re-read state says off (the state is the truth, not the reply)");
+  const w1b = await a.setDelivery({ names: ["alice"], status: "offline" });
+  ok(w1b.ok, "status: the same request again is accepted (idempotent)");
+  const w2 = await a.setDelivery({ names: ["alice", "bob"], status: "offline" });
+  ok(w2.ok && w2.data.names.join() === "alice,bob", "status: several mailboxes on master go one by one", JSON.stringify(w2));
+  is([await sw("alice"), await sw("bob")], ["off", "off"], "…both are off in the re-read state");
+  const w3 = await a.setDelivery({ group: "team", status: "online" });
+  ok(w3.ok, "status: a group (name without @) is accepted", JSON.stringify(w3));
+  is([await sw("alice"), await sw("bob")], ["on", "on"], "…every member is on in the re-read state");
+  const w3b = await a.setDelivery({ group: "@team", status: "offline" });
+  ok(w3b.ok && (await sw("bob")) === "off", "status: a group given with a leading @ is sent without it");
+  const w4 = await a.setDelivery({ name: "ghost", status: "online" });
+  is([w4.ok, w4.error && w4.error.code], [false, "invalid"], "status: an unknown mailbox is refused (400, the backend gives no reason)");
+  const w5 = await a.setDelivery({ group: "nosuch", status: "online" });
+  ok(!w5.ok && /nosuch/.test(w5.error.message), "status: an unknown group is refused with the backend's own reason", w5.error && w5.error.message);
+  const w6 = await a.setDelivery({ names: ["alice", "ghost", "bob"], status: "online" });
+  ok(!w6.ok && w6.error.failedAt === "ghost" && w6.error.applied.join() === "alice" && w6.error.notTried.join() === "bob", "status: several, one unknown: stops there and says what was applied and what was not tried", JSON.stringify(w6.error));
+  is([await sw("alice"), await sw("bob")], ["on", "off"], "…the state shows exactly that: alice on, bob untouched");
+  const w7 = await a.setDelivery({ name: "alice", status: "sideways" });
+  is([w7.ok, w7.error.code], [false, "invalid"], "status: a value other than online / offline is not even sent");
+
+  const bulk = [send("carol", "owner", "Bulk one", "仅告知", "1\n"), send("carol", "owner", "Bulk two", "仅告知", "2\n")];
+  const before = (await a.getSnapshot()).data.mail.filter((m) => m.box === "carol").length;
+  ok(before >= 2, "carol's inbox lists the letters before the clear", String(before));
+  const c1 = await a.clearMailbox({ name: "carol" });
+  ok(c1.ok, "clear: the whole inbox is cleared", JSON.stringify(c1));
+  ok((await a.getSnapshot()).data.mail.filter((m) => m.box === "carol").length === 0, "…and the re-read state lists none");
+  ok(bulk.every((id) => !existsSync(join(home, "carol", "inbox", id + ".md"))) && existsSync(join(home, "carol", "archived")), "…they moved to archived/ (kept on disk)");
+  ok(!bulk.some((id) => existsSync(join(home, "carol", "done", id + ".md"))), "…and NOT to done/, which is where 'file one letter' puts a letter");
+  is(Object.keys(c1.data).sort(), ["name"], "clear: the reply carries no count (the client must not invent one)");
+  const c2 = await a.clearMailbox({ name: "carol" });
+  ok(c2.ok, "clear: an already empty inbox is accepted too (idempotent)");
+  const c3 = await a.clearMailbox({ name: "ghost" });
+  is([c3.ok, c3.error && c3.error.code], [false, "invalid"], "clear: an unknown mailbox is refused");
 
   // ---------- the backend's own guards ----------
   const evil = createHttpAdapter({ baseUrl: base, fetchImpl: (u, o) => fetch(u, { ...o, headers: { ...(o && o.headers), Origin: "http://evil.example" } }) });

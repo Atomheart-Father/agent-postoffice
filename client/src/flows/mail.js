@@ -57,8 +57,8 @@ export function composeReduce(c, ev) {
 
 // ---------- one letter dialog (an inbox letter, or a sent one with edit / retract) ----------
 // src "inbox": a pending letter in a mailbox.  src "sent": a row of the operator's outbox.
-export function openLetter({ src = "inbox", box, id, subject = "", sender = "", delivery = null, mailId = "" }) {
-  return { src, box, id, subject, sender, delivery, mailId, phase: "loading", data: null, error: null, act: null, edit: null };
+export function openLetter({ src = "inbox", box, id, subject = "", sender = "", delivery = null, rawStatus = null, mailId = "" }) {
+  return { src, box, id, subject, sender, delivery, rawStatus, mailId, phase: "loading", data: null, error: null, act: null, edit: null };
 }
 export function letterReduce(l, ev) {
   switch (ev.type) {

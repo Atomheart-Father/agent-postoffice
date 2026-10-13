@@ -171,7 +171,10 @@ export function normalizeSnapshot(raw) {
     threads: arr(s.threads).map(normalizeThread),
     // roleId is empty when the backend does not record which role a letter was for; `box` is the mailbox it sits in.
     mail: arr(s.mail).map((m) => ({ id: str(m.id), letterId: str(m.letterId), roleId: str(m.roleId), box: str(m.box), threadId: str(m.threadId) || null, workId: str(m.workId) || null, dir: pick(m.dir, ["in", "out"], "in"),
-      from: str(m.from), to: str(m.to), subject: str(m.subject), at: numOrNull(m.at), delivery: pick(m.delivery, DELIVERY), sourceStatus: str(m.sourceStatus) || null })),
+      from: str(m.from), to: str(m.to), subject: str(m.subject), at: numOrNull(m.at), delivery: pick(m.delivery, DELIVERY), sourceStatus: str(m.sourceStatus) || null,
+      kind: str(m.kind) || null })),   // the backend's own word for the letter's kind (formal, notice, receipt, alarm ...), shown as written, never interpreted
+    // Delivery groups as the backend lists them (name without "@"). counts are the backend's; nothing is summed here.
+    groups: arr(s.groups).filter((g) => g && typeof g.name === "string" && g.name).map((g) => ({ name: g.name, members: arr(g.members).map(String), total: numOrNull(g.total), online: numOrNull(g.online) })),
     work: arr(s.work).map((w) => ({ id: str(w.id), roleId: str(w.roleId), title: str(w.title), state: pick(w.state, WORK_STATES, "open"), difficulty: numOrNull(w.difficulty),
       updatedAt: numOrNull(w.updatedAt), note: str(w.note), history: arr(w.history).map((h) => ({ state: pick(h.state, WORK_STATES, "open"), at: numOrNull(h.at), by: str(h.by) })) })),
     approvals: arr(s.approvals).map((a) => ({ id: str(a.id), kind: str(a.kind), roleId: str(a.roleId), title: str(a.title), at: numOrNull(a.at), state: pick(a.state, ["pending", "approved", "denied"], "pending") })),
@@ -219,7 +222,7 @@ export const PROJECTION = ["fresh", "pending", "not_applicable"];
 // A successful apply. `saved` is the authoritative config; `projection` is the derived cards, a separate fact.
 export function normalizeApplied(raw) {
   const r = raw && typeof raw === "object" ? raw : {};
-  return { saved: r.saved === true, projection: pick(r.projection, PROJECTION), message: str(r.message), backup: str(r.backup) || null,
+  return { saved: r.saved === true, projection: pick(r.projection, PROJECTION), projectionRaw: typeof r.projection === "string" ? r.projection : null, message: str(r.message), backup: str(r.backup) || null,
     activeNow: lineList(r.active_now != null ? r.active_now : r.activeNow), acceptorNow: lineList(r.acceptor_now != null ? r.acceptor_now : r.acceptorNow) };
 }
 

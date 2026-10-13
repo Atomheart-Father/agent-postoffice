@@ -1,6 +1,6 @@
-# BOXZ OFFICE 独立客户端（1.0 真实读写批）
+# BOXZ OFFICE 独立客户端（1.0 真实读写批 + 上下线 / 整箱清理 / 写入台账）
 
-> 状态：**默认就是真实后端适配器**。邮件读写已对真实 master v1.14.1 实际跑通（Node 集成测试 + 浏览器）；岗位 role-diff / role-apply **只对合同包里的匿名 fixture 核对过**，本地候选 `e819f0e` 没有部署，客户端从没碰过它。没有原生打包。Node 测试与截图不等于视觉验收，也不等于输入法验收。
+> 状态：**默认就是真实后端适配器**。邮件读写、上下线（status）、整箱清理（clear）已对真实 master v1.14.1 实际跑通（Node 集成测试 + 浏览器）；岗位 role-diff / role-apply **只对合同包里的匿名 fixture 核对过**，本地候选 `e819f0e` 没有部署，客户端从没碰过它。没有原生打包。Node 测试与截图不等于视觉验收，也不等于输入法验收。
 > 分支：`claude/office-client`（基于 `master` 的 `1ab0f54`，v1.14.1）。没有改动 `panel/index.html`，旧 Panel 原样可用。
 > **使用的后端合同：** `Atomheart-Father/agent-postoffice@9cd53d5ea47c3dfc37b7ae7d402705762ca02803` 的 `docs/cloud-client-api-e819/`（入口 `CLOUD_CLIENT_API_PACK.md`，校验 `SHA256SUMS.txt`）。客户端只按这份包与真实 master 的 `/api/state` 推接口，不读 master 去推 role-diff / role-apply（master 没有）。
 
@@ -8,7 +8,7 @@
 
 | 来源 | 是什么 | 本客户端怎么对待 |
 |---|---|---|
-| **GitHub master v1.14.1**（`1ab0f54`） | 已发布的后端。`do_POST` 只有 `status / clear / archive-one / ack-one / send / edit-one / retract-one`，没有 `role-diff / role-apply`，`/api/state` 没有 `role_cards` | **真跑过。** 状态读、读信、已发信读、发信、收执、归档、改信、撤回都对它实际执行过；角色操作一律 `capability_missing` |
+| **GitHub master v1.14.1**（`1ab0f54`） | 已发布的后端。`do_POST` 只有 `status / clear / archive-one / ack-one / send / edit-one / retract-one`，没有 `role-diff / role-apply`，`/api/state` 没有 `role_cards` | **真跑过。** 状态读、读信、已发信读、发信、收执、归档、改信、撤回、上下线（单个 / 多个 / 按组）、整箱清理都对它实际执行过；角色操作一律 `capability_missing` |
 | **本地候选 `e819f0e`** | **不在 GitHub master 上，未部署。** 有 `POST /api/role-diff`、`/api/role-apply`，`/api/state` 另有 `role_cards`、`aliases` | 按合同包 9cd53d5 的匿名 fixture 做了映射与整套错误路径；**没有对运行中的候选跑过**。能力表里最高只标「已接线·仅 fixture 核对」，不标「已接通」 |
 | **客户端 mock** | 样例数据（匿名公司 Northwind Studio） | 只在 `?backend=mock` 显式打开；每个用到它的区域都标「样例·未接线」，不再是默认 |
 
@@ -47,6 +47,7 @@ node tests/client_contract_test.mjs
 node tests/client_render_test.mjs
 node tests/client_candidate_render_test.mjs
 node tests/client_fixture_test.mjs              # 合同包 fixture + 错误路径
+node tests/client_ops_test.mjs                  # 上下线 / 整箱清理 / 写入台账 / 英文默认与原词
 node tests/client_master_integration_test.mjs   # 起一个真实 master 后端做邮件读写端到端
 ```
 
@@ -66,6 +67,8 @@ client/
     fixtures/demo-company.js  匿名样例公司
     flows/roleEdit.js       岗位编辑状态机与请求构造（纯函数）
     flows/mail.js           邮件写入流（发信 / 回复 / 收执 / 归档 / 改 / 撤）
+    flows/writes.js         写入台账：每个写请求一个一次性本地 request 标识与阶段（待确认 / 已受理 / 已拒绝 / 未知 / 已核对）
+    flows/mailbox.js        上下线与整箱清理的状态机（纯函数）
     views/                  纯函数 (状态)→HTML 字符串
     app.js · paint.js · router.js · theme.js · i18n.js · strings.js · fx.js · host.js · main.js
 ```
@@ -93,6 +96,31 @@ client/
 | 已发信 | `GET /api/outbox`、`POST /api/edit-one`、`POST /api/retract-one` | 后端给出「能不能改 / 撤」的判断，POST 时再核；通道已受理的信改不了也撤不了 |
 
 呈现规则：**已写入信箱 / 已提醒 / 通道已受理 ≠ 对方读过 ≠ 工作完成**。邮件状态保留后端的说法（waiting / reminded / failed，认不出的显示「状态未知」并保留原词），`ride` 在计数里出现但合同包没说明含义，不并入任何状态。回复丢失（网络）= 结果未知，不重发。
+
+### 5.1 上下线与整箱清理（合同 §C 第 7 项）
+
+| 操作 | 端点 | 说明 |
+|---|---|---|
+| 上下线 | `POST /api/status` | 单个 `{name,status}`；按组 `{group,status}`（组名不带 `@`，客户端会去掉前导 `@`）；`status` 只能是 `online` / `offline`。**master 没有 `names` 批量：** 选多个时客户端按顺序逐个发单个请求，遇到第一个错误就停，并列出已改 / 未试 / 失败的；候选 `e819f0e` 的 `names` 批量只有 fixture。按钮状态**以服务端返回为准**：每次写完都用 `loadFresh()` 重读，对比“我要求的”与“服务端现在的” |
+| 整箱清理 | `POST /api/clear` `{name}` | **把整个 inbox 收进 `archived/<时间>/`**，不是 `done/`。后端回复 `{ok:true,error:""}`，**没有数量**，所以影响封数来自点击前的快照，写完再重读，写“现在列出 N 封” |
+
+- **整箱清理 ≠ 归档单封。** 归档单封（archive-one）把一封信移到 `done/`；整箱清理是岗位面板里独立的危险分区，弹窗里明确写「整箱」「N 封」，不是「归档」按钮，也不共用文案。两步：先看影响（不发任何请求），再勾选确认框后按钮才可点。第二步时如果快照里的封数变了，会提示。
+- 未知的信箱 / 组：master 回 400，客户端显示后端的话；403 `{"ok":false}` 仍只解释为 Host/Origin/Content-Type 保护。
+- 在 mock 下两项都是“缺失”，不冒充。
+
+### 5.2 写入台账：不自动重试，丢回复 = 可能已发出
+
+- 每个写请求（send / apply / edit / retract / ack / archive / status / clear）在发出前生成一个**一次性本地 request 标识**（`w-…`），进入台账，顶栏出现「待确认请求 N」。标识**只在本地**：后端没有幂等键，所以**不发送**，也不能靠它去重。
+- 阶段：待确认（pending）→ 已受理 / 已拒绝 / **未知（unknown，可能已发出）** → 已核对。断网 / 超时 = unknown：界面写「可能已发出」，让用户先看已发信 / 状态再决定，**不静默重发**；适配器没有任何自动重试。
+- **客户端看不见的一种重发：** 浏览器或代理（keep-alive）可能自动重送“已发出但回复丢失”的 POST，这在 JS 里既看不到也拦不住；真实后端是 HTTP/1.0 无 keep-alive，我这边只用 route.abort 测过 UI 状态，**不是真实断连测试**，由本地真实浏览器链路补。
+
+### 5.3 邮件里的原词与未明字段
+
+邮件状态 waiting / reminded / failed 保留后端原词（旁边给统一英文释义）。「回执 / 岗位告知」类的信不会单独叫醒收件人（后端 `reason:"receipts_wait"`），所以**不等于普通待投递**，客户端不把它们并入 waiting。`kind`（formal / notice / receipt / alarm 以合同包 §3.10 为准）、`status` 里的 `ride`、`confirmed` / `escalation_acceptor` / `escalation_target` / `binding` 的含义**待本地核完补 fixture 与人话标签**，在此之前直接显示原值或「未知」，不推断。`saved` / `pending` / `stale`、`projection` 同样同时显示统一英文释义与原词。
+
+### 5.4 语言
+
+对外默认**英文**（首次打开不看浏览器语言），中文是可选语言，选择会记住；视觉不变。后端状态词用统一英文释义，不把中文系统术语当唯一界面文字。用户自己写的信件正文 / 主题 / 岗位职责不翻译。邮局协议本身的英文化由本地做，客户端不改协议、不猜后端字段（`need` 的 回复 / 审核 / 仅告知 是协议词，按原样显示并加释义）。
 
 ## 6. 岗位：读模型与编辑（候选合同，fixture 核对）
 
@@ -155,6 +183,8 @@ client/
 | 收执（回执） | 已接通 | 已接线·仅 fixture 核对 | 样例·未接线 | POST /api/ack-one：记一份回执、把原信归档，并在对方空闲时通知发信人。回执只表示「看到了」，不表示工作完成；重复调用不会产生第二份回执。 |  |
 | 归档（处理完成） | 已接通 | 已接线·仅 fixture 核对 | 样例·未接线 | POST /api/archive-one：把这一封从收件箱移到 done/，不发回执。同名文件已存在时后端拒绝并什么都不动。 |  |
 | 已发信：修改与撤回 | 已接通 | 已接线·仅 fixture 核对 | 样例·未接线 | GET /api/outbox 列出 operator 发出、仍在对方收件箱里的普通信，并给出后端对「还能不能改 / 撤」的判断；POST 时后端会重新检查，可能因竞争而拒绝。通道已受理的信改不了也撤不了。 |  |
+| 上下线（投递开关） | 已接通 | 已接线·仅 fixture 核对 | 缺失 | POST /api/status：单个、批量（候选的 names；master 没有，客户端逐个发、遇错即停）或按组（组名不带 @）。回复只说「后端接受了」，开关到底是什么以重新读到的状态为准；按钮永远按服务端状态显示。开关不等于连接，也不是老板的权限。 |  |
+| 整箱清理（不是归档单封） | 已接通 | 已接线·仅 fixture 核对 | 缺失 | POST /api/clear：把这个信箱 inbox 里的全部信收进 archived/<时间>/（留在磁盘上，不再投递）。和归档单封（archive-one → done/）是两回事：独立入口、写明「整箱」和封数、二次确认。回复不带封数，之后重新读状态。 |  |
 | 工作提交 / 验证 / 接受 / 退修 / 发布 | 缺失 | 缺失 | 样例·未接线 | 一套通用状态，不是某个行业专用的状态机。后端未接线。 | work module read model + transitions |
 | 待批准事项 | 缺失 | 缺失 | 样例·未接线 | 批准决定由后端执行。 | approvals read model + decide API |
 | Token HUD（官方累计用量） | 缺失 | 缺失 | 样例·未接线 | 用量账模块已验收，但真实 reader / HUD 接口未交付；缺失值显示「未知」，不当作 0。 | usage reader API: input / output / cache / total / model / updatedAt / source / coverage; context occupancy |
@@ -167,23 +197,25 @@ client/
 
 ## 9. 还需要本地团队给什么
 
+0. **`kind` / `ride` / `confirmed` / `escalation_acceptor` / `escalation_target` / `binding` / `roleNoteTiming`** 的真实含义与人话标签（客户端现在显示原值或「未知」）。
 1. **部署候选 `e819f0e` 或给一个可连的匿名实例**，让 role-diff / role-apply 和 `role_cards` 对真实后端跑一次；目前只有合同包 fixture。
 2. **同源承载方案**：谁来提供 `/client/` 静态文件，以及 `POSTOFFICE_PANEL_BASE_URL` 怎么设；不要为了预览开 CORS 或删保护。
 3. **合同包没说明的值**：pending 邮件计数里的 `ride`、`role_cards[].kind` 的取值、`confirmed` 的语义、`escalation_acceptor` 与 `escalation_target` 的区别、`binding` 非 null 时的形状、`roleNoteTiming` 的文案；在得到回答前客户端按原样显示、不解释。
 4. role-apply 的 `200 + projection:not_applicable` 现在不可达（合同包说明），已按字面处理。
 5. Work、审批、HUD、线程列表 / 控制、秘书：后端没有接口，客户端显示「能力缺失」，**不由前端临时造一套**。
-6. 浏览器对复用的 keep-alive 连接上掉线的 POST 会**静默重发**一次（我用 keep-alive 的 fixture 替身重现过：apply 被记了两次）。真实后端是 HTTP/1.0、无 keep-alive，我的验证中没有出现；若以后改成 keep-alive 或前面挂了代理，这点需要重新评估。
+6. 浏览器对复用的 keep-alive 连接上掉线的 POST 会**静默重发**一次（我用 keep-alive 的 fixture 替身重现过：apply 被记了两次）。真实后端是 HTTP/1.0、无 keep-alive，我的验证中没有出现；若以后改成 keep-alive 或前面挂了代理，这点需要重新评估。**真实浏览器链路的断连测试由本地做**，客户端无法在 JS 里检测或阻止这种重发，只能靠台账让用户先核对。
 
 ## 10. 验证状态（如实）
 
-**真正接通且对真实后端跑过（master v1.14.1，`1ab0f54`）：** `/api/state`、`/api/letter`、`/api/outbox` 读；`send`、`ack-one`、`archive-one`、`edit-one`、`retract-one` 写。证据：`tests/client_master_integration_test.mjs`（Node，起真实 `postoffice panel`）与浏览器端到端（同源反向代理，`POSTOFFICE_PANEL_BASE_URL` 指向代理源）。
+**真正接通且对真实后端跑过（master v1.14.1，`1ab0f54`）：** `/api/state`、`/api/letter`、`/api/outbox` 读；`send`、`ack-one`、`archive-one`、`edit-one`、`retract-one`、`status`（单个 / 多个逐个 / 按组）、`clear`（整箱）写。证据：`tests/client_master_integration_test.mjs`（Node，起真实 `postoffice panel`）与浏览器端到端（同源反向代理，`POSTOFFICE_PANEL_BASE_URL` 指向代理源）。
 
-**只对 fixture 核对（候选 e819f0e，未部署）：** `role_cards` 映射、role-diff、role-apply（fresh / pending / 未知 projection / 409 / 400 / 404 / 500 / 丢回复 / 403 保护）、`aliases`。浏览器里用一个按合同包 fixture 回放的同源替身主机跑过整条编辑流，**这不是对候选的实测**。
+**只对 fixture 核对（候选 e819f0e，未部署）：** `role_cards` 映射、role-diff、role-apply（fresh / pending / 未知 projection / 409 / 400 / 404 / 500 / 丢回复 / 403 保护）、`aliases`、`status` 的 `names` 批量。浏览器里用一个按合同包 fixture 回放的同源替身主机跑过整条编辑流，**这不是对候选的实测**。
 
 **mock（`?backend=mock`，标「未接线」）：** 线程、线程控制、Work、审批、HUD、秘书。
 
-**不支持 / 未接：** 上述各项在真实后端下显示「能力缺失」；`/api/status`、`/api/clear` 后端有但本批没要求，不接。
+**不支持 / 未接：** 上述各项在真实后端下显示「能力缺失」。
 
+- 上下线 / 整箱清理 / 台账 / 中英文切换在 Chromium（zh-CN 区域设置）对真实 master 跑过：英文首次打开、批量与按组各发了预期的 POST、clear 只发 1 个 `/api/clear` 且没有 archive-one、丢回复后不自动重发（route.abort，只验证 UI 状态）。
 - 键盘、窄屏、草稿保留：在 Chromium 里测过（Tab 顺序、Escape、窄屏全屏岗位页、刷新时不丢草稿、HUD 芯片 Tab 移出不丢焦点——这是一个原有的键盘陷阱，已修并加了回归测试）。**这不是视觉最终验收，也不替老板宣布审美通过。**
 - **中文输入法没有被验证。** 自动化只用 CDP 的 `Input.imeSetComposition` 模拟了“组合输入期间不重绘”，这**不是**真实输入法测试。需要真机（macOS Safari + Chrome，Windows 微软拼音至少一个）按下面步骤：
   1. 打开客户端（真实后端）→ 写信：在正文里切到中文拼音输入法，输入 `nihao` 不选词，让候选条保持打开。

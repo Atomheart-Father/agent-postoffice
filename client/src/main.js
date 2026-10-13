@@ -1,11 +1,12 @@
 // Browser entry: wires real DOM events to the controller. Everything with behaviour lives in app.js.
 import { createApp } from "./app.js";
 import { chooseAdapter } from "./adapters/index.js";
-import { detectLang, setLang } from "./i18n.js";
+import { setLang } from "./i18n.js";
 import { loadTheme, paintTheme, loadLang } from "./theme.js";
 import { startGround } from "./fx.js";
 
-const lang = setLang(loadLang() || detectLang(navigator));
+// BOXZ OFFICE speaks English by default; Chinese is an explicit choice (kept in storage). The browser's language is not consulted.
+const lang = setLang(loadLang() === "zh" ? "zh" : "en");
 const theme = loadTheme();
 paintTheme(theme);
 const adapter = chooseAdapter(location.search);
