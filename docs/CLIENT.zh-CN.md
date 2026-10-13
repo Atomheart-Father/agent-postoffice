@@ -49,6 +49,7 @@ node tests/client_candidate_render_test.mjs
 node tests/client_fixture_test.mjs              # 合同包 fixture + 错误路径
 node tests/client_ops_test.mjs                  # 上下线 / 整箱清理 / 写入台账 / 英文默认与原词
 node tests/client_requests_test.mjs             # 发信去重键 / 请求状态 / 有界保留 / 刷新恢复与存储隐私
+node tests/client_writer_test.mjs               # 单写者（两标签页 / 关闭与崩溃接管 / 操作者切换 / 旧摘要升级 / 不支持锁）
 node tests/client_master_integration_test.mjs   # 起一个真实 master 后端做邮件读写端到端
 ```
 
@@ -69,7 +70,8 @@ client/
     flows/roleEdit.js       岗位编辑状态机与请求构造（纯函数）
     flows/mail.js           邮件写入流（发信 / 回复 / 收执 / 归档 / 改 / 撤）
     flows/writes.js         请求记录：一次操作一条（pending / acknowledged / rejected / unknown + dismissed 标记）、client_request_id、30 条有界保留、存储摘要的纯函数
-    ledgerStore.js          请求摘要的 localStorage 存取（按后端地址 + 操作者分开，版本化，失败不崩）
+    ledgerStore.js          请求摘要的 localStorage 存取（按后端地址 + 操作者分开，v2，只由写入页整份写，失败不崩）
+    flows/writer.js         单写者：Web Locks 锁的获取 / 排队接管 / 释放；测试用的内存锁（可模拟标签页崩溃）
     flows/mailbox.js        上下线与整箱清理的状态机（纯函数）
     views/                  纯函数 (状态)→HTML 字符串
     app.js · paint.js · router.js · theme.js · i18n.js · strings.js · fx.js · host.js · main.js
@@ -136,11 +138,14 @@ client/
 
 **刷新恢复与隐私**
 
-- 只在 `localStorage` 保存最小摘要：`local_id、client_request_id（仅发信）、operation、started_at、result_state、dismissed、result_ref（后端确实返回时）、last_checked_at`。**不保存**信件正文、主题、岗位草稿、收件人、完整请求体或任何凭据。
-- **注意：`result_ref` 是后端返回的信件引用，而真实 master 的信件 id 里带有「发件人 + 主题的缩写」**（如 `bob/20261013-154020_owner_Heldsend`）。按要求保存了它，但这意味着摘要里间接含有一段主题缩写；如果不接受，改为只存信箱名即可，需要产品决定。
+- 只在 `localStorage` 保存最小摘要：`local_id、client_request_id（仅发信）、operation、started_at、result_state、dismissed、last_checked_at`。**不保存**信件正文、主题、岗位草稿、收件人、完整请求体、凭据，**也不保存后端返回的信件引用（`result_ref`，也不用信箱名替代）**：真实 master 的信件 id 里带有「发件人 + 主题的缩写」，存下来就等于间接存了主题。当前页面里仍保留完整引用用于导航（刷新后没有，这是有意的）。
+- **旧存储升级**：上一版（`boxz.office.requests.v1`）写过 `result_ref`。新版用 `…v2`；升级时读出旧记录（**不读** `result_ref`），由写入页写成 v2 并**删除 v1 条目**，其它未决记录（pending 变 unknown、unknown、关闭提示标记、请求键）全部保留。只读页不改写存储，旧条目留到写入页接管时清掉。
+- **同一后端地址 + 操作者只允许一个可写标签页**（Web Locks 独占锁，锁名带版本、地址、操作者）。其余标签页只读：不能发信、改、撤、收执、归档、上下线、整箱清理、保存岗位，也不能关闭提示或写存储，页面顶部和请求列表都写明原因；读取、刷新和核对仍可用。持有者关闭、跳走或崩溃时浏览器自动释放锁，排队的标签页自动接管：**接管时重新读取存储里的摘要（不信任自己之前读到的），不发送任何请求**，旧持有者没来得及收到回复的 pending 记录显示为 unknown。只读页通过 `storage` 事件跟随持有者的更新。操作者在页面里切换时，先释放旧作用域的锁，再为新作用域申请。存储只由持有者整份写入：没有合并，也没有用 localStorage 读改写或超时租约冒充互斥，所以旧页面状态不可能覆盖已确认的结果，列表也不会因为跨页合并超过 30 条（读入时另有 30 条硬上限，超出的最旧已结束记录不载入并提示）。
+- **兼容性限制**：没有 Web Locks（浏览器太旧，或页面不是 https / localhost 这样的安全上下文）时无法保证单写者，**这里直接关闭写操作**并说明原因，不静默放行；读取、刷新和核对仍可用。
 - 存储按（后端地址、操作者）分开：键、载荷内的 scope 都带两者，载荷里 scope 不符、版本不符、不是 JSON、记录不合格的一律不使用（并提示）；操作者在页面里切换时列表跟着换，互不可见。存储版本在键里（`boxz.office.requests.v1`）。
 - 刷新后：旧 pending 变 unknown；**不自动发送任何恢复记录**；不从已发信里“找相似内容”判定成功；没有保存请求体，所以刷新后的未决发送**只能核对，不能重试**。
-- 存储缺失 / 被禁止 / 满 / 读不回时页面正常工作，请求列表提示“未决记录仅在当前页面保留，刷新后无法恢复”。多标签页：写入时合并别的标签页存下的记录，但**不是**多标签页同步，同一条记录在两个标签页里各自改动时以最后写入为准。
+- 存储缺失 / 被禁止 / 满 / 读不回时页面正常工作，请求列表提示“未决记录仅在当前页面保留，刷新后无法恢复”。
+- **发信键与未来的正式去重通道**：现在没有任何去重承诺（`SEND_KEY.required = false`），所以浏览器生成不了键时这封信仍会发出，但记录里标“没有请求标识，没有重复保护”，不声称有保护。正式去重合同固定后，同一次提交必须把 `SEND_KEY.required` 改成 `true`：此后生成不了键的发信**在发出之前被拒**，不会静默无键发送。
 - **浏览器或代理（keep-alive）自动重送已发出但回复丢失的 POST，JS 看不到也拦不住**；去重是否真的在承载链上生效，必须由本地用真实浏览器链路验证。客户端测试里用 fake 数一数调用次数**不能**说明这个问题已解决。
 
 ### 5.3 邮件里的原词与未明字段
@@ -244,7 +249,7 @@ client/
 
 **不支持 / 未接：** 上述各项在真实后端下显示「能力缺失」。
 
-- 发信键 / 请求记录 / 刷新恢复在 Chromium 对真实 master 跑过：每次发信带自己的 UUID、存储里没有主题、刷新不发请求、丢回复后刷新变 unknown 且无重试、关闭提示不改状态；**这些只验证客户端行为，不验证服务端去重**。
+- 发信键 / 请求记录 / 刷新恢复在 Chromium 对真实 master 跑过：每次发信带自己的 UUID、存储里没有主题、刷新不发请求、丢回复后刷新变 unknown 且无重试、关闭提示不改状态；**这些只验证客户端行为，不验证服务端去重**。两个真实标签页的单写者（后者只读、不发 POST；关闭或崩溃后接管并重读摘要）也在 Chromium 里跑过。
 - 上下线 / 整箱清理 / 台账 / 中英文切换在 Chromium（zh-CN 区域设置）对真实 master 跑过：英文首次打开、批量与按组各发了预期的 POST、clear 只发 1 个 `/api/clear` 且没有 archive-one、丢回复后不自动重发（route.abort，只验证 UI 状态）。
 - 键盘、窄屏、草稿保留：在 Chromium 里测过（Tab 顺序、Escape、窄屏全屏岗位页、刷新时不丢草稿、HUD 芯片 Tab 移出不丢焦点——这是一个原有的键盘陷阱，已修并加了回归测试）。**这不是视觉最终验收，也不替老板宣布审美通过。**
 - **中文输入法没有被验证。** 自动化只用 CDP 的 `Input.imeSetComposition` 模拟了“组合输入期间不重绘”，这**不是**真实输入法测试。需要真机（macOS Safari + Chrome，Windows 微软拼音至少一个）按下面步骤：

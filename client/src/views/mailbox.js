@@ -124,6 +124,11 @@ export const writesChip = (S) => {
   const n = unconfirmed(S.writes).length, full = ledgerFull(S.writes);
   return `<button type="button" class="act${n || full ? " warn" : ""}" data-act="writes" data-fk="writes">${esc(t(full ? "wr.openFull" : "wr.open"))}${n ? ` <span class="counter" aria-label="${esc(fmt(t("wr.chip"), { n }))}">${n}</span>` : ""}</button>`;
 };
+// Why this page is not the writer, when it is not.
+export const writerNote = (S) => {
+  const w = S.ledger && S.ledger.writer;
+  return w === "reader" ? note("warn", t("wr.readonly")) : w === "unsupported" ? note("warn", t("wr.noLocks")) : "";
+};
 const shortKey = (k) => (k ? `${k.slice(0, 8)}…` : "");
 export function writesDialog(S, now) {
   const L = getLang(), un = unconfirmed(S.writes), full = ledgerFull(S.writes), off = S.ledger && S.ledger.store === "off", bad = S.ledger && S.ledger.store === "unusable";
@@ -135,6 +140,7 @@ export function writesDialog(S, now) {
       `${esc(bits.join(" · "))} · ${esc(t("wr.id"))} ${rawCode(w.id)}`,
       w.clientRequestId ? `${esc(t("wr.key"))} ${rawCode(shortKey(w.clientRequestId))}` : "",
       w.ref ? `${esc(t("wr.ref"))} ${rawCode(w.ref)}` : "",
+      w.kind === "send" && !w.clientRequestId && !w.restored ? esc(t("wr.noKey")) : "",
       typeof w.checkedAt === "number" ? esc(fmt(t("wr.checkedAt"), { s: ago(w.checkedAt, now, L) || t("unknown") })) : "",
     ].filter(Boolean).join(" · ");
     return `<li class="row static wr" data-phase="${esc(w.phase)}"${w.dismissed ? ' data-dismissed="1"' : ""}><span class="t1"><b>${esc(kind)}</b>
@@ -143,12 +149,14 @@ export function writesDialog(S, now) {
       ${w.deduped ? `<span class="t3">${esc(t("wr.deduped"))}</span>` : ""}
       ${w.message ? `<span class="t3">${esc(w.message)}</span>` : ""}
       ${open ? `<span class="t3">${esc(t(w.restored ? "wr.noRetryRestored" : w.kind === "send" ? "wr.noRetrySend" : "wr.noRetry"))}</span>` : ""}
-      ${w.phase === "unknown" && !w.dismissed ? `<span class="actions"><button type="button" class="btn ghost" data-act="writes-dismiss" data-write="${esc(w.id)}" data-fk="wr-d:${esc(w.id)}">${esc(t("wr.dismiss"))}</button></span>` : ""}</li>`;
+      ${w.phase === "unknown" && !w.dismissed && S.ledger.writer === "holder" ? `<span class="actions"><button type="button" class="btn ghost" data-act="writes-dismiss" data-write="${esc(w.id)}" data-fk="wr-d:${esc(w.id)}">${esc(t("wr.dismiss"))}</button></span>` : ""}</li>`;
   }).join("");
   return `<div class="layer" data-layer="writes"><div class="scrim" data-act="close-dialog"></div>
     <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="dlg-t"><header class="dh"><h2 id="dlg-t">${esc(t("wr.title"))}</h2>
       <button type="button" class="close-x" data-act="close-dialog" data-fk="close-dialog">${esc(t("close"))}</button></header>
     <div class="sb pad" data-keep="dlg"><p class="lead">${esc(t("wr.lead"))}</p>
+      ${writerNote(S)}
+      ${S.ledger && S.ledger.dropped ? note("warn", fmt(t("wr.dropped"), { n: S.ledger.dropped, max: LIMIT })) : ""}
       ${full ? note("warn", fmt(t("wr.full"), { n: LIMIT })) : ""}
       ${un.length ? note("warn", fmt(t("wr.warn"), { n: un.length })) : ""}
       ${off ? note("warn", t("wr.storeOff")) : ""}${bad ? note("warn", t("wr.storeBad")) : ""}

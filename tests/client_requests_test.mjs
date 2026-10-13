@@ -11,6 +11,7 @@ import {
   writesReduce, unconfirmed, evictable, ledgerFull, LIMIT, newClientRequestId, isUuid, sendDedupe, toStored, fromStored, STORED_FIELDS,
 } from "../client/src/flows/writes.js";
 import { createLedgerStore, KEY_PREFIX } from "../client/src/ledgerStore.js";
+import { createMemoryLocks } from "../client/src/flows/writer.js";
 
 let failures = 0;
 const ok = (m) => console.log("ok   - " + m);
@@ -42,12 +43,13 @@ function backend(routes) {
 }
 const withOperator = (op) => { const s = JSON.parse(JSON.stringify(state)); s.panel.operator = op; return s; };
 const memStorage = (init = {}) => { const m = new Map(Object.entries(init)); return { m, getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => { m.set(k, String(v)); }, removeItem: (k) => { m.delete(k); } }; };
-function boot(routes, { st = state, storage = memStorage(), base = "http://office-a", hash = "#/work", newKey } = {}) {
+const sharedLocks = createMemoryLocks();
+function boot(routes, { st = state, storage = memStorage(), base = "http://office-a", hash = "#/work", newKey, locks = createMemoryLocks().tab() } = {}) {
   const root = { innerHTML: "", querySelectorAll() { return []; }, querySelector() { return null; }, contains() { return false; } };
   const win = { location: { hash }, innerWidth: 1440, setTimeout: () => 0, clearTimeout() {} };
   const b = backend({ "/api/state": [200, st], ...routes });
   const adapter = createHttpAdapter({ fetchImpl: b.fetchImpl, timeoutMs: 300, writeTimeoutMs: 300 });
-  const app = createApp({ root, toastRoot: { textContent: "" }, adapter, win, doc: null, storage, ledgerBase: base, ...(newKey ? { newKey } : {}) });
+  const app = createApp({ root, toastRoot: { textContent: "" }, adapter, win, doc: null, storage, ledgerBase: base, locks, ...(newKey ? { newKey } : {}) });
   return { app, root, S: app.S, log: b.log, adapter, storage };
 }
 const posts = (t, path) => t.log.filter((l) => l.method === "POST" && (!path || l.path === path));
@@ -280,8 +282,10 @@ const stored = (t) => [...t.storage.m.entries()].filter(([k]) => k.startsWith(KE
   hasNot(all.toLowerCase(), "token", "…no credential-looking field"); hasNot(all, "password", "…no password");
   const p = JSON.parse(stored(t)[0][1]);
   is(Object.keys(p.items[0]).sort(), [...STORED_FIELDS].sort(), "each item has exactly the summary fields");
-  is(p.v, 1, "…with a schema version");
-  is(p.items[0].result_ref, "box_a/20260101-000000-a.md", "…the reference the backend returned is kept");
+  is(p.v, 2, "…with a schema version");
+  is("result_ref" in p.items[0], false, "…and there is no letter reference in it (it carries the sender and a shortened subject)");
+  hasNot(all, "20260101-000000-a", "…not even as text anywhere");
+  is(t.S.writes[0].ref, "box_a/20260101-000000-a.md", "…while this page still holds the full reference for navigation");
   is(p.scope, { base: "http://office-a", operator: "panelop" }, "…and the scope is written inside the payload");
   // another Office, another operator
   const other = boot({}, { storage, base: "http://office-b" }); await other.app.load();
@@ -323,14 +327,14 @@ const stored = (t) => [...t.storage.m.entries()].filter(([k]) => k.startsWith(KE
   const key = (t) => createLedgerStore({ storage: t.storage, base: "http://office-a" }).keyOf({ base: "http://office-a", operator: "panelop" });
   const probe = boot({}); const k = key(probe);
   const sc = { base: "http://office-a", operator: "panelop" };
-  const good = { local_id: "w-1", client_request_id: null, operation: "send", started_at: 5, result_state: "acknowledged", dismissed: false, result_ref: "", last_checked_at: null };
+  const good = { local_id: "w-1", client_request_id: null, operation: "send", started_at: 5, result_state: "acknowledged", dismissed: false, last_checked_at: null };
   const bads = {
     "not JSON": "{{{{",
     "an array": "[]",
-    "an old schema version": JSON.stringify({ v: 0, scope: sc, items: [good] }),
-    "a newer schema version": JSON.stringify({ v: 2, scope: sc, items: [good] }),
-    "another scope's payload under this key": JSON.stringify({ v: 1, scope: { base: "http://office-b", operator: "panelop" }, items: [good] }),
-    "items that are not records": JSON.stringify({ v: 1, scope: sc, items: [1, null, "x", { local_id: 5 }, { local_id: "w-2" }] }),
+    "an old schema version under the new key": JSON.stringify({ v: 1, scope: sc, items: [good] }),
+    "a newer schema version": JSON.stringify({ v: 3, scope: sc, items: [good] }),
+    "another scope's payload under this key": JSON.stringify({ v: 2, scope: { base: "http://office-b", operator: "panelop" }, items: [good] }),
+    "items that are not records": JSON.stringify({ v: 2, scope: sc, items: [1, null, "x", { local_id: 5 }, { local_id: "w-2" }] }),
   };
   for (const [name, raw] of Object.entries(bads)) {
     const t = boot({}, { storage: memStorage({ [k]: raw }) });

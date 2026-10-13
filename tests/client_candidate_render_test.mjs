@@ -5,6 +5,7 @@
 // exact failure shapes (pending projection, stale 409, lost reply) handled as the task demands.
 import { readFileSync } from "node:fs";
 import { createApp } from "../client/src/app.js";
+import { createMemoryLocks } from "../client/src/flows/writer.js";
 import { createHttpAdapter } from "../client/src/adapters/http.js";
 import { chooseAdapter } from "../client/src/adapters/index.js";
 import { setLang, missing } from "../client/src/i18n.js";
@@ -37,7 +38,7 @@ function boot(routes, { hash = "", width = 1440 } = {}) {
   const win = { location: { hash }, innerWidth: width, setTimeout: () => 0, clearTimeout() {} };
   const b = backend(routes);
   const adapter = createHttpAdapter({ fetchImpl: b.fetchImpl, timeoutMs: 300, writeTimeoutMs: 300 });
-  const app = createApp({ root, toastRoot: { textContent: "" }, adapter, win, doc: null });
+  const app = createApp({ root, toastRoot: { textContent: "" }, adapter, win, doc: null, locks: createMemoryLocks().tab() });
   return { app, root, S: app.S, log: b.log, adapter };
 }
 const inp = (app) => (field, value) => app.input({ closest: () => ({ dataset: { edit: field }, value }) }, false);

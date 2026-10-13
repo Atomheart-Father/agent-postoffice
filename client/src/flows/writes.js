@@ -25,6 +25,11 @@ export const LIMIT = 30;
 // `features.send_request_id` is only a candidate and a flag nobody has pinned is not a promise.
 export const SEND_DEDUPE = { contract: null };
 export const sendDedupe = () => ({ supported: false, reason: SEND_DEDUPE.contract ? "unpinned-flag" : "contract-pending" });
+// Whether a send MAY go out without a request key. Today it may (no de-duplication is claimed, so nothing is promised that a
+// missing key could break). The change that pins the formal de-duplication contract must set `required: true` in the same
+// commit: from then on a send whose key cannot be made is refused before anything leaves, never sent bare under a promise of
+// protection.
+export const SEND_KEY = { required: false };
 
 // ---------- ids ----------
 // Display / log id for the local record. Not a server key.
@@ -81,15 +86,17 @@ const clean = (s) => (typeof s === "string" ? s.slice(0, 200) : "");
 export const unconfirmed = (list) => list.filter((w) => (w.phase === "pending" || w.phase === "unknown") && !w.dismissed);
 
 // ---------- what survives a reload ----------
-// Only this minimal summary is ever stored. Never a body, a subject, a draft, a full request or anything that is a credential.
-// (`result_ref` is the letter reference the backend itself returned; `target` - who it went to - is deliberately not kept.)
-export const STORED_FIELDS = ["local_id", "client_request_id", "operation", "started_at", "result_state", "dismissed", "result_ref", "last_checked_at"];
+// Only this minimal summary is ever stored. Never a body, a subject, a draft, a full request, a recipient, a letter reference
+// or anything that is a credential. (A letter reference is returned by the backend and may be shown on THIS page for
+// navigation, but it is built from the sender and a shortened subject, so it is not part of the stored summary.)
+export const STORED_FIELDS = ["local_id", "client_request_id", "operation", "started_at", "result_state", "dismissed", "last_checked_at"];
 export const toStored = (w) => ({
   local_id: w.id, client_request_id: w.clientRequestId || null, operation: w.kind, started_at: w.at, result_state: w.phase,
-  dismissed: !!w.dismissed, result_ref: w.ref || "", last_checked_at: typeof w.checkedAt === "number" ? w.checkedAt : null,
+  dismissed: !!w.dismissed, last_checked_at: typeof w.checkedAt === "number" ? w.checkedAt : null,
 });
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
-// One stored summary back to a record, or null when it is not usable. A state nobody recognises becomes `unknown`, never a success.
+// One stored summary back to a record, or null when it is not usable. A state nobody recognises becomes `unknown`, never a
+// success. Fields that are not in the summary (a `result_ref` written by an older client, anything else) are not read.
 export function fromStored(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   if (typeof raw.local_id !== "string" || !raw.local_id || raw.local_id.length > 80) return null;
@@ -100,21 +107,16 @@ export function fromStored(raw) {
   return {
     id: raw.local_id, kind: op, target: "", at, phase, message: "", closedAt: null,
     clientRequestId: isUuid(raw.client_request_id) ? raw.client_request_id : null,
-    ref: clean(raw.result_ref), dismissed: raw.dismissed === true, checkedAt: num(raw.last_checked_at), restored: true, deduped: false,
+    ref: "", dismissed: raw.dismissed === true, checkedAt: num(raw.last_checked_at), restored: true, deduped: false,
   };
 }
-// Newest first, at most LIMIT; when over the limit the evictable ones go first, then the oldest. Unresolved records go last.
+// At most LIMIT records, newest first. Only the single writer ever saves, so a stored list never legitimately exceeds the limit;
+// a payload that does (damaged, edited by hand) is cut: records that could be dropped by the rules go first, then the oldest.
 export function capList(list) {
   const sorted = [...list].sort((a, b) => b.at - a.at);
-  if (sorted.length <= LIMIT) return sorted;
-  const keep = sorted.filter((w) => !evictable(w));
-  const room = Math.max(0, LIMIT - keep.length);
-  const spare = sorted.filter(evictable).slice(0, room);
-  return [...keep, ...spare].sort((a, b) => b.at - a.at).slice(0, Math.max(LIMIT, keep.length));
-}
-// What to write: this page's records plus records another tab of the same scope stored that this page never had.
-export function mergeForSave(mine, stored, seen) {
-  const have = new Set(mine.map((w) => w.id));
-  const others = stored.filter((w) => !have.has(w.id) && !seen.has(w.id));
-  return capList([...mine, ...others]);
+  if (sorted.length <= LIMIT) return { list: sorted, dropped: 0 };
+  const keep = sorted.filter((w) => !evictable(w)).slice(0, LIMIT);
+  const spare = sorted.filter(evictable).slice(0, LIMIT - keep.length);
+  const out = [...keep, ...spare].sort((a, b) => b.at - a.at);
+  return { list: out, dropped: sorted.length - out.length };
 }

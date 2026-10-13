@@ -3,6 +3,7 @@
 // by client_master_integration_test.mjs. Nothing here says anything about a running e819f0e.
 import { readFileSync, readdirSync } from "node:fs";
 import { createApp } from "../client/src/app.js";
+import { createMemoryLocks } from "../client/src/flows/writer.js";
 import { createHttpAdapter, mapMasterState } from "../client/src/adapters/http.js";
 import { setLang, getLang, missing } from "../client/src/i18n.js";
 import { STR } from "../client/src/strings.js";
@@ -61,7 +62,7 @@ function boot(routes, { hash = "", width = 1440, st = state } = {}) {
   const win = { location: { hash }, innerWidth: width, setTimeout: () => 0, clearTimeout() {} };
   const b = backend({ "/api/state": [200, st], ...routes });
   const adapter = createHttpAdapter({ fetchImpl: b.fetchImpl, timeoutMs: 300, writeTimeoutMs: 300 });
-  const app = createApp({ root, toastRoot: { textContent: "" }, adapter, win, doc: null });
+  const app = createApp({ root, toastRoot: { textContent: "" }, adapter, win, doc: null, locks: createMemoryLocks().tab() });
   return { app, root, S: app.S, log: b.log, adapter };
 }
 const box = (dataset, extra = {}) => ({ closest: () => ({ dataset, getAttribute: () => null, ...extra }) });
