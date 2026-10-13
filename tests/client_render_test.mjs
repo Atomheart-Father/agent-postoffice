@@ -135,8 +135,10 @@ const spyApply = (adapter) => { const calls = []; const f = adapter.applyRoleCha
   const real = adapter.applyRoleChange; let n = 0;
   adapter.applyRoleChange = async (...a) => { n++; await real(...a); return { ok: false, error: { code: "network", message: "reply lost", retryable: true } }; };   // the backend saved, the reply never arrived
   inpOf(app)("duties", "Only duty"); await app.act("ed-preview"); await app.act("ed-apply");
-  is(S.edits.analyst.phase, "error", "lost reply: error phase"); hasS(root.innerHTML, "not known whether this was saved", "…says the outcome is unknown");
-  hasS(root.innerHTML, "most likely saved", "…and notices that the refetched role already matches the draft");
+  is(S.edits.analyst.phase, "error", "lost reply: error phase"); hasS(root.innerHTML, "not known whether the apply took effect", "…says the outcome is unknown");
+  hasS(root.innerHTML, "will not send it again", "…and that the client will not send it again");
+  hasNot(root.innerHTML, "most likely saved", "…and does not infer success from the state read (it has no whole-config baseline)");
+  hasS(root.innerHTML, 'data-act="ed-preview"', "…the way to find out is a fresh preview");
   hasNot(root.innerHTML, 'data-act="ed-retry"', "no retry button for apply"); hasNot(root.innerHTML, 'data-edit="duties"', "…and no form to resubmit from"); hasS(root.innerHTML, 'data-act="ed-refresh"', "the follow-up is to refresh and look");
   await app.act("ed-refresh"); is(n, 1, "refreshing does not resend");
 }
@@ -145,7 +147,7 @@ const spyApply = (adapter) => { const calls = []; const f = adapter.applyRoleCha
   const { app, root, S } = boot({ hash: "#/office/analyst/edit" }); await app.load();
   const r = S.snap.roles.find((x) => x.id === "analyst");
   r.escalationRole = null; app.render(); hasS(root.innerHTML, "does not say who this position escalates to", "an unknown escalation role closes editing");
-  r.escalationRole = "research-lead"; r.origin = "mailbox"; app.render(); hasS(root.innerHTML, "legacy node drawn from a mailbox", "a mailbox node is not editable as a role");
+  r.escalationRole = "research-lead"; r.origin = "mailbox"; app.render(); hasS(root.innerHTML, "drawn from a mailbox", "a mailbox node is not editable as a role");
 }
 {
   // the master mapping on screen: mailbox nodes, unassigned node, letters by mailbox with their own states
@@ -155,7 +157,7 @@ const spyApply = (adapter) => { const calls = []; const f = adapter.applyRoleCha
       pending: [{ file: "x.md", status: "waiting", subject: "Hello", from: "a", mtime: 1 }, { file: "y.md", status: "reminded", subject: "Again", from: "a", mtime: 2 }] },
     { name: "late", app: "Codex", online: true, counts: {}, identity: {}, activity: {}, pending: [] }] }, Date.now() / 1000);
   S.view = "office"; S.roleId = "box:boss"; S.roleTab = "overview"; app.render();
-  hasS(root.innerHTML, "Unassigned mailboxes", "a mailbox the tree forgot is drawn"); hasS(root.innerHTML, "stands for one mailbox, not a formal position", "a mailbox node says what it is");
+  hasS(root.innerHTML, "Mailboxes not in the tree", "a mailbox the tree forgot is drawn"); hasS(root.innerHTML, "stands for one mailbox, not a formal position", "a mailbox node says what it is");
   hasS(root.innerHTML, "Delivery switch: on", "the delivery switch is shown as a switch"); hasS(root.innerHTML, 'class="st" data-st="unknown"', "…and the holder is drawn as unknown, not connected");
   S.roleTab = "work"; app.render(); hasS(root.innerHTML, "Waiting in mailbox", "a waiting letter keeps its state"); hasS(root.innerHTML, "Reminded, not consumed", "a reminded letter keeps its state");
   hasS(root.innerHTML, "by mailbox boss", "letters are labelled as attributed by mailbox"); hasNot(root.innerHTML, ">Accepted<", "nothing is flattened to accepted");
@@ -201,6 +203,16 @@ const spyApply = (adapter) => { const calls = []; const f = adapter.applyRoleCha
   hasS(root.innerHTML, 'aria-expanded="false"', "the HUD starts closed"); app.hudIn(target({ x: 1 })); is(S.hud, true, "hover/focus opens it");
   app.hudOut(null, null); is(S.hud, false, "leaving closes it (unpinned)");
   app.act("hud"); is(S.hud && S.hudPin, true, "click pins it"); app.key({ key: "Escape" }); is(S.hud, false, "Esc closes it");
+}
+{
+  // Tab out of the HUD chip: the next element gets focus only after the handler returns, so the repaint must wait for it
+  // (a repaint inside focusout replaced the element about to be focused and dropped focus to <body>).
+  const timers = []; const root = { innerHTML: "", querySelectorAll() { return []; }, querySelector() { return null; }, contains() { return false; } };
+  const win = { location: { hash: "" }, innerWidth: 1440, setTimeout: (f) => { timers.push(f); return 1; }, clearTimeout() {} };
+  const app = createApp({ root, toastRoot: { textContent: "" }, adapter: createMockAdapter({ latency: 0 }), win, doc: null }); await app.load();
+  app.hudIn(target({ x: 1 })); hasS(root.innerHTML, 'aria-expanded="true"', "the HUD opened on focus");
+  app.hudOut({ closest: () => null }, null); is(timers.length, 1, "leaving toward another element defers the repaint");
+  hasS(root.innerHTML, 'aria-expanded="true"', "…nothing is replaced while the focus move is under way"); timers[0](); hasS(root.innerHTML, 'aria-expanded="false"', "…and the repaint follows once it has landed");
 }
 
 // ---- IME safety, escaping, wiring ----

@@ -11,6 +11,7 @@ import { threadsView } from "./threads.js";
 import { workView } from "./work.js";
 import { needsYou } from "./office.js";
 import { capsDialog, newThreadDialog } from "./dialogs.js";
+import { letterDialog, composeDialog } from "./mail.js";
 
 const TABS = [["office", "tab.office"], ["threads", "tab.threads"], ["work", "tab.work2"]];
 
@@ -29,7 +30,7 @@ function bar(snap, S, adapter, now) {
 
 function page(snap, S, adapter, now) {
   if (S.load === "loading" && !snap) return `<div class="pad">${note("loading", t("loading"))}</div>`;
-  if (!snap) return `<div class="pad">${note("error", S.err ? S.err.message : t("nk.error"), `<div class="actions"><button type="button" class="btn primary" data-act="reload" data-fk="reload">${esc(t("retry"))}</button></div>`)}</div>`;
+  if (!snap) return `<div class="pad">${note("error", S.err ? S.err.message : t("nk.error"), `<div class="actions"><button type="button" class="btn primary" data-act="reload" data-fk="reload">${esc(t("retry"))}</button></div>`)}${adapter && adapter.kind === "http" ? `<p class="fine">${esc(t("err.mockHint"))}</p>` : ""}</div>`;
   const stale = S.err ? note("error", fmt(t("stale.data"), { s: ago(snap.asOf, now, getLang()) || t("unknown"), e: S.err.message }), `<button type="button" class="btn" data-act="reload" data-fk="reload2">${esc(t("retry"))}</button>`) : "";
   const strip = adapter && adapter.kind === "mock" ? `<div class="strip">${esc(t("mock.strip"))}</div>` : "";
   let main;
@@ -40,6 +41,7 @@ function page(snap, S, adapter, now) {
 }
 
 export function shell(snap, S, adapter, now) {
-  const layer = S.dialog === "caps" ? capsDialog(snap, S, adapter) : S.dialog === "newthread" && snap ? newThreadDialog(snap, S) : "";
+  const layer = S.dialog === "caps" ? capsDialog(snap, S, adapter) : S.dialog === "newthread" && snap ? newThreadDialog(snap, S)
+    : S.dialog === "letter" && snap && S.letter ? letterDialog(snap, S, now) : S.dialog === "compose" && snap && S.compose ? composeDialog(snap, S) : "";
   return `${bar(snap, S, adapter, now)}<main id="main" tabindex="-1" class="view-${esc(S.view)}">${page(snap, S, adapter, now)}</main>${layer}`;
 }

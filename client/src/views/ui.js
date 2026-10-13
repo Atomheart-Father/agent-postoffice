@@ -1,6 +1,6 @@
 // Small shared pieces. Every status is a mark plus a word: colour is never the only carrier.
 import { esc } from "../util.js";
-import { t } from "../i18n.js";
+import { t, has } from "../i18n.js";
 
 export const lamp = (kind, st) => `<i class="lamp k-${esc(kind)}" data-p="${esc(st)}"></i>`;
 export const presenceWord = (p) => t("p." + p);
@@ -22,6 +22,8 @@ export function seg(items, current, attr, label) {
     `<button type="button" ${attr}="${esc(k)}" aria-pressed="${k === current ? "true" : "false"}" data-fk="${esc(attr)}:${esc(k)}">${esc(text)}</button>`).join("")}</div>`;
 }
 
+// The adapter names the groups it makes up itself (roles / mailboxes / unassigned) by id; their words belong to the client.
+export const roleLabel = (r) => (r && has("team." + r.id) ? t("team." + r.id) : r ? r.title : "");
 export const roleById = (snap, id) => (snap ? snap.roles.find((r) => r.id === id) : null) || null;
 export const roleTitle = (snap, id) => { const r = roleById(snap, id); return r ? r.title : id || "—"; };
 

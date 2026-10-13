@@ -1,0 +1,528 @@
+{
+  "baseline": "e819f0e（本地候选 worktree <local worktree>，postoffice 同版本行数见 CHAPTER_0）",
+  "method": "隔离 temp HOME＋匿名数据实跑：POSTOFFICE_HOME=<temp> POSTOFFICE_NO_NOTIFY=1 POSTOFFICE_POLL=1 postoffice panel --no-open --port <p>，curl 逐条；临时路径已抹为 <HOME>",
+  "anon_fixture": {
+    "boxes": [
+      "panelop(operator,notify)",
+      "box_a(notify)",
+      "box_b(notify)",
+      "box_unlisted(notify,不在组织树)",
+      "box_c(opencode_plugin)"
+    ],
+    "aliases": [
+      "office.design(候选 box_a,scope=project anonproj)",
+      "office.worker(候选 box_b)",
+      "office.missing(候选 box_unlisted)"
+    ],
+    "pending_states": {
+      "box_a": "waiting+reminded 各一",
+      "box_c": "failed 一"
+    },
+    "org_tree": "panel.organization={members:[box_a,box_b],label:匿名团队}（box_unlisted/box_c 已登记但未编入——API 不标记，前端自行差集）"
+  },
+  "cases": [
+    {
+      "name": "state_ok",
+      "method": "GET",
+      "path": "/api/state",
+      "status": 200,
+      "note": "全量只读投影；顶层 11 键（见 state_ok.json）"
+    },
+    {
+      "name": "letter_ok",
+      "method": "GET",
+      "path": "/api/letter?box=box_a&id=<urlencoded-id>",
+      "status": 200,
+      "note": "id 必须 URL 编码；响应 {ok,id,box,sender,subject,need,body}"
+    },
+    {
+      "name": "letter_raw_utf8_id",
+      "method": "GET",
+      "path": "/api/letter?box=box_a&id=<原始UTF-8字节>",
+      "status": 400,
+      "note": "HTML 错误页非 JSON：http.server 拒含原始非 ASCII 的请求行；客户端必须先 percent-encode"
+    },
+    {
+      "name": "letter_bad_id_md",
+      "method": "GET",
+      "path": "/api/letter?box=box_a&id=x.md",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"error\":\"bad_request\"}"
+    },
+    {
+      "name": "letter_glob",
+      "method": "GET",
+      "path": "/api/letter?box=box_a&id=*",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"error\":\"bad_request\"}"
+    },
+    {
+      "name": "letter_unknown_box",
+      "method": "GET",
+      "path": "/api/letter?box=nobody&id=<valid>",
+      "status": 404,
+      "body_resp": "{\"ok\":false,\"error\":\"not_found\"}"
+    },
+    {
+      "name": "letter_bad_box_name",
+      "method": "GET",
+      "path": "/api/letter?box=bad/name&id=<valid>",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"error\":\"bad_request\"}"
+    },
+    {
+      "name": "outbox_ok",
+      "method": "GET",
+      "path": "/api/outbox",
+      "status": 200,
+      "note": "operator 已发仍在他人 inbox 的信；行 10 键（见 outbox_ok.json）"
+    },
+    {
+      "name": "x01_get_evil_origin",
+      "method": "GET",
+      "path": "/api/state",
+      "headers": {
+        "Origin": "http://evil.example.com",
+        "Content-Type": "application/json"
+      },
+      "status": 403,
+      "body_resp": "{\"ok\":false}",
+      "note": "e819f0e 新增：GET 也校 Origin"
+    },
+    {
+      "name": "x01_get_evil_host",
+      "method": "GET",
+      "path": "/api/state",
+      "headers": {
+        "Host": "evil.example.com"
+      },
+      "status": 403,
+      "body_resp": "{\"ok\":false}",
+      "note": "e819f0e 新增：Host 精确白名单（带端口，防 DNS rebinding）"
+    },
+    {
+      "name": "x01_post_evil_origin",
+      "method": "POST",
+      "path": "/api/status",
+      "headers": {
+        "Origin": "http://evil.example.com",
+        "Content-Type": "application/json"
+      },
+      "body": "{}",
+      "status": 403,
+      "body_resp": "{\"ok\":false}"
+    },
+    {
+      "name": "x01_post_evil_host",
+      "method": "POST",
+      "path": "/api/status",
+      "headers": {
+        "Host": "evil.example.com",
+        "Content-Type": "application/json"
+      },
+      "body": "{}",
+      "status": 403,
+      "body_resp": "{\"ok\":false}"
+    },
+    {
+      "name": "x01_post_text_plain",
+      "method": "POST",
+      "path": "/api/status",
+      "headers": {
+        "Content-Type": "text/plain"
+      },
+      "body": "{}",
+      "status": 403,
+      "body_resp": "{\"ok\":false}"
+    },
+    {
+      "name": "status_offline",
+      "method": "POST",
+      "path": "/api/status",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"box_b\",\"status\":\"offline\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"error\":\"\"}"
+    },
+    {
+      "name": "status_offline_repeat",
+      "method": "POST",
+      "path": "/api/status",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"box_b\",\"status\":\"offline\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"error\":\"\"}",
+      "note": "幂等"
+    },
+    {
+      "name": "status_unknown_box",
+      "method": "POST",
+      "path": "/api/status",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"ghost\",\"status\":\"online\"}",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"error\":\"\"}",
+      "note": "无原因串"
+    },
+    {
+      "name": "status_batch",
+      "method": "POST",
+      "path": "/api/status",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"names\":[\"box_b\",\"box_unlisted\"],\"status\":\"offline\",\"label\":\"匿名\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"error\":\"\"}"
+    },
+    {
+      "name": "status_group",
+      "method": "POST",
+      "path": "/api/status",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"group\":\"notify\",\"status\":\"offline\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"error\":\"\"}",
+      "note": "group 不带 @"
+    },
+    {
+      "name": "status_group_unknown",
+      "method": "POST",
+      "path": "/api/status",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"group\":\"nosuch\",\"status\":\"offline\"}",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"error\":\"配置里没有分组 @nosuch；`postoffice config show` 看有哪些分组\"}"
+    },
+    {
+      "name": "clear_ok",
+      "method": "POST",
+      "path": "/api/clear",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"box_b\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"error\":\"\"}",
+      "note": "整箱→archived/（与 archive-one 的 done 不同）"
+    },
+    {
+      "name": "archive_one_moved",
+      "method": "POST",
+      "path": "/api/archive-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"box\":\"box_a\",\"id\":\"20261013-044210_panelop_样例待唤醒\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"state\":\"moved\"}"
+    },
+    {
+      "name": "archive_one_already",
+      "method": "POST",
+      "path": "/api/archive-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"box\":\"box_a\",\"id\":\"20261013-044210_panelop_样例待唤醒\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"state\":\"already\"}",
+      "note": "幂等"
+    },
+    {
+      "name": "archive_one_bad_box_name",
+      "method": "POST",
+      "path": "/api/archive-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"box\":\"bad/name\",\"id\":\"x\"}",
+      "status": 404,
+      "body_resp": "{\"ok\":false,\"error\":\"not_found\"}",
+      "note": "box_name_ok 先拒"
+    },
+    {
+      "name": "archive_one_unknown_box",
+      "method": "POST",
+      "path": "/api/archive-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"box\":\"ghost\",\"id\":\"x\"}",
+      "status": 404,
+      "body_resp": "{\"ok\":false,\"error\":\"not_found\"}"
+    },
+    {
+      "name": "archive_one_md_suffix",
+      "method": "POST",
+      "path": "/api/archive-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"box\":\"box_a\",\"id\":\"x.md\"}",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"error\":\"bad_request\"}"
+    },
+    {
+      "name": "ack_one_recorded",
+      "method": "POST",
+      "path": "/api/ack-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"box\":\"box_a\",\"id\":\"20261013-044210_panelop_样例已提醒\",\"note\":\"样例回执\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"state\":\"recorded\",\"id\":\"20261013-044210_panelop_样例已提醒\",\"to\":\"panelop\"}"
+    },
+    {
+      "name": "ack_one_already",
+      "method": "POST",
+      "path": "/api/ack-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"box\":\"box_a\",\"id\":\"20261013-044210_panelop_样例已提醒\",\"note\":\"样例回执\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"state\":\"already\",\"id\":\"20261013-044210_panelop_样例已提醒\",\"to\":\"panelop\"}",
+      "note": "幂等"
+    },
+    {
+      "name": "send_new_id",
+      "method": "POST",
+      "path": "/api/send",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"from\":\"panelop\",\"to\":\"box_b\",\"subject\":\"契约样例·send\",\"need\":\"仅告知\",\"body\":\"第一封\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"id\":\"20261013-051058_panelop_契约样例send\",\"ref\":\"box_b/20261013-051058_panelop_契约样例send\"}"
+    },
+    {
+      "name": "send_same_content_second",
+      "method": "POST",
+      "path": "/api/send",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"from\":\"panelop\",\"to\":\"box_b\",\"subject\":\"契约样例·send\",\"need\":\"仅告知\",\"body\":\"第二封同样内容\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"id\":\"20261013-051058-1_panelop_契约样例send\",\"ref\":\"box_b/20261013-051058-1_panelop_契约样例send\"}",
+      "note": "无幂等键，id 带 -1 后缀"
+    },
+    {
+      "name": "send_alias",
+      "method": "POST",
+      "path": "/api/send",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"from\":\"panelop\",\"to\":\"@office.design\",\"subject\":\"契约样例·alias\",\"need\":\"仅告知\",\"body\":\"走逻辑地址\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"id\":\"20261013-051058_panelop_契约样例alias\",\"ref\":\"box_a/20261013-051058_panelop_契约样例alias\"}",
+      "note": "解析到首个在线候选"
+    },
+    {
+      "name": "edit_one_updated",
+      "method": "POST",
+      "path": "/api/edit-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"to\":\"box_b\",\"id\":\"<id>\",\"subject\":\"编辑样例2·改\",\"need\":\"回复\",\"body\":\"改后正文\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"state\":\"updated\",\"id\":\"...\",\"to\":\"box_b\"}",
+      "note": "收件箱字段名是 to 不是 box；sender 恒取 panel.operator"
+    },
+    {
+      "name": "edit_one_repeat",
+      "method": "POST",
+      "path": "/api/edit-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"to\":\"box_b\",\"id\":\"<id>\",\"body\":\"二次改\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"state\":\"updated\",\"id\":\"...\",\"to\":\"box_b\"}",
+      "note": "可重复改"
+    },
+    {
+      "name": "edit_one_not_sender",
+      "method": "POST",
+      "path": "/api/edit-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"to\":\"box_a\",\"id\":\"<box_b发的信>\",\"subject\":\"s\"}",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"error\":\"refused\",\"message\":\"信 ... 的来源是 box_b，不是你指定的 panelop；不改别人的信\"}"
+    },
+    {
+      "name": "retract_one_ok",
+      "method": "POST",
+      "path": "/api/retract-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"to\":\"box_b\",\"id\":\"<id>\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"state\":\"retracted\",\"id\":\"...\",\"to\":\"box_b\"}"
+    },
+    {
+      "name": "retract_one_repeat",
+      "method": "POST",
+      "path": "/api/retract-one",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"to\":\"box_b\",\"id\":\"<id>\"}",
+      "status": 404,
+      "body_resp": "{\"ok\":false,\"error\":\"not_found\"}",
+      "note": "一次性"
+    },
+    {
+      "name": "role_diff_ok",
+      "method": "POST",
+      "path": "/api/role-diff",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.worker\",\"candidates\":[\"box_a\",\"box_b\"],\"duties\":[\"跑样例\",\"核样例\"],\"resources\":[{\"kind\":\"dir\",\"ref\":\"/tmp\"}]}",
+      "status": 200,
+      "note": "{ok,diff:{name,baseline,change,expected,facts}}；baseline=config 字节 SHA256，diff 与基线同窗"
+    },
+    {
+      "name": "role_diff_400_duties6",
+      "method": "POST",
+      "path": "/api/role-diff",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.worker\",\"candidates\":[\"box_a\"],\"duties\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\"]}",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"error\":\"role.duties 最多 5 条（现在 6 条）\"}"
+    },
+    {
+      "name": "role_diff_400_no_cands",
+      "method": "POST",
+      "path": "/api/role-diff",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.worker\"}",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"error\":\"candidates 必须是非空字符串数组（按优先级排序）\"}"
+    },
+    {
+      "name": "role_diff_404",
+      "method": "POST",
+      "path": "/api/role-diff",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.nope\",\"candidates\":[\"box_a\"]}",
+      "status": 404,
+      "body_resp": "{\"ok\":false,\"error\":\"没有岗位 @office.nope\"}"
+    },
+    {
+      "name": "role_apply_fresh",
+      "method": "POST",
+      "path": "/api/role-apply",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.worker\",\"candidates\":[\"box_a\",\"box_b\"],\"duties\":[\"跑样例\",\"核样例\"],\"resources\":[{\"kind\":\"dir\",\"ref\":\"/tmp\"}],\"baseline\":\"<sha256>\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"saved\":true,\"projection\":\"fresh\",\"message\":\"已保存 @office.worker 的候选/升级（备份：config.role.<ns>-<rand>.bak）；名片已刷新：box_a\",\"backup\":\"config.role.<ns>-<rand>.bak\",\"active_now\":\"box_a\",\"acceptor_now\":\"\"}"
+    },
+    {
+      "name": "role_apply_pending",
+      "method": "POST",
+      "path": "/api/role-apply",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.worker\",\"candidates\":[\"box_b\",\"box_a\"],\"baseline\":\"<fresh>\"}",
+      "status": 200,
+      "body_resp": "{\"ok\":true,\"saved\":true,\"projection\":\"pending\",\"message\":\"...配置已保存，名片投影待刷新：box_b\",\"backup\":\"config.role.<ns>-<rand>.bak\",\"active_now\":\"box_b\",\"acceptor_now\":\"\"}",
+      "note": "box_b 目录 chmod 555→project_contact 失败；saved 仍 true（权威已存）"
+    },
+    {
+      "name": "role_apply_409_stale",
+      "method": "POST",
+      "path": "/api/role-apply",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.worker\",\"candidates\":[\"box_b\"],\"baseline\":\"<旧>\"}",
+      "status": 409,
+      "body_resp": "{\"ok\":false,\"stale\":true,\"saved\":false,\"projection\":\"not_applicable\",\"error\":\"配置已被外部修改，页面差异已过期；请重新查看差异后再确认\"}",
+      "note": "无 current 字段；baseline 检查先于别名存在性——旧 baseline+不存在别名也得 409 不是 404"
+    },
+    {
+      "name": "role_apply_404",
+      "method": "POST",
+      "path": "/api/role-apply",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.nope\",\"candidates\":[\"box_a\"],\"baseline\":\"<fresh>\"}",
+      "status": 404,
+      "body_resp": "{\"ok\":false,\"saved\":false,\"projection\":\"not_applicable\",\"error\":\"没有岗位 @office.nope\"}"
+    },
+    {
+      "name": "role_apply_400_no_baseline",
+      "method": "POST",
+      "path": "/api/role-apply",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.worker\",\"candidates\":[\"box_b\"]}",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"saved\":false,\"projection\":\"not_applicable\",\"error\":\"缺少基线哈希（请先查看差异）\"}"
+    },
+    {
+      "name": "role_apply_400_validate",
+      "method": "POST",
+      "path": "/api/role-apply",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.worker\",\"candidates\":[\"box_b\"],\"duties\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\"],\"baseline\":\"<fresh>\"}",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"saved\":false,\"projection\":\"not_applicable\",\"error\":\"role.duties 最多 5 条（现在 6 条）\"}"
+    },
+    {
+      "name": "role_apply_400_unregistered_cand",
+      "method": "POST",
+      "path": "/api/role-apply",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.missing\",\"candidates\":[\"box_ghost\"],\"baseline\":\"<fresh>\"}",
+      "status": 400,
+      "body_resp": "{\"ok\":false,\"saved\":false,\"projection\":\"not_applicable\",\"error\":\"校验不通过，未落盘：alias office.missing 的候选指向未登记信箱 box_ghost\"}"
+    },
+    {
+      "name": "role_apply_500_backup_failed",
+      "method": "POST",
+      "path": "/api/role-apply",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": "{\"name\":\"office.worker\",\"candidates\":[\"box_b\"],\"baseline\":\"<fresh>\"}",
+      "status": 500,
+      "body_resp": "{\"ok\":false,\"saved\":false,\"projection\":\"not_applicable\",\"error\":\"无法创建配置备份（回滚点），已中止本次提交；配置保持原样\"}",
+      "note": "logs/ 目录 chmod 555 构造"
+    }
+  ]
+}

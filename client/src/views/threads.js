@@ -5,6 +5,8 @@ import { t, getLang } from "../i18n.js";
 import { note, seg, controlBadge, deliveryBadge, roleTitle, mockChip } from "./ui.js";
 import { hudCard } from "./hud.js";
 
+const capOn = (snap, k) => { const c = snap.capabilities[k]; return !!c && c.status !== "missing"; };
+
 export function filteredThreads(snap, f) {
   return snap.threads.filter((x) => (!f.role || x.roleId === f.role) && (!f.source || x.source === f.source))
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
@@ -20,9 +22,9 @@ function listPane(snap, S, now) {
   const rows = list.length ? `<ul class="plist">${list.map((x) => `<li><button type="button" class="pl" data-act="thread" data-thread="${esc(x.id)}" data-fk="thr:${esc(x.id)}" aria-selected="${S.threadId === x.id ? "true" : "false"}">
       <span class="who">${esc(x.title)}</span><span class="tm">${esc(ago(x.updatedAt, now, L) || t("unknown"))}</span>
       <span class="meta"><span class="sj">${esc(roleTitle(snap, x.roleId))} · ${esc(x.harness || t("noHarness"))} · ${esc(t("src." + x.source))}</span><span class="nd">${controlBadge(x.control)}</span></span></button></li>`).join("")}</ul>`
-    : `<div class="pad">${note("empty", snap.threads.length ? t("th.noMatch") : t("th.empty"))}</div>`;
+    : `<div class="pad">${!capOn(snap, "thread.list") ? note("missing", t("th.missing")) : note("empty", snap.threads.length ? t("th.noMatch") : t("th.empty"))}</div>`;
   return `<div class="tl-list"><div class="tl-head"><h1>${esc(t("tab.threads"))}</h1>${snap.capabilities["thread.list"] && snap.capabilities["thread.list"].status === "mock" ? mockChip() : ""}
-      <button type="button" class="btn" data-act="newthread" data-role="${esc(S.roleId || "")}" data-fk="newthread">${esc(t("th.new"))}</button></div>${filters}<div class="sb" data-keep="tl-list">${rows}</div></div>`;
+      ${capOn(snap, "thread.control") ? `<button type="button" class="btn" data-act="newthread" data-role="${esc(S.roleId || "")}" data-fk="newthread">${esc(t("th.new"))}</button>` : ""}</div>${filters}<div class="sb" data-keep="tl-list">${rows}</div></div>`;
 }
 
 function controlBlock(snap, x) {
