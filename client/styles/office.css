@@ -401,5 +401,5 @@ section.danger h3{color:var(--bad)}
 .dl-res{margin:10px 0}
 .badge[data-b^="write:"]::before{border-style:solid}
 .badge[data-b="write:unknown"]::before,.badge[data-b="write:pending"]::before{border-style:dotted}
-.badge[data-b="write:accepted"]::before{background:var(--ink)}
+.badge[data-b="write:acknowledged"]::before{background:var(--ink)}
 .row.wr .actions{margin-top:6px}

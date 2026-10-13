@@ -28,7 +28,7 @@ function errBlock(e, what) {
   const kind = k === "unknown" ? "warn" : k === "denied" ? "denied" : k === "capability_missing" ? "missing" : k === "not_found" ? "stale" : "error";
   const extra = k === "unknown" || k === "not_found"
     ? `<div class="actions"><button type="button" class="btn" data-act="mail-refresh" data-fk="mail-refresh">${esc(t("ml.refresh"))}</button></div>` : "";
-  return note(kind, body, extra) + (k !== "unknown" && msg && body !== msg ? `<p class="fine">${esc(msg)}</p>` : "");
+  return note(kind, body, extra) + ((k !== "unknown" || (e && e.status)) && msg && body !== msg ? `<p class="fine">${esc(msg)}</p>` : "");
 }
 // the sentence for a write that the backend accepted
 function doneText(kind, r, l) {
@@ -130,13 +130,13 @@ export function composeDialog(snap, S) {
   let status = "";
   if (c.phase === "sent") {
     const r = c.result, a = c.archive;
-    status = note("ok", fmt(t("ml.done.send.sent"), { to: r.to, ref: r.ref })) + `<p class="fine">${esc(t("ml.after.send"))}</p>`;
+    status = (r.deduped ? note("warn", fmt(t("ml.done.send.deduped"), { ref: r.ref || r.id || "—" })) : note("ok", fmt(t("ml.done.send.sent"), { to: r.to, ref: r.ref }))) + `<p class="fine">${esc(t("ml.after.send"))}</p>`;
     if (c.replyOf && c.fileOriginal && a) {
       status += a.phase === "busy" || a.phase === "pending" ? note("loading", t("cp.filing"))
         : a.phase === "done" ? note("ok", t(`ml.done.archive.${a.state}`) === `ml.done.archive.${a.state}` ? t("ml.done.other") : t(`ml.done.archive.${a.state}`))
         : errBlock(a.error, "archive") + `<p class="fine">${esc(t("cp.replyOut"))}</p><div class="actions"><button type="button" class="btn" data-act="compose-refile" data-fk="cp-refile">${esc(t("cp.refile"))}</button></div>`;
     }
-  } else if (c.phase === "unknown") status = errBlock(c.error, "send") + `<div class="actions"><button type="button" class="btn" data-act="compose-check" data-fk="cp-check">${esc(t("cp.checkSent"))}</button></div>`;
+  } else if (c.phase === "unknown") status = errBlock(c.error, "send") + `<p class="fine">${esc(t("cp.newLetterWarn"))}</p><div class="actions"><button type="button" class="btn" data-act="compose-check" data-fk="cp-check">${esc(t("cp.checkSent"))}</button></div>`;
   else if (c.phase === "error") status = errBlock(c.error, "send");
   const opNote = op ? `<span class="fine">${esc(t("cp.operatorNote"))}</span>` : "";
   return `<div class="layer" data-layer="compose"><div class="scrim" data-act="close-dialog"></div>

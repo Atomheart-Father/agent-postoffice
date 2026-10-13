@@ -1,32 +1,120 @@
-// The local ledger of write requests. Every POST the client makes gets a one-off request id here, BEFORE it is sent, and
-// stays on screen as "awaiting confirmation" until the backend's reply is in hand.
+// The local request log: one record per client OPERATION (one explicit click that sends a write), not a company ledger and
+// not an audit trail. It exists so a request whose reply was lost does not vanish and so the user is pointed at the place
+// where the truth can be read (the mailbox state, the sent list).
 //
-// The id is local. The backend has no idempotency key, so it cannot de-duplicate anything with it, and the client sends
-// it nowhere: it exists so a user (and a test) can tell requests apart and so a request whose reply was lost does not
-// vanish. A browser or proxy may resend a POST it already sent when a keep-alive connection drops; JavaScript cannot see
-// that, so a lost reply is always "may have been sent" and the user looks at the mailbox state / sent list first.
+// States (result_state):
+//   pending       the request has left; there is no reliable result yet
+//   acknowledged  the backend said, in a readable reply, what happened to THIS request (for a send: filed; says nothing about
+//                 the receiver having read it, and nothing about the work being done)
+//   rejected      the backend refused, and the reply itself proves nothing was applied (see the adapter's classification);
+//                 an HTTP status alone never proves that - a proxy can answer 502 after the backend already saved
+//   unknown       timeout, dropped connection, unreadable reply or an error that does not prove "not applied": it MAY have run
+// `dismissed` is a separate flag: "I no longer want this reminder". It never changes the state and is not a verdict.
 //
-// Nothing in this file sends anything. There is no retry here and no "send again" for a lost reply.
+// A send also carries a one-off `client_request_id` (a UUID made before the request leaves). The id used here for display
+// (`w-...`) is not that key and is never sent. Whether the backend de-duplicates by the key is NOT assumed anywhere in this
+// file: no "safe retry" exists until the pinned backend contract says so (see SEND_DEDUPE below).
+//
+// Nothing in this file sends anything. There is no retry here.
 
-export const PHASES = ["pending", "accepted", "refused", "unknown", "checked"];
-// accepted  the backend said yes (it still does not say anything about the receiver)
-// refused   the backend answered with an error that says it did not apply the request
-// unknown   no usable answer: the request may or may not have been applied
-// checked   the user looked at the state / sent list and dismissed an unknown or pending entry
+export const PHASES = ["pending", "acknowledged", "rejected", "unknown"];
+export const LIMIT = 30;
 
+// The pinned contract version that defines send de-duplication (capability flag, retention window, error replies). Until a
+// fixed, reviewed contract names it, the answer is "not supported" whatever a backend claims in /api/state: the candidate flag
+// `features.send_request_id` is only a candidate and a flag nobody has pinned is not a promise.
+export const SEND_DEDUPE = { contract: null };
+export const sendDedupe = () => ({ supported: false, reason: SEND_DEDUPE.contract ? "unpinned-flag" : "contract-pending" });
+
+// ---------- ids ----------
+// Display / log id for the local record. Not a server key.
 export function newRequestId(seq, rand = Math.random) {
   return `w-${Number(seq).toString(36)}-${Math.floor(rand() * 36 ** 4).toString(36).padStart(4, "0")}`;
 }
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export const isUuid = (v) => typeof v === "string" && UUID.test(v);
+// A cryptographically random UUID v4 for ONE send operation. Math.random is never used for this: with no CSPRNG the result is
+// null and the request goes out without a key (which is exactly what an old backend gets anyway), not with a guessable one.
+export function newClientRequestId(c = globalThis.crypto) {
+  try {
+    if (c && typeof c.randomUUID === "function") { const u = c.randomUUID(); if (isUuid(u)) return u; }
+    if (c && typeof c.getRandomValues === "function") {
+      const b = c.getRandomValues(new Uint8Array(16));
+      b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+      const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+      const u = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+      if (isUuid(u)) return u;
+    }
+  } catch { /* fall through: no key */ }
+  return null;
+}
 
-const LIMIT = 30;
+// ---------- the log ----------
+// A record can be dropped to make room when nobody has to look at it any more: the backend answered (acknowledged / rejected),
+// or the user said they stopped watching it. pending / unknown that are not dismissed are never dropped by the client.
+export const evictable = (w) => w.phase === "acknowledged" || w.phase === "rejected" || w.dismissed === true;
+export const ledgerFull = (list) => list.length >= LIMIT && !list.some(evictable);
+
 export function writesReduce(list, ev) {
   switch (ev.type) {
-    case "start": return [{ id: ev.id, kind: ev.kind, target: ev.target || "", at: ev.at, phase: "pending", message: "", closedAt: null }, ...list].slice(0, LIMIT);
-    case "ok": return list.map((w) => (w.id === ev.id ? { ...w, phase: "accepted", closedAt: ev.at } : w));
-    case "fail": return list.map((w) => (w.id === ev.id ? { ...w, phase: ev.error && ev.error.outcomeUnknown ? "unknown" : "refused", message: (ev.error && ev.error.message) || "", closedAt: ev.at } : w));
-    case "dismiss": return list.map((w) => (w.id === ev.id && (w.phase === "unknown" || w.phase === "pending") ? { ...w, phase: "checked" } : w));
+    case "start": {
+      let rest = list;
+      if (rest.length >= LIMIT) {   // make room: the oldest record that may go, never an unresolved one
+        const i = [...rest].reverse().findIndex(evictable);
+        if (i < 0) return list;   // full of unresolved records: the caller refuses the write before it gets here
+        const at = rest.length - 1 - i;
+        rest = rest.filter((_, k) => k !== at);
+      }
+      return [{ id: ev.id, kind: ev.kind, target: ev.target || "", at: ev.at, phase: "pending", message: "", closedAt: null, clientRequestId: ev.clientRequestId || null, ref: "", dismissed: false, checkedAt: null, restored: false, deduped: false }, ...rest];
+    }
+    case "ok": return list.map((w) => (w.id === ev.id ? { ...w, phase: "acknowledged", closedAt: ev.at, ref: clean(ev.ref), deduped: ev.deduped === true } : w));
+    case "fail": return list.map((w) => (w.id === ev.id ? { ...w, phase: ev.error && ev.error.outcomeUnknown ? "unknown" : "rejected", message: (ev.error && ev.error.message) || "", closedAt: ev.at } : w));
+    // The user stops watching an unresolved request. The state stays what it was: this is not "it worked".
+    case "dismiss": return list.map((w) => (w.id === ev.id && w.phase === "unknown" ? { ...w, dismissed: true } : w));
+    // The user looked (state / sent list were read again). Only a record that is still unresolved records the time.
+    case "checked": return list.map((w) => (w.phase === "unknown" || w.phase === "pending" ? { ...w, checkedAt: ev.at } : w));
     default: return list;
   }
 }
-// What still needs a human look: not yet answered, or answered with nothing usable.
-export const unconfirmed = (list) => list.filter((w) => w.phase === "pending" || w.phase === "unknown");
+const clean = (s) => (typeof s === "string" ? s.slice(0, 200) : "");
+// What still needs a human look: not yet answered, or answered with nothing usable, and not dismissed.
+export const unconfirmed = (list) => list.filter((w) => (w.phase === "pending" || w.phase === "unknown") && !w.dismissed);
+
+// ---------- what survives a reload ----------
+// Only this minimal summary is ever stored. Never a body, a subject, a draft, a full request or anything that is a credential.
+// (`result_ref` is the letter reference the backend itself returned; `target` - who it went to - is deliberately not kept.)
+export const STORED_FIELDS = ["local_id", "client_request_id", "operation", "started_at", "result_state", "dismissed", "result_ref", "last_checked_at"];
+export const toStored = (w) => ({
+  local_id: w.id, client_request_id: w.clientRequestId || null, operation: w.kind, started_at: w.at, result_state: w.phase,
+  dismissed: !!w.dismissed, result_ref: w.ref || "", last_checked_at: typeof w.checkedAt === "number" ? w.checkedAt : null,
+});
+const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+// One stored summary back to a record, or null when it is not usable. A state nobody recognises becomes `unknown`, never a success.
+export function fromStored(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (typeof raw.local_id !== "string" || !raw.local_id || raw.local_id.length > 80) return null;
+  const at = num(raw.started_at); if (at == null) return null;
+  const op = typeof raw.operation === "string" && /^[a-z][a-z0-9-]{0,30}$/.test(raw.operation) ? raw.operation : "unknown";
+  let phase = PHASES.includes(raw.result_state) ? raw.result_state : "unknown";
+  if (phase === "pending") phase = "unknown";   // the page that sent it is gone: nothing can bring its reply back
+  return {
+    id: raw.local_id, kind: op, target: "", at, phase, message: "", closedAt: null,
+    clientRequestId: isUuid(raw.client_request_id) ? raw.client_request_id : null,
+    ref: clean(raw.result_ref), dismissed: raw.dismissed === true, checkedAt: num(raw.last_checked_at), restored: true, deduped: false,
+  };
+}
+// Newest first, at most LIMIT; when over the limit the evictable ones go first, then the oldest. Unresolved records go last.
+export function capList(list) {
+  const sorted = [...list].sort((a, b) => b.at - a.at);
+  if (sorted.length <= LIMIT) return sorted;
+  const keep = sorted.filter((w) => !evictable(w));
+  const room = Math.max(0, LIMIT - keep.length);
+  const spare = sorted.filter(evictable).slice(0, room);
+  return [...keep, ...spare].sort((a, b) => b.at - a.at).slice(0, Math.max(LIMIT, keep.length));
+}
+// What to write: this page's records plus records another tab of the same scope stored that this page never had.
+export function mergeForSave(mine, stored, seen) {
+  const have = new Set(mine.map((w) => w.id));
+  const others = stored.filter((w) => !have.has(w.id) && !seen.has(w.id));
+  return capList([...mine, ...others]);
+}

@@ -20,10 +20,15 @@ import { roleById } from "./views/ui.js";
 import { openLetter, letterReduce, editRequest, newCompose, composeReduce, canSend, sendRequest, hasContent } from "./flows/mail.js";
 import { composeIssuesHtml } from "./views/mail.js";
 import { normalizeLetter } from "./contract.js";
-import { newRequestId, writesReduce } from "./flows/writes.js";
+import { newRequestId, newClientRequestId, writesReduce, ledgerFull, LIMIT } from "./flows/writes.js";
+import { createLedgerStore, defaultStorage } from "./ledgerStore.js";
+import { fmt } from "./util.js";
 import { newDelivery, deliveryReduce, verifyAgainst, newClear, clearReduce, canClear, lettersIn, mailboxOf, mailboxesOf } from "./flows/mailbox.js";
 
-export function createApp({ root, toastRoot = null, adapter, now = () => Date.now() / 1000, win = globalThis, doc = globalThis.document, host = null, theme = "paper", lang = "en" }) {
+// The display id of a log record only needs to differ from its neighbours; the CSPRNG is used when there is one.
+const cryptoRand = () => { try { const a = new Uint32Array(1); globalThis.crypto.getRandomValues(a); return a[0] / 2 ** 32; } catch { return Math.random(); } };
+
+export function createApp({ root, toastRoot = null, adapter, now = () => Date.now() / 1000, win = globalThis, doc = globalThis.document, host = null, theme = "paper", lang = "en", storage, ledgerBase, newKey = newClientRequestId }) {
   const r0 = parseHash(win.location && win.location.hash);
   const S = {
     lang, theme, view: r0.view, roleId: r0.roleId, roleTab: r0.roleTab, threadId: r0.threadId,
@@ -37,7 +42,14 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     outbox: { phase: "idle", rows: [], error: null, at: null },
     // writes: the local ledger of every POST (id, kind, phase) - see flows/writes.js; delivery: switch dialog + last result; clear: whole-mailbox clear flow
     writes: [], delivery: newDelivery(), clear: null,
+    // ledger: where the request log is kept. store = "unset" until the first snapshot names the operator, then "ok" | "empty" |
+    // "unusable" (stored data not read) | "off" (storage missing or failing: the log lives on this page only)
+    ledger: { scope: null, store: "unset", seen: new Set() },
   };
+  const ledgerStore = createLedgerStore({
+    storage: storage === undefined ? defaultStorage(win) : storage,
+    base: ledgerBase !== undefined ? ledgerBase : (win.location && win.location.origin) || "",
+  });
   let wseq = 0;
   let pendingRender = false, inflight = null, ret = null, lastLayer = null, toastTimer = null, hashSelf = "";
   const narrow = () => (win.innerWidth || 1440) <= 900;
@@ -106,7 +118,7 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     }
   }
   function apply(res) {
-    if (res.ok) { S.snap = res.data; S.load = "ready"; S.err = null; reconcile(); }
+    if (res.ok) { S.snap = res.data; S.load = "ready"; S.err = null; adoptScope(); reconcile(); }
     else { S.err = res.error; if (!S.snap) S.load = "error"; }
     render();
   }
@@ -120,15 +132,44 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
   // can still show the old state; anything that compares "what we asked" with "what the server says" must not use that one.
   async function loadFresh() { if (inflight) { try { await inflight; } catch { /* the next read decides */ } } return load(); }
 
-  // Every write goes through here: it gets a one-off local request id and a ledger entry (awaiting confirmation) before it is
-  // sent, and the entry is closed by the reply. A throw or an unreadable reply is "unknown", never "failed". Nothing is retried.
-  async function tracked(kind, target, run) {
-    const id = newRequestId(++wseq);
-    S.writes = writesReduce(S.writes, { type: "start", id, kind, target, at: now() });
+  // ---------- the request log ----------
+  // The records of one (backend, operator) scope are restored from storage when the first snapshot says who the operator is.
+  // Restoring only fills the list: it sends nothing, and a record that was pending is shown as unknown (its reply is gone).
+  function adoptScope() {
+    if (!S.snap) return;
+    const sc = ledgerStore.scopeOf(S.snap.company.operatorBox), key = ledgerStore.keyOf(sc);
+    if (S.ledger.scope === key) return;
+    const got = ledgerStore.load(S.snap.company.operatorBox);
+    // Records made on this page before the scope was known (none today) stay on top; stored ones follow, without duplicates.
+    const here = S.ledger.scope === null ? S.writes : [];
+    const ids = new Set(here.map((w) => w.id));
+    S.writes = [...here, ...got.items.filter((w) => !ids.has(w.id))];
+    S.ledger = { scope: key, store: got.state, seen: new Set(S.writes.map((w) => w.id)) };
+  }
+  function persist() {
+    if (S.ledger.scope === null || !S.snap) return;
+    for (const w of S.writes) S.ledger.seen.add(w.id);
+    const r = ledgerStore.save(S.snap.company.operatorBox, S.writes, S.ledger.seen);
+    S.ledger = { ...S.ledger, store: r };
+  }
+  const logEv = (ev) => { S.writes = writesReduce(S.writes, ev); persist(); };
+
+  // Every write goes through here: it gets a record (pending) before it is sent, and the record is closed by the reply. A throw
+  // or an unreadable reply is "unknown", never "failed". Nothing is retried. `opts.key` = a send operation: it gets ONE fresh
+  // client_request_id here, passed to `run(id, key)`; the key belongs to this operation and to no other.
+  // A full log (LIMIT records, none of them resolvable by the client) refuses new writes before anything is sent.
+  async function tracked(kind, target, run, opts = {}) {
+    if (ledgerFull(S.writes)) {
+      return { ok: false, error: { code: ERR.REFUSED, message: fmt(t("wr.fullMsg"), { n: LIMIT }), retryable: false, blockedLocally: true } };
+    }
+    const id = newRequestId(++wseq, cryptoRand);
+    const key = opts.key ? newKey() : null;
+    logEv({ type: "start", id, kind, target, at: now(), clientRequestId: key });
     render();   // the top bar shows "awaiting confirmation" from the moment the request leaves
     let res;
-    try { res = await run(id); } catch (e) { res = unknownOutcome(`The request ended without a usable answer (${String((e && e.message) || e)}). It may have been sent.`); }
-    S.writes = writesReduce(S.writes, res.ok ? { type: "ok", id, at: now() } : { type: "fail", id, error: res.error, at: now() });
+    try { res = await run(id, key); } catch (e) { res = unknownOutcome(`The request ended without a usable answer (${String((e && e.message) || e)}). It may have been sent.`); }
+    const ref = res.ok && res.data ? (typeof res.data.ref === "string" && res.data.ref ? res.data.ref : typeof res.data.id === "string" ? res.data.id : "") : "";
+    logEv(res.ok ? { type: "ok", id, at: now(), ref: kind === "send" ? ref : "", deduped: !!(res.data && res.data.deduped === true) } : { type: "fail", id, error: res.error, at: now() });
     return res.ok ? { ...res, data: { ...(res.data && typeof res.data === "object" ? res.data : {}), reqId: id } } : { ...res, error: { ...res.error, reqId: id } };
   }
 
@@ -240,7 +281,10 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     const key = S.composeKey;
     setCompose({ type: "send:start" }); render();
     const req = sendRequest(c);
-    const res = await tracked("send", req.to, () => adapter.sendMail(req));
+    // One click = one operation = one key. The body is built once, here, and is the same object for the whole operation. Clicking
+    // again while it is in flight does nothing (phase "sending"); a send after the draft changed, or after an unknown result, is a
+    // new operation with a new key - the earlier record stays in the log either way.
+    const res = await tracked("send", req.to, (_, key) => adapter.sendMail(key ? { ...req, client_request_id: key } : req), { key: true });
     if (!S.composes[key]) { await loadFresh(); return; }   // discarded while the request was out: the letter was still sent, so only refresh
     S.composeKey = key; setCompose(res.ok ? { type: "send:ok", result: res.data } : { type: "send:fail", error: res.error }); render();
     if (res.ok) { await loadFresh(); if (S.compose && S.compose.mode === "reply" && S.compose.fileOriginal) await fileOriginal(); else if (S.outbox.phase === "ok") await loadOutbox(); }
@@ -335,8 +379,10 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     "mail-refresh"() { return load().then(() => (S.outbox.phase === "ok" ? loadOutbox() : null)); },
     "outbox-refresh"() { return loadOutbox(); },
     writes(d, el) { remember(el); S.dialog = "writes"; render(); },
-    "writes-check"() { return loadFresh().then(() => (S.outbox.phase === "ok" ? loadOutbox() : null)); },
-    "writes-dismiss"(d) { S.writes = writesReduce(S.writes, { type: "dismiss", id: d.write }); render(); },
+    "writes-check"() {
+      return loadFresh().then(() => (S.outbox.phase === "ok" ? loadOutbox() : null)).then(() => { if (!S.err) { logEv({ type: "checked", at: now() }); render(); } });
+    },
+    "writes-dismiss"(d) { logEv({ type: "dismiss", id: d.write }); render(); },
     delivery(d, el) { remember(el); S.delivery = deliveryReduce(S.delivery, { type: "reset" }); S.dialog = "delivery"; render(); },
     "dl-pick"(d, el) { S.delivery = deliveryReduce(S.delivery, { type: "select", box: d.box, on: !!(el && el.checked) }); render(); },
     "dl-all"() { S.delivery = deliveryReduce(S.delivery, { type: "select:set", boxes: mailboxesOf(S.snap).map((m) => m.box) }); render(); },
