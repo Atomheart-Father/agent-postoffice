@@ -1,0 +1,68 @@
+{
+ "_source": "进程内调用 role_diff_payload（基线 e819f0e，隔离 temp HOME，匿名岗位 build/w1/w2），HTTP 层只是把 (ok,status,resp) 的 resp 原样 JSON 化；与 http_cases.role_diff_ok 同一函数。非 curl 实抓。",
+ "status": 200,
+ "body": {
+  "ok": true,
+  "diff": {
+   "name": "build",
+   "change": {
+    "candidates_from": [
+     "w1",
+     "w2"
+    ],
+    "candidates_to": [
+     "w2",
+     "w1"
+    ],
+    "escalation_from": "",
+    "escalation_to": "",
+    "escalation_to_title": "",
+    "duties_from": [
+     "职责A"
+    ],
+    "duties_to": [
+     "职责A",
+     "职责B"
+    ],
+    "resources_from": [
+     {
+      "kind": "doc",
+      "ref": "DOC.md",
+      "note": "n"
+     }
+    ],
+    "resources_to": [
+     {
+      "kind": "doc",
+      "ref": "DOC.md",
+      "note": "n"
+     }
+    ]
+   },
+   "expected": {
+    "active_now": "w1",
+    "active_after": "w2",
+    "active_will_change": true,
+    "acceptor_now": "",
+    "acceptor_after": "",
+    "note_key": "roleNoteTiming"
+   },
+   "facts": {
+    "active_now": "w1",
+    "acceptor_now": "",
+    "confirmed": null,
+    "candidates": [
+     {
+      "name": "w1",
+      "state": "online"
+     },
+     {
+      "name": "w2",
+      "state": "online"
+     }
+    ]
+   },
+   "baseline": "<sha256 of config bytes, 64 hex>"
+  }
+ }
+}
