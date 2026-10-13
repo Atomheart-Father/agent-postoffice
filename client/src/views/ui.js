@@ -24,3 +24,13 @@ export function seg(items, current, attr, label) {
 
 export const roleById = (snap, id) => (snap ? snap.roles.find((r) => r.id === id) : null) || null;
 export const roleTitle = (snap, id) => { const r = roleById(snap, id); return r ? r.title : id || "—"; };
+
+// Mail of one role. A letter whose role the backend did not record (roleId empty) belongs to its mailbox only, so it
+// appears on a mailbox node (role.box) and nowhere else; a role is never guessed from the mailbox.
+export const mailOf = (snap, role) => (role ? snap.mail.filter((m) => m.roleId === role.id || (!m.roleId && role.box && m.box === role.box)) : snap.mail);
+export function mailMeta(m, when) {
+  const bits = [t(m.dir === "in" ? "mail.in" : "mail.out"), `${m.from} → ${m.to}`, when || t("unknown")];
+  if (!m.roleId && m.box) bits.push(`${t("mail.byBox")} ${m.box}`);
+  if (m.sourceStatus && m.delivery === "unknown") bits.push(`${t("mail.src")}: ${m.sourceStatus}`);
+  return bits.join(" · ");
+}

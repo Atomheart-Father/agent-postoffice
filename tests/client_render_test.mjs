@@ -6,6 +6,7 @@ import { setLang, missing, has } from "../client/src/i18n.js";
 import { STR } from "../client/src/strings.js";
 import { PRESENCE, DELIVERY, WORK_STATES, CONTROL } from "../client/src/contract.js";
 import { hudCard } from "../client/src/views/hud.js";
+import { mapMasterState } from "../client/src/adapters/http.js";
 import { normalizeUsage } from "../client/src/contract.js";
 import { readFileSync } from "node:fs";
 
@@ -82,29 +83,83 @@ setLang("en");
   app.click(target({ act: "close-role" })); is(S.roleId, null, "close role");
 }
 
-// ---- role edit end to end through the controller ----
+// ---- role edit end to end through the controller (the contract's own fields, nothing else) ----
+const inpOf = (app) => (field, value) => app.input({ closest: () => ({ dataset: { edit: field }, value }) }, false);
+const spyApply = (adapter) => { const calls = []; const f = adapter.applyRoleChange; adapter.applyRoleChange = (...a) => { calls.push(a); return f(...a); }; return calls; };
 {
   const { app, root, S, adapter } = boot({ hash: "#/office/analyst/edit" }); await app.load();
-  const inp = (field, value) => app.input({ closest: () => ({ dataset: { edit: field }, value }) }, false);
-  inp("summary", "Collects, tabulates and cites sources.");
+  const inp = inpOf(app); const applies = spyApply(adapter);
+  for (const f of ["candidates", "escalation", "duties", "resources"]) hasS(root.innerHTML, `data-edit="${f}"`, `the form has the ${f} field`);
+  hasNot(root.innerHTML, 'data-edit="summary"', "no summary field (not in the write contract)"); hasNot(root.innerHTML, 'data-edit="level"', "no qualification field in the form");
+  hasS(root.innerHTML, "Qualification, policy and capability assignment are still design", "the richer fields are said to be design, not wired");
+  inp("duties", "Collect pricing data\nCite every figure");
   is(S.edits.analyst.phase, "idle", "typing does not leave the draft state");
-  await app.act("ed-preview"); is(S.edits.analyst.phase, "preview", "preview phase"); hasS(root.innerHTML, "Changed", "the diff is shown"); hasS(root.innerHTML, "Confirm and apply", "confirm is a separate step");
-  await app.act("ed-apply"); is(S.edits.analyst.phase, "done", "done"); hasS(root.innerHTML, "every projection was written", "result says what was written");
-  is(S.snap.roles.find((r) => r.id === "analyst").summary, "Collects, tabulates and cites sources.", "the snapshot was reloaded from the backend");
+  await app.act("ed-preview"); is(S.edits.analyst.phase, "preview", "preview phase"); hasS(root.innerHTML, "Added", "the diff is shown"); hasS(root.innerHTML, "Confirm and apply", "confirm is a separate step");
+  hasS(root.innerHTML, "even outside this role", "the page says the baseline covers the whole configuration");
+  await app.act("ed-apply"); is(S.edits.analyst.phase, "done", "done"); is(applies.length, 1, "apply was sent once");
+  hasS(root.innerHTML, "authoritative configuration is written", "result says the config is saved"); hasS(root.innerHTML, "Derived cards are fresh", "…and, separately, that the cards are fresh");
+  is(S.snap.roles.find((r) => r.id === "analyst").duties.join("|"), "Collect pricing data|Cite every figure", "the snapshot was reloaded from the backend");
+  await app.act("ed-apply"); is(applies.length, 1, "pressing apply again after done sends nothing");
   // denied role: no form
   S.roleId = "reviewer"; S.roleTab = "edit"; app.render(); hasS(root.innerHTML, "role.edit on Engineering", "a role the actor may not edit shows the backend's reason"); hasNot(root.innerHTML, 'data-edit="duties"', "…and offers no form");
-  // conflict keeps the draft
-  adapter.setScenario("conflict"); await app.load(); S.roleId = "fact-checker"; S.roleTab = "edit"; app.render();
-  inp("summary", "My draft"); await app.act("ed-preview"); await app.act("ed-apply");
-  is(S.edits["fact-checker"].phase, "error", "conflict: error phase"); hasS(root.innerHTML, "Your draft is still here", "conflict says nothing was overwritten"); is(S.edits["fact-checker"].text.summary, "My draft", "conflict: the draft is kept");
-  hasS(root.innerHTML, "Added by someone else", "conflict shows what changed upstream");
-  adapter.setScenario("default"); await app.load(); await app.act("ed-rebase"); is(S.edits["fact-checker"].phase, "preview", "rebase re-previews on the new version");
+  // limits are shown next to the field and block the preview
+  S.roleId = "analyst"; await app.act("ed-reset"); is(S.edits.analyst.phase, "idle", "Done starts a fresh draft"); inp("duties", "1\n2\n3\n4\n5\n6"); app.render(); hasS(root.innerHTML, "allows at most 5 entries", "a contract limit is shown next to the field");
+  await app.act("ed-preview"); is(S.edits.analyst.phase, "idle", "…and the preview is not requested");
+  inp("duties", "ok"); inp("resources", "tool: web"); app.render(); hasS(root.innerHTML, "needs a kind of doc / dir / skill / url", "an unknown resource kind is explained");
 }
 {
-  const { app, root, S } = boot({ hash: "#/office/analyst/edit", scenario: "partial" }); await app.load();
-  app.input({ closest: () => ({ dataset: { edit: "summary" }, value: "S2" }) }, false); await app.act("ed-preview"); await app.act("ed-apply");
-  hasS(root.innerHTML, "some projections failed", "partial failure is not reported as success"); hasS(root.innerHTML, "contacts/ could not be written", "…with the failing projection and reason");
-  await app.act("ed-retryproj"); hasS(root.innerHTML, "Applied", "retry resolves it");
+  // conflict: the backend refuses without sending the current role; the client refetches and compares
+  const { app, root, S, adapter } = boot({ hash: "#/office/fact-checker/edit", scenario: "conflict" }); await app.load();
+  const inp = inpOf(app);
+  inp("duties", "Re-derive figures from sources\nMy own duty"); await app.act("ed-preview"); await app.act("ed-apply");
+  const es = S.edits["fact-checker"];
+  is(es.phase, "error", "conflict: error phase"); hasS(root.innerHTML, "nothing was saved", "conflict says nothing was saved"); hasS(root.innerHTML, "Your draft is still here", "…and that nothing was overwritten");
+  is(es.text.duties.includes("My own duty"), true, "conflict: the draft is kept"); hasS(root.innerHTML, "Added by someone else", "conflict shows what changed upstream (from the refetched snapshot)");
+  hasS(root.innerHTML, "would remove them", "…and warns that the whole-list draft would remove the upstream addition");
+  hasNot(root.innerHTML, 'data-edit="duties"', "the form is not shown over the conflict");
+  await app.act("ed-rebase"); is(S.edits["fact-checker"].phase, "preview", "rebase re-previews on the latest configuration");
+  await app.act("ed-apply"); is(S.edits["fact-checker"].phase, "done", "and the second apply goes through on the fresh baseline");
+}
+{
+  // saved, derived cards pending: saved, not failed, and nothing offers to apply again
+  const { app, root, S, adapter } = boot({ hash: "#/office/analyst/edit", scenario: "projection" }); await app.load(); const applies = spyApply(adapter);
+  inpOf(app)("duties", "Only duty"); await app.act("ed-preview"); await app.act("ed-apply");
+  is(S.edits.analyst.phase, "done", "projection pending ends as done, not as an error"); hasS(root.innerHTML, "authoritative configuration is written", "the config is reported saved");
+  hasS(root.innerHTML, "Derived cards are pending", "…and the cards are reported pending, separately"); hasS(root.innerHTML, "Do not apply again", "…with the instruction not to re-submit");
+  hasNot(root.innerHTML, "ed-retryproj", "no fake retry-projection button"); hasNot(root.innerHTML, 'data-act="ed-apply"', "no apply button in the result");
+  await app.act("ed-refresh"); await app.act("ed-apply"); is(applies.length, 1, "refresh and apply-after-done never send a second apply");
+}
+{
+  // a lost reply to apply: unknown outcome, no automatic or one-click resend
+  const { app, root, S, adapter } = boot({ hash: "#/office/analyst/edit" }); await app.load();
+  const real = adapter.applyRoleChange; let n = 0;
+  adapter.applyRoleChange = async (...a) => { n++; await real(...a); return { ok: false, error: { code: "network", message: "reply lost", retryable: true } }; };   // the backend saved, the reply never arrived
+  inpOf(app)("duties", "Only duty"); await app.act("ed-preview"); await app.act("ed-apply");
+  is(S.edits.analyst.phase, "error", "lost reply: error phase"); hasS(root.innerHTML, "not known whether this was saved", "…says the outcome is unknown");
+  hasS(root.innerHTML, "most likely saved", "…and notices that the refetched role already matches the draft");
+  hasNot(root.innerHTML, 'data-act="ed-retry"', "no retry button for apply"); hasNot(root.innerHTML, 'data-edit="duties"', "…and no form to resubmit from"); hasS(root.innerHTML, 'data-act="ed-refresh"', "the follow-up is to refresh and look");
+  await app.act("ed-refresh"); is(n, 1, "refreshing does not resend");
+}
+{
+  // roles that cannot be edited say why, instead of building a request from guesses
+  const { app, root, S } = boot({ hash: "#/office/analyst/edit" }); await app.load();
+  const r = S.snap.roles.find((x) => x.id === "analyst");
+  r.escalationRole = null; app.render(); hasS(root.innerHTML, "does not say who this position escalates to", "an unknown escalation role closes editing");
+  r.escalationRole = "research-lead"; r.origin = "mailbox"; app.render(); hasS(root.innerHTML, "legacy node drawn from a mailbox", "a mailbox node is not editable as a role");
+}
+{
+  // the master mapping on screen: mailbox nodes, unassigned node, letters by mailbox with their own states
+  const { app, root, S } = boot(); await app.load();
+  S.snap = mapMasterState({ panel: { ok: true, label: "Demo", operator: "boss", organization: { mailbox: "boss", label: "Director", members: [] } },
+    boxes: [{ name: "boss", app: "Manual", online: true, counts: { waiting: 1, reminded: 1 }, identity: { binding: null, profile: { kind: "human", display_name: "Boss" } }, activity: { state: "unknown" },
+      pending: [{ file: "x.md", status: "waiting", subject: "Hello", from: "a", mtime: 1 }, { file: "y.md", status: "reminded", subject: "Again", from: "a", mtime: 2 }] },
+    { name: "late", app: "Codex", online: true, counts: {}, identity: {}, activity: {}, pending: [] }] }, Date.now() / 1000);
+  S.view = "office"; S.roleId = "box:boss"; S.roleTab = "overview"; app.render();
+  hasS(root.innerHTML, "Unassigned mailboxes", "a mailbox the tree forgot is drawn"); hasS(root.innerHTML, "stands for one mailbox, not a formal position", "a mailbox node says what it is");
+  hasS(root.innerHTML, "Delivery switch: on", "the delivery switch is shown as a switch"); hasS(root.innerHTML, 'class="st" data-st="unknown"', "…and the holder is drawn as unknown, not connected");
+  S.roleTab = "work"; app.render(); hasS(root.innerHTML, "Waiting in mailbox", "a waiting letter keeps its state"); hasS(root.innerHTML, "Reminded, not consumed", "a reminded letter keeps its state");
+  hasS(root.innerHTML, "by mailbox boss", "letters are labelled as attributed by mailbox"); hasNot(root.innerHTML, ">Accepted<", "nothing is flattened to accepted");
+  S.roleTab = "edit"; app.render(); hasS(root.innerHTML, "does not offer role editing", "role editing is missing on master and stays closed");
 }
 
 // ---- threads: observe is not control ----

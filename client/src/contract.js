@@ -16,8 +16,13 @@ export const PRESENCE = ["connected", "busy", "power_save", "offline", "unconnec
 // What the client may do with a thread. Observation is not control: only "controllable" enables input, and
 // only because the backend said so for this thread right now.
 export const CONTROL = ["controllable", "observe_only", "pending_approval", "denied", "capability_missing", "stale", "unknown"];
-// Mail delivery. "accepted" means the mailbox took it -- it says nothing about the work.
-export const DELIVERY = ["sent", "accepted", "consumed", "failed", "retracted", "unknown"];
+// Mail delivery, kept as the backend states it. Four different facts, never merged into one "ok":
+//   waiting   = the letter is on disk in a mailbox and nothing has surfaced it yet
+//   reminded  = a reminder was shown for it; still not read by the session
+//   accepted  = a channel (e.g. an Office thread) took it; the session has not consumed it
+//   consumed  = the receiving session took it
+// None of them says the work is done. An unrecognised source state stays "unknown", never "accepted".
+export const DELIVERY = ["sent", "waiting", "reminded", "accepted", "consumed", "failed", "retracted", "unknown"];
 // Work is one generic state model; it is not specific to any industry.
 export const WORK_STATES = ["open", "submitted", "verified", "accepted", "returned", "released"];
 export const KINDS = ["team", "position"];                 // a team groups roles; a position is held by an incumbent
@@ -33,8 +38,14 @@ export const ERR = {
   PENDING: "pending_approval",      // accepted but waits for an approver; not done
   DEGRADED: "degraded",             // part of the read model could not be produced
   NETWORK: "network",               // could not reach the backend
-  INVALID: "invalid",               // the request or the reply was malformed
+  INVALID: "invalid",               // the request or the reply was malformed (HTTP 400: nothing was saved)
+  NOT_FOUND: "not_found",           // the named object does not exist (HTTP 404)
+  SERVER: "server",                 // the backend failed before it could save (HTTP 500, e.g. backup failed)
 };
+// Resource kinds the role-edit contract accepts today, and its limits. Checked in the form only to save a round
+// trip; the backend validates again and its verdict wins.
+export const RESOURCE_KINDS = ["doc", "dir", "skill", "url"];
+export const LIMITS = { duties: 5, dutyChars: 80, resources: 8, refChars: 200, noteChars: 60 };
 
 export const ok = (data, extra = {}) => ({ ok: true, data, ...extra });
 export const fail = (code, message = "", extra = {}) => ({ ok: false, error: { code, message, retryable: code === ERR.NETWORK || code === ERR.STALE, ...extra } });
@@ -63,6 +74,9 @@ export function normalizeOccupant(o) {
     id: str(o.id), label: str(o.label || o.id), kind: pick(o.kind, OCCUPANT, "unspecified"),
     harness: str(o.harness) || null, model: str(o.model) || null,
     presence: pick(o.presence, PRESENCE), presenceAt: numOrNull(o.presenceAt),
+    // Separate facts, never folded into presence: the delivery switch (on = letters may be delivered; off may be a
+    // manual choice, not a broken Harness), the session binding (kind only; null = none known) and what it last did.
+    switch: pick(o.switch, ["on", "off", "unknown"]), binding: str(o.binding) || null, activity: normalizeActivity(o.activity),
     note: str(o.note),
   };
 }
@@ -73,12 +87,31 @@ export function normalizeRole(r) {
   return {
     id: str(r.id), parentId: r.parentId == null ? null : str(r.parentId), order: numOrNull(r.order) ?? 0,
     kind: pick(r.kind, KINDS, "position"), title: str(r.title || r.id), summary: str(r.summary),
-    duties: arr(r.duties).map(String), resources: arr(r.resources).map((x) => ({ kind: str(x && x.kind, "resource"), label: str(x && x.label) })).filter((x) => x.label),
+    duties: arr(r.duties).map(String),
+    resources: arr(r.resources).map((x) => ({ kind: str(x && x.kind, "resource"), ref: str(x && (x.ref != null ? x.ref : x.label)), note: str(x && x.note) })).filter((x) => x.ref),
     qualification: r.qualification && typeof r.qualification === "object" ? { level: numOrNull(r.qualification.level), note: str(r.qualification.note) } : null,
+    // incumbent = who holds it now; candidates = the ordered list of who may hold it (the incumbent is usually one of them)
     incumbent: normalizeOccupant(r.incumbent), candidates: arr(r.candidates).map(normalizeOccupant).filter(Boolean),
-    waiting: numOrNull(r.waiting) ?? 0, rev: numOrNull(r.rev), can,
+    // the position this one escalates to: "" = none, null = the backend did not say (never treated as "none")
+    escalationRole: typeof r.escalationRole === "string" ? r.escalationRole : null,
+    escalationAcceptor: typeof r.escalationAcceptor === "string" ? r.escalationAcceptor : null,
+    // origin "mailbox" = a legacy node standing for one mailbox, not a position: its id is not a stable role id and
+    // it cannot be edited as a role. `box` is that mailbox.
+    origin: pick(r.origin, ["role", "mailbox"], "role"), box: str(r.box),
+    waiting: numOrNull(r.waiting) ?? 0, can,
   };
 }
+
+// What an occupant is doing, with when and from where it was said. Missing = unknown, never "idle".
+export function normalizeActivity(a) {
+  if (!a || typeof a !== "object") return null;
+  const text = str(a.text || a.state);
+  if (!text) return null;
+  return { text, at: numOrNull(a.at), source: str(a.source) || null };
+}
+
+// Candidates other than the one holding the role.
+export const standbys = (r) => r.candidates.filter((c) => !r.incumbent || c.id !== r.incumbent.id);
 
 export function normalizeThread(t) {
   return {
@@ -104,13 +137,45 @@ export function normalizeSnapshot(raw) {
     capabilities: caps,
     roles: arr(s.roles).map(normalizeRole),
     threads: arr(s.threads).map(normalizeThread),
-    mail: arr(s.mail).map((m) => ({ id: str(m.id), roleId: str(m.roleId), threadId: str(m.threadId) || null, workId: str(m.workId) || null, dir: pick(m.dir, ["in", "out"], "in"),
-      from: str(m.from), to: str(m.to), subject: str(m.subject), at: numOrNull(m.at), delivery: pick(m.delivery, DELIVERY) })),
+    // roleId is empty when the backend does not record which role a letter was for; `box` is the mailbox it sits in.
+    mail: arr(s.mail).map((m) => ({ id: str(m.id), roleId: str(m.roleId), box: str(m.box), threadId: str(m.threadId) || null, workId: str(m.workId) || null, dir: pick(m.dir, ["in", "out"], "in"),
+      from: str(m.from), to: str(m.to), subject: str(m.subject), at: numOrNull(m.at), delivery: pick(m.delivery, DELIVERY), sourceStatus: str(m.sourceStatus) || null })),
     work: arr(s.work).map((w) => ({ id: str(w.id), roleId: str(w.roleId), title: str(w.title), state: pick(w.state, WORK_STATES, "open"), difficulty: numOrNull(w.difficulty),
       updatedAt: numOrNull(w.updatedAt), note: str(w.note), history: arr(w.history).map((h) => ({ state: pick(h.state, WORK_STATES, "open"), at: numOrNull(h.at), by: str(h.by) })) })),
     approvals: arr(s.approvals).map((a) => ({ id: str(a.id), kind: str(a.kind), roleId: str(a.roleId), title: str(a.title), at: numOrNull(a.at), state: pick(a.state, ["pending", "approved", "denied"], "pending") })),
     usage: normalizeUsage(s.usage),
   };
+}
+
+// ---- role-diff / role-apply replies ----
+// The reply shapes are the backend's. Inner shapes the client has no fixture for yet (what exactly `expected` and
+// `facts` contain) are shown as the backend wrote them: strings stay strings, anything else is printed compactly.
+// Nothing is derived from them and nothing is invented to fill a gap.
+const text = (v) => (v == null ? "" : typeof v === "string" ? v : typeof v === "number" || typeof v === "boolean" ? String(v) : JSON.stringify(v));
+export const lineList = (v) => (Array.isArray(v) ? v.map(text).filter(Boolean)
+  : v && typeof v === "object" ? Object.entries(v).map(([k, x]) => `${k}: ${text(x)}`)
+  : v == null || v === "" ? [] : [text(v)]);
+
+export function normalizeDiff(raw) {
+  const d = raw && typeof raw === "object" ? raw : {};
+  const changes = [];
+  const ch = d.change;
+  if (ch && typeof ch === "object" && !Array.isArray(ch)) {
+    for (const [field, v] of Object.entries(ch)) {
+      if (v && typeof v === "object" && !Array.isArray(v) && ("from" in v || "to" in v)) changes.push({ field, from: v.from, to: v.to });
+      else changes.push({ field, from: undefined, to: v, raw: true });
+    }
+  } else if (Array.isArray(ch)) ch.forEach((v, i) => changes.push({ field: String(i), from: undefined, to: v, raw: true }));
+  // `baseline` is opaque: the client hands it back to apply unchanged and never makes one up. Without it nothing can be applied.
+  return { name: str(d.name), baseline: typeof d.baseline === "string" ? d.baseline : "", changes, expected: lineList(d.expected), facts: lineList(d.facts) };
+}
+
+export const PROJECTION = ["fresh", "pending", "not_applicable"];
+// A successful apply. `saved` is the authoritative config; `projection` is the derived cards, a separate fact.
+export function normalizeApplied(raw) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  return { saved: r.saved === true, projection: pick(r.projection, PROJECTION), message: str(r.message), backup: str(r.backup) || null,
+    activeNow: lineList(r.active_now != null ? r.active_now : r.activeNow), acceptorNow: lineList(r.acceptor_now != null ? r.acceptor_now : r.acceptorNow) };
 }
 
 // For tests and the dev console: structural problems in a snapshot that the UI cannot render honestly.

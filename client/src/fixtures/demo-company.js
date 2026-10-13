@@ -7,64 +7,80 @@ const M = 60, H = 3600, D = 86400;
 
 export function demoSnapshot(now = Date.now() / 1000) {
   const ago = (s) => Math.round(now - s);
-  const occ = (id, label, kind, harness, model, presence, at, note = "") => ({ id, label, kind, harness, model, presence, presenceAt: at == null ? null : ago(at), note });
+  // The sample holds the facts the real backend keeps apart: presence (from a fresh signal), the delivery switch,
+// the session binding and the last activity. A holder can be "unknown" with the switch on: switch on is not connected.
+  const occ = (id, label, kind, harness, model, presence, at, note = "") => ({ id, label, kind, harness, model, presence, presenceAt: at == null ? null : ago(at), note,
+    switch: presence === "offline" ? "off" : presence === "unconnected" ? "unknown" : "on", binding: harness ? "session" : null,
+    activity: presence === "busy" ? { text: "working", at: ago(at), source: "activity hook" } : presence === "connected" && at != null ? { text: "idle", at: ago(at), source: "activity hook" } : null });
   const eng = (seq, at, kind, who, text) => ({ seq, at: ago(at), kind, who, text });
 
   const roles = [
-    { id: "owner", parentId: null, kind: "position", title: "Owner", order: 0, rev: 4,
+    { id: "owner", parentId: null, kind: "position", title: "Owner", order: 0,
       summary: "Sets direction, approves what leaves the company.",
       duties: ["Approve releases and external messages", "Set quarterly priorities", "Decide who holds each role"],
-      resources: [{ kind: "budget", label: "Monthly token budget" }, { kind: "channel", label: "Operator mailbox" }],
+      resources: [{ kind: "doc", ref: "budgets/monthly.md", note: "Monthly token budget" }, { kind: "doc", ref: "operator.md", note: "Operator mailbox" }],
       incumbent: occ("you", "You (operator)", "human", null, null, "connected", 20),
       candidates: [], waiting: 2, qualification: { level: 5, note: "Final approver" },
       can: { edit: { allowed: false, reason: "The operator role is defined in the company config file, not from the client." } } },
 
-    { id: "research", parentId: "owner", kind: "team", title: "Research", order: 1, rev: 1, summary: "Finds and checks facts before anything is built.", duties: [], resources: [], incumbent: null, candidates: [], waiting: 0, can: {} },
-    { id: "research-lead", parentId: "research", kind: "position", title: "Research Lead", order: 1, rev: 7,
+    { id: "research", parentId: "owner", kind: "team", title: "Research", order: 1, summary: "Finds and checks facts before anything is built.", duties: [], resources: [], incumbent: null, candidates: [], waiting: 0, can: {} },
+    { id: "research-lead", parentId: "research", kind: "position", title: "Research Lead", order: 1,
       summary: "Plans the research queue and signs off summaries.",
       duties: ["Break a question into checkable parts", "Assign sources to the Analyst", "Sign off the weekly summary"],
-      resources: [{ kind: "repo", label: "notes/ (read, write)" }, { kind: "tool", label: "Web search" }, { kind: "budget", label: "40% of research budget" }],
+      resources: [{ kind: "dir", ref: "notes/", note: "read, write" }, { kind: "skill", ref: "web-search", note: "" }, { kind: "doc", ref: "budgets/research.md", note: "40% of research budget" }],
       incumbent: occ("rl-1", "Lead agent", "agent", "Claude Code", "opus-class", "connected", 2 * M), candidates: [occ("rl-2", "Backup lead", "agent", "Codex", "codex-default", "offline", 3 * H)],
       waiting: 1, qualification: { level: 4, note: "May sign off summaries" }, can: { edit: { allowed: true, reason: "" } } },
-    { id: "analyst", parentId: "research-lead", kind: "position", title: "Analyst", order: 1, rev: 3,
+    { id: "analyst", parentId: "research-lead", kind: "position", title: "Analyst", order: 1,
       summary: "Collects and tabulates sources.", duties: ["Collect sources for a question", "Tabulate figures with their origin", "Flag figures that cannot be traced"],
-      resources: [{ kind: "tool", label: "Web search" }, { kind: "repo", label: "notes/ (read)" }],
+      resources: [{ kind: "skill", ref: "web-search", note: "" }, { kind: "dir", ref: "notes/", note: "read" }],
       incumbent: occ("an-1", "Analyst agent", "agent", "OpenCode", "oss-coder", "busy", 20, "Working on a pricing table"), candidates: [],
       waiting: 0, qualification: { level: 2, note: "" }, can: { edit: { allowed: true, reason: "" } } },
-    { id: "fact-checker", parentId: "research-lead", kind: "position", title: "Fact-checker", order: 2, rev: 2,
-      summary: "Re-derives every figure from its source.", duties: ["Re-derive figures from sources", "Mark unverifiable claims"], resources: [{ kind: "tool", label: "Web search" }],
+    { id: "fact-checker", parentId: "research-lead", kind: "position", title: "Fact-checker", order: 2,
+      summary: "Re-derives every figure from its source.", duties: ["Re-derive figures from sources", "Mark unverifiable claims"], resources: [{ kind: "skill", ref: "web-search", note: "" }],
       incumbent: occ("fc-1", "Checker agent", "agent", "Claude Code", "sonnet-class", "power_save", 41 * M, "Idle on purpose until a summary arrives"), candidates: [],
       waiting: 0, qualification: { level: 3, note: "" }, can: { edit: { allowed: true, reason: "" } } },
 
-    { id: "engineering", parentId: "owner", kind: "team", title: "Engineering", order: 2, rev: 1, summary: "Builds and ships.", duties: [], resources: [], incumbent: null, candidates: [], waiting: 0, can: {} },
-    { id: "eng-lead", parentId: "engineering", kind: "position", title: "Engineering Lead", order: 1, rev: 5,
+    { id: "engineering", parentId: "owner", kind: "team", title: "Engineering", order: 2, summary: "Builds and ships.", duties: [], resources: [], incumbent: null, candidates: [], waiting: 0, can: {} },
+    { id: "eng-lead", parentId: "engineering", kind: "position", title: "Engineering Lead", order: 1,
       summary: "Owns the build plan and the release checklist.", duties: ["Turn requests into build tasks", "Own the release checklist", "Escalate blocked work to the Owner"],
-      resources: [{ kind: "repo", label: "main repo (read, write on branches)" }, { kind: "budget", label: "35% of build budget" }],
+      resources: [{ kind: "dir", ref: "repo/", note: "read, write on branches" }, { kind: "doc", ref: "budgets/build.md", note: "35% of build budget" }],
       incumbent: occ("el-1", "Build lead agent", "agent", "Claude Code", "opus-class", "connected", 90), candidates: [occ("el-2", "Spare lead", "agent", "OpenCode", "oss-coder", "unconnected", null, "Named, no Harness attached")],
       waiting: 1, qualification: { level: 4, note: "" }, can: { edit: { allowed: true, reason: "" } } },
-    { id: "builder", parentId: "eng-lead", kind: "position", title: "Builder", order: 1, rev: 2,
+    { id: "builder", parentId: "eng-lead", kind: "position", title: "Builder", order: 1,
       summary: "Writes code on branches.", duties: ["Implement tasks on a branch", "Open a change for review", "Never merge own change"],
-      resources: [{ kind: "repo", label: "main repo (branches only)" }, { kind: "tool", label: "Test runner" }],
+      resources: [{ kind: "dir", ref: "repo/", note: "branches only" }, { kind: "skill", ref: "test-runner", note: "" }],
       incumbent: occ("bd-1", "Builder agent", "agent", "Codex", "codex-default", "busy", 15, "Running tests"), candidates: [], waiting: 0, qualification: { level: 2, note: "" }, can: { edit: { allowed: true, reason: "" } } },
-    { id: "reviewer", parentId: "eng-lead", kind: "position", title: "Reviewer", order: 2, rev: 6,
+    { id: "reviewer", parentId: "eng-lead", kind: "position", title: "Reviewer", order: 2,
       summary: "Reads changes and returns or accepts them.", duties: ["Review every change before release", "Return a change with reasons, or accept it"],
-      resources: [{ kind: "repo", label: "main repo (read)" }],
+      resources: [{ kind: "dir", ref: "repo/", note: "read" }],
       incumbent: occ("rv-1", "Review agent", "agent", "Codex", "codex-default", "unknown", null, "No recent signal from the Harness"), candidates: [], waiting: 0, qualification: { level: 3, note: "" },
       can: { edit: { allowed: false, reason: "Changing a reviewer's resources needs the capability role.edit on Engineering, which you have not been granted." } } },
-    { id: "release", parentId: "eng-lead", kind: "position", title: "Release Manager", order: 3, rev: 1,
-      summary: "Cuts releases once changes are accepted.", duties: ["Cut a release from accepted changes", "Write release notes"], resources: [{ kind: "repo", label: "main repo (tags)" }],
+    { id: "release", parentId: "eng-lead", kind: "position", title: "Release Manager", order: 3,
+      summary: "Cuts releases once changes are accepted.", duties: ["Cut a release from accepted changes", "Write release notes"], resources: [{ kind: "dir", ref: "repo/", note: "tags" }],
       incumbent: occ("rm-1", "Release agent", "agent", null, null, "unconnected", null, "Named, no Harness attached"), candidates: [], waiting: 0, qualification: { level: 3, note: "" }, can: { edit: { allowed: true, reason: "" } } },
 
-    { id: "operations", parentId: "owner", kind: "team", title: "Operations", order: 3, rev: 1, summary: "Keeps records and the day-to-day.", duties: [], resources: [], incumbent: null, candidates: [], waiting: 0, can: {} },
-    { id: "ops-coordinator", parentId: "operations", kind: "position", title: "Ops Coordinator", order: 1, rev: 2,
+    { id: "operations", parentId: "owner", kind: "team", title: "Operations", order: 3, summary: "Keeps records and the day-to-day.", duties: [], resources: [], incumbent: null, candidates: [], waiting: 0, can: {} },
+    { id: "ops-coordinator", parentId: "operations", kind: "position", title: "Ops Coordinator", order: 1,
       summary: "Routes requests and keeps the calendar.", duties: ["Route incoming requests to a role", "Keep the shared calendar"],
-      resources: [{ kind: "channel", label: "Shared inbox" }],
+      resources: [{ kind: "doc", ref: "shared-inbox.md", note: "Shared inbox" }],
       incumbent: occ("oc-1", "Coordinator agent", "agent", "OpenCode", "oss-coder", "offline", 5 * H), candidates: [], waiting: 0, qualification: { level: 2, note: "" }, can: { edit: { allowed: true, reason: "" } } },
-    { id: "archivist", parentId: "operations", kind: "position", title: "Archivist", order: 2, rev: 1,
-      summary: "Files finished work so it can be found again.", duties: ["File accepted work with its sources"], resources: [{ kind: "repo", label: "archive/ (write)" }],
+    { id: "archivist", parentId: "operations", kind: "position", title: "Archivist", order: 2,
+      summary: "Files finished work so it can be found again.", duties: ["File accepted work with its sources"], resources: [{ kind: "dir", ref: "archive/", note: "write" }],
       incumbent: null, candidates: [occ("ar-1", "Archive agent A", "agent", "Claude Code", "sonnet-class", "connected", 4 * M), occ("ar-2", "Archive agent B", "agent", null, null, "unconnected", null)],
       waiting: 0, qualification: { level: 1, note: "" }, can: { edit: { allowed: true, reason: "" } } },
   ];
+
+  // Candidates are the ordered list of who may hold a position; the incumbent is normally one of them (a candidate is
+  // not the holder). Escalation goes to the nearest position above; its current holder is the acceptor.
+  const byId = new Map(roles.map((r) => [r.id, r]));
+  for (const r of roles) {
+    if (r.kind !== "position") continue;
+    if (r.incumbent && !r.candidates.some((c) => c.id === r.incumbent.id)) r.candidates = [r.incumbent, ...r.candidates];
+    let up = r.parentId ? byId.get(r.parentId) : null;
+    while (up && up.kind !== "position") up = up.parentId ? byId.get(up.parentId) : null;
+    r.escalationRole = up ? up.id : "";
+    r.escalationAcceptor = up && up.incumbent ? up.incumbent.id : null;
+  }
 
   const full = { input: 1284000, output: 212000, cacheRead: 9400000, cacheWrite: 310000, total: 11206000, model: "opus-class", updatedAt: ago(40), source: "harness usage report", coverage: "complete", context: { tokens: 84000, window: 200000 } };
   const partial = { input: 402000, output: 88000, cacheRead: null, cacheWrite: null, total: null, model: "oss-coder", updatedAt: ago(14 * M), source: "harness usage report", coverage: "partial", context: null };
@@ -128,7 +144,7 @@ export function demoSnapshot(now = Date.now() / 1000) {
   ];
 
   return {
-    contract: CONTRACT_VERSION, asOf: Math.round(now), rev: 1, consistency: "consistent", degraded: [],
+    contract: CONTRACT_VERSION, asOf: Math.round(now), consistency: "consistent", degraded: [],
     company: { name: "Northwind Studio", operatorRoleId: "owner" },
     capabilities: {},   // filled by the adapter
     roles, threads, mail, work, approvals,

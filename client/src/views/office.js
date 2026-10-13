@@ -3,6 +3,7 @@
 import { esc, fmt } from "../util.js";
 import { t } from "../i18n.js";
 import { lamp, presenceWord, note, mockChip } from "./ui.js";
+import { standbys } from "../contract.js";
 
 export const NODES = {};   // wire graph for the current paint: id -> {parent, kind, role}
 const sid = (id) => "s:" + id;
@@ -28,7 +29,7 @@ function seat(snap, r, selected) {
   const st = inc ? inc.presence : "vacant";
   const kind = inc ? (inc.kind === "human" ? "human" : "agent") : "agent";
   const w = waitingFor(snap, r);
-  const cands = r.candidates.length;
+  const cands = standbys(r).length;
   const word = inc ? presenceWord(inc.presence) : t("vacant");
   const l2 = [`<span class="pw">${esc(word)}</span>`, inc ? `<span>${esc(inc.label)}</span>` : "", inc && inc.harness ? `<span>${esc(inc.harness)}</span>` : "", cands ? `<span>${esc(fmt(t(cands === 1 ? "cand1" : "candN"), { n: cands }))}</span>` : ""].filter(Boolean).join("");
   return `<button type="button" class="item seat${st === "offline" || st === "vacant" || st === "unconnected" ? " dead" : ""}" data-act="role" data-role="${esc(r.id)}" data-id="${esc(sid(r.id))}"
@@ -66,7 +67,8 @@ export function officeView(snap, S) {
     const set = under(idx, c).filter((r) => r.kind === "position");
     const on = set.filter((r) => r.incumbent && (r.incumbent.presence === "connected" || r.incumbent.presence === "busy")).length;
     const mail = set.reduce((s, r) => s + waitingFor(snap, r), 0);
-    const line = [fmt(t(set.length === 1 ? "roles1" : "rolesN"), { n: set.length }), fmt(t("connN"), { n: on }), mail ? fmt(t("waitingN"), { n: mail }) : ""].filter(Boolean).join(t("sep"));
+    const boxy = set.length > 0 && set.every((r) => r.origin === "mailbox");   // a tree of mailbox nodes counts mailboxes, not positions
+    const line = [fmt(t(boxy ? (set.length === 1 ? "boxes1" : "boxesN") : (set.length === 1 ? "roles1" : "rolesN")), { n: set.length }), fmt(t("connN"), { n: on }), mail ? fmt(t("waitingN"), { n: mail }) : ""].filter(Boolean).join(t("sep"));
     let body;
     if (c.kind === "team") body = `<ul class="tree">${(idx.kids.get(c.id) || []).map((k) => node(snap, idx, k, hid, S.roleId, S)).join("")}</ul>`;
     else { NODES[sid(c.id)] = { parent: hid, kind: "item", role: c.id }; body = `<ul class="tree"><li>${seat(snap, c, S.roleId === c.id)}${(idx.kids.get(c.id) || []).length ? `<ul class="tree">${idx.kids.get(c.id).map((k) => node(snap, idx, k, sid(c.id), S.roleId, S)).join("")}</ul>` : ""}</li></ul>`; }
@@ -78,7 +80,7 @@ export function officeView(snap, S) {
     <div class="root" data-id="root" data-st="${esc(opInc ? opInc.presence : "unknown")}">${lamp("human", opInc ? opInc.presence : "unknown")}
       <div class="who"><h1>${esc(snap.company.name || t("brand"))}</h1>
         <p>${opInc ? `<b>${esc(op.title)}</b>&ensp;${esc(opInc.label)}` : `<b>${esc(op.title)}</b>`}</p></div>
-      <div class="stats"><div class="stat"><b>${filled}<small>/${all.length}</small></b><span>${esc(t("stat.filled"))}</span></div>
+      <div class="stats"><div class="stat"><b>${filled}<small>/${all.length}</small></b><span>${esc(t(all.length && all.every((r) => r.origin === "mailbox") ? "stat.filledBox" : "stat.filled"))}</span></div>
         <div class="stat"><b>${live}</b><span>${esc(t("stat.connected"))}</span></div>
         <div class="stat"><b>${busy}</b><span>${esc(t("stat.busy"))}</span></div></div>
       <button type="button" class="cta${need ? "" : " zero"}" data-act="go" data-view="work" data-fk="cta" aria-label="${esc(need ? `${need} ${t(need === 1 ? "cta.one" : "cta.many")}` : t("cta.zero"))}">

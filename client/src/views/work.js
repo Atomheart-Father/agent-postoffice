@@ -4,7 +4,7 @@
 import { esc, fmt, ago } from "../util.js";
 import { t, getLang } from "../i18n.js";
 import { WORK_STATES } from "../contract.js";
-import { note, seg, workBadge, deliveryBadge, roleTitle, mockChip, proto } from "./ui.js";
+import { note, seg, workBadge, deliveryBadge, roleTitle, mockChip, proto, mailOf, mailMeta, roleById } from "./ui.js";
 
 function approvals(snap, S) {
   const pend = snap.approvals.filter((a) => a.state === "pending");
@@ -33,14 +33,14 @@ function workCol(snap, S, now, role) {
 
 function mailCol(snap, S, now, role) {
   const L = getLang();
-  const ms = snap.mail.filter((m) => !role || m.roleId === role).sort((a, b) => (b.at || 0) - (a.at || 0));
+  const ms = mailOf(snap, role ? roleById(snap, role) || { id: role } : null).sort((a, b) => (b.at || 0) - (a.at || 0));
   const w = (id) => snap.work.find((x) => x.id === id);
   return `<div class="ml"><div class="sec-h"><h2>${esc(t("work.mail"))}</h2></div>
     ${ms.length ? `<ul class="rows">${ms.map((m) => {
       const wk = m.workId ? w(m.workId) : null;
       const unfinished = wk && ["open", "submitted", "verified"].includes(wk.state) && (m.delivery === "accepted" || m.delivery === "consumed");
       return `<li class="row static"><span class="t1"><b>${esc(m.subject)}</b>${deliveryBadge(m.delivery)}</span>
-        <span class="t2">${esc(t(m.dir === "in" ? "mail.in" : "mail.out"))} · ${esc(m.from)} → ${esc(m.to)} · ${esc(ago(m.at, now, L) || t("unknown"))}</span>
+        <span class="t2">${esc(mailMeta(m, ago(m.at, now, L)))}</span>
         ${unfinished ? `<span class="t3">${esc(fmt(t("work.stillOpen"), { s: t("w." + wk.state) }))}</span>` : ""}
         ${m.threadId ? `<span class="t3"><button type="button" class="lk" data-act="thread" data-thread="${esc(m.threadId)}" data-fk="ml-t:${esc(m.id)}">${esc(t("work.toThread"))}</button></span>` : ""}</li>`;
     }).join("")}</ul>` : note("empty", t("work.noMail"))}
