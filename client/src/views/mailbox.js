@@ -8,7 +8,7 @@ import { esc, fmt, ago } from "../util.js";
 import { t, getLang } from "../i18n.js";
 import { note, rawCode, mockChip } from "./ui.js";
 import { mailboxesOf, mailboxOf, lettersIn, canClear } from "../flows/mailbox.js";
-import { unconfirmed, ledgerFull, LIMIT } from "../flows/writes.js";
+import { unconfirmed, ledgerFull, openCount, LIMIT } from "../flows/writes.js";
 
 const capOn = (snap, k) => { const c = snap && snap.capabilities[k]; return !!c && c.status !== "missing"; };
 export const deliveryOn = (snap) => capOn(snap, "mailbox.status") && mailboxesOf(snap).length > 0;
@@ -130,9 +130,17 @@ export const writerNote = (S) => {
   return w === "reader" ? note("warn", t("wr.readonly")) : w === "unsupported" ? note("warn", t("wr.noLocks")) : "";
 };
 const shortKey = (k) => (k ? `${k.slice(0, 8)}…` : "");
+export const WRITES_PAGE = 10;
 export function writesDialog(S, now) {
   const L = getLang(), un = unconfirmed(S.writes), full = ledgerFull(S.writes), off = S.ledger && S.ledger.store === "off", bad = S.ledger && S.ledger.store === "unusable";
-  const rows = S.writes.map((w) => {
+  // Everything is kept and everything can be reviewed: the list is paged, not cut.
+  const total = S.writes.length, pages = Math.max(1, Math.ceil(total / WRITES_PAGE));
+  const page = Math.min(Math.max(0, Number(S.writesPage) || 0), pages - 1), from = page * WRITES_PAGE, to = Math.min(total, from + WRITES_PAGE);
+  const pager = total > WRITES_PAGE ? `<div class="pager" role="navigation" aria-label="${esc(t("wr.pager"))}">
+        <button type="button" class="btn ghost" data-act="writes-page" data-dir="prev" data-fk="wr-prev"${page === 0 ? " disabled" : ""}>${esc(t("wr.prev"))}</button>
+        <span class="fine">${esc(fmt(t("wr.pageInfo"), { a: from + 1, b: to, n: total, u: openCount(S.writes) }))}</span>
+        <button type="button" class="btn ghost" data-act="writes-page" data-dir="next" data-fk="wr-next"${page >= pages - 1 ? " disabled" : ""}>${esc(t("wr.next"))}</button></div>` : "";
+  const rows = S.writes.slice(from, to).map((w) => {
     const kind = t(`wr.kind.${w.kind}`) === `wr.kind.${w.kind}` ? w.kind : t(`wr.kind.${w.kind}`);
     const open = w.phase === "unknown" || w.phase === "pending";
     const bits = [w.target || "", ago(w.at, now, L) || t("unknown")].filter(Boolean);
@@ -156,11 +164,13 @@ export function writesDialog(S, now) {
       <button type="button" class="close-x" data-act="close-dialog" data-fk="close-dialog">${esc(t("close"))}</button></header>
     <div class="sb pad" data-keep="dlg"><p class="lead">${esc(t("wr.lead"))}</p>
       ${writerNote(S)}
-      ${S.ledger && S.ledger.dropped ? note("warn", fmt(t("wr.dropped"), { n: S.ledger.dropped, max: LIMIT })) : ""}
+      ${S.ledger && S.ledger.legacyLeft ? note("warn", t("wr.legacyLeft")) : ""}
       ${full ? note("warn", fmt(t("wr.full"), { n: LIMIT })) : ""}
       ${un.length ? note("warn", fmt(t("wr.warn"), { n: un.length })) : ""}
       ${off ? note("warn", t("wr.storeOff")) : ""}${bad ? note("warn", t("wr.storeBad")) : ""}
+      ${pager}
       ${rows ? `<ul class="rows">${rows}</ul>` : note("empty", t("wr.none"))}
+      ${pager}
       <p class="fine">${esc(t("wr.scope"))}</p></div>
     <footer class="df"><button type="button" class="btn primary" data-act="writes-check" data-fk="wr-check">${esc(t("wr.check"))}</button>
       <button type="button" class="btn ghost" data-act="close-dialog" data-fk="close-dialog2">${esc(t("close"))}</button></footer></div></div>`;

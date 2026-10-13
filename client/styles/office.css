@@ -45,6 +45,7 @@
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 .pad{padding:22px 28px 32px}
 .fine{color:var(--ink-3);font-size:13.5px;max-width:60ch}
+.pager{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:8px 0}
 .lead{font-size:16px;color:var(--ink);max-width:62ch;margin-bottom:6px}
 .dim{color:var(--ink-2)}
 .lk{font-weight:650;text-decoration:underline;text-underline-offset:3px;text-decoration-color:var(--rule)}
