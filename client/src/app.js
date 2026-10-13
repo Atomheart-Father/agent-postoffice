@@ -25,6 +25,7 @@ import { createWriterGate } from "./flows/writer.js";
 import { createLedgerStore, defaultStorage } from "./ledgerStore.js";
 import { fmt } from "./util.js";
 import { newDelivery, deliveryReduce, verifyAgainst, newClear, clearReduce, canClear, lettersIn, mailboxOf, mailboxesOf } from "./flows/mailbox.js";
+import { WRITES_PAGE } from "./views/mailbox.js";
 
 // The display id of a log record only needs to differ from its neighbours; the CSPRNG is used when there is one.
 const cryptoRand = () => { try { const a = new Uint32Array(1); globalThis.crypto.getRandomValues(a); return a[0] / 2 ** 32; } catch { return Math.random(); } };
@@ -47,7 +48,8 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     // "unusable" (stored data not read) | "off" (storage missing or failing: the log lives on this page only).
     // writer: this page's role for the scope (backend address + operator): "none" (scope not known yet) | "checking" | "holder" |
     // "reader" | "unsupported" - only the holder sends writes and saves the summary (flows/writer.js).
-    ledger: { scope: null, store: "unset", writer: "none", dropped: 0 },
+    ledger: { scope: null, store: "unset", writer: "none", legacyLeft: false },
+    writesPage: 0,
   };
   const ledgerStore = createLedgerStore({
     storage: storage === undefined ? defaultStorage(win) : storage,
@@ -140,11 +142,12 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
   // only fills the list: it sends nothing, and a record that was pending shows as unknown (its reply is gone). Exactly one page
   // per scope is the writer (a Web Locks lock); the others are read-only and take over when the holder goes away.
   const operatorNow = () => (S.snap ? S.snap.company.operatorBox : "");
-  const lockName = () => ledgerStore.lockNameOf(ledgerStore.scopeOf(operatorNow()));
+  const lockNames = () => { const sc = ledgerStore.scopeOf(operatorNow()); return [ledgerStore.lockNameOf(sc), ...ledgerStore.legacyLockNamesOf(sc)]; };
+  const lockName = () => lockNames()[0];
   function readSummary() {
     const got = ledgerStore.load(operatorNow());
     S.writes = got.items;
-    S.ledger = { ...S.ledger, store: got.state, dropped: got.dropped };
+    S.ledger = { ...S.ledger, store: got.state, legacyLeft: got.legacy };
     return got;
   }
   function onWriter(state, name) {
@@ -153,7 +156,7 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     if (state === "holder") {
       // Taking over (first claim, or the previous holder closed or crashed): what is stored NOW is the truth, not what this page
       // read earlier. Whatever the old holder left pending is unknown. Nothing is sent. A summary of the previous schema is
-      // rewritten once (and its old key removed) so no letter reference stays behind.
+      // carried over once; its old key is removed only after the new entry was written and read back (ledgerStore.save).
       const got = readSummary();
       if (got.legacy) persist();
     }
@@ -166,9 +169,10 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     if (S.ledger.scope === key) return;
     // A new scope (first snapshot, or the operator changed): this page lets go of the old scope's lock first, shows what is
     // stored for the new one read-only, and asks for the new lock.
-    S.ledger = { scope: key, store: "unset", writer: "checking", dropped: 0 };
+    S.ledger = { scope: key, store: "unset", writer: "checking", legacyLeft: false };
+    S.writesPage = 0;
     readSummary();
-    gate.claim(lockName());
+    gate.claim(lockNames());
   }
   // Another page (the holder) saved: a read-only page shows the new summary. The holder never reacts to this.
   function syncLedger() {
@@ -180,14 +184,15 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
     if (S.ledger.scope === null || !S.snap || S.ledger.writer !== "holder") return;   // a page that is not the writer never writes
     // "off" stays off: a store that could not be read (or written) once is not promised to bring the records back after a reload
     const r = ledgerStore.save(operatorNow(), S.writes);
-    S.ledger = { ...S.ledger, store: r === "off" || S.ledger.store === "off" ? "off" : "ok" };
+    S.ledger = { ...S.ledger, store: r === "off" || S.ledger.store === "off" ? "off" : "ok", legacyLeft: ledgerStore.legacyLeft(operatorNow()) };
   }
   const logEv = (ev) => { S.writes = writesReduce(S.writes, ev); persist(); };
 
   // Every write goes through here: it gets a record (pending) before it is sent, and the record is closed by the reply. A throw
   // or an unreadable reply is "unknown", never "failed". Nothing is retried. `opts.key` = a send operation: it gets ONE fresh
   // client_request_id here, passed to `run(id, key)`; the key belongs to this operation and to no other.
-  // A full log (LIMIT records, none of them resolvable by the client) refuses new writes before anything is sent.
+  // A log with LIMIT open records (pending / unknown, not dismissed) refuses new writes before anything is sent; nothing is
+  // dropped to make room for one.
   const refuseLocally = (message) => ({ ok: false, error: { code: ERR.REFUSED, message, retryable: false, blockedLocally: true } });
   async function tracked(kind, target, run, opts = {}) {
     // Only the writing page of this scope sends writes. Every other state says why, before anything leaves.
@@ -418,6 +423,7 @@ export function createApp({ root, toastRoot = null, adapter, now = () => Date.no
       return loadFresh().then(() => (S.outbox.phase === "ok" ? loadOutbox() : null)).then(() => { if (!S.err && S.ledger.writer === "holder") { logEv({ type: "checked", at: now() }); render(); } });
     },
     "ledger-sync"() { syncLedger(); },
+    "writes-page"(d) { const last = Math.max(0, Math.ceil(S.writes.length / WRITES_PAGE) - 1); S.writesPage = Math.min(last, Math.max(0, (Math.min(last, Number(S.writesPage) || 0)) + (d.dir === "next" ? 1 : -1))); render(); },
     "writes-dismiss"(d) { if (S.ledger.writer !== "holder") return; logEv({ type: "dismiss", id: d.write }); render(); },
     delivery(d, el) { remember(el); S.delivery = deliveryReduce(S.delivery, { type: "reset" }); S.dialog = "delivery"; render(); },
     "dl-pick"(d, el) { S.delivery = deliveryReduce(S.delivery, { type: "select", box: d.box, on: !!(el && el.checked) }); render(); },

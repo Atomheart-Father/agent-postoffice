@@ -56,17 +56,22 @@ export function newClientRequestId(c = globalThis.crypto) {
 
 // ---------- the log ----------
 // A record can be dropped to make room when nobody has to look at it any more: the backend answered (acknowledged / rejected),
-// or the user said they stopped watching it. pending / unknown that are not dismissed are never dropped by the client.
+// or the user said they stopped watching it. pending / unknown that are not dismissed are NEVER dropped by the client: not to
+// make room, not on load, not on a schema upgrade. When LIMIT of them are open, new business writes stop (reading, refreshing,
+// checking and dismissing still work) until the user has dismissed enough of them.
 export const evictable = (w) => w.phase === "acknowledged" || w.phase === "rejected" || w.dismissed === true;
-export const ledgerFull = (list) => list.length >= LIMIT && !list.some(evictable);
+export const openCount = (list) => list.filter((w) => !evictable(w)).length;
+export const ledgerFull = (list) => openCount(list) >= LIMIT;
 
 export function writesReduce(list, ev) {
   switch (ev.type) {
     case "start": {
+      if (ledgerFull(list)) return list;   // the caller refuses the write before it gets here; nothing is ever dropped to fit one
       let rest = list;
-      if (rest.length >= LIMIT) {   // make room: the oldest record that may go, never an unresolved one
+      // make room (the new record is added to the list, so keep it below LIMIT): the oldest records that may go, never an open one
+      while (rest.length >= LIMIT) {
         const i = [...rest].reverse().findIndex(evictable);
-        if (i < 0) return list;   // full of unresolved records: the caller refuses the write before it gets here
+        if (i < 0) break;
         const at = rest.length - 1 - i;
         rest = rest.filter((_, k) => k !== at);
       }
@@ -109,14 +114,4 @@ export function fromStored(raw) {
     clientRequestId: isUuid(raw.client_request_id) ? raw.client_request_id : null,
     ref: "", dismissed: raw.dismissed === true, checkedAt: num(raw.last_checked_at), restored: true, deduped: false,
   };
-}
-// At most LIMIT records, newest first. Only the single writer ever saves, so a stored list never legitimately exceeds the limit;
-// a payload that does (damaged, edited by hand) is cut: records that could be dropped by the rules go first, then the oldest.
-export function capList(list) {
-  const sorted = [...list].sort((a, b) => b.at - a.at);
-  if (sorted.length <= LIMIT) return { list: sorted, dropped: 0 };
-  const keep = sorted.filter((w) => !evictable(w)).slice(0, LIMIT);
-  const spare = sorted.filter(evictable).slice(0, LIMIT - keep.length);
-  const out = [...keep, ...spare].sort((a, b) => b.at - a.at);
-  return { list: out, dropped: sorted.length - out.length };
 }

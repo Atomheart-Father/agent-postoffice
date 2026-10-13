@@ -19,8 +19,9 @@ The backend has no CORS and a Host / Origin / Content-Type guard (`403 {"ok":fal
 read or write it; there is no token and no `can.*`. The page never holds credentials. Status (online/offline) and whole-mailbox clear are wired (live on master, fixture on the candidate); every write has a
 local record and is never auto-resent (a lost reply shows as "may have been sent"). A send carries a one-off
 `client_request_id` (UUID); the client does not claim de-duplication and offers no "safe retry" until a pinned backend
-contract says so. Unresolved records are kept (max 30, never silently dropped) and a minimal summary (no letter reference) survives a
-reload. Per backend address + operator only one tab writes (Web Locks); other tabs are read-only and take over when it
-closes or crashes; without Web Locks (needs https/localhost) writing is turned off, not silently allowed. The client opens in
+contract says so. Unresolved records are never dropped by the client (only finished or dismissed ones make room; 30 open ones pause new writes and
+the log is paged for review) and a minimal summary (no letter reference) survives a reload. Per backend address + operator only
+one tab writes (Web Locks, one lock name for every release; same origin and browser profile only, not across browsers or
+devices); other tabs are read-only and take over when it closes or crashes; without Web Locks (needs https/localhost) writing is turned off, not silently allowed. The client opens in
 English by default; Chinese is optional. Real-device Chinese IME testing is
 still pending (steps in the docs, §10).

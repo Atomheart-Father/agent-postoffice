@@ -6,8 +6,8 @@ import { readFileSync } from "node:fs";
 import { createApp } from "../client/src/app.js";
 import { createHttpAdapter } from "../client/src/adapters/http.js";
 import { setLang } from "../client/src/i18n.js";
-import { LIMIT, SEND_KEY } from "../client/src/flows/writes.js";
-import { createLedgerStore, KEY_PREFIX } from "../client/src/ledgerStore.js";
+import { LIMIT, SEND_KEY, writesReduce, ledgerFull } from "../client/src/flows/writes.js";
+import { createLedgerStore, KEY_PREFIX, normalizeBase } from "../client/src/ledgerStore.js";
 import { createMemoryLocks, createWriterGate } from "../client/src/flows/writer.js";
 
 let failures = 0;
@@ -43,6 +43,8 @@ const memStorage = (init = {}) => { const m = new Map(Object.entries(init)); ret
 const viewOf = (s) => { const v = { writes: 0, getItem: (k) => s.getItem(k), setItem: (k, x) => { v.writes++; s.setItem(k, x); }, removeItem: (k) => { v.writes++; s.removeItem(k); } }; return v; };
 const OKSEND = () => [200, { ok: true, state: "sent", id: "20260101-000000-a", ref: "box_a/20260101-000000-a.md", to: "box_a" }];
 
+// the scope locks of the current release (each page also holds the name earlier releases used; those are not counted here)
+const stableHolders = (w) => w.mgr.holders().filter((n) => n.startsWith("boxz.office.writer|"));
 const world = ({ base = "http://office-a" } = {}) => ({ mgr: createMemoryLocks(), storage: memStorage(), base });
 async function tab(w, routes = {}, { st = state, base = w.base, lockless } = {}) {
   const root = { innerHTML: "", querySelectorAll() { return []; }, querySelector() { return null; }, contains() { return false; } };
@@ -100,7 +102,7 @@ const rec = (n, phase, extra = {}) => ({ local_id: `w-${n}`, client_request_id: 
   const other = await tab(w, {}, { st: withOperator("someone_else") });
   const elsewhere = await tab(w, {}, { base: "http://office-b" });
   is([A.writer(), other.writer(), elsewhere.writer()], ["holder", "holder", "holder"], "another operator and another backend address each have their own writer");
-  is(w.mgr.holders().length, 3, "…three separate locks");
+  is(stableHolders(w).length, 3, "…three separate locks");
   const again = await tab(w);
   is(again.writer(), "reader", "…while the same scope again is read-only");
 }
@@ -164,10 +166,11 @@ const rec = (n, phase, extra = {}) => ({ local_id: `w-${n}`, client_request_id: 
   current = withOperator("third_one");
   await A.app.load(); await settle();
   is([A.writer(), D.writer()], ["reader", "holder"], "switching into a scope another page writes: read-only");
-  is(w.mgr.holders().length, 2, "…and the page holds no lock for the scope it left");
+  is(stableHolders(w).length, 2, "…and the page holds no lock for the scope it left");
 }
 
-// ---------- capacity, hard cap ----------
+// ---------- capacity: unresolved records are never dropped ----------
+const idsIn = (html) => [...new Set(String(html).match(/w-\d+/g) || [])];
 {
   const w = world();
   const key = keyFor(w);
@@ -178,15 +181,80 @@ const rec = (n, phase, extra = {}) => ({ local_id: `w-${n}`, client_request_id: 
   is(A.posts().length, 0, "…a full log pauses new writes after a takeover as well");
   hasS(A.root.innerHTML, "Writes are paused", "…with the reason");
   is(stored(w, key).items.length, LIMIT, "…and the stored list stays at the limit");
-  // a payload over the limit is cut at the limit; unresolved records go last
+  is(writesReduce(A.S.writes, { type: "start", id: "w-x", kind: "send", at: 999 }), A.S.writes, "the reducer does not make room by dropping an unresolved record either");
+}
+{
+  // 31 records, none finished, none dismissed: nothing is dropped on load, on reload, or by any write; writes stop; every record can be paged to
+  const w = world();
+  const key = keyFor(w);
+  const all = Array.from({ length: 31 }, (_, i) => rec(100 + i, i % 3 ? "unknown" : "pending"));
+  w.storage.setItem(key, JSON.stringify({ v: 2, scope: { base: w.base, operator: "panelop" }, items: all }));
+  const A = await tab(w, { "/api/send": OKSEND(), "/api/status": [200, { ok: true, error: "" }] });
+  is([A.S.writes.length, A.S.writes.every((x) => x.phase === "unknown")], [31, true], "31 unresolved records: all 31 load (no cap on load), pending shown as unknown");
+  yes(ledgerFull(A.S.writes), "…the log counts as full");
+  hasNot(A.root.innerHTML, "were not loaded", "…and nothing claims records were left out");
+  await sendOne(A);
+  is(A.posts().length, 0, "a new send is not made");
+  await A.app.act("dl-one", { box: "box_a", status: "offline" });
+  is(A.posts().length, 0, "…nor any other business write (the guard is one gate for all of them)");
+  is(stored(w, key).items.length, 31, "…storage still holds all 31");
+  A.app.act("writes-check", {}); await settle();
+  is(A.S.writes.length, 31, "checking state still works and keeps all 31");
+  // paging: every record is reachable
+  A.S.dialog = "writes"; A.app.render();
+  hasS(A.root.innerHTML, "1–10 of 31", "the dialog shows the first page and the total");
+  const seen = new Set(idsIn(A.root.innerHTML));
+  is(seen.size, 10, "…ten rows on a page");
+  for (let i = 0; i < 4; i++) { A.app.act("writes-page", { dir: "next" }); idsIn(A.root.innerHTML).forEach((x) => seen.add(x)); }
+  is(seen.size, 31, "…and paging reaches all 31");
+  hasS(A.root.innerHTML, "31–31 of 31", "…the last page is bounded");
+  A.app.act("writes-page", { dir: "prev" }); hasS(A.root.innerHTML, "21–30 of 31", "…and goes back");
+  // a reader pages too
+  const R = await tab(w); R.S.dialog = "writes"; R.app.render();
+  is(R.writer(), "reader", "(a second page)");
+  R.app.act("writes-page", { dir: "next" }); hasS(R.root.innerHTML, "11–20 of 31", "a read-only page can page as well");
+  // dismissing: 31 -> 30 open is still full, 29 resumes
+  const open = () => A.S.writes.filter((x) => !x.dismissed).length;
+  A.app.act("writes-dismiss", { write: "w-130" });
+  is([open(), ledgerFull(A.S.writes)], [30, true], "dismissing one of 31 leaves 30 open: still paused");
+  await sendOne(A); is(A.posts().length, 0, "…still no send");
+  A.app.act("writes-dismiss", { write: "w-129" });
+  is([open(), ledgerFull(A.S.writes)], [29, false], "dismissing a second one: 29 open, writes may resume");
+  await sendOne(A);
+  is(A.posts().length, 1, "…and the next send goes out");
+  const kept = A.S.writes.filter((x) => x.id !== A.S.writes[0].id);
+  is([A.S.writes.length, kept.filter((x) => !x.dismissed).length], [30, 29], "…making room removed only the two dismissed records; the 29 open ones are all still there");
+  is(stored(w, key).items.length, 30, "…and storage matches");
+}
+{
+  // mixed: open records are never evicted; finished and dismissed ones go, oldest first, only when a write needs room
+  const w = world();
+  const key = keyFor(w);
+  const items = [
+    ...Array.from({ length: 20 }, (_, i) => rec(1 + i, "unknown")),
+    ...Array.from({ length: 20 }, (_, i) => rec(21 + i, i % 2 ? "rejected" : "acknowledged")),
+    ...Array.from({ length: 3 }, (_, i) => rec(41 + i, "unknown", { dismissed: true })),
+  ];
+  w.storage.setItem(key, JSON.stringify({ v: 2, scope: { base: w.base, operator: "panelop" }, items }));
+  const A = await tab(w, { "/api/send": OKSEND() });
+  is(A.S.writes.length, 43, "43 mixed records all load");
+  is(stored(w, key).items.length, 43, "…loading alone rewrites nothing");
+  await sendOne(A);
+  is(A.posts().length, 1, "a write is allowed: only 20 are open");
+  const ids = A.S.writes.map((x) => x.id);
+  is(A.S.writes.length, LIMIT, "…and the log is back at the limit");
+  is(Array.from({ length: 20 }, (_, i) => `w-${1 + i}`).every((x) => ids.includes(x)), true, "…every one of the 20 open records is still there");
+  is(Array.from({ length: 14 }, (_, i) => `w-${21 + i}`).some((x) => ids.includes(x)), false, "…the 14 that went are the oldest finished ones");
+  is(["w-35", "w-40", "w-41", "w-42", "w-43"].every((x) => ids.includes(x)), true, "…the newer finished and the dismissed ones are still there");
+  is(stored(w, key).items.length, LIMIT, "…storage matches");
+  // 29 open + 1 finished: the finished one makes room, an open one never
   const w2 = world();
-  const many = [...Array.from({ length: 15 }, (_, i) => rec(i, "unknown")), ...Array.from({ length: 30 }, (_, i) => rec(200 + i, "acknowledged"))];
-  w2.storage.setItem(keyFor(w2), JSON.stringify({ v: 2, scope: { base: w2.base, operator: "panelop" }, items: many }));
-  const B = await tab(w2);
-  is([B.S.writes.length, B.S.writes.filter((x) => x.phase === "unknown").length, B.S.ledger.dropped], [LIMIT, 15, 15], "45 stored records load as 30: every unresolved one stays, the oldest finished ones are left out");
-  B.S.dialog = "writes"; B.app.render();
-  hasS(B.root.innerHTML, "the 15 oldest were not loaded", "…and the list says so");
-  is(stored(w2, keyFor(w2)).items.length, 45, "…the page that only loaded it did not rewrite storage on its own (the writer saves on its next change)");
+  w2.storage.setItem(keyFor(w2), JSON.stringify({ v: 2, scope: { base: w2.base, operator: "panelop" }, items: [...Array.from({ length: 29 }, (_, i) => rec(1 + i, "unknown")), rec(50, "acknowledged")] }));
+  const B = await tab(w2, { "/api/send": [200, "LOST"] });
+  await sendOne(B);
+  is([B.posts().length, B.S.writes.length, B.S.writes.filter((x) => x.phase === "unknown").length], [1, LIMIT, 30], "at 29 open + 1 finished the finished one gives way; the 30th open record is the new one");
+  await sendOne(B);
+  is(B.posts().length, 1, "…and now 30 are open: the next send is refused");
 }
 
 // ---------- an old summary is upgraded ----------
@@ -221,6 +289,142 @@ const rec = (n, phase, extra = {}) => ({ local_id: `w-${n}`, client_request_id: 
   const w3 = world(); w3.storage.setItem(createLedgerStore({ storage: w3.storage, base: w3.base }).legacyKeyOf({ base: w3.base, operator: "panelop" }), "{{{{");
   const Z = await tab(w3);
   is([Z.writer(), Z.S.writes.length], ["holder", 0], "an unreadable old entry is ignored");
+}
+
+// ---------- upgrade v1 -> v2 never loses a record and never deletes on failure ----------
+const store0 = (w) => createLedgerStore({ storage: w.storage, base: w.base });
+const scope0 = (w) => store0(w).scopeOf("panelop");
+const v1key = (w) => store0(w).legacyKeyOf(scope0(w));
+const putV1 = (w, items) => w.storage.setItem(v1key(w), JSON.stringify({ v: 1, scope: scope0(w), saved_at: 1, items }));
+{
+  // 31 unresolved records in an old store: all 31 arrive in v2, v1 goes only after v2 was written and read back
+  const w = world();
+  putV1(w, Array.from({ length: 31 }, (_, i) => rec(100 + i, i % 2 ? "unknown" : "pending", { result_ref: `bob/secret-${i}` })));
+  const A = await tab(w, { "/api/send": OKSEND() });
+  const now = stored(w, keyFor(w));
+  is([A.writer(), A.S.writes.length, now.items.length], ["holder", 31, 31], "31 unresolved v1 records: all 31 are carried into v2, none cut");
+  yes(!w.storage.m.has(v1key(w)), "…the v1 key is removed after that");
+  hasNot([...w.storage.m.values()].join("\n"), "secret-", "…and no result_ref is left anywhere");
+  await sendOne(A); is(A.posts().length, 0, "…and the 31 open records pause new writes");
+}
+{
+  // both keys exist: v1-only records join v2's, a record both have is kept once (v2's version)
+  const w = world();
+  w.storage.setItem(keyFor(w), JSON.stringify({ v: 2, scope: scope0(w), items: [rec(5, "acknowledged"), rec(6, "unknown")] }));
+  putV1(w, [rec(5, "unknown"), rec(7, "unknown"), rec(8, "pending")]);
+  const A = await tab(w);
+  const now = stored(w, keyFor(w));
+  is(now.items.map((i) => [i.local_id, i.result_state]).sort(), [["w-5", "acknowledged"], ["w-6", "unknown"], ["w-7", "unknown"], ["w-8", "unknown"]], "v1-only records are added to an existing v2 list; a shared record is kept once, as v2 has it");
+  yes(!w.storage.m.has(v1key(w)), "…then v1 is removed");
+  void A;
+}
+{
+  // the new entry cannot be written: nothing is deleted anywhere, the records stay on the page
+  const w = world();
+  const removed = [];
+  const base = memStorage();
+  w.storage = { ...base, m: base.m, getItem: base.getItem, removeItem: (k) => { removed.push(k); base.removeItem(k); }, setItem: (k, v) => { if (k.startsWith("boxz.office.requests.v2")) throw new Error("QuotaExceededError"); base.setItem(k, v); } };
+  putV1(w, Array.from({ length: 12 }, (_, i) => rec(1 + i, "unknown")));
+  const before = w.storage.m.get(v1key(w));
+  const A = await tab(w);
+  is([A.writer(), A.S.writes.length], ["holder", 12], "v2 cannot be written: the page still shows all 12 records");
+  is([w.storage.m.get(v1key(w)) === before, removed.length], [true, 0], "…the v1 entry is byte for byte what it was and nothing was removed");
+  is(A.S.ledger.store, "off", "…the store says it is off");
+  A.S.dialog = "writes"; A.app.render();
+  hasS(A.root.innerHTML, "still in the old storage place", "…and the dialog says the old records are still in the old place");
+}
+{
+  // a storage that accepts the write and then does not hold it: read-back catches it, v1 stays
+  const w = world();
+  const base = memStorage();
+  const removed = [];
+  w.storage = { m: base.m, getItem: base.getItem, removeItem: (k) => { removed.push(k); base.removeItem(k); }, setItem: (k, v) => { if (!k.startsWith("boxz.office.requests.v2")) base.setItem(k, v); } };
+  putV1(w, [rec(1, "unknown"), rec(2, "pending")]);
+  const A = await tab(w);
+  is([A.S.writes.length, w.storage.m.has(v1key(w)), removed.length, A.S.ledger.store], [2, true, 0, "off"], "a write that did not stick: v1 is kept, nothing removed, store 'off'");
+}
+{
+  // an old entry that cannot be read (damaged, other schema) is never touched
+  const w = world();
+  w.storage.setItem(v1key(w), "{{{{");
+  const A = await tab(w);
+  is([A.writer(), A.S.writes.length, w.storage.m.get(v1key(w))], ["holder", 0, "{{{{"], "an unreadable old entry is ignored and left in place");
+  const w2 = world();
+  w2.storage.setItem(v1key(w2), JSON.stringify({ v: 3, scope: scope0(w2), items: [rec(1, "unknown")] }));
+  await tab(w2);
+  yes(w2.storage.m.has(v1key(w2)), "an entry of another schema is left in place as well");
+  // a record the reader cannot make sense of is not a record; the readable ones are carried
+  const w3 = world(); putV1(w3, [rec(1, "unknown"), { nonsense: true }, null]);
+  const C = await tab(w3);
+  is([C.S.writes.length, w3.storage.m.has(v1key(w3))], [1, false], "entries without an id and time are not records: the readable one is carried over");
+}
+
+// ---------- the lock name: one per backend address + operator, whatever the version ----------
+{
+  const w = world();
+  const st = store0(w);
+  const name = st.lockNameOf(st.scopeOf("panelop"));
+  yes(!/\.v\d/.test(name) && !name.includes("requests"), "the lock name carries no version number: " + name);
+  is(createLedgerStore({ storage: w.storage, base: "HTTP://Office-A:80/" }).lockNameOf({ base: normalizeBase("HTTP://Office-A:80/"), operator: "panelop" }), name, "…and the same address spelled differently gives the same name");
+  is(normalizeBase("https://x.test:443/a/?q=1#h"), "https://x.test/a", "address normalisation: default port, trailing slash, query and fragment go");
+  yes(st.lockNameOf(st.scopeOf("other")) !== name && (() => { const b = createLedgerStore({ storage: w.storage, base: "http://office-b" }); return b.lockNameOf(b.scopeOf("panelop")); })() !== name, "…and another operator or another address gives another name");
+  is(st.legacyLockNamesOf(st.scopeOf("panelop")), ["boxz.office.writer.v2|" + encodeURIComponent(st.scopeOf("panelop").base) + "|panelop"], "the name the previous release used is known, for the transition");
+}
+
+// ---------- old and new releases compete for the same scope ----------
+{
+  // a page of the previous release holds ITS lock name: this release's page is a reader although its own name is free
+  const w = world();
+  const st = store0(w);
+  const oldName = st.legacyLockNamesOf(st.scopeOf("panelop"))[0];
+  const oldPage = (tabLocks) => { const seen = []; const g = createWriterGate({ locks: tabLocks, onChange: (x) => seen.push(x) }); return { g, seen, last: () => seen[seen.length - 1] }; };
+  const O = oldPage(w.mgr.tab()); O.g.claim(oldName); await settle();
+  is(O.last(), "holder", "(the old page is the writer)");
+  const A = await tab(w, { "/api/send": OKSEND() });
+  const B = await tab(w, { "/api/send": OKSEND() });
+  is([A.writer(), B.writer()], ["reader", "reader"], "the old page holds the old name: both pages of this release are read-only");
+  await sendOne(A); is(A.posts().length, 0, "…and send nothing");
+  O.g.release(); await settle();
+  is([A.writer(), B.writer()].sort(), ["holder", "reader"], "the old page leaves: exactly one of this release takes over");
+  const hold = A.writer() === "holder" ? A : B, other = hold === A ? B : A;
+  is(hold.posts().length + other.posts().length, 0, "…and the takeover sent nothing");
+  // now the old page tries again while this release writes
+  const O2 = oldPage(w.mgr.tab()); O2.g.claim(oldName); await settle();
+  is(O2.last(), "reader", "an old page that starts now is held out: it is a reader, so this release's lock really restricts it");
+  await sendOne(hold); is(hold.posts("/api/send").length, 1, "(the writer of this release can send)");
+  hold.lk.crash(); await settle();
+  // the old page was queued on its own name and may be granted it first; either way exactly one of the two writes
+  is([other.writer(), O2.last()].filter((x) => x === "holder").length, 1, "the writer crashes: of the waiting page of this release and the waiting old page, exactly one becomes the writer");
+  is(other.posts().length, 0, "…and the takeover sent nothing");
+}
+{
+  // a future release (other storage version) asks for the same stable name: it competes with this one, not beside it
+  const w = world();
+  const st = store0(w);
+  const stable = st.lockNameOf(st.scopeOf("panelop"));
+  const A = await tab(w);
+  const seen = []; const fut = createWriterGate({ locks: w.mgr.tab(), onChange: (x) => seen.push(x) }); fut.claim([stable]); await settle();
+  is([A.writer(), seen[seen.length - 1]], ["holder", "reader"], "a release with only the stable name is held out by this one");
+  A.lk.crash(); await settle();
+  is(seen[seen.length - 1], "holder", "…and takes over when this one is gone");
+  const w2 = world(); const f2 = []; const fg = createWriterGate({ locks: w2.mgr.tab(), onChange: (x) => f2.push(x) });
+  fg.claim([w2.base ? createLedgerStore({ storage: w2.storage, base: w2.base }).lockNameOf(scope0(w2)) : ""]); await settle();
+  const C = await tab(w2);
+  is([f2[f2.length - 1], C.writer()], ["holder", "reader"], "and the other way round: if that release writes first, this one reads");
+}
+{
+  // a page of this release that holds the stable name but cannot yet have the old one does not count as the writer
+  const w = world();
+  const st = store0(w);
+  const oldName = st.legacyLockNamesOf(st.scopeOf("panelop"))[0];
+  const oldHolder = w.mgr.tab(); oldHolder.request(oldName, async () => new Promise(() => {}));
+  const A = await tab(w, { "/api/send": OKSEND() });
+  is(A.writer(), "reader", "holding only the new name is not enough to write");
+  yes(stableHolders(w).length === 1, "…it does hold the new name while it waits for the old one (so a second page of this release queues behind it)");
+  await sendOne(A); is(A.posts().length, 0, "…and sends nothing");
+  oldHolder.crash(); await settle();
+  is(A.writer(), "holder", "the old holder crashes: this page becomes the writer");
+  is(A.S.writes.length, 0, "(it re-read storage on taking over)");
 }
 
 // ---------- dismiss never changes the meaning ----------

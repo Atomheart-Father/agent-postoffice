@@ -12,6 +12,10 @@
 //   unsupported  this browser / page has no Web Locks (they need a secure context: https or localhost). There is no safe way to
 //                tell whether another tab writes, so writing is OFF here, with a message. It is never silently allowed.
 //
+// Scope of the guarantee: Web Locks are shared by pages of the same origin in the same browser storage partition (one browser
+// profile; not another browser, another profile, a private window or another device). It is exactly the reach of localStorage,
+// which is where the log lives; the guarantee is claimed for that reach and for nothing wider.
+//
 // Release: the lock is released when the holder calls release() (scope change, shutdown) and by the browser when the page is
 // closed, navigated away from or crashes - that is how Web Locks work; it needs no timer and no heartbeat. The waiting tab is
 // granted the lock then and calls onChange("holder"): the app reads the summary again from storage (it never trusts what it
@@ -31,26 +35,34 @@ export function createWriterGate({ locks, onChange }) {
     if (me.free) me.free();
   }
 
-  function claim(name) {
+  // `names[0]` is the scope's lock (the same for every release of this client); the rest are names earlier releases used.
+  // All of them are taken, always in this order, and the page is the holder only when it holds every one: a page of an
+  // earlier release that still holds only its own name keeps this page a reader, and once this page holds the whole set
+  // that page is a reader too. Nobody waits for a name while holding a later one, so two pages cannot lock each other up.
+  // The answer is always reported under names[0].
+  function claim(spec) {
     release();
-    if (!usable) { onChange("unsupported", name); return; }
+    const names = (Array.isArray(spec) ? spec : [spec]).filter((n, i, a) => typeof n === "string" && n && a.indexOf(n) === i);
+    const name = names[0];
+    if (!usable || !name) { onChange("unsupported", name); return; }
     const me = { name, dead: false, free: null, ctl: typeof AbortController === "function" ? new AbortController() : null };
     cur = me;
     const say = (state) => { if (!me.dead) onChange(state, name); };
     const hold = () => { if (me.dead) return undefined; say("holder"); return new Promise((res) => { me.free = res; if (me.dead) res(); }); };
-    say("checking");
-    let first;
-    try {
-      first = locks.request(name, { ifAvailable: true }, async (lock) => {
+    // Take names[i] and, inside it, the rest. The returned promise settles when this page lets go of names[i] and all after it.
+    const take = (i) => {
+      const proceed = () => (i === names.length - 1 ? hold() : take(i + 1));
+      return locks.request(names[i], { ifAvailable: true }, async (lock) => {
         if (me.dead) return undefined;
-        if (lock) return hold();
+        if (lock) return proceed();
         say("reader");
-        // not available: wait for it. A pending request is cancelled with the signal when the scope changes or the page shuts down.
-        try { locks.request(name, me.ctl ? { signal: me.ctl.signal } : {}, async () => hold()).catch(() => { /* aborted */ }); } catch { say("unsupported"); }
-        return undefined;
+        // Not available: wait for it (still holding the earlier names). A pending request is cancelled with the signal when the
+        // scope changes or the page shuts down. The wait is returned, so the earlier names stay held while it lasts.
+        return locks.request(names[i], me.ctl ? { signal: me.ctl.signal } : {}, async () => (me.dead ? undefined : proceed())).catch(() => { /* aborted */ });
       });
-    } catch { say("unsupported"); return; }
-    Promise.resolve(first).catch(() => say("unsupported"));
+    };
+    say("checking");
+    try { Promise.resolve(take(0)).catch(() => say("unsupported")); } catch { say("unsupported"); }
   }
   return { claim, release, usable };
 }
