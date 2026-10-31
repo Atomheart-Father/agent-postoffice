@@ -2,8 +2,8 @@
 
 # 开发说明 v1.6：稳定认人、只为真阻塞提醒、回执合并排后
 
-发起：T0（2026-10-05 批准三项）。规格/审核：reviewer（Claude「‼️POSTOFFICE」）；联审：manager。开发：implementer。
-分支 `v1.6-identity-alerts`（基于 master 175ac13），工作副本 `<worktree>`。
+发起：项目负责人（2026-10-05 批准三项）。规格/审核：`manager`（示例信箱名）；联审：`reviewer`；开发：`implementer`。
+分支 `v1.6-identity-alerts`（基于当时的 master），工作副本 `<worktree>`。
 
 ## 1. 会话改名、回退后照样认人
 
@@ -40,7 +40,7 @@
 
 ## 3. 回执合并成一条，排在正式信后面
 
-**问题（真实发生）**：01:44–01:48 给 manager 投了 3 份交付 + 3 条回执，触发限流，01:48:37 的“发布完成”正式信晚了约 6 分钟才送达。
+**问题（真实发生）**：01:44–01:48 给 `reviewer` 投了 3 份交付 + 3 条回执，触发限流，01:48:37 的“发布完成”正式信晚了约 6 分钟才送达。
 
 **行为（T0 定）**：同一信箱同一次唤醒里，**正式信在前，回执合并成一条放最后**，例如：
 ```
@@ -74,7 +74,7 @@
 10. 原有测试全部继续通过；`/usr/bin/python3 -m py_compile postoffice`；`node --experimental-strip-types --check opencode/postoffice.ts`。
 
 ## 约束
-- 只改 `<worktree>`；不碰 `~/code/agent-postoffice`（线上）、不改 `~/agent-postoffice` 的配置和账本（发信除外）、不 push、不重启任何 App、不动 launchd/Claude/OpenCode 设置。
+- 只在隔离工作树 `<worktree>` 里改；不碰线上的 `~/agent-postoffice`、不改它的配置和账本（发信除外）、不 push、不重启任何 App、不动 launchd/Claude/OpenCode 设置。
 - 纯标准库、Python 3.9 兼容；沿用现有风格；中英 README、MAILBOX_GUIDE、SKILL 同步更新（含“需要”字段的标准写法）。
 - 提交作者：`-c user.name="Atomheart-Father" -c user.email="90882389+Atomheart-Father@users.noreply.github.com"`。
-- 完成后发信给 reviewer（需要：审核），附 smoke 末尾几行；抄送说明可给 manager（仅告知）。规格不清先问，不自改规格。
+- 完成后发信给 `manager`（需要：审核），附 smoke 末尾几行；抄送说明可给 `reviewer`（仅告知）。规格不清先问，不自改规格。

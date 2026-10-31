@@ -2,12 +2,12 @@
 
 # 交付：组织与身份标准化 v1（PO-ORG-IDENTITY-V1）
 
-- 隔离 worktree：`<worktree>`
+- 隔离 worktree：`<worktree>`（本机任意路径）
 - 分支：`org-identity-v1`，基线 = v1.13 PR #5 head `ff9a69172ad89e69ff2be0ade0d2d5ba3bcc34d2`
 - **当前冻结提交：本分支 HEAD** = 第 3 轮 `fdd33f8` 之上再叠一个「终审第 4 轮收尾」提交
   （确切 SHA 见交付信；提交内容不自引 SHA 以免每次改文档都要改 SHA）
 - 状态：已提交、worktree clean；**未 push、未合并、未部署**；本机线上（panel v1.12.4）一字未动
-- 管理者/终审：`manager`；实施：`implementer`
+- 管理者/终审：`manager`（示例信箱名）；实施：`implementer`（示例信箱名）
 
 ## 交付内容
 

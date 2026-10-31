@@ -5,7 +5,7 @@
 - 分支：`human-console-maturity`
 - 基线 SHA：`ce14581c185d5447bed65182ce65538f19cb1171`（v1.12.4）
 - HEAD：`ce14581c185d5447bed65182ce65538f19cb1171` —— 全部改动**未提交**，在工作树里
-- 工作树：`<worktree>`
+- 工作树：`<worktree>`（本机任意路径）
 - 范围：A Runtime Presence、B Operator Outbox、C Appearance、D Mobile/iPad、§27-32 来源口径
 - 未 merge、未 deploy（线上仍是 v1.12.4）
 

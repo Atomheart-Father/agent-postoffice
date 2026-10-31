@@ -1112,7 +1112,7 @@ prefers-color-scheme
 继续：
 
 
-BOXZ Precision Editorial
+ACME Precision Editorial
 
 
 
@@ -1601,7 +1601,7 @@ transport 不知道这些事实。
 
 
 
-收件 AI 已经能从 project-local instructions 知道：
+收件 AI 已经能从 ACME project-local instructions 知道：
 
 
 boss = 老板 / Human Operator

@@ -2,7 +2,7 @@
 
 # 小票交付：20 分钟未确认唤醒提醒同步 Slack
 
-- 工作树：`<worktree>`，分支 `slack-grace-timeout`，基线 `ce14581c185d5447bed65182ce65538f19cb1171`（master v1.12.4）。
+- 工作树：`<worktree>`（本机任意路径），分支 `slack-grace-timeout`，基线 `ce14581c185d5447bed65182ce65538f19cb1171`（master v1.12.4）。
 - 与 v1.13 完全隔离（manager 裁决 A：从 master 明确基线另建 worktree）；未提交、未合并、未部署。
 - 线的组织/身份标准化**不在本票**（仍在设计，未发实施票）。
 
