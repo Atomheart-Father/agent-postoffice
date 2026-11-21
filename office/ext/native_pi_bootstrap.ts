@@ -431,11 +431,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     // Pi 的 `timestamp` 是**毫秒**（pi-ai：请求开始时刻），Core 的 `at` 是秒。
     if (typeof msg.timestamp === 'number' && Number.isFinite(msg.timestamp)) entry.at = msg.timestamp / 1000;
     // 费用只在 provider **真的报了**的时候才带：`totalFromProvider` 就是那条凭据；0 不是免费。
-    if (usage.cost && typeof usage.cost === 'object' && usage.cost.totalFromProvider === true
-        && typeof usage.cost.total === 'number' && Number.isFinite(usage.cost.total)) {
-      entry.cost = usage.cost.total;
-      entry.cost_from_provider = true;
-    }
+
     observeOutcome(() => wakeLoop?.reportUsage?.([entry], `usage:pi:${entryId}`));
   };
   on('turn_end', (event: any, ctx: any) => {

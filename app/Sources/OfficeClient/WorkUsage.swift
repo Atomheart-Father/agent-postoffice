@@ -7,7 +7,7 @@ public struct ModelUsage: Sendable, Equatable {
     public let cell: UsageCell
 }
 
-/// 承办或审核一方的用量：与后端 usage_sum 同形（`tokens{in,out,cache}`、`cost`，缺 = null = 未知），多一个可选的 `by_model`。
+/// 承办或审核一方的用量：与后端 usage_sum 同形（`tokens{in,out,cache}`，缺 = null = 未知），多一个可选的 `by_model`。
 /// byModel == nil = 后端没按模型拆（模型就是"未知"）。
 public struct RoleUsage: Sendable, Equatable {
     public let cell: UsageCell
@@ -39,7 +39,7 @@ public struct WorkUsageCard: Sendable, Equatable {
 
     static func cell(_ o: [String: Any]) -> UsageCell {
         let t = OfficeReads.tokens(o)
-        return UsageCell(tokensIn: t.i, tokensOut: t.o, tokensCache: t.c, cost: OfficeReads.number(o["cost"]))
+        return UsageCell(tokensIn: t.i, tokensOut: t.o, tokensCache: t.c)
     }
     static func role(_ raw: Any?) -> RoleUsage? {
         guard let o = raw as? [String: Any] else { return nil }

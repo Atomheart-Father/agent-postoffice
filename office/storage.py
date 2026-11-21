@@ -547,8 +547,7 @@ CREATE TABLE IF NOT EXISTS releases(
 --   `entry_id` = sha(harness, session, 原生消息 ID)：宿主持久化的那条 entry id（Pi 的
 --   `turn_end` 的 `messageEntryId`），所以重复上报是同一个主键，天然只算一次。
 --   `tokens_in` / `tokens_out` / `tokens_cache` 三格，**NULL = 宿主没报**（不是 0）。
---   `cost` NULL = **费用缺失**（Pi 在无价目表时给 0 且 `totalFromProvider=false`；
---   那种 0 是“没算”，不能当“免费”存进来）。
+--   cost 保留用于兼容旧数据库，当前用量不读写。
 --   `role_in_work` NULL = 归属不到承办/审核（照实留着，不挑一个安上）。
 --   `attribution` = measured | estimated | unassigned：仅在可信记录明确关联 Work 时才是 measured。
 CREATE TABLE IF NOT EXISTS usage(

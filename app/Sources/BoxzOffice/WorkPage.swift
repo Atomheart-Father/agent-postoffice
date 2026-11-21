@@ -181,7 +181,6 @@ struct WorkPage: View {
     var inText: String { loading ? "…" : Self.n(spent?.tokensIn) }
     var outText: String { loading ? "…" : Self.n(spent?.tokensOut) }
     var cacheText: String { loading ? "…" : Self.n(spent?.tokensCache) }
-    var costText: String { loading ? "…" : Cost.text(spent?.cost) }
     var roundsText: String { loading ? "…" : (rounds.map { tr("\($0) 轮", "\($0)") } ?? Self.unknown) }
 }
 
@@ -281,7 +280,7 @@ private struct CompareBar: View {
 
     private var labels: some View {
         VStack(alignment: .leading, spacing: 5) {
-            ForEach([tr("工作", "Work"), tr("承办", "Assignee"), tr("模型", "Model"), tr("入", "In"), tr("出", "Out"), tr("审核", "Rounds"), tr("缓存", "Cache"), tr("费用", "Cost")], id: \.self) {
+            ForEach([tr("工作", "Work"), tr("承办", "Assignee"), tr("模型", "Model"), tr("入", "In"), tr("出", "Out"), tr("审核", "Rounds"), tr("缓存", "Cache")], id: \.self) {
                 Text($0).font(Theme.Font.sub).foregroundStyle(Theme.ink3).frame(height: $0 == tr("工作", "Work") ? 34 : 17, alignment: .topLeading)
             }
         }
@@ -295,7 +294,7 @@ private struct CompareBar: View {
                 Text(f.row.objective).font(Theme.Font.small.weight(.bold)).lineLimit(1)
             }.frame(height: 34, alignment: .topLeading)
             cell(desk.seatName(f.row.assignee)); cell(f.modelText); cell(f.inText, mono: true); cell(f.outText, mono: true)
-            cell(f.roundsText); cell(f.cacheText, mono: true); cell(f.costText, mono: true)
+            cell(f.roundsText); cell(f.cacheText, mono: true)
         }
         .frame(width: colW, alignment: .leading)
         .overlay(alignment: .leading) { Rectangle().fill(Theme.rule).frame(width: Theme.Line.hair) }

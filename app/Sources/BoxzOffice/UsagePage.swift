@@ -1,11 +1,7 @@
 import SwiftUI
 import OfficeClient
 
-/// Usage：按线程看宏观用量——每个线程（绑定）一行；按"入 + 出"从多到少排，缓存单列（不进排序），cost 有值才写，否则"未知"。
-/// （排序键是 Q1，先按保守做法；用户定了再改。）
-/// 数据要等后端的线程用量读口（R4）：现在是夹具，页头标"模拟数据"。（这一页之后会改成按 Work 的网状图，这里只保持现状。）
-/// Work 级用量在 Work 抽屉里（usage.read 按 work_ref 筛）。
-/// 后端没报的分量写"未知"，不画 0；合计也不替后端补"≥"：有一行未知，合计就写"未知"。
+/// 按绑定查看 token 用量，逻辑地址用于识别当前线程。
 struct UsagePage: View {
     @ObservedObject var desk: DeskModel
 
@@ -17,7 +13,7 @@ struct UsagePage: View {
                     if page.threads.isEmpty { Text(tr("0 个线程", "0 threads")).font(Theme.Font.body).foregroundStyle(Theme.ink3).padding(.top, 40) }
                     else {
                         hostStrip(groupedByHost(page.threads, harness: \.harness)).padding(.top, 34)
-                        ThreadTable(threads: Self.ranked(page.threads)).padding(.top, 30)
+                        ThreadTable(threads: Self.ranked(page.threads), hosts: desk.hosts.value?.threads ?? []).padding(.top, 30)
                     }
                 }
             }
@@ -90,35 +86,32 @@ enum Sum {
     }
 }
 
-enum Cost {
-    /// cost 单位后端没说，原样当数字；没报 = "未知"。
-    static func text(_ c: Double?) -> String { c.map { String(format: "%.2f", $0) } ?? tr("未知", "Unknown") }
-}
-
 private struct ThreadTable: View {
     let threads: [ThreadUsage]
-    private static let wNum: CGFloat = 76, wHost: CGFloat = 88
+    let hosts: [HostThread]
+    private static let wNum: CGFloat = 70, wHost: CGFloat = 84, wAddress: CGFloat = 140
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 head(tr("线程", "THREAD"), nil, .leading)
+                head(tr("逻辑地址", "LOGICAL ADDRESS"), Self.wAddress, .leading)
                 head(tr("宿主", "HOST"), Self.wHost, .leading)
                 head(tr("入", "IN"), Self.wNum, .trailing)
                 head(tr("出", "OUT"), Self.wNum, .trailing)
                 head(tr("入+出", "IN+OUT"), Self.wNum, .trailing)
                 head(tr("缓存", "CACHE"), Self.wNum, .trailing)
-                head(tr("费用", "COST"), Self.wNum, .trailing)
             }
             .padding(.horizontal, 10).frame(height: 34)
             .overlay(alignment: .bottom) { Rectangle().fill(Theme.ink).frame(height: Theme.Line.hair) }
             ForEach(threads) { t in
                 HStack(spacing: 0) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(t.bindingID == nil ? tr("来源未知", "Unknown source") + " · " + t.actor : t.actor).font(Theme.Font.body).lineLimit(1)
-                        if let p = t.position { Text(p).font(Theme.Font.sub).foregroundStyle(Theme.ink3).lineLimit(1) }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(t.bindingID == nil ? tr("来源未知", "Unknown source") + " · " + t.actor : t.actor)
+                        .font(Theme.Font.body).lineLimit(1).help(t.actor)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    let address = HostThread.currentAddress(for: t, in: hosts)
+                    Text(address ?? "—").font(Theme.Font.body).lineLimit(1).help(address ?? "")
+                        .frame(width: Self.wAddress, alignment: .leading)
                     Text(hostName(t.harness)).font(Theme.Font.small).foregroundStyle(Theme.ink2).lineLimit(1).frame(width: Self.wHost, alignment: .leading)
                     num(t.cell.tokensIn); num(t.cell.tokensOut)
                     VStack(alignment: .trailing, spacing: 2) {
@@ -128,8 +121,7 @@ private struct ThreadTable: View {
                     }
                     .frame(width: Self.wNum, alignment: .trailing)
                     num(t.cell.tokensCache)
-                    Text(Cost.text(t.cell.cost)).font(Theme.Font.body).monospacedDigit().foregroundStyle(t.cell.cost == nil ? Theme.ink3 : Theme.ink2)
-                        .frame(width: Self.wNum, alignment: .trailing)
+
                 }
                 .padding(.horizontal, 10).frame(minHeight: 52)
                 .overlay(alignment: .bottom) { Rule() }

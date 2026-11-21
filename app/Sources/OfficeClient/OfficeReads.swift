@@ -236,7 +236,6 @@ public struct OfficeReads: Sendable {
         let t = g["tokens"] as? [String: Any] ?? [:]
         return (t["in"] as? Int, t["out"] as? Int, t["cache"] as? Int)
     }
-    public static func number(_ raw: Any?) -> Double? { (raw as? NSNumber).map(\.doubleValue) }
 
     public func workDetail(_ ref: String) -> Outcome<WorkDetail> {
         call(.workGet, ["work_ref": ref, "history": true]) { r in

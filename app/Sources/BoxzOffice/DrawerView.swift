@@ -468,7 +468,7 @@ struct UsageLine: View {
                 VStack(alignment: .leading, spacing: 2) {
                     if let caption { Text(caption).font(Theme.Font.sub.weight(.semibold)).foregroundStyle(Theme.ink2) }
                     Text(c.inOut.map { TokenFmt.short($0) + " token" } ?? tr("未知", "Unknown")).font(Theme.Font.f14Bold).monospacedDigit()
-                    Text(tr("入 \(f(c.tokensIn)) · 出 \(f(c.tokensOut)) · 缓存 \(f(c.tokensCache)) · 费用 \(Cost.text(c.cost))", "In \(f(c.tokensIn)) · Out \(f(c.tokensOut)) · Cache \(f(c.tokensCache)) · Cost \(Cost.text(c.cost))"))
+                    Text(tr("入 \(f(c.tokensIn)) · 出 \(f(c.tokensOut)) · 缓存 \(f(c.tokensCache))", "In \(f(c.tokensIn)) · Out \(f(c.tokensOut)) · Cache \(f(c.tokensCache))"))
                         .font(Theme.Font.sub).monospacedDigit().foregroundStyle(Theme.ink3)
                 }
             } else { Text(tr("无记录", "No records")).font(Theme.Font.f14).foregroundStyle(Theme.ink3) }

@@ -49,6 +49,13 @@ public struct HostThread: Sendable, Equatable, Identifiable {
         Set(bindings.compactMap(\.position)).sorted()
     }
 
+    public static func currentAddress(for usage: ThreadUsage, in threads: [HostThread]) -> String? {
+        guard let id = usage.bindingID,
+              let thread = threads.first(where: { $0.bindings.contains { $0.bindingID == id && $0.actor == usage.actor } }),
+              !thread.positionAddresses.isEmpty else { return nil }
+        return thread.positionAddresses.joined(separator: " · ")
+    }
+
     public var title: String {
         if !positionAddresses.isEmpty { return positionAddresses.joined(separator: " · ") }
         if harness == "pi", sessionRef.hasPrefix("/") {

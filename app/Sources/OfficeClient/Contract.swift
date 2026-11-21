@@ -114,7 +114,7 @@ public struct HostPage: Sendable, Equatable {
     func excluding(actor: String) -> HostPage { HostPage(bindings: bindings.filter { $0.actor != actor }) }
 }
 
-/// R4 usage.read(group_by="binding") 的一组：与 usage_sum 同一形状——`tokens:{in,out,cache}`、`cost`，缺格 = null = "未知"。
+/// R4 usage.read(group_by="binding") 的一组：与 usage_sum 同一形状——`tokens:{in,out,cache}`，缺格 = null = "未知"。
 /// 分组键 (binding_id, actor, harness, position)；binding_id 为空 = 来源未知（宿主没上报绑定），不算线程。
 public struct ThreadUsage: Sendable, Equatable, Identifiable {
     public let bindingID: String?
@@ -122,7 +122,7 @@ public struct ThreadUsage: Sendable, Equatable, Identifiable {
     public let harness: String?
     public let position: String?
     public let events: Int?, estimatedEvents: Int?
-    /// 三个 token 格 + cost，复用 Work 用量的 UsageCell。
+    /// 三个 token 格，复用 Work 用量的 UsageCell。
     public let cell: UsageCell
     public var id: String { (bindingID ?? "unbound") + "|" + actor + "|" + (harness ?? "") + "|" + (position ?? "") }
     public var estimated: Bool { (estimatedEvents ?? 0) > 0 }
@@ -134,7 +134,7 @@ public struct ThreadUsage: Sendable, Equatable, Identifiable {
         let t = OfficeReads.tokens(r)
         return ThreadUsage(bindingID: r["binding_id"] as? String, actor: actor, harness: r["harness"] as? String,
                            position: r["position"] as? String, events: r["events"] as? Int, estimatedEvents: r["estimated_events"] as? Int,
-                           cell: UsageCell(tokensIn: t.i, tokensOut: t.o, tokensCache: t.c, cost: OfficeReads.number(r["cost"])))
+                           cell: UsageCell(tokensIn: t.i, tokensOut: t.o, tokensCache: t.c))
     }
 }
 

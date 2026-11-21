@@ -214,19 +214,19 @@ def relation_changes(conn, work_ref, *, live_only=False, reverse=True, may_read=
 def usage_sum(rows):
     """一组用量行的合计（履历卡与 `usage.read` 共用的唯一一份加法）。
 
-    token 三格与 `cost` 都是**一格缺则合计缺**（`None`）：宿主没报的不能当 0 加起来；
+    token 三格都是**一格缺则合计缺**（`None`）：宿主没报的不能当 0 加起来；
     `estimated_events` = 其中 `attribution="estimated"` 的条数（分母仍是 `events`）。
     """
-    out = {"events": 0, "estimated_events": 0, "tokens": {"in": None, "out": None, "cache": None},
-           "cost": None}
+    out = {"events": 0, "estimated_events": 0, "tokens": {"in": None, "out": None, "cache": None}}
     for r in rows:
         first = out["events"] == 0
         out["events"] += 1
         out["estimated_events"] += (r["attribution"] or "") == "estimated"
-        for target, key, col in ((out["tokens"], "in", "tokens_in"), (out["tokens"], "out", "tokens_out"),
-                                 (out["tokens"], "cache", "tokens_cache"), (out, "cost", "cost")):
-            target[key] = r[col] if first else (
-                None if target[key] is None or r[col] is None else target[key] + r[col])
+        tokens = out["tokens"]
+        for key in tokens:
+            value = r["tokens_" + key]
+            tokens[key] = value if first else (
+                None if tokens[key] is None or value is None else tokens[key] + value)
     return out
 
 

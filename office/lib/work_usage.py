@@ -57,9 +57,8 @@ class UsageOperations:
                                         (ref, actor)).fetchone()):
             work_ref, role = r["work_ref"], "reviewer"
         key = hashlib.sha256(("%s\n%s\n%s" % (harness, binding[0], entry_id)).encode()).hexdigest()
-        cost = e.get("cost") if e.get("cost_from_provider") else None                  # 没算 ≠ 0
         return ((key, harness, binding[0] or None, actor, None, work_ref, role, e.get("model"),
-                 n["in"], n["out"], n["cache"], cost, "measured" if work_ref else "unassigned", float(at)),
+                 n["in"], n["out"], n["cache"], "measured" if work_ref else "unassigned", float(at)),
                 {"entry_id": entry_id, "harness": harness, "session_ref": binding[0], "at": e.get("at"),
                  "ref": ref})
 
@@ -78,13 +77,13 @@ class UsageOperations:
                 return replay
             # 签发之前的条目不是本次绑定的用量（会话的旧记录在签发后才被适配层读到）：不入账，回执计数。
             issued = conn.execute(ISSUED_AT.format("?"), (binding[0],)).fetchone()[0]
-            fresh = [r for r, _ in got if issued is None or r[13] >= issued]
+            fresh = [r for r, _ in got if issued is None or r[-1] >= issued]
             added = 0
             for row in fresh:
                 added += conn.execute(
                     "INSERT OR IGNORE INTO usage(entry_id, harness, binding_id, actor, position, work_ref,"
-                    " role_in_work, model, tokens_in, tokens_out, tokens_cache, cost, attribution, at)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row).rowcount
+                    " role_in_work, model, tokens_in, tokens_out, tokens_cache, attribution, at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", row).rowcount
             out = {"ok": True, "added": added, "duplicated": len(fresh) - added, "skipped": len(got) - len(fresh),
                    "binding_id": binding[0] or None, "generation": binding[1] or None}
             self.storage.record_action(conn, actor, ACTION, act_key, digest, out, now_ts)
@@ -92,7 +91,7 @@ class UsageOperations:
 
     def usage_read(self, actor, *, project_ref=None, group_by=None, now_ts=None):
         """`project_ref` 缺省 = 我自己的用量；给了 = 这个项目里我读得到的 Work（读权 = `work.list role=all`）。
-        `counted` 已计入（逐 Work×角色，token 与 cost 各自合计）；`uncovered`：`missing` 宿主没报的格各缺几条，
+        `counted` 已计入（逐 Work×角色，只合计 token）；`uncovered`：`missing` 宿主没报的格各缺几条，
         个人视图另有 `unassigned` 归不到 Work 的（未归属只在个人汇总里出现），项目视图另有 `works` 还没有
         记录的 Work；`total` = 各组之和。"""
         self._check_actor(actor)
@@ -132,7 +131,7 @@ class UsageOperations:
                       pair[0][0] is None, pair[0][0] or "", pair[0][1] or ""))]
         counted, lost = [r for r in rows if r["work_ref"]], [r for r in rows if not r["work_ref"]]
         uncovered = {"missing": {k: sum(r[c] is None for r in counted) for k, c in (
-            ("in", "tokens_in"), ("out", "tokens_out"), ("cache", "tokens_cache"), ("cost", "cost"))}}
+            ("in", "tokens_in"), ("out", "tokens_out"), ("cache", "tokens_cache"))}}
         if project_ref is None:
             uncovered["unassigned"] = usage_sum(lost) if lost else None
         else:
