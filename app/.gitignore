@@ -1,0 +1,7 @@
+.build/
+build/
+build.noindex/
+*.xcodeproj
+.DS_Store
+docs/shots/
+docs/compare/

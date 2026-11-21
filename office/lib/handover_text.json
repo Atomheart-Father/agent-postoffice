@@ -1,0 +1,12 @@
+{
+  "_comment": "申请相关系统信的全部文字。代码只持有键和插值；改文案只改这里。",
+  "list_invalid": {"zh": "申请列表筛选或分页参数无效", "en": "Invalid request-list filter or page parameter"},
+  "items": {"position": "岗位与绑定", "project": "新建项目", "grant": "授权", "revoke": "收回授权", "deactivate": "停用身份", "unbind": "撤销别人的绑定", "broadcast": "全员广播", "read_mail": "读信箱里点名的信", "join": "开个人信箱"},
+  "pending": {"subject": "申请待批：{ref}", "need": "批准、拒绝，或转给用户",
+              "body": "{applicant} 提了申请 {ref}（{kind}，目标 {target}，版本 {version}）：{reason}\n需要你批的项：{items}\n用 office_request_decide 处理，request_ref={ref}，expected_version={version}。"},
+  "to_user": {"subject": "申请转给你：{ref}", "need": "决定这条申请",
+              "body": "{applicant} 的申请 {ref}（{kind}，目标 {target}，版本 {version}）已转给你。\n申请理由：{reason}\n转办理由：{referral_reason}\n可以批准或拒绝。"},
+  "done": {"subject": "申请已批准：{ref}", "body": "{ref} 已由 {by} 批准并执行。"},
+  "refused": {"subject": "申请被拒绝：{ref}", "body": "{ref} 被 {by} 拒绝。原因：{reason}"},
+  "no_operator": "没有配置用户（config.json 的 panel.operator）：无法转给用户"
+}

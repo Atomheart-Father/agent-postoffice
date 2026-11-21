@@ -1,0 +1,29 @@
+{
+  "_comment": "岗位知识的全部对外文字（拒绝原因、导航行）。代码只持有键、协议值和插值；改文案只改这里。",
+  "title": {"zh": "{role} 岗位实践", "en": "{role} position practice"},
+  "refusal": {
+    "position_required": {"zh": "position 必须是岗位名", "en": "position must be a position name"},
+    "op_unknown": {"zh": "op 只能是 add / replace / remove / restore", "en": "op must be one of add / replace / remove / restore"},
+    "text_required": {"zh": "{op} 需要非空的 text", "en": "{op} needs a non-empty text"},
+    "id_required": {"zh": "{op} 需要 id", "en": "{op} needs id"},
+    "version_required": {"zh": "{op} 需要 expected_version（读一次现状，原样带回）", "en": "{op} needs expected_version (read the current state and send it back unchanged)"},
+    "to_version_required": {"zh": "restore 需要 to_version（岗位快照号）", "en": "restore needs to_version (a position snapshot number)"},
+    "field_type": {"zh": "{field} 的类型不对", "en": "{field} has the wrong type"},
+    "when_invalid": {"zh": "when 必须是至多 {max} 个非空字符串（项目引用或路径前缀，路径不含 ..）：{why}", "en": "when must be at most {max} non-empty strings (project refs or path prefixes, no ..): {why}"},
+    "entry_not_found": {"zh": "没有这条岗位经验：{id}", "en": "No such knowledge entry: {id}"},
+    "snapshot_not_found": {"zh": "该岗位没有第 {ver} 号快照", "en": "This position has no snapshot number {ver}"},
+    "stale": {"zh": "{what}已变（你读到的是 {expected}，现在是 {current}）；先读取现状再改", "en": "{what} changed (you read {expected}, it is {current}); read the current state first"},
+    "entry_too_long": {"zh": "单条岗位经验最多 {limit} 字（这条 {chars} 字，原条目 {before} 字）：要么拆成几条，要么不比原来长", "en": "One knowledge entry is at most {limit} characters ({chars} here, was {before}); split it, or keep it no longer than before"},
+    "over_limit": {"zh": "岗位经验会超过 {limit} 字上限，且这一版比现在长（{before} → {chars} 字）：请先合并或删除，再重试", "en": "Position knowledge would exceed the {limit}-character limit and is longer than it is now ({before} → {chars}); merge or remove entries first"}
+  },
+  "dispatch": "{role} 岗位里与这件 Work 相关的经验：",
+  "review_followup": {"zh": "如这次改正有可复用的经验，承办人可用 office_position_knowledge_update 补一条；没有可跳过。", "en": "If the correction offers a reusable lesson, the assignee can add it with office_position_knowledge_update. Otherwise skip it."},
+  "what": {"entry": {"zh": "这条经验", "en": "This entry"}, "position": {"zh": "岗位经验", "en": "Position knowledge"}},
+  "navigation": {
+    "duties": {"zh": "{role} 职责：{duties}", "en": "{role} duties: {duties}"},
+    "knowledge": {"zh": "{role} 经验（{count} 条，{chars}/{limit} 字）：", "en": "{role} practice ({count} entries, {chars}/{limit} chars):"},
+    "omitted": {"zh": "  还有 {n} 条放不进这里，用 office_position_knowledge_read 读。", "en": "  {n} more do not fit here; read them with office_position_knowledge_read."},
+    "scoped": {"zh": "  另有 {n} 条按项目或路径触发的经验，随相关派工送达。", "en": "  {n} more entries are tied to a project or path and arrive with the matching work."}
+  },
+  "welcome": {"subject": "岗位资料：%s", "duties": "你的职责：%s"}
+}

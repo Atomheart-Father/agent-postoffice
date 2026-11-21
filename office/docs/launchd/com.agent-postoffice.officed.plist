@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- W420 · officed 的 launchd 单元**模板**（未安装）。
+
+     安装（部署方做，不是开发测试做）：
+       1. 指定固定发布树 __TREE__、Python 绝对路径 __PYTHON__ 和专用目录 __OFFICE_HOME__；
+       2. __BINDINGS__ 换成受控供给绝对路径（0600/0400、属主为本用户），先创建 home/logs；
+       3. cp 到 ~/Library/LaunchAgents/ 后 `launchctl bootstrap gui/$(id -u) <plist>`；
+       4. 用生成的描述文件执行 office-cli whoami，确认绑定；重启后再次回读。
+
+     KeepAlive=true：进程崩了由 launchd 拉起（§3.1 的自愈），不需要第二个看门进程。
+     注意（PLAN 11-13 23:30 的教训）：KeepAlive=true 而不是 SuccessfulExit=false ——
+     后者收到 SIGTERM 以 0 退出时被当作正常退出、不会拉回。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-postoffice.officed</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__TREE__/office/officed.py</string>
+    <string>--home</string>
+    <string>__OFFICE_HOME__</string>
+    <string>--bindings</string>
+    <string>__BINDINGS__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>POSTOFFICE_HOME</key>
+    <string>__OFFICE_HOME__</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Nice</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>__OFFICE_HOME__/logs/officed.log</string>
+  <key>StandardErrorPath</key>
+  <string>__OFFICE_HOME__/logs/officed.log</string>
+</dict>
+</plist>

@@ -1,0 +1,7 @@
+{
+  "_comment": "授权的固定动作目录：只有一种。grant.create 不认识的动作直接拒；其余管理能力不靠授权（见 PERMISSION_DESIGN_DRAFT）。",
+  "project.manage": {
+    "zh": "管理一个项目（范围 = 项目）：建/派/改派/取消 Work、设审核人、管 Work 资源、读本项目私密 Work、记发版、回统筹信、批申请里落在本项目的那一项",
+    "en": "Manage one project (scope = the project): create/assign/reassign/cancel Work, set reviewers, manage Work resources, read private Work, record releases, answer coordination letters, approve the part of a request that falls inside the project"
+  }
+}

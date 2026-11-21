@@ -1,0 +1,12 @@
+{
+  "entries": {"zh": "entries 至少一条", "en": "entries needs at least one item"},
+  "entry_shape": {"zh": "entries[{i}] 必须是对象", "en": "entries[{i}] must be an object"},
+  "entry_id": {"zh": "entries[{i}] 缺 entry_id（原生请求标识）", "en": "entries[{i}] needs entry_id (the native request id)"},
+  "harness": {"zh": "entries[{i}] 的受控绑定没有登记宿主",
+              "en": "entries[{i}] has no host registered on its controlled binding"},
+  "at": {"zh": "entries[{i}].at 必须是数字（原生时刻）", "en": "entries[{i}].at must be a number (native time)"},
+  "tokens": {"zh": "entries[{i}] 的 {key} 必须是非负整数或省略",
+             "en": "entries[{i}].{key} must be a non-negative integer or omitted"},
+  "tokens_unknown": {"zh": "entries[{i}].tokens 有不认识的分项 {key}，只收 in / out / cache",
+                     "en": "entries[{i}].tokens has unknown fields {key}; only in / out / cache are accepted"}
+}

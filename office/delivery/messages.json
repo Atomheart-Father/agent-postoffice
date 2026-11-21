@@ -1,0 +1,28 @@
+{
+  "quota_subject": "额度受限：%s",
+  "quota_body": "%s 的宿主报告额度耗尽（status=%s，窗口=%s），自动续工已暂停，待办保留。请按用户授权决定套餐安排；承办人可在原宿主继续。",
+  "tool_stall_subject": "%s 的原生工具调用卡住了",
+  "tool_stall_body": "这次调用在阈值内没有真实进展，重复输出不算进展。请检查该会话，必要时从宿主中断。",
+  "empty_batch": "本轮 %s 没有可投的信。",
+  "batch_header": "本轮 %s 有 %d 封信：",
+  "unavailable_letter": "- %s｜（这封信此刻读不到，请先查清再处理）",
+  "letter": "- %s｜%s｜%s｜需要：%s",
+  "unspecified_need": "（未写）",
+  "read_instruction": "先用 office_letter_read 逐封读正文。需要回信时用 office_letter_send，在 reply_to 填原信编号。",
+  "idle_obsolete": "Office Work is no longer actionable; the queued continuation was skipped.",
+  "idle": "请根据当前受控 Core 待办继续处理已有的 Office Work：先用 office_work_runnable/office_work_get 读取现状，按当前责任继续（承办项完成并按要求提交/发布，待审项走审阅流程）。不要从旧对话猜任务或另建重复 Work；若确需等待外部输入，使用 Work 的 wait 状态后停止自动续工。",
+  "work_assigned": {
+    "subject": "新 Work：%s",
+    "body": "你被派了一件 Work：%s\n目标：%s\n先用 office_work_get 读取现状，完成并按要求提交；要等外部输入就用 Work 的 wait 状态。",
+    "need": "开始并提交这件 Work"
+  },
+  "work_returned": {
+    "subject": "Work 已退回：%s",
+    "body": "你的 Work %s 已被退回。\n退回理由：%s\n请从 office_work_get 核对当前要求，修改后提交。",
+    "need": "处理退回要求并重新提交"
+  },
+  "todo_context": {
+    "zh": "可动手的 Work 共 %d 件，当前列出 %s。用 office_work_runnable 查其余，用 office_work_get 看要求。",
+    "en": "%d actionable Work items. Showing %s. Use office_work_runnable for the rest and office_work_get for instructions."
+  }
+}

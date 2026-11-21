@@ -1,0 +1,337 @@
+#!/usr/bin/env node
+// office-cli: the thin business entry. argv -> one controlled op; the answer is shown as it came.
+//
+// Why this file is short and stays short
+// --------------------------------------
+// The tool table is `ext/office_tool_spec.mjs` (one definition, also consumed by the MCP server and
+// every host adapter), the call path is `ext/office_tools.mjs` (one validator, one act_key rule, one
+// retry_ref rule) and the three outcomes are decided in `ext/office_result.mjs` (one classifier, one
+// exit-code table). What is left for this program is: turn argv into that tool's business fields.
+//
+// What it must never do
+// ---------------------
+//   * report an identity. `--actor`, `--binding-id`, `--generation` do not exist here; the actor,
+//     binding, generation and instance come from the endpoint the host delivered, and the listener
+//     fixed them to the socket. An argument that tried would reach Core as an unknown field and be
+//     refused -- which is the intended outcome, not a gap to fill.
+//   * carry a second field list. Allowed fields are the tool's own JSON schema; anything else is
+//     refused by `validateArgs` with the schema's own sentence, so there is one contract.
+//   * fall back to another entry. There is no `postoffice` passthrough here and no local write:
+//     no endpoint means exit 3 and nothing written.
+//
+// Exit codes (they are the reason `sent` exists in the transport):
+//   0 ok            2 refused            3 unavailable (nothing was sent)            4 unknown (no auto-retry)
+
+import { readFileSync } from "node:fs";
+import { OFFICE_TOOLS } from "../ext/office_tool_spec.mjs";
+import { createOfficeTools, validateArgs } from "../ext/office_tools.mjs";
+import { outcomeOf, exitCodeOf, renderToolResult, OUTCOMES } from "../ext/office_result.mjs";
+import { openSession, splitFlags } from "../ext/office_socket.mjs";
+import { installPiHome } from "../ext/office_pi_install.mjs";
+import { installOpenCode } from "../ext/office_opencode_install.mjs";
+import { installCodexHooks } from "../ext/office_codex_install.mjs";
+
+//: verb -> the tool it names, plus the positional arguments that verb takes (in order).
+//  This is argv shape only. Every field name, type and `required` comes from the tool's schema.
+const VERBS = {
+	whoami: { tool: "office_whoami", positional: [] },
+	lookup: { tool: "office_lookup", positional: [] },
+	"binding revoke": { tool: "office_binding_revoke", positional: [] },
+	"coord respond": { tool: "office_coord_respond", positional: ["item", "choice"] },
+	"request create": { tool: "office_request_create", positional: ["kind", "target"] },
+	"request list": { tool: "office_request_list", positional: [] },
+	"request admin-set": { tool: "office_request_admin_set", positional: [] },
+	"request decide": { tool: "office_request_decide", positional: ["request_ref", "decision"] },
+	"request withdraw": { tool: "office_request_withdraw", positional: ["request_ref"] },
+	"request revoke": { tool: "office_request_revoke", positional: ["request_ref"] },
+	"handover return": { tool: "office_handover_return", positional: ["position"] },
+	"identity join": { name: "identity join", op: "identity.join", positional: ["session_ref"],
+		parameters: { properties: { session_ref: { type: "string" }, surface: { type: "string" } },
+			required: ["session_ref"], additionalProperties: false } },
+	"identity deactivate": { tool: "office_identity_deactivate", positional: [] },
+	"position retire": { tool: "office_position_retire", positional: ["position"] },
+	"usage read": { tool: "office_usage_read", positional: [] },
+	"release status": { tool: "office_release_status", positional: [] },
+	send: { tool: "office_letter_send", positional: ["to"] },
+	list: { tool: "office_letter_list", positional: [] },
+	read: { tool: "office_letter_read", positional: ["letter_id"] },
+	archive: { tool: "office_letter_archive", positional: ["letter_id"] },
+	revise: { tool: "office_letter_revise", positional: ["letter_id", "to"] },
+	retract: { tool: "office_letter_retract", positional: ["letter_id", "to"] },
+	"work list": { tool: "office_work_list", positional: [] },
+	"work get": { tool: "office_work_get", positional: ["work_ref"] },
+	"work runnable": { tool: "office_work_runnable", positional: [] },
+	"work read": { tool: "office_work_read", positional: ["work_ref"] },
+	"work create": { tool: "office_work_create", positional: [] },
+	"work update": { tool: "office_work_update", positional: ["work_ref"] },
+	"work withdraw": { tool: "office_work_withdraw", positional: ["work_ref"] },
+	"work publish": { tool: "office_work_publish", positional: ["work_ref"] },
+	"work review": { tool: "office_work_review", positional: ["work_ref"] },
+	"grant create": { tool: "office_grant_create", positional: [] },
+	"grant revoke": { tool: "office_grant_revoke", positional: ["grant_ref"] },
+	"grant list": { tool: "office_grant_list", positional: [] },
+	"project create": { tool: "office_project_create", positional: [] },
+	"grant show": { tool: "office_grant_show", positional: ["grant_ref"] },
+};
+
+//: Verbs this program answers itself: no tool, no wire, no session.
+const LOCAL_VERBS = {
+	"install codex-hooks": "[--home DIR]：按本机 Office 安装目录配置 Codex 用户级钩子",
+	"install opencode": "[--home DIR]：安装或升级此固定发布包的 OpenCode 全局入口",
+	"install pi": "--home DIR：安装或升级 Pi 用户级入口",
+};
+
+//: 本树被 Pi 加载的那一个文件（与 `pi install` 要的同一个路径），只从自身位置算一次。
+
+const BY_NAME = Object.fromEntries(OFFICE_TOOLS.map((t) => [t.name, t]));
+
+/**
+ * The usage text, derived from the two things that already know the answer.
+ *
+ * A hand-written list was a third copy of the verb table: it said `--reviewer` for `work create`
+ * after that name had moved, and it could name a command the table had dropped. The verbs come from
+ * `VERBS` and the field names from each tool's own schema, so the only prose left is the header.
+ */
+function usage() {
+	const lines = [`office-cli [--home DIR] [--box BOX] [--descriptor FILE] [--json] [--locale zh|en]`, ""];
+	const width = Math.max(...Object.keys(VERBS).map((v) => v.length));
+	for (const [verb, spec] of Object.entries(VERBS)) {
+		const props = Object.keys((BY_NAME[spec.tool] ?? spec).parameters?.properties ?? {});
+		const free = spec.positional.filter((p) => !props.includes(p));
+		const shown = [...spec.positional, ...props.filter((p) => !spec.positional.includes(p))];
+		const flags = shown.map((f) => (spec.positional.includes(f) || free.includes(f)
+			? `<${f}>`                                     // a value the verb takes by position
+			: `[--${f.replace(/_/g, "-")}]`));
+		// `--body-file` is argv mechanics, not a schema field: the letter has a body, not a path.
+		if (props.includes("body")) flags.push("[--body-file F]");
+		lines.push(`  ${verb.padEnd(width)}  ${flags.join(" ")}`.trimEnd());
+	}
+	const lw = Math.max(...Object.keys(LOCAL_VERBS).map((v) => v.length));
+	lines.push("", "Local (no wire, no session):");
+	for (const [verb, what] of Object.entries(LOCAL_VERBS))
+		lines.push(`  ${verb.padEnd(lw)}  ${what}`);
+	lines.push("", "Identity is never an argument: it comes from the controlled endpoint the host delivered.");
+	return lines.join("\n");
+}
+
+function fail(message, code = 2) {
+	process.stderr.write(`office-cli: ${message}\n`);
+	process.exitCode = code;
+}
+
+/**
+ * Globals are recognised anywhere, then the longest matching verb (so `work list` beats `work`).
+ *
+ * Positionally they would be a trap: `send bob --subject s --json` puts `--json` after business
+ * fields, and a parser that only looks before the verb would then hand it to the tool as a field
+ * named `json`. These four names are not business fields of any tool, so pulling them out first is
+ * unambiguous and keeps "print JSON" available in the natural place.
+ */
+function parse(argv) {
+	// The four connection flags come from the one reader the MCP server also uses; the rest of the
+	// vocabulary below (`--json`, verbs) is this entry's own.
+	const got = splitFlags(argv);
+	const opts = { home: "", box: "", descriptor: "", json: false, locale: "", ...got.values };
+	opts.json = got.rest.includes("--json");
+	const rest = got.rest.filter((a) => a !== "--json");
+	// A two-word verb wins over its first word — for business verbs and the local ones alike, so
+	// `install pi` is not mistaken for an unknown `install`.
+	const two = rest.slice(0, 2).join(" ");
+	const pair = VERBS[two] || LOCAL_VERBS[two] ? two : "";
+	const verb = pair || rest[0];
+	return { opts, verb, tail: rest.slice(pair ? 2 : 1) };
+}
+
+/** The tool's own schema decides the type of each flag; this only moves text into it. */
+function coerce(prop, raw) {
+	const type = prop?.type;
+	if (type === "object") {
+		try { return JSON.parse(raw); } catch { return raw; }
+	}
+	if (type === "integer") {
+		const n = Number(raw);
+		return Number.isFinite(n) ? n : raw;      // a bad number stays text and the schema refuses it
+	}
+	if (type === "array") {
+		// Array shapes are decided by the schema's own `items`, never by a second flag:
+		//   * objects only (`relations`, `references`) -- every element is JSON;
+		//   * string-or-object (`work_publish/files`, `work_update/add`) -- JSON when the text *is*
+		//     JSON, otherwise the plain comma list exactly as before.
+		// A JSON object carries commas and braces of its own, so the platform parser splits it, not a
+		// scanner: a complete array parses as itself, a `{...}` is the same array without brackets,
+		// and anything the parser rejects stays one text element for the shared validator to refuse.
+		const items = prop?.items ?? {};
+		const typed = items.type === "object" || (items.anyOf ?? []).some((t) => t?.type === "object");
+		const text = String(raw).trim();
+		if (typed && (items.type === "object" || /^[[{]/.test(text))) {
+			try {
+				const arr = JSON.parse(text.startsWith("[") ? text : `[${text}]`);
+				if (Array.isArray(arr)) return arr;
+			} catch { /* not JSON: falls through as text */ }
+			return [text];
+		}
+		return text.split(",").map((s) => s.trim()).filter(Boolean);
+	}
+	return raw;
+}
+
+/**
+ * argv tail -> the tool's business fields.
+ *
+ * `--x-y` names the field `x_y`. A boolean field takes no value; everything else takes one. An
+ * unknown `--flag` is kept as a field of that name on purpose: `validateArgs` then refuses it with
+ * the same sentence the model gets, listing the fields this tool really accepts. Dropping it here
+ * would make the CLI quietly accept what the tool path rejects.
+ */
+function toArgs(tool, positional, tail) {
+	const props = tool.parameters?.properties ?? {};
+	const args = {};
+	const free = [...positional];
+	let i = 0;
+	while (i < tail.length) {
+		const a = tail[i];
+		if (!a.startsWith("--")) {
+			const slot = free.shift();
+			if (!slot) throw new Error(`${tool.name} 不接受多余的位置参数 ${a}`);
+			args[slot] = a;
+			i += 1;
+			continue;
+		}
+		const eq = a.indexOf("=");
+		const name = (eq > 0 ? a.slice(0, eq) : a).slice(2).replace(/-/g, "_");
+		const prop = props[name] ?? (name === "body_file" ? props.body : undefined);
+		if (prop?.type === "boolean") {
+			// bare = true; `--x=false` / `--x=true` honoured as written; anything else refused
+			// before anything is sent — a wrong explicit value must not become true.
+			const v = eq > 0 ? a.slice(eq + 1) : "true";
+			if (v !== "true" && v !== "false")
+				throw new Error(`--${name.replace(/_/g, "-")} 是布尔开关：--x（真）或 --x=false（假），不能是 ${JSON.stringify(v)}`);
+			args[name] = v === "true";
+			i += 1;
+			continue;
+		}
+		const value = eq > 0 ? a.slice(eq + 1) : tail[i + 1];
+		if (value === undefined) throw new Error(`--${name.replace(/_/g, "-")} 需要一个值`);
+		args[name] = coerce(prop, value);
+		i += eq > 0 ? 1 : 2;
+	}
+	if (props.body && args.body_file !== undefined) {
+		// `--body-file` is argv mechanics, not a business field: the letter has a body, not a path.
+		args.body = readFileSync(args.body_file, "utf8");
+		delete args.body_file;
+	}
+	for (const slot of free) throw new Error(`缺少 ${slot}`);
+	return args;
+}
+
+function main(argv) {
+	let parsed;
+	try {
+		parsed = parse(argv);
+	} catch (e) {
+		fail(e.message);
+		return;
+	}
+	const { opts, verb, tail } = parsed;
+	if (verb === "install pi") {
+		if (!opts.home || tail.length) return fail("install pi --home DIR");
+		try { process.stdout.write(JSON.stringify(installPiHome(opts.home)) + "\n"); }
+		catch (e) { fail(e.message); }
+		return;
+	}
+	if (verb === "install opencode" || verb === "install codex-hooks") {
+		if (tail.length > (verb === "install opencode" ? 1 : 0) || tail[0]?.startsWith("--")) return fail(`${verb} [--home DIR]`);
+		try {
+			const result = verb === "install opencode" ? installOpenCode(tail[0], opts.home) : installCodexHooks(opts.home || undefined);
+			const version = result.version ? ` (${result.version})` : "";
+			process.stdout.write(opts.json ? JSON.stringify(result) + "\n" : `${result.state}: ${result.path}${version}\n`);
+		} catch (e) { fail(e.message); }
+		return;
+	}
+	if (!verb || verb === "help" || verb === "--help" || verb === "-h") {
+		// `help` is not a business verb: nothing is sent, and a person asking what exists is not an error.
+		const asked = Boolean(verb);
+		(asked ? process.stdout : process.stderr).write(usage() + "\n");
+		process.exitCode = asked ? 0 : 2;
+		return;
+	}
+	if (!VERBS[verb]) {
+		fail(`不认识的命令 ${verb}`, 2);
+		process.stderr.write(usage() + "\n");
+		return;
+	}
+	const spec = VERBS[verb];
+	const tool = BY_NAME[spec.tool];
+	if (!tool && !spec.op) {
+		// The verb table and the shared tool table disagree. That is a defect in this build, not a
+		// business answer, so it is said as one: nothing was sent and the name is missing.
+		fail(`这条命令还没接通（共用工具表里没有 ${spec.tool}）：没有发出任何请求`);
+		return;
+	}
+	let args;
+	try {
+		args = toArgs(tool ?? spec, spec.positional, tail);
+		if (spec.op) {
+			const invalid = validateArgs(spec, args);
+			if (invalid) throw new Error(invalid.message_zh);
+		}
+	} catch (e) {
+		fail(e.message);
+		return;
+	}
+
+	const session = openSession({ home: opts.home, box: opts.box,
+		descriptor: opts.descriptor, locale: opts.locale });
+	const locale = session.locale;
+
+	// No endpoint is a real answer ("the line is not there"), not an empty result: show it through the
+	// same renderer and exit 3. Nothing is written and no local store is consulted.
+	if (!session.ok) {
+		report(session.problem, locale, opts.json);
+		process.exitCode = 3;
+		return;
+	}
+
+	const office = createOfficeTools({ endpoint: session.endpoint, core: session.core,
+		locale: () => locale });
+
+	/**
+	 * `work review` needs this session to have seen the submission it judges: the adapter refuses
+	 * otherwise, because the version it asserts is a concurrency baseline, not a guess.
+	 *
+	 * In a long-lived host the earlier `office_work_get` provides that. The CLI is one process per
+	 * invocation, so nothing is remembered between commands and the review could never succeed.
+	 * Reading the Work first, in this same process, is exactly that step — same call the model would
+	 * make, same collected facts, so the baseline is real rather than asserted by hand.
+	 */
+	async function readForBaseline() {
+		if (spec.tool !== "office_work_review") return;
+		await office.callTool("office_work_get", { work_ref: args.work_ref });
+	}
+
+	readForBaseline().then(() => spec.op
+		? session.core.handle({ op: spec.op, ...args })
+		: office.callTool(spec.tool, args)).then((res) => {
+		report(res, locale, opts.json);
+		process.exitCode = exitCodeOf(res);
+	}).catch((e) => {
+		// An exception here is our own defect, not a business answer: say unknown, never "ok".
+		report({ ok: false, error: "outcome_unknown", message: String(e?.message ?? e) }, locale, opts.json);
+		process.exitCode = 4;
+	}).finally(() => session.core.close?.());
+}
+
+function report(res, locale, asJson) {
+	if (asJson) {
+		process.stdout.write(JSON.stringify(res ?? null) + "\n");
+		return;
+	}
+	const rendered = renderToolResult(res, locale);
+	const text = rendered.content?.[0]?.text ?? "";
+	// A refusal goes to stderr so a shell pipeline never mistakes it for a result; the retry_ref and
+	// the next-step sentence are part of it and stay in one block.
+	if (outcomeOf(res) === OUTCOMES.ok) process.stdout.write(text + "\n");
+	else process.stderr.write(text + "\n");
+}
+
+main(process.argv.slice(2));

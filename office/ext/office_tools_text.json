@@ -1,0 +1,44 @@
+{
+	"messages": {
+		"no_endpoint": {
+			"en": "This session has no controlled Office connection yet (the host has not provided it). If you just registered, call this tool again shortly; if it still fails, reload the Office extension in this host (do not start another session or process).",
+			"zh": "本会话还没有受控 Office 连接（宿主还没交付）。刚完成登记的话，稍后再调用一次这条工具；仍不行就让当前宿主重载 Office 扩展（不要另开会话或另起进程）。"
+		},
+		"outcome_unknown_letter": {
+			"en": "The request was sent but no answer came back, so it may or may not have taken effect. Pass the retry_ref from this answer with every other field unchanged to continue that same letter (Core replays the original outcome); calling again WITHOUT it is a NEW letter, even with identical text.",
+			"zh": "请求已发出但没收到结果，不确定是否已生效。带上这次返回的 retry_ref、其它字段一字不改再调一次，就是同一封信（Core 按原动作事实回放）；**不带回执再调一次就是新的一封**，即使正文一样。"
+		},
+		"outcome_unknown_write": {
+			"en": "The request was sent but no answer came back, so it may or may not have taken effect. Calling again with the same arguments reuses the original key while this tools connection instance survives. After the connection is rebuilt or the process restarts, check existing results first: a retry may create a second action.",
+			"zh": "请求已发出但没收到结果，不确定是否已生效。当前工具连接实例未重建时，按原参数再调一次会复用原请求键。连接重建或进程重启后认不出；这时先核已有结果，避免重试变成第二笔。"
+		},
+		"retry_hint": {
+			"en": "To continue this same letter: call this tool again with the same retry_ref and every other field unchanged - the adapter then treats it as the same action, Core replays the original outcome, and it will not become a second letter. Calling again without the receipt is a NEW letter, even with identical text.",
+			"zh": "要把这封信继续下去：带同一个 retry_ref、其它字段一字不改再调一次本工具 —— 适配器会把这次认成同一个操作，Core 按原动作事实回放，不会变成第二封。不带回执再调一次就是**新的一封**（正文一样也一样）。"
+		},
+		"retry_ref_invalid": {
+			"en": "That retry_ref is not a usable continuation receipt (do not invent one). Leave it out to send a new letter, or copy the value from the previous answer unchanged to continue that one.",
+			"zh": "retry_ref 不能当续接回执用（别自己编）。要新发一封就别填它；要续接就把上一回答里的值原样抄回来。"
+		},
+		"retry_ref_mismatch": {
+			"en": "That retry_ref does not belong to this call ({why}); nothing was sent. Keep the original fields to continue it, or drop retry_ref to send a new letter.",
+			"zh": "retry_ref 与这次调用对不上（{why}），没有发出任何信。要续接就保持原收件人/事由/需要/正文不变；要发新信就别带 retry_ref。"
+		},
+		"unknown_tool": {
+			"en": "Unknown tool {work}",
+			"zh": "未知工具 {work}"
+		},
+		"view_ambiguous": {
+			"en": "This session saw submission {sub} in several different states (v{versions}); open it again with office_work_get, then decide.",
+			"zh": "你在本会话里看过 {sub} 的几个不同状态（v{versions}）；请重新 office_work_get 确认后再判定。"
+		},
+		"view_required": {
+			"en": "Open {work} with office_work_get first to see submission {sub} (this session has not seen it yet).",
+			"zh": "先用 office_work_get 打开 {work}，确认你要审核的提交 {sub}（本会话还没看过它）。"
+		}
+	},
+	"validate": {
+		"en": "{tool} refused to run: {problem} (nothing was sent). Fields this tool accepts: {allowed}. Fill those in and call it again; do not substitute another name (unknown fields are always refused, never mapped to a similar one).",
+		"zh": "{tool} 拒绝执行：{problem}（没有发出任何请求）。这个工具允许的字段：{allowed}{required_clause}。按这些字段重填再调一次；不要用别的名字代替（不认识的字段一律拒绝，不会被当成近义字段）。"
+	}
+}

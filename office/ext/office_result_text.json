@@ -1,0 +1,58 @@
+{
+	"guide": {
+		"busy": {
+			"en": "The system was busy (already retried); try the same call again later.",
+			"zh": "系统暂时忙，已自动重试过；稍后再试同一调用。"
+		},
+		"capability_missing": {
+			"en": "This capability is not wired into this session (not your mistake); use another way or tell your manager.",
+			"zh": "这项能力在本会话没有接入（不是你的错误）；改用其他可用方式或告诉负责人。"
+		},
+		"conflict": {
+			"en": "The current state does not allow this action (see the message).",
+			"zh": "当前状态不允许这个动作（见说明）。"
+		},
+		"forbidden": {
+			"en": "Not accessible to you (or your session was revoked).",
+			"zh": "没有访问资格（或你的会话已被撤销）。"
+		},
+		"invalid_request": {
+			"en": "A field is wrong (see the message); fix it and retry.",
+			"zh": "请求字段有问题（见说明），修正后再试。"
+		},
+		"no_controlled_endpoint": {
+			"en": "This session has no controlled Office connection right now. The host only knows there is none, not why (never joined, or unbound / handed to another session by management). Do not guess by reloading extensions, starting another process or re-binding yourself. Joining is the user's choice and has no command of its own here; continue another way.",
+			"zh": "本会话现在没有受控 Office 连接。宿主只知道「没有」，看不到原因（可能从未接入，也可能已由管理侧解绑或换给别的会话）；不要靠重载扩展、另起进程或自己重绑去猜。接入与否由用户决定，这里没有可用的接入命令；没有接入需要时就按别的办法继续。"
+		},
+		"not_found": {
+			"en": "Not found; check that the reference came from office_work_list / office_lookup.",
+			"zh": "没有找到这个对象；检查引用是否来自 office_work_list / office_lookup。"
+		},
+		"stale": {
+			"en": "The object changed after you looked at it; nothing was applied. Re-open it with office_work_get, then decide.",
+			"zh": "对象在你查看后已变化，本次未应用。先 office_work_get 重新查看，再决定是否继续。"
+		},
+		"unauthorized_attempt": {
+			"en": "Your current role cannot do this; the message above says what is missing and whom to ask.",
+			"zh": "你当前的职责不能做这个操作；说明里写了缺什么能力、该找谁。"
+		}
+	},
+	"no_endpoint_state": {
+		"authorization_missing": {
+			"en": "The mailbox's line still points at this session, but its receive authorization is missing or belongs to another session, so the controlled endpoint cannot attach. This is not an unbind, and not something to fix yourself: do not reload extensions, start another process or re-bind yourself; tell your manager to use the existing recovery rules.",
+			"zh": "这个信箱的线还指着本会话，但收信授权不在（缺失或不属于本会话），受控端点因此接不上。这不是解绑，也不是你该自己修的事：不要重载扩展、另起进程或自己重绑，报告给负责人按既有恢复规则处理；"
+		},
+		"not_connected": {
+			"en": "This session is not connected to any mailbox. The host can only confirm there is none, not why (never joined, or unbound earlier); do not guess by reloading extensions, starting another process or re-binding yourself. Joining is the user's choice: unless the user asks to join Office, do not join, look up projects or contact colleagues.",
+			"zh": "本会话没有受控 Office 连接：既没有交付的描述文件，也不知道是哪个信箱（--box）。宿主只能确认没有连接，说不出原因（从未接入，或早先被解绑）；不要靠重载扩展、另起进程或自行重绑去猜。接入与否由用户决定：除非用户要求接入 Office，不要擅自接入、查项目或联系同事。"
+		},
+		"registered_pending": {
+			"en": "No controlled endpoint was found for this session. If Office access was just approved, try again shortly. If an existing connection fails, tell your manager.",
+			"zh": "未找到本会话的受控端点。如果接入刚获批准，可以稍后重试。已有连接失效时，请报告给负责人。"
+		},
+		"unbound": {
+			"en": "This mailbox is no longer received by this session (unbound by management, e.g. notify-only). That is a normal management outcome, not a fault: do not try to restore receive rights, and do not reload extensions, start another process or re-bind yourself. Reconnecting is management's call, not yours.",
+			"zh": "这个信箱已经不由本会话接收（管理侧解绑，例如改成只通知）。这是正常的管理结果，不是故障：不要再尝试恢复接收权，也不要重载扩展、另起进程或自己重绑。能否重新接入由管理侧决定，不归你处理。"
+		}
+	}
+}

@@ -1,0 +1,839 @@
+{
+	"_office_connect": {
+		"description": "Connect this session to its issued Office descriptor",
+		"usage": "用法：/office-connect <已签发的 descriptor 路径>",
+		"already_connected": "当前会话已有 Office 连接，请先使用原有连接。",
+		"wrong_endpoint": "无法连接：端点不可用或不属于当前会话。",
+		"connected": "Office 已连接到当前会话。",
+		"tools_failed": "Office 工具加载失败。",
+		"unavailable": "无法连接：端点或受控线路不可用。"
+	},
+	"_opencode_connect": {
+		"busy": "Office is already connected or connecting",
+		"descriptor": "Choose an Office descriptor in the current Office home",
+		"wrong_session": "The descriptor is unavailable or does not belong to this session"
+	},
+	"_office_join": {
+		"description": {
+			"zh": "新会话第一次使用邮局时直接调此工具，kind=join，只填 reason。个人通信身份无需项目或岗位。登记无需审批，返回 issued 后直接继续。收件地址不清楚时问用户。",
+			"en": "First time using Office in this session? Call with kind=join and a reason to register a personal mailbox without a project or position. No approval is required. Continue when issued. Ask if the recipient's address is unclear."
+		},
+		"required": {
+			"zh": "当前会话还没有邮局身份。先用 office_request_create(kind=join, reason=…)；签发后在原会话直接继续。",
+			"en": "This session has no Office identity yet. Call office_request_create with kind=join and a reason, then continue when issued."
+		}
+	},
+	"_shared": {
+		"REQUEST_REF": { "zh": "申请编号。", "en": "Request reference." },
+		"REQUEST_QUOTES": { "zh": "旧版兼容字段，不参与审批；需要保留的话写在决定理由中。", "en": "Legacy field, not used for approval; include any relevant wording in the decision reason." },
+		"APPOINTMENT_POSITION": { "zh": "岗位名。", "en": "Position name." },
+		"RESOURCE_KIND": {
+			"zh": "资源类型。",
+			"en": "Resource kind."
+		},
+		"RESOURCE_LOCATOR": {
+			"zh": "Skill、MCP 或资料的实际定位。",
+			"en": "Locator of the skill, MCP server, or material."
+		},
+		"RESOURCE_DIGEST": {
+			"zh": "已知的 SHA-256 摘要，格式为 sha256:<64 位小写十六进制>。",
+			"en": "Known SHA-256 digest as sha256:<64 lowercase hex digits>."
+		},
+		"RESOURCE_TARGET_KIND": {
+			"zh": "目标类型，岗位或 Work。",
+			"en": "Target type: position or Work."
+		},
+		"RESOURCE_TARGET_REF": {
+			"zh": "岗位名或 Work 引用。",
+			"en": "Position name or Work reference."
+		},
+		"RESOURCE_REF": {
+			"zh": "资源登记返回的引用。",
+			"en": "Reference returned on resource registration."
+		},
+		"REFERENCE": {
+			"en": "Reference: a resource string, or {resource, version?, sub?, location?, note?, adopted?}. Leave version out when unknown; adopted=true means this exact version must be used",
+			"zh": "参考资料：资源定位字符串，或 {resource, version?, sub?, location?, note?, adopted?}。版本不知道就不填；adopted=true 表示要求采用该准确版本"
+		},
+		"RELATION": {
+			"en": "Relation to an existing Work: belongs_to (parent), modifies (revised Work), waits_for (prerequisite), based_on or references.",
+			"zh": "与已有 Work 的关系：belongs_to（属于）、modifies（修正）、waits_for（等待前置）、based_on（基于）、references（引用）。"
+		},
+		"RELATION_KIND": {
+			"en": "relation",
+			"zh": "关系"
+		},
+		"RELATION_NOTE": {
+			"en": "note",
+			"zh": "说明"
+		},
+		"RELATION_WORK": {
+			"en": "Work reference",
+			"zh": "Work 引用"
+		},
+		"REVIEWER": {
+			"en": "Reviewer: a mailbox, or a role with one holder; write none for no review",
+			"zh": "审核者：员工信箱名或只有一人在岗的岗位；不需要审核写 none"
+		},
+		"WORK": {
+			"en": "Work reference such as prj-1/W17 (from office_work_list, a notice or office_work_get)",
+			"zh": "Work 引用，如 prj-1/W17（来自 office_work_list / 通知 / office_work_get）"
+		}
+	},
+	"_tools": {
+		"office_binding_revoke": {
+			"label": { "zh": "撤销自己的绑定", "en": "Revoke your binding" },
+			"description": { "zh": "撤销自己的会话绑定。缺省撤销当前会话。", "en": "Revoke your own session binding. Defaults to the current session." },
+			"parameters": {
+				"target": { "zh": "可指定自己的另一条绑定。", "en": "Optional ID of another binding you own." },
+				"expect_generation": { "zh": "指定另一条绑定时，填该绑定的当前代次。", "en": "Current generation when targeting another binding." }
+			}
+		},
+		"office_request_list": {
+			"label": { "zh": "查看申请", "en": "List requests" },
+			"description": { "zh": "查看自己的申请和有权处理的申请。审批用当前申请号和版本。", "en": "List your requests and those you can decide. Use the current request reference and version to decide." },
+			"parameters": {
+				"state": { "zh": "状态，默认 pending。", "en": "State, defaults to pending." },
+				"limit": { "zh": "每页最多返回几条。", "en": "Maximum requests per page." },
+				"cursor": { "zh": "上一页的 next_cursor。", "en": "The preceding page's next_cursor." }
+			}
+		},
+		"office_request_create": {
+			"label": { "zh": "提交申请", "en": "Submit request" },
+			"description": { "zh": "申请本人上岗：用 office_lookup 查项目，再提交 kind=holder。经理批准后，邮局把岗位绑定到本会话。新会话用 join 自助开个人信箱。", "en": "To join a project, find it with office_lookup and submit kind=holder. Manager approval binds the position to this session. Use join to open a personal mailbox." },
+			"parameters": {
+				"kind": { "zh": "holder 任职，grant/revoke 授权/收回，project 建项目，deactivate 停用个人，retire 撤岗，unbind 撤绑定，broadcast 广播，read_mail 读指定信件，join 自助开箱（只填 reason）。", "en": "holder: appoint; grant/revoke: change authority; project: create; deactivate: disable a person; retire: close a position; unbind: revoke a binding; broadcast: announce; read_mail: read specific letters; join: open a personal mailbox (reason only)." },
+				"target": { "zh": "holder 申请自己上岗时省略，替他人申请填个人信箱。unbind 填绑定号，broadcast 填标题，retire 填 position，read_mail 填信箱名。", "en": "For holder, omit to appoint this session or give the successor's mailbox. For unbind use a binding ID, broadcast a title, retire a position, read_mail a mailbox." },
+				"reason": { "zh": "申请理由。", "en": "Reason for the request." },
+				"params": { "zh": "申请参数。授权填 scope、actions，可选 project_ref 和 expires_at。建项目填 name 和 workspace_refs，广播填 body，读信填信件编号数组 letter_ids。", "en": "For grants, specify scope and actions, optionally project_ref and expires_at. For projects, specify name and workspace_refs. For broadcasts, specify body. For read_mail, provide an array of letter IDs in letter_ids." },
+				"create": { "zh": "新项目岗位填 {position:{project_ref:\"prj-…\"}}，用 office_lookup 返回的项目编号。name、duties、reports_to 可省略；reports_to 只填 @岗位。组织岗位明确填 project_ref:null。已有岗位省略 create。随岗位新建项目另填 project（name、owner_ref、workspace_refs）。", "en": "For a new project position use {position:{project_ref:\"prj-…\"}} with the reference from office_lookup. Name, duties and reports_to are optional; use an @position for reports_to. For an organization position set project_ref to null. Omit create for an existing position. To create a project with the position, add project (name, owner_ref, workspace_refs)." }
+			}
+		},
+		"office_request_decide": {
+			"label": { "zh": "处理申请", "en": "Decide request" },
+			"description": { "zh": "在自己的权限内决定原申请，记录审批人和理由；拿不准可转给用户。", "en": "Decide the request within your authority, recording the decision and reason; refer it to the user when unsure." },
+			"parameters": {
+				"decision": { "zh": "approve 批准，refuse 拒绝，to_user 转给用户。", "en": "approve, refuse, or refer to the user with to_user." },
+				"expected_version": { "zh": "申请的当前版本，见 office_request_list 或待批邮件。", "en": "Current request version from office_request_list or the decision notice." },
+				"reason": { "zh": "决定理由，可省略。", "en": "Optional decision reason." }
+			}
+		},
+		"office_request_withdraw": {
+			"label": { "zh": "撤回申请", "en": "Withdraw request" },
+			"description": { "zh": "撤回本人尚待处理的申请。", "en": "Withdraw your own pending request." }
+		},
+		"office_request_revoke": {
+			"label": { "zh": "撤销读信批准", "en": "Revoke mail approval" },
+			"description": { "zh": "原审批人或老板撤销一条已批准的读信申请，立即收回这次授予的读取权限。", "en": "The original approver or the user can revoke an approved request to read specified letters. The access granted by that request ends immediately." }
+		},
+		"office_identity_deactivate": {
+			"label": { "zh": "停用本人身份", "en": "Deactivate own identity" },
+			"description": { "zh": "停用本人的个人身份。停用别人走申请。", "en": "Deactivate your own identity. Submit a request to deactivate someone else." }
+		},
+		"office_position_retire": {
+			"label": { "zh": "撤岗", "en": "Retire a position" },
+			"description": { "zh": "经理撤掉本项目的普通岗位。撤经理岗或组织岗走申请。", "en": "Retire a regular position in a project you manage. Submit a request to retire a manager or organization position." },
+			"parameters": { "cancel_work": { "zh": "是否取消仍待该岗位处理的 Work。", "en": "Cancel Work still assigned to the position." } }
+		},
+		"office_handover_return": {
+			"label": { "zh": "交还本人岗位", "en": "Step down from a position" },
+			"description": { "zh": "现任本人交还后，岗位变为空缺。岗位的信、Work 和待办留在岗位上。", "en": "Vacate a position you currently hold. Its mail, Work, and pending items stay with the position." }
+		},
+		"office_coord_respond": {
+			"label": { "zh": "处理统筹待办", "en": "Respond to a coordination item" },
+			"description": { "zh": "处理一封 Work 阻塞通知。可自行接手、交回承办人或等到指定时间。", "en": "Respond to a Work blockage notice by handling it, delegating it to the assignee, or waiting until a deadline." },
+			"parameters": {
+				"item": { "zh": "统筹通知的邮件编号。", "en": "Letter ID of the coordination notice." },
+				"choice": { "zh": "handle 接手、delegate 交回承办人、wait 继续等待。", "en": "Handle, delegate to the assignee, or wait." },
+				"reason": { "zh": "处理理由，可省略。", "en": "Optional reason for the decision." },
+				"deadline": { "zh": "选择 wait 时必填。填写未来的 Unix 时间戳，单位为秒。", "en": "Required for wait. A future Unix timestamp in seconds." }
+			}
+		},
+		"office_request_admin_set": {
+			"label": {"zh": "设置管理员审批", "en": "Set administrator approvals"},
+			"description": {"zh": "老板开启或关闭管理员处理组织申请。", "en": "The operator enables or disables administrator approval of organization requests."},
+			"parameters": {"enabled": {"zh": "是否开启管理员审批。", "en": "Whether administrator approvals are enabled."}}
+		},
+		"office_usage_read": {
+			"label": {"zh": "查看用量", "en": "Read usage"},
+			"description": {"zh": "查看本人或可见项目的用量，分别显示已计入的用量和未覆盖项。", "en": "Read personal usage or usage for visible Work in a project. Counted usage and coverage gaps are shown separately."},
+			"parameters": {
+				"project_ref": {"zh": "项目引用。省略时查看本人用量。", "en": "Project reference. Omit for personal usage."},
+				"group_by": {"zh": "填 binding 按绑定分组。", "en": "Use binding to group by binding."}
+			}
+		},
+		"office_release_status": {
+			"label": {
+				"zh": "查看发布状态",
+				"en": "Read release status"
+			},
+			"description": {
+				"zh": "查看项目发版与窗口实载版本。老板省略项目可看全部有效绑定。未上报显示未知。",
+				"en": "Read releases and loaded versions. The operator may omit the project to see all active bindings. Unreported versions are unknown."
+			},
+			"parameters": {
+				"project_ref": {"zh": "要查的项目。仅管理一个项目时可省略。", "en": "Project to inspect. May be omitted if you manage exactly one project."}
+			}
+		},
+		"office_resource_register": {
+			"label": {
+				"zh": "登记资源",
+				"en": "Register resource"
+			},
+			"description": {
+				"zh": "登记 Skill、MCP 或资料，返回资源引用。",
+				"en": "Register a skill, MCP server, or material and return its resource reference."
+			}
+		},
+		"office_resource_assign": {
+			"label": {
+				"zh": "分配资源",
+				"en": "Assign resource"
+			},
+			"description": {
+				"zh": "把已登记的资源分配给岗位或 Work。",
+				"en": "Assign a registered resource to a position or Work."
+			}
+		},
+		"office_resource_unassign": {
+			"label": {
+				"zh": "取消资源分配",
+				"en": "Unassign resource"
+			},
+			"description": {
+				"zh": "取消岗位或 Work 的该项资源分配。",
+				"en": "Remove a resource assignment from a position or Work."
+			}
+		},
+		"office_resource_status": {
+			"label": {
+				"zh": "查看资源状态",
+				"en": "Read resource status"
+			},
+			"description": {
+				"zh": "查看已分配、已加载及实际可用。null 表示当前没有该项观测。",
+				"en": "Read assignment, loading, and availability. Null means the current observation is unknown."
+			}
+		},
+		"office_grant_create": {
+			"description": {
+				"en": "Request project management authority for a person or position, for example scope=[\"prj-2\"], actions=[\"project.manage\"]. For ordinary appointments use holder; for assignments use office_work_create.",
+				"zh": "申请授予项目管理权，例如 scope=[\"prj-2\"]、actions=[\"project.manage\"]。普通任职用 holder，派发用 office_work_create。"
+			},
+			"label": {
+				"en": "Grant",
+				"zh": "授权"
+			},
+			"parameters": {
+				"actions": {
+					"en": "The supported action is project.manage.",
+					"zh": "当前唯一动作是 project.manage。"
+				},
+				"expires_at": {
+					"en": "Optional: expiry (ISO time)",
+					"zh": "可选：到期时间（ISO 时间）"
+				},
+				"project_ref": {
+					"en": "Optional: the project this grant belongs to",
+					"zh": "可选：所属项目"
+				},
+				"scope": {
+					"en": "One project reference, for example prj-2.",
+					"zh": "一个项目引用，例如 prj-2。"
+				},
+				"subject_ref": {
+					"en": "Grantee: a mailbox or a position",
+					"zh": "被授权人：员工信箱名或岗位"
+				}
+			}
+		},
+		"office_grant_list": {
+			"description": {
+				"en": "List visible grants and their state, including grants to or from you. The visible field reports scope.",
+				"zh": "列可见的授权及状态，含发给自己和自己发出的授权。visible 表示可见范围。"
+			},
+			"label": {
+				"en": "Grants",
+				"zh": "授权列表"
+			},
+			"parameters": {
+				"include_revoked": {
+					"en": "Optional: false = only the ones that still hold (by default revoked and expired are listed too)",
+					"zh": "可选：false = 只看现在还有效的（默认连已撤/已过期一起列）"
+				},
+				"project_ref": {
+					"en": "Optional: only grants related to this project",
+					"zh": "可选：只看与这个项目有关的授权"
+				},
+				"subject_ref": {
+					"en": "Optional: only grants given to this person or position",
+					"zh": "可选：只看发给这个人或岗位的授权"
+				}
+			}
+		},
+		"office_grant_revoke": {
+			"description": {
+				"en": "Request revocation of a grant by its grant_ref. Returns the request reference and decision state.",
+				"zh": "申请收回一条授权。用授权结果里的 grant_ref，返回申请编号和处理状态。"
+			},
+			"label": {
+				"en": "Revoke grant",
+				"zh": "撤销授权"
+			},
+			"parameters": {
+				"grant_ref": {
+					"en": "The grant to revoke, e.g. G3",
+					"zh": "要撤销的授权引用，如 G3"
+				}
+			}
+		},
+		"office_grant_show": {
+			"description": {
+				"en": "Read one grant's full facts by grant_ref: scope, actions, evidence/decision/artifact scopes, who issued it and when, whether it still holds, and its event stream (who issued or revoked what, when).",
+				"zh": "按 grant_ref 读一条授权的完整事实：范围、动作、证据/决定/成果范围、发授人与时间、当前是否有效，以及它的事件流（谁在什么时候发了什么、撤了什么）。"
+			},
+			"label": {
+				"en": "Show a grant",
+				"zh": "查一条授权"
+			},
+			"parameters": {
+				"grant_ref": {
+					"en": "The grant to read, e.g. G3 (from office_grant_list)",
+					"zh": "要读的授权引用，如 G3（来自 office_grant_list）"
+				}
+			}
+		},
+		"office_letter_revise": {
+			"description": {"en": "Revise your sent letter for one direct recipient before delivery begins.", "zh": "投递开始前，修订自己发给一个主送收件人的信。"},
+			"label": {"en": "Revise sent letter", "zh": "改信"},
+			"parameters": {"content_version": {"en": "Expected version for this recipient. A newly sent letter starts at 1.", "zh": "该收件箱的当前正文版本。新信从 1 开始。"}}
+		},
+		"office_letter_retract": {
+			"description": {"en": "Retract your sent letter for one direct recipient before delivery begins.", "zh": "投递开始前，撤回自己发给一个主送收件人的信。"},
+			"label": {"en": "Retract sent letter", "zh": "撤信"}
+		},
+		"office_letter_archive": {
+			"description": {
+				"en": "Optionally file a letter from your personal inbox or a position carried by this session. Filing is not handling, replying or waking anyone. Settled letters are filed automatically.",
+				"zh": "可选整理动作。按信件编号归档本人或本会话承载岗位的来信。归档不回信、不唤醒、也不等于办完；已结清的信会自动归档。"
+			},
+			"label": {
+				"en": "File a letter",
+				"zh": "归档来信"
+			},
+			"parameters": {
+				"letter_id": {
+					"en": "Full letter ID.",
+					"zh": "完整信件编号。"
+				},
+				"unit": {
+					"en": "Recipient mailbox or @position. Omit for a personal letter or a single eligible position.",
+					"zh": "收件箱名或 @岗位。个人件或只投到一个本会话岗位时可省略。"
+				}
+			}
+		},
+		"office_letter_list": {
+			"description": {
+				"en": "List inbox metadata, excluding archived letters by default. Use office_letter_read for the body. Filing is optional.",
+				"zh": "列收件箱，默认排除已归档信。用 office_letter_read 读正文。归档可选。"
+			},
+			"label": {
+				"en": "Inbox",
+				"zh": "收件箱"
+			},
+			"parameters": {
+				"include_archived": {
+					"en": "Optional: include archived letters too (default: no)",
+					"zh": "可选：连已归档的也列出来（默认不列）"
+				}
+			}
+		},
+		"office_letter_read": {
+			"description": {
+				"en": "Read a letter by ID, leaving its filing and completion state unchanged. Continue long bodies using body_page.cursor.",
+				"zh": "按编号读信。归档和处理状态保持原样。长信按 body_page.cursor 续读。"
+			},
+			"label": {
+				"en": "Read a letter",
+				"zh": "读信"
+			},
+			"parameters": {
+				"include_archived": {
+					"en": "Optional: read it even if it has been archived",
+					"zh": "可选：这封已归档也照样读出来"
+				},
+				"letter_id": {
+					"en": "Letter id (the inbox file name without .md; copy it whole, a shortened id is refused)",
+					"zh": "信的编号（收件箱里的文件名去掉 .md，抄全；截短会被拒）"
+				},
+				"target": { "zh": "信箱名。经 read_mail 批准的信填获批的信箱。", "en": "Mailbox name. For read_mail approval, use the approved mailbox." },
+				"cursor": {
+					"en": "Previous page's body_page.cursor.",
+					"zh": "上一页的 body_page.cursor。"
+				},
+				"limit": {
+					"en": "Body characters per page. Default 8000, max 20000.",
+					"zh": "每页正文字符数。默认 8000，最多 20000。"
+				}
+			}
+		},
+		"office_letter_send": {
+			"description": {
+				"en": "Send ordinary mail as yourself. Direct mail asking for action, including replies, enters wake batching. FYI and cc never wake on their own. Delivery or waiting does not mean read or accepted. After sending, wait for system notifications.",
+				"zh": "用当前身份发普通信。需要行动的直送信（含回信）进入唤醒合批。FYI 和 cc 不单独唤醒。落箱与 waiting 均不代表已读或接单。发出后等系统通知。"
+			},
+			"label": {
+				"en": "Send a letter",
+				"zh": "发信"
+			},
+			"parameters": {
+				"body": {
+					"en": "Body. For Work, give the conclusion, next action and references to the relevant Work or artifact version.",
+					"zh": "正文。涉及 Work 时写结论、下一步和 Work 或成果版本的引用。"
+				},
+				"cc": {
+					"en": "Mailbox names or @positions to copy. Copies can be read or filed and need no reply.",
+					"zh": "抄送的信箱名或 @岗位。抄送人可读、可归档，无需回复。"
+				},
+				"keep_open": {
+					"en": "Optional: with reply_to, true leaves the original open after sending",
+					"zh": "可选：与 reply_to 配合；true 时发送后不收纳原信"
+				},
+				"need": {
+					"en": "State the actual next action (e.g. confirm a date or review a draft). If no action is needed, use FYI. Do not add a request just to trigger a wake.",
+					"zh": "写对方实际要做的事，如确认日期或审核草稿。无需行动时写「仅告知」（FYI）。不要为了唤醒而虚构待办。"
+				},
+				"reply_to": {
+					"en": "Original letter ID. Leave to empty to reply to the sender of ordinary mail in your inbox. The original is filed after sending.",
+					"zh": "原信编号。回本人收件箱的普通信时可省略 to，由邮局找原发件人。发送后归档原信。"
+				},
+				"retry_ref": {
+					"en": "After outcome_unknown, use the returned retry_ref with all other fields unchanged. Omit it for a new letter.",
+					"zh": "仅在 outcome_unknown 后续接同一封信时填上次返回的 retry_ref，其他字段原样重试。"
+				},
+				"subject": {
+					"en": "Subject (one line)",
+					"zh": "事由（单行）"
+				},
+				"to": {
+					"en": "Mailbox or @position from office_lookup. Required for new mail or a reply to an explicitly chosen recipient.",
+					"zh": "用 office_lookup 查信箱名或 @岗位。新信或指定其他收件人时填写。"
+				}
+			}
+		},
+		"office_position_knowledge_read": {
+			"description": {
+				"en": "Read a position's practice notes: every entry (id, section, text, why, when) and the current version. Pass a version to read an older snapshot as text. Allowed for the current holder and anyone above on the reporting line.",
+				"zh": "读取一个岗位的经验笔记：全部条目（id、分区、正文、原因、适用范围）和当前版本；给 version 则以文本读取历史快照。仅该岗位现任持有人和汇报线上级可读。"
+			},
+			"label": {
+				"en": "Read position knowledge",
+				"zh": "读岗位经验"
+			},
+			"parameters": {
+				"position": {
+					"en": "Position name such as app.dev (from office_whoami positions)",
+					"zh": "岗位名，如 app.dev（来自 office_whoami 的 positions）"
+				},
+				"version": {
+					"en": "Optional: a snapshot number from an earlier read, to see that older version",
+					"zh": "可选：此前读到的快照号，用来查看那一版"
+				}
+			}
+		},
+		"office_position_knowledge_update": {
+			"description": {
+				"en": "Update position knowledge as its holder or reporting-line manager. Read the version first and refresh on conflict. Merge or remove entries if over the size limit.",
+				"zh": "现任或汇报线上的上级可改岗位知识。先读版本，冲突时重读。总量超限时先合并或删除。"
+			},
+			"label": {
+				"en": "Update position knowledge",
+				"zh": "改岗位经验"
+			},
+			"parameters": {
+				"position": {
+					"en": "Position name such as app.dev (from office_whoami positions)",
+					"zh": "岗位名，如 app.dev（来自 office_whoami 的 positions）"
+				},
+				"action": {
+					"en": "add | replace | remove | restore",
+					"zh": "add 增加 | replace 改写 | remove 删除 | restore 恢复到某个快照"
+				},
+				"id": {
+					"en": "Entry id such as K3 (replace, remove)",
+					"zh": "条目号，如 K3（replace、remove 时给）"
+				},
+				"text": {
+					"en": "Entry text (add, replace)",
+					"zh": "条目正文（add、replace 时给）"
+				},
+				"section": {
+					"en": "Optional section heading; default is the general section",
+					"zh": "可选：分区标题；不填归入通用分区"
+				},
+				"why": {
+					"en": "Optional: the incident or reason behind this entry",
+					"zh": "可选：这条经验背后的事故或原因"
+				},
+				"when": {
+					"en": "Optional: at most 8 project refs (prj-3) or path prefixes (office/lib); the entry then arrives only with matching work. Leave out for a general entry",
+					"zh": "可选：至多 8 个项目引用（prj-3）或路径前缀（office/lib）；给了则只随匹配的派工送达。通用条目不填"
+				},
+				"expected_version": {
+					"en": "The version you read (replace, remove, restore), sent back unchanged",
+					"zh": "你读到的版本号（replace、remove、restore 时给），原样带回"
+				},
+				"to_version": {
+					"en": "Snapshot number to restore (restore only)",
+					"zh": "要恢复到的快照号（仅 restore）"
+				}
+			}
+		},
+		"office_project_create": {
+			"description": {
+				"en": "Request a project with an owner and workspaces. On approval the project is created and the owner receives project management authority.",
+				"zh": "申请建项目，指定负责人和工作空间。批准即创建项目并授予负责人项目管理权。"
+			},
+			"label": {
+				"en": "Create project",
+				"zh": "建项目"
+			},
+			"parameters": {
+				"description": {
+					"en": "Optional: description",
+					"zh": "可选：项目说明"
+				},
+				"name": {
+					"en": "Project name",
+					"zh": "项目名称"
+				},
+				"owner_ref": {
+					"en": "Owner mailbox or position. A position's authority follows its current holder.",
+					"zh": "负责人的信箱或岗位名。授权随岗位现任走。"
+				},
+				"visibility": {
+					"en": "Optional: shared (default, readable by company staff) / private",
+					"zh": "可选：shared（默认，公司员工可读）/ private"
+				},
+				"workspace_refs": {
+					"en": "Workspace references (names registered in workspace-map, e.g. repo/app); at least one",
+					"zh": "工作空间引用（workspace-map 里登记的名字，如 repo/app），至少一个"
+				}
+			}
+		},
+		"office_lookup": {
+			"label": { "zh": "查通讯录", "en": "Find Office contacts" },
+			"description": { "zh": "查可见项目、经理及可发信的地址。指定项目查岗位和 Work 参与人。", "en": "Find visible projects, managers, and mail addresses. Select a project for positions and Work participants." },
+			"parameters": {
+				"query": { "zh": "可选：信箱、岗位名称、项目名称或其开头（如 REV）、manager。", "en": "Optional mailbox, position name, project name or its prefix (e.g. REV), or manager." },
+				"project_ref": { "zh": "可选：项目编号。", "en": "Optional project reference." }
+			}
+		},
+		"office_whoami": {
+			"description": {
+				"en": "Check your identity, positions, reporting line, permissions, and to-dos.",
+				"zh": "查自己的身份、岗位、直属上级、权限和待办。"
+			},
+			"label": {
+				"en": "Who am I",
+				"zh": "我是谁"
+			}
+		},
+		"office_work_create": {
+			"description": {
+				"en": "Create Work in a project you manage. You can assign it to a personal mailbox. The assignee is notified.",
+				"zh": "在你管理的项目里创建 Work。可直接派给有个人信箱的人。系统通知承办人。"
+			},
+			"label": {
+				"en": "Create work",
+				"zh": "派工"
+			},
+			"parameters": {
+				"acceptance": {
+					"en": "Optional: acceptance notes in plain words",
+					"zh": "可选：验收说明（自然语言）"
+				},
+				"assignee": {
+					"en": "Assignee (person, or a role with exactly one holder)",
+					"zh": "执行者（员工或只有一人在岗的岗位）"
+				},
+				"objective": {
+					"en": "Goal: what must be achieved",
+					"zh": "目标：要做成什么"
+				},
+				"project_ref": {
+					"en": "Project reference, e.g. prj-1.",
+					"zh": "项目编号，如 prj-1。"
+				},
+				"references": {
+					"en": "Reference: a resource string, or {resource, version?, sub?, location?, note?, adopted?}. Leave version out when unknown; adopted=true means this exact version must be used",
+					"zh": "参考资料：资源定位字符串，或 {resource, version?, sub?, location?, note?, adopted?}。版本不知道就不填；adopted=true 表示要求采用该准确版本"
+				},
+				"relations": {
+					"en": "Optional: relations to existing Work",
+					"zh": "可选：与已有 Work 的关系"
+				},
+				"reviewer": {
+					"en": "Reviewer: a mailbox, or a role with one holder; write none for no review",
+					"zh": "审核者：员工信箱名或只有一人在岗的岗位；不需要审核写 none"
+				},
+				"scope": {
+					"en": "Optional: delivery scope (choose when the project has several workspaces). A workspace reference name such as repo/app — a name, not a directory",
+					"zh": "可选：交付范围（项目有多个工作空间时选一个）。写工作空间引用名，如 repo/app——是名字，不是目录"
+				}
+			}
+		},
+		"office_work_get": {
+			"description": {
+				"en": "Read a Work's goal, responsibility, current or final submission, latest return feedback, references, relations and available actions. history=true adds events, reviews and changes; todo=true adds actionable items. Both default off. Work is authoritative; notices are pointers.",
+				"zh": "打开一项 Work：目标、责任、当前/最终提交（文件与版本）、最近一次退回意见、参考、关系、你能做的动作。history=true 附带完整履历（事件、已决定的审核轮次、材料与关系的全部变化）；todo=true 附带「我现在还能动手的」那一段。两个可选段都默认不给——日常处理靠现状、准确提交和最近一次退回。Work 是权威；通知只指路。"
+			},
+			"label": {
+				"en": "Open work",
+				"zh": "打开工作"
+			},
+			"parameters": {
+				"history": {
+					"en": "Optional: include full history",
+					"zh": "可选：附带全部历史"
+				},
+				"todo": {
+					"en": "Optional: true = also return the part of this Work you can act on right now (your own to-do; the predicate is the same one the system uses for assignment, returned under your existing rights)",
+					"zh": "可选：true = 同时给我「现在还能动手的」那一段（本人待办；判据就是系统派工用的那一份，按既有权限返回）"
+				},
+				"work_ref": {
+					"en": "Work reference such as prj-1/W17 (from office_work_list, a notice or office_work_get)",
+					"zh": "Work 引用，如 prj-1/W17（来自 office_work_list / 通知 / office_work_get）"
+				}
+			}
+		},
+		"office_work_list": {
+			"description": {
+				"en": "List Work related to you by default. Use role=all for visible Work in a project.",
+				"zh": "列 Work，默认与自己相关。role=all 列项目中可见的 Work。"
+			},
+			"label": {
+				"en": "Work list",
+				"zh": "工作列表"
+			},
+			"parameters": {
+				"cursor": {
+					"en": "Next page: next_cursor from the previous page",
+					"zh": "续页：上一页返回的 next_cursor"
+				},
+				"limit": {
+					"en": "Page size (1–200, default 20). Use next_cursor to continue or office_work_get for one item.",
+					"zh": "每页条数（1–200，默认 20）。用 next_cursor 续页，用 office_work_get 查单项。"
+				},
+				"project_ref": {
+					"en": "Optional: one project",
+					"zh": "可选：只看某项目"
+				},
+				"role": {
+					"en": "assigned / review / managed / all",
+					"zh": "assigned / review / managed / all"
+				},
+				"state": {
+					"en": "Optional: Active / Submitted / Done / Cancelled",
+					"zh": "可选：Active / Submitted / Done / Cancelled"
+				},
+				"top_level": {
+					"en": "For a project overview, use with role=all. Lists top-level deliverables; office_work_get shows their visible children and revisions.",
+					"zh": "项目概览配合 role=all 使用，只列顶层成果。用 office_work_get 查看某个成果可见的子 Work 和修正。"
+				}
+			}
+		},
+		"office_work_publish": {
+			"description": {
+				"en": "Submit changed files. Paths are relative to this Work's working directory, delivery.root in office_work_get, which does not follow the shell's current directory. In scope repo/app, `export.py` becomes repo/app/export.py; the scope-prefixed path is equivalent. Repeated subdirectories are refused. The system notifies reviewers and sends feedback; no completion letter is needed.",
+				"zh": "交付本次修改的文件。路径相对本 Work 的工作目录 delivery.root（见 office_work_get），不随 shell 的当前目录变。`export.py` 在 scope 为 repo/app 时生成 repo/app/export.py，带 scope 前缀等价，重复子目录会被拒绝。系统通知审核者并投递退回理由，无需另发完成信。"
+			},
+			"label": {
+				"en": "Publish",
+				"zh": "交付"
+			},
+			"parameters": {
+				"files": {
+					"en": "Paths relative to delivery.root, e.g. `export.py` (ref repo/app/export.py). Delete with {path, op:\"delete\"}.",
+					"zh": "路径相对 delivery.root，如 `export.py`（结果 repo/app/export.py）。删除用 {path, op:\"delete\"}。"
+				},
+				"final": {
+					"en": "Optional: true = final delivery (completes a no-review Work; a reviewed Work completes when the final submission passes). Omitted or false = an interim submission; the Work stays open.",
+					"zh": "可选：true = 最终交付（免审直接完成；需审核的最终版通过后完成）。不填或 false = 中途提交，Work 保持进行中。"
+				},
+				"note": {
+					"en": "Optional: what changed and how it was checked; no length limit, be complete",
+					"zh": "可选：本次交付说明（改了什么、怎么验证的）；长度不限，写清即可"
+				},
+				"replaces": {
+					"en": "Optional: your pending submission to replace, e.g. prj-1/W17/S1",
+					"zh": "可选：要替换的本人待审提交，如 prj-1/W17/S1"
+				},
+				"work_ref": {
+					"en": "Work reference such as prj-1/W17 (from office_work_list, a notice or office_work_get)",
+					"zh": "Work 引用，如 prj-1/W17（来自 office_work_list / 通知 / office_work_get）"
+				}
+			}
+		},
+		"office_work_read": {
+			"description": {
+				"en": "Read a file from a submission, with the same access as office_work_get. Text is paged; binary returns size only. Returns content_verified.",
+				"zh": "读提交里的文件。权限同 office_work_get。文本分页，二进制只返回大小。返回 content_verified。"
+			},
+			"label": {
+				"en": "Read one file from a submission",
+				"zh": "读提交里那一份文件"
+			},
+			"parameters": {
+				"cursor": {
+					"en": "Previous page's cursor.",
+					"zh": "上一页的 cursor。"
+				},
+				"limit": {
+					"en": "Maximum lines, subject to the byte cap. has_more signals another page.",
+					"zh": "最大行数，响应还受字节上限约束。has_more 表示有下一页。"
+				},
+				"path": {
+					"en": "The file path within the submission; required when it holds several files, otherwise optional. Use the full ref when the path is ambiguous",
+					"zh": "提交里的文件路径；多文件提交必填，其余时候可选。路径不唯一时用完整 ref"
+				},
+				"sub_ref": {
+					"en": "A submission ref (e.g. prj-1/W1/S1). With it, work_ref is not needed; pass it to read an earlier submission",
+					"zh": "提交引用（如 prj-1/W1/S1）。给它就不必再给 work_ref；读历史提交时用它"
+				},
+				"work_ref": {
+					"en": "The Work ref; with it and no sub_ref, the submission on the table is read",
+					"zh": "Work 引用；给了它、没给 sub_ref 时读这件 Work 桌上那一份"
+				}
+			}
+		},
+		"office_work_review": {
+			"description": {
+				"en": "Review the exact submission after inspection. Only final acceptance completes the Work. Return reasons go to the assignee.",
+				"zh": "查阅具体提交再审核。只有最终提交通过才完成 Work。退回理由会送给承办人。"
+			},
+			"label": {
+				"en": "Review",
+				"zh": "审核"
+			},
+			"parameters": {
+				"decision": {
+					"en": "accept / return",
+					"zh": "accept / return"
+				},
+				"evidence": {
+					"en": "Optional: locatable evidence {resource, location?, note?}",
+					"zh": "可选：有可定位依据时给 {resource, location?, note?}"
+				},
+				"reason": {
+					"en": "Reasoning; required for return",
+					"zh": "判断理由；退回必填"
+				},
+				"sub_ref": {
+					"en": "The submission you judge, e.g. prj-1/W17/S2 (current_submission in office_work_get)",
+					"zh": "所审提交，如 prj-1/W17/S2（office_work_get 的 current_submission）"
+				},
+				"work_ref": {
+					"en": "Work reference such as prj-1/W17 (from office_work_list, a notice or office_work_get)",
+					"zh": "Work 引用，如 prj-1/W17（来自 office_work_list / 通知 / office_work_get）"
+				}
+			}
+		},
+		"office_work_runnable": {
+			"description": {
+				"en": "List the Work you can still act on right now (the same predicate the system uses for assignment and the todo section of work get, under your existing rights). The optional unit only narrows by delivery unit — it is not an identity: a position you do not hold yields an empty result with a skipped note, and nothing is written.",
+				"zh": "列出此刻还能由你动手的 Work（判定与系统派工、work get 的 todo 段是同一条谓词，按既有权限返回）。可选的 unit 只影响按投递单元收窄，不是身份：传一个你不在任的岗位地址得到空结果加 skipped 说明，不写任何行。"
+			},
+			"label": {
+				"en": "The Work I can act on now",
+				"zh": "我现在能动手的 Work"
+			},
+			"parameters": {
+				"unit": {
+					"en": "Optional: narrow by delivery unit (a position address or mailbox name)",
+					"zh": "可选：按投递单元收窄（岗位地址或信箱名）"
+				}
+			}
+		},
+		"office_work_update": {
+			"description": {
+				"en": "Change an open Work. For follow-up on a closed Work, create a related Work. For Done/Cancelled Work, references is the one exception: fixed references and relations can be maintained. This leaves the Work state untouched, creates no submission, and preserves its goal, responsibility and review; authorisation and version checks are unchanged. Every other action is refused.",
+				"zh": "变更 Work。已完成的 Work 若需续做，另建并关联。唯一例外是 references：已完成/已取消的 Work 也可维护固定引用和关系。它不改变 Work 状态、责任、目标或审核，不产生提交，判权与版本核对不变。其余 action 对已完成/已取消一律拒绝。"
+			},
+			"label": {
+				"en": "Update work",
+				"zh": "更新工作"
+			},
+			"parameters": {
+				"acceptance": {
+					"en": "edit: new acceptance notes",
+					"zh": "edit：新验收说明"
+				},
+				"action": {
+					"en": "assign / reviewer / edit / references / wait / continue / cancel",
+					"zh": "assign / reviewer / edit / references / wait / continue / cancel"
+				},
+				"add": {
+					"en": "references: add materials or relations {work, relation}; also allowed on Done/Cancelled Work.",
+					"zh": "references：新增参考或关系 {work, relation}，已完成/已取消也可用。"
+				},
+				"assignee": {
+					"en": "assign: new assignee",
+					"zh": "assign：新执行者"
+				},
+				"note": {
+					"en": "continue: optional note",
+					"zh": "continue：可选说明"
+				},
+				"objective": {
+					"en": "edit: new goal",
+					"zh": "edit：新目标"
+				},
+				"on": {
+					"en": "wait: optional, the material, Work or person you wait for",
+					"zh": "wait：可选，在等的资料、Work 或人"
+				},
+				"reason": {
+					"en": "wait / cancel: reason",
+					"zh": "wait / cancel：原因"
+				},
+				"remove": {
+					"en": "references: items to remove, {\"seq\":…} or {\"relation_id\":…} (see office_work_get)",
+					"zh": "references：要移除的项 {\"seq\":…} 或 {\"relation_id\":…}（见 office_work_get）"
+				},
+				"reviewer": {
+					"en": "reviewer: the new reviewer; none for no review",
+					"zh": "reviewer：新审核者；不需要审核写 none"
+				},
+				"scope": {
+					"en": "assign: optional delivery scope (a workspace reference name such as repo/app; a name, not a directory)",
+					"zh": "assign：可选交付范围（工作空间引用名，如 repo/app；是名字，不是目录）"
+				},
+				"work_ref": {
+					"en": "Work reference such as prj-1/W17 (from office_work_list, a notice or office_work_get)",
+					"zh": "Work 引用，如 prj-1/W17（来自 office_work_list / 通知 / office_work_get）"
+				}
+			}
+		},
+		"office_work_withdraw": {
+			"description": {
+				"en": "Withdraw your own submission that is still waiting for review (fails if it was already judged).",
+				"zh": "撤回你本人仍在待审的提交（审核已作出判断时撤回会失败）。"
+			},
+			"label": {
+				"en": "Withdraw",
+				"zh": "撤回提交"
+			},
+			"parameters": {
+				"sub_ref": {
+					"en": "Your pending submission",
+					"zh": "你的待审提交"
+				},
+				"work_ref": {
+					"en": "Work reference such as prj-1/W17 (from office_work_list, a notice or office_work_get)",
+					"zh": "Work 引用，如 prj-1/W17（来自 office_work_list / 通知 / office_work_get）"
+				}
+			}
+		}
+	}
+}
