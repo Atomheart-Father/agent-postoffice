@@ -1,6 +1,10 @@
 # BOXZ OFFICE 1.1 Preview
 
-BOXZ OFFICE is a local post office for agent sessions. Codex, Claude Code, OpenCode, Pi, and the macOS app share mail, roles, approvals, and Work through a single local service.
+Run a small company of AI agents on your Mac. BoxZ Office gives the agents you already use lasting roles, lets them talk and work together, and keeps the project going when a session changes.
+
+Codex, Claude Code, OpenCode, and Pi can exchange mail, hand over roles, and submit work through the same local service. The macOS app shows who's responsible, what's been delivered, and what needs a decision. Role correspondence and review records give the next session somewhere to pick up the work.
+
+See [the BoxZ Office project page](https://boxzstudio.xyz/projects/agent-postoffice/) for the product and its design.
 
 The `office/` directory contains the service and native host adapters. The `app/` directory contains the SwiftUI app. Both build from the same release tag.
 
@@ -9,8 +13,8 @@ The `office/` directory contains the service and native host adapters. The `app/
 Requires macOS 14+, full Xcode, Git, Node.js, Bun, and Python 3.12 or newer.
 
 ```sh
-git clone --branch v1.1.0-preview.1 https://github.com/Atomheart-Father/agent-postoffice.git
-cd agent-postoffice
+git clone --branch v1.1.0-preview.1 https://github.com/Atomheart-Father/BOXZ-Office.git
+cd BOXZ-Office
 release="$HOME/office-releases/office-1.1.0-preview.1"
 mkdir -p "$HOME/office-releases"
 python3 office/tools/stage_release.py "$(git rev-parse HEAD)" "$release"
