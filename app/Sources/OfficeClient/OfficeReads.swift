@@ -31,15 +31,6 @@ public struct LetterRow: Sendable, Equatable, Identifiable {
     /// R5：服务端 meta.system 的种类（request.pending / request.to_user / …）；普通信 null。后端没返回这一列 = nil。
     public let systemKind: String?
 
-    /// 一封信在"在送"口径下的三种读法：在送（terminal == false 且 accepted == false）/ 已了结或已受理 / 说不准
-    /// （terminal 没报；或 terminal == false 而 accepted 没报）。说不准的不进确数，单独计。
-    public enum Flight: Sendable, Equatable { case inFlight, settled, unsure }
-    public var flight: Flight {
-        guard let t = terminal else { return .unsure }
-        if t { return .settled }
-        guard let a = accepted else { return .unsure }
-        return a ? .settled : .inFlight
-    }
     /// 申请类的系统信（只在"待批权限"里处理，信件列表不重复显示）：后端给了 system_kind 就只认那两类；
     /// R5 上线前后端不给 system_kind（nil）：按结构判——系统发的、要回复的信（这里本来就回不了，要去"待批权限"处理）。
     /// 不按标题猜；批准 / 拒绝的回执（不要回复）照常留在信件页。
@@ -52,24 +43,15 @@ public struct LetterRow: Sendable, Equatable, Identifiable {
     }
 }
 
-/// 在送封数的读法：确数 / 确数之外还有几封说不准（含未知）/ 没读全时的下限 / 一封也数不出（未知）。
-public enum InFlight: Equatable, Sendable { case exact(Int), withUnknown(Int, unsure: Int), atLeast(Int), unknown }
-
 extension Inbox {
     /// 在等老板的信：要回复、且不是申请类系统信（后者在"待批权限"里）。读不全时只是下限（`complete` 为假）。
     public var waiting: Int { letters.filter { $0.needsReply && !$0.isRequestNotice }.count }
-    public var inFlight: InFlight {
-        var n = 0, unsure = 0
-        for l in letters { switch l.flight { case .inFlight: n += 1; case .unsure: unsure += 1; case .settled: break } }
-        if !complete { return n > 0 ? .atLeast(n) : .unknown }
-        return unsure == 0 ? .exact(n) : .withUnknown(n, unsure: unsure)
-    }
+
 }
 
 /// 项目明细（`office.lookup` 带 project_ref）。岗位与参与人读不全就留空，不猜。
 public struct Party: Sendable, Equatable, Identifiable {
     public let to: String
-    public let name: String
     public let holder: String?
     public let roles: [String]
     /// 只认后端明确返回的空岗位；没返回 holder 不等于空缺。
@@ -234,7 +216,7 @@ public struct OfficeReads: Sendable {
 
     static func parties(_ raw: Any?) -> [Party] {
         (raw as? [[String: Any]] ?? []).map { p in
-            Party(to: p["to"] as? String ?? "", name: p["name"] as? String ?? "",
+            Party(to: p["to"] as? String ?? "",
                   holder: p["holder"] as? String, roles: p["roles"] as? [String] ?? [],
                   isVacant: p["kind"] as? String == "position" && p["holder"] is NSNull)
         }

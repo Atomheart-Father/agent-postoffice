@@ -89,18 +89,9 @@ struct CountBlock: View {
     }
 }
 
-/// "在送 n"：确数 / "≥n" / 未知；读失败写原因，不画成 0。
-func flightText(_ p: Panel<Inbox>?) -> String {
-    guard let p else { return tr("在送 未知", "In flight unknown") }
-    if let box = p.value {
-        switch box.inFlight {
-        case .exact(let n): return tr("在送 \(n)", "In flight \(n)")
-        case .withUnknown(let n, let u): return tr("在送 \(n) · 含 \(u) 封未知", "In flight \(n) · incl. \(u) unknown")
-        case .atLeast(let n): return tr("在送 ≥\(n)", "In flight ≥\(n)")
-        case .unknown: return tr("在送 未知", "In flight unknown")
-        }
-    }
-    return tr("在送 ", "In flight ") + p.text { _ in "" }
+func deliveryText(_ count: Int?) -> String {
+    guard let count else { return tr("待投递 未知", "Delivery pending: unknown") }
+    return tr("待投递 \(count)", "Delivery pending: \(count)")
 }
 
 /// 读口不是"读到了"时的单格显示：未知 / 未连接 / 被拒绝 各说各的，不画成 0。
@@ -272,6 +263,11 @@ struct FocusRing: ViewModifier {
     }
 }
 extension View { func focusRing() -> some View { modifier(FocusRing()) } }
+
+func projectManagerLabel(_ project: ProjectDetail) -> String {
+    let name = project.name.isEmpty ? project.ref : project.name
+    return name + tr(" · 经理", " · Manager")
+}
 
 /// 人的名字（M4）：标题 = 岗位名 / "项目经理" / "个人身份"，次级行 = 固定缩写 id；`full` 时（抽屉）再给完整 id，可选中复制。
 struct PersonName: View {

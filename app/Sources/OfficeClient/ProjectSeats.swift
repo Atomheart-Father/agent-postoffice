@@ -8,6 +8,11 @@ public struct SeatEntry: Sendable, Equatable, Identifiable {
     public let isManager: Bool       // 这一行同时是经理
     public let countable: Bool       // 只有岗位行才有件数可写
     public var id: String { party.to }
+
+    public func addresses(in threads: [HostThread]) -> [String] {
+        if countable { return [party.to] }
+        return Set(threads.filter { $0.carries(party.to) }.flatMap(\.positionAddresses)).sorted()
+    }
 }
 
 public enum ProjectSeats {
@@ -20,6 +25,6 @@ public enum ProjectSeats {
             let isManager = managerIDs.contains(position.to) || (position.holder.map(managerIDs.contains) ?? false)
             return SeatEntry(party: position, isManager: isManager, countable: true)
         }
-        return managerOnly + positions
+        return managerOnly + positions.filter(\.isManager) + positions.filter { !$0.isManager }
     }
 }

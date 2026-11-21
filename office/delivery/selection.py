@@ -154,6 +154,22 @@ def candidates(conn, box, *, only=None, exclude=None, own_round=None):
     return out
 
 
+
+def pending_delivery_count(conn, box):
+    """Count letters waiting for a native turn, including refs already frozen for that turn."""
+    from delivery import due
+
+    batch = due.get(conn, due.due_key("batch", box))
+    waiting = sum(item["kind"] in FORMAL_KINDS and item["created_at"] is not None
+                  for item in candidates(conn, box)) if batch and batch["state"] == "armed" else 0
+    frozen = conn.execute(
+        "SELECT COUNT(*) FROM round_ref rr JOIN round r ON r.token=rr.token"
+        " JOIN letter_states s ON (s.box,s.letter_id)=(rr.box,rr.ref)"
+        " WHERE rr.box=? AND rr.ref_state='active' AND s.state='delivered'"
+        " AND r.state IN ('begun','accepted') AND r.run_state IS NULL AND r.deadline_ts>?",
+        (box, time.time())).fetchone()[0]
+    return waiting + frozen
+
 def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
     """`{deliver, carry, hold_until, reason, unread, would_deliver}` — the one selection answer.
 

@@ -22,13 +22,12 @@ class PositionOperations:
             "SELECT 1 FROM box_archive WHERE box=?", (position,)).fetchone()
 
     def _position_spec(self, conn, position):
-        """岗位定义（名称 / 职责 / 汇报岗），形状同 config 的 `aliases.<岗位>`：以 `position_holders` 的列为准，未填的回落到 config。"""
+        """岗位定义（职责 / 汇报岗），形状同 config 的 `aliases.<岗位>`：以 `position_holders` 的列为准，未填的回落到 config。"""
         aliases = self._config().get("aliases")
         spec = dict((aliases or {}).get(position) or {}) if isinstance(aliases, dict) else {}
-        row = conn.execute("SELECT name, duties, reports_to FROM position_holders WHERE position=?", (position,)).fetchone()
+        row = conn.execute("SELECT duties, reports_to FROM position_holders WHERE position=?", (position,)).fetchone()
         if row is not None:
             spec["role"] = {**(spec.get("role") or {}),
-                            **({"title": row["name"]} if row["name"] else {}),
                             **({"duties": json.loads(row["duties"])} if row["duties"] else {})}
             spec["reports_to"] = row["reports_to"] or spec.get("reports_to")
         return spec
@@ -131,7 +130,7 @@ class PositionOperations:
         return duties, up
 
     def _position_install(self, conn, actor, position, holder, create, now_ts):
-        """申请里的 `create`：同一事务写岗位（名称 / 职责 / 汇报岗 + 现任），再按需建项目。绑定与上岗信由调用方接着做。"""
+        """申请里的 `create`：同一事务写岗位（职责 / 汇报岗 + 现任），再按需建项目。绑定与上岗信由调用方接着做。"""
         spec, proj = create.get("position") or {}, create.get("project")
         duties, up = self._position_create_fields(conn, spec)
         if conn.execute("SELECT 1 FROM position_holders WHERE position=?", (position,)).fetchone():
@@ -140,9 +139,9 @@ class PositionOperations:
         if proj is not None and not proj.get("owner_ref"):      # 谁负责由申请写明，不替申请人默认
             raise self.CoreError("invalid_request", "create.project 要写明负责人 owner_ref",
                                  en="create.project needs owner_ref", field="create")
-        conn.execute("INSERT INTO position_holders(position, holder, prev_holder, updated_at, name, duties, reports_to, project_ref)"
-                     " VALUES(?,?,NULL,?,?,?,?,?)",
-                     (position, holder, self._now(now_ts), spec.get("name") or position,
+        conn.execute("INSERT INTO position_holders(position, holder, prev_holder, updated_at, duties, reports_to, project_ref)"
+                     " VALUES(?,?,NULL,?,?,?,?)",
+                     (position, holder, self._now(now_ts),
                       json.dumps(duties, ensure_ascii=False), up, spec.get("project_ref")))
         self._gov_cache.clear()
         made = {"position": position}
@@ -291,19 +290,18 @@ class PositionOperations:
             if not contact:
                 continue
             positions.append(contact)
-            if query and query in (position.casefold(), contact["name"].casefold()):
+            if query and query == position.casefold():
                 matches.append(contact)
         return positions
 
     def _directory_contact(self, conn, address, *, include_holder=False):
         if conn.execute("SELECT 1 FROM box_archive WHERE box=?", (address,)).fetchone():
             return None
-        row = conn.execute("SELECT project_ref, name, holder FROM position_holders WHERE position=?",
+        row = conn.execute("SELECT project_ref, holder FROM position_holders WHERE position=?",
                            (address,)).fetchone()
         if row is None:
             return {"kind": "person", "to": address}
-        name = row["name"] or self._position_spec(conn, address).get("role", {}).get("title") or address
-        contact = {"kind": "position", "to": "@" + address, "name": name}
+        contact = {"kind": "position", "to": "@" + address}
         if include_holder:
             contact.update(project_ref=row["project_ref"], holder=row["holder"])
         return contact
@@ -375,7 +373,7 @@ class PositionOperations:
     def _position_welcome(self, conn, position, recipient, change, now_ts):
         pk = _mod("position_knowledge.py")
         knowledge = pk.read(conn, position)["entries"]
-        duties = pk.duties_of(self._position_spec(conn, position))[1]
+        duties = pk.duties_of(self._position_spec(conn, position))
         if not (knowledge or duties):
             return
         fact = "position-welcome:%s:%s" % (position, change)

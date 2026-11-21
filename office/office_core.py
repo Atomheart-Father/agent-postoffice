@@ -939,7 +939,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
 
         · `grant`：`target` 是授权主体，`params={scope,actions,project_ref?,expires_at?}`（动作只能是 `project.manage`，范围就是一个项目；不能给自己）；
         · `holder`：`position` + `target`（接任人名，省略则是调用方当前会话），申请时**锁定**目标会话与代次（批准时再核，变了 ⇒
-          `target_session_changed`，申请留在原地）。`create={position:{name,duties,reports_to},
+          `target_session_changed`，申请留在原地）。`create={position:{duties,reports_to},
           project:{name,owner_ref,workspace_refs,…}}` 是**新岗位**：批准时同一事务先写岗位（和项目），再绑定、发上岗信；
           新岗位属于哪个项目写在 `create.position.project_ref`，新项目的负责人 `owner_ref` 同一事务拿到它的 `project.manage`；
         · `revoke`：`target` 是要收回的授权号（`grant_ref`）；

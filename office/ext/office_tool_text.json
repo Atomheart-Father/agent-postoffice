@@ -106,7 +106,7 @@
 				"target": { "zh": "holder 申请自己上岗时省略，替他人申请填个人信箱。unbind 填绑定号，broadcast 填标题，retire 填 position，read_mail 填信箱名。", "en": "For holder, omit to appoint this session or give the successor's mailbox. For unbind use a binding ID, broadcast a title, retire a position, read_mail a mailbox." },
 				"reason": { "zh": "申请理由。", "en": "Reason for the request." },
 				"params": { "zh": "申请参数。授权填 scope、actions，可选 project_ref 和 expires_at。建项目填 name 和 workspace_refs，广播填 body，读信填信件编号数组 letter_ids。", "en": "For grants, specify scope and actions, optionally project_ref and expires_at. For projects, specify name and workspace_refs. For broadcasts, specify body. For read_mail, provide an array of letter IDs in letter_ids." },
-				"create": { "zh": "新项目岗位填 {position:{project_ref:\"prj-…\"}}，用 office_lookup 返回的项目编号。name、duties、reports_to 可省略；reports_to 只填 @岗位。组织岗位明确填 project_ref:null。已有岗位省略 create。随岗位新建项目另填 project（name、owner_ref、workspace_refs）。", "en": "For a new project position use {position:{project_ref:\"prj-…\"}} with the reference from office_lookup. Name, duties and reports_to are optional; use an @position for reports_to. For an organization position set project_ref to null. Omit create for an existing position. To create a project with the position, add project (name, owner_ref, workspace_refs)." }
+				"create": { "zh": "新项目岗位填 {position:{project_ref:\"prj-…\"}}，用 office_lookup 返回的项目编号。duties、reports_to 可省略；reports_to 只填 @岗位。组织岗位明确填 project_ref:null。已有岗位省略 create。随岗位新建项目另填 project（name、owner_ref、workspace_refs）。", "en": "For a new project position use {position:{project_ref:\"prj-…\"}} with the reference from office_lookup. Duties and reports_to are optional; use an @position for reports_to. For an organization position set project_ref to null. Omit create for an existing position. To create a project with the position, add project (name, owner_ref, workspace_refs)." }
 			}
 		},
 		"office_request_decide": {
@@ -525,7 +525,7 @@
 			"label": { "zh": "查通讯录", "en": "Find Office contacts" },
 			"description": { "zh": "查可见项目、经理及可发信的地址。指定项目查岗位和 Work 参与人。", "en": "Find visible projects, managers, and mail addresses. Select a project for positions and Work participants." },
 			"parameters": {
-				"query": { "zh": "可选：信箱、岗位名称、项目名称或其开头（如 REV）、manager。", "en": "Optional mailbox, position name, project name or its prefix (e.g. REV), or manager." },
+				"query": { "zh": "可选：信箱、岗位地址、项目名称或其开头（如 REV）、manager。", "en": "Optional mailbox, @position address, project name or its prefix (e.g. REV), or manager." },
 				"project_ref": { "zh": "可选：项目编号。", "en": "Optional project reference." }
 			}
 		},

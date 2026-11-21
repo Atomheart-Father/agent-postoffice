@@ -351,7 +351,7 @@ CREATE INDEX IF NOT EXISTS handover_pos ON handover_requests(position, created_a
 CREATE TABLE IF NOT EXISTS position_holders(
   position TEXT PRIMARY KEY, holder TEXT, prev_holder TEXT, updated_at TEXT NOT NULL,
   project_ref TEXT REFERENCES projects(project_ref),
-  name TEXT, duties TEXT, reports_to TEXT);        -- 岗位定义以这里为准（名称 / 职责 JSON / 汇报岗）；config 只是导出
+  name TEXT, duties TEXT, reports_to TEXT);        -- 岗位定义以这里为准（地址 / 职责 JSON / 汇报岗）；name 仅兼容旧库
 -- ★ W409（ARCHITECTURE §3.3c）：**信箱级归档**的事实，唯一一份就在 Core 里（不写 `.<box>/.archived`
 --   标记文件、不搬信件文件）。归档只表示"不再接收新信"：读、检索、历史都不受影响；删掉这一行即复原。
 CREATE TABLE IF NOT EXISTS box_archive(

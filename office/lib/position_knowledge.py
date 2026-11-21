@@ -282,12 +282,10 @@ def _apply(conn, position, actor, now, *, op, id=None, text=None, section=None, 
 
 # ------------------------------------------------------------------ 上下文合同
 def duties_of(spec):
-    """从该岗位在组织配置里的登记（`aliases.<role>`）取职责：`role.title` 与 `role.duties[]`。"""
+    """从该岗位在组织配置里的登记（`aliases.<role>`）取职责 `role.duties[]`。"""
     role = spec.get("role") if isinstance(spec, dict) else None
     role = role if isinstance(role, dict) else {}
-    duties = [d.strip() for d in (role.get("duties") or []) if isinstance(d, str) and d.strip()]
-    title = role.get("title") if isinstance(role.get("title"), str) else ""
-    return title.strip(), duties
+    return [d.strip() for d in (role.get("duties") or []) if isinstance(d, str) and d.strip()]
 
 
 def summary(conn, position, spec):
@@ -296,7 +294,7 @@ def summary(conn, position, spec):
     只读本岗自己的行；别的岗位、历史、快照都不碰。装不下的按序截断并记 `omitted`（读口取全）；
     有 `when` 的条目只数个数（`scoped`），随派工送达。
     """
-    title, duties = duties_of(spec)
+    duties = duties_of(spec)
     entries = _live(conn, position)
     general = [e for e in entries if not e["when"]]
     shown, used = [], 0
@@ -306,7 +304,7 @@ def summary(conn, position, spec):
             break
         shown.append({"id": e["id"], "section": e["section"], "text": e["text"]})
         used += n
-    return {"title": title, "duties": duties,
+    return {"duties": duties,
             "knowledge": {"entries": shown, "chars": used, "limit": LIMIT,
                           "omitted": len(general) - len(shown), "scoped": len(entries) - len(general)}}
 

@@ -111,19 +111,20 @@ private struct ProjectColumn: View {
     let spacing: CGFloat
 
     var body: some View {
-        let seats = desk.seatCounts      // 没读全 = nil；归不到唯一席位的项目整个不给数 → 每行"进行 未知"
+        let seats = desk.seatCounts      // 没读全 = nil；归不到唯一席位的项目整个不给数 → 每行"进行中 Work 未知"
         let counts: (String) -> SeatCount? = { seats?.count(project: project.ref, to: $0) }
         let hasRows = !project.managers.isEmpty || !project.positions.isEmpty
         VStack(alignment: .leading, spacing: 0) {
             Button { desk.drawer = .project(project.ref) } label: { head(hasRows: hasRows) }.buttonStyle(.plain).focusRing()
             // 平铺在项目线上（后端没有汇报关系的读口，不画上下级）；同一个人只一行：经理标签并到他的岗位行。
             let seatsList = ProjectSeats.entries(project)
+            let threads = desk.hosts.value?.threads ?? []
             ForEach(Array(seatsList.enumerated()), id: \.element.id) { i, s in
-                Button { desk.openSeat(s.party.to) } label: {
-                    SeatRow(entry: s, holders: desk.holders, isLast: i == seatsList.count - 1, counts: s.countable ? counts(s.party.to) : nil,
-                            flight: desk.seatMail[s.party.to])
-                }
-                .buttonStyle(.plain).focusRing()
+                let addresses = s.addresses(in: threads)
+                let mailbox = addresses.count == 1 ? addresses[0] : s.party.to
+                SeatRow(desk: desk, entry: s, isLast: i == seatsList.count - 1,
+                        counts: s.countable ? counts(s.party.to) : nil, addresses: addresses,
+                        threads: threads.filter { $0.carries(s.party.to) }, deliveryPending: desk.deliveryPending(mailbox))
             }
         }
     }
@@ -158,39 +159,50 @@ private struct ProjectColumn: View {
 
 // MARK: - 席位行（灯 + 名 + 事实），自带连线；所有席位同一级
 private struct SeatRow: View {
+    @ObservedObject var desk: DeskModel
     let entry: SeatEntry
-    let holders: [String: [String]]
     let isLast: Bool
     let counts: SeatCount?
-    /// 这个席位信箱的读取结果（letter.read 带 target）；在送 = 没了结且没被受理的信。没读到 = "在送 未知"。
-    let flight: Panel<Inbox>?
-
-    private var flightText: String { BoxzOffice.flightText(flight) }
+    let addresses: [String]
+    let threads: [HostThread]
+    let deliveryPending: Int?
 
     var body: some View {
         let lampLeft: CGFloat = 24, lineX: CGFloat = 5.5
         let party = entry.party
         VStack(alignment: .leading, spacing: 2) {
-            if entry.countable {     // 岗位行（可能同时是经理）
-                HStack(alignment: .firstTextBaseline, spacing: 9) {
-                    Text(party.name.isEmpty ? party.to : party.name).font(Theme.Font.rowTitle).tracking(-0.17).lineLimit(1)
-                    if entry.isManager { Text(tr("经理", "Manager")).font(Theme.Font.small).foregroundStyle(Theme.ink3) }
-                    if party.isVacant { Text(tr("空缺", "Vacant")).font(Theme.Font.small).foregroundStyle(Theme.ink3) }
-                    if !party.name.isEmpty && party.to != "@" + party.name {
-                        Text(party.to).font(Theme.Font.small).foregroundStyle(Theme.ink3).lineLimit(1)
+            HStack(alignment: .firstTextBaseline, spacing: 9) {
+                if addresses.isEmpty {
+                    Button { desk.openSeat(party.to) } label: {
+                        Text(tr("未登记岗位地址", "No position address")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
                     }
+                    .buttonStyle(.plain).focusRing()
                 }
-                // 件数：能唯一归到这个席位才写数；否则"未知"，绝不写成 0。"正在干活"在页头写一次，这里只靠灯（悬停有说明）。
-                HStack(spacing: 12) {
-                    if let c = counts { Text(tr("进行 \(c.active)", "Active \(c.active)")); if c.submitted > 0 { Text(tr("待审 \(c.submitted)", "In review \(c.submitted)")) } }
-                    else { Text(tr("进行 未知", "Active unknown")) }
-                    Text(flightText)
+                ForEach(addresses, id: \.self) { address in
+                    Button { desk.openSeat(address) } label: {
+                        Text(address).font(Theme.Font.rowTitle).tracking(-0.17).lineLimit(1).help(address)
+                    }
+                    .buttonStyle(.plain).focusRing()
                 }
-                .font(Theme.Font.small).foregroundStyle(Theme.ink3).lineLimit(1)
-            } else {                 // 没有对应岗位的经理：只写谁，不写件数（件数归不到个人 id）
-                PersonName(id: party.to, holders: holders, context: .manager, tag: tr("经理", "Manager"), titleFont: Theme.Font.rowTitle)
-                Text(flightText).font(Theme.Font.small).foregroundStyle(Theme.ink3).lineLimit(1)
+                if entry.isManager { Text(tr("经理", "Manager")).font(Theme.Font.small).foregroundStyle(Theme.ink3) }
+                if party.isVacant { Text(tr("空缺", "Vacant")).font(Theme.Font.small).foregroundStyle(Theme.ink3) }
+                ForEach(threads) { thread in
+                    let host = hostName(thread.harness)
+                    Button { desk.showOnHostPage(thread.id) } label: {
+                        Text(host).font(Theme.Font.small).underline()
+                    }
+                    .buttonStyle(.plain).focusRing()
+                    .help(tr("在宿主页查看 \(host) 会话", "View \(host) session on Hosts"))
+                }
             }
+            HStack(spacing: 12) {
+                if entry.countable {
+                    if let c = counts { Text(tr("进行中 Work \(c.active)", "Active Work \(c.active)")); if c.submitted > 0 { Text(tr("待审 \(c.submitted)", "In review \(c.submitted)")) } }
+                    else { Text(tr("进行中 Work 未知", "Active Work unknown")) }
+                }
+                Text(deliveryText(deliveryPending))
+            }
+            .font(Theme.Font.small).foregroundStyle(Theme.ink3).lineLimit(1)
         }
         .padding(.leading, lampLeft + 22).padding(.vertical, 9)
         .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
@@ -204,13 +216,13 @@ private struct SeatRow: View {
                         .help(tr("正在干活：未知（后端没有这个事实）", "Working: unknown (the office has no such fact)"))
                 }
             }
+            .allowsHitTesting(false)
         }
     }
 }
 
 
-/// 未分配：有活动绑定、却不在任何项目花名册里的线程。后端不给这份名单：用 R2 窗口里的绑定减去项目花名册算出来
-/// （任何一边读不到 = 未知）。R2 现在是夹具，所以标"模拟数据"。每行是一个绑定：能写信，也能跳到宿主页对应的那一张卡。
+/// 已登记宿主会话中未关联任何项目席位的成员。
 private struct UnassignedBlock: View {
     @ObservedObject var desk: DeskModel
     var body: some View {

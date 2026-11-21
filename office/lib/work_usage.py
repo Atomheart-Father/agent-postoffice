@@ -10,6 +10,7 @@ import json
 import time
 from pathlib import Path
 
+from delivery.selection import pending_delivery_count
 from work_history import usage_sum
 from work_release import not_releaser, release_projects
 from work_result import may_read_work
@@ -199,6 +200,9 @@ class UsageOperations:
                 harness = prefix if ref and native_id == ref and prefix in ("codex", "claude", "opencode") else None
                 if ref and Path(ref).is_absolute() and Path(ref).suffix == ".jsonl":
                     harness = "pi"
-                window.update(host_session_ref=ref or None, harness=harness, quota=json.loads(row["quota"] or "null"))
+                position = "@" + row["actor"] if self._is_position_address(conn, row["actor"]) else None
+                window.update(host_session_ref=ref or None, harness=harness, position=position,
+                              delivery_pending=pending_delivery_count(conn, row["actor"]) if ref else None,
+                              quota=json.loads(row["quota"] or "null"))
             windows.append(window)
         return windows

@@ -207,11 +207,10 @@ final class DeskModel: ObservableObject {
 
     /// 缓存只留当前集合里还有的（项目 / Work / 席位没了，对应的信箱、详情、用量也丢掉）。
     private func prune() {
-        if projects.value != nil {
-            var addrs = seatAddresses
-            addrs.formUnion((hosts.value?.bindings ?? []).map(\.actor))
-            if case .seat(let a) = drawer { addrs.insert(a) }
-            seatMail = seatMail.filter { addrs.contains($0.key) }
+        if case .seat(let address) = drawer {
+            seatMail = seatMail.filter { $0.key == address }
+        } else {
+            seatMail.removeAll()
         }
         if let w = work.value {
             var refs = Set(w.items.map(\.ref))
@@ -249,8 +248,7 @@ final class DeskModel: ObservableObject {
     private func needs(_ page: Page) -> Needs {
         var n = Needs()
         switch page {
-        case .org: n.mail = seatAddresses                                              // 每个席位一次 letter.read(target)
-        case .host: n.mail = Set((hosts.value?.bindings ?? []).map(\.actor))    // 每个活动绑定的 actor 一次
+        case .org, .host: break
         case .work: n.works = Set(doneInTab.map(\.ref))                                   // 只读当前页签里已完成的（图上只画它们）
         case .settings: n.admin = true
         case .usage: n.usage = true
@@ -303,11 +301,13 @@ final class DeskModel: ObservableObject {
         page = .host
     }
 
-    /// 席位的名字：岗位名 / 个人身份；认不出就是地址本身。
+    func deliveryPending(_ mailbox: String) -> Int? {
+        hosts.value?.bindings.first { $0.mailbox == mailbox && $0.hostSessionRef != nil }?.deliveryPending
+    }
+
+    /// 岗位使用逻辑地址，个人信箱沿用个人身份标签。
     func seatName(_ addr: String) -> String {
-        for p in projects.value ?? [] {
-            if let party = (p.positions + p.managers).first(where: { $0.to == addr }), !party.name.isEmpty { return party.name }
-        }
+        if seatAddresses.contains("@" + addr) { return "@" + addr }
         return PersonLabel.resolve(addr, holders: holders, context: .person).title
     }
 }

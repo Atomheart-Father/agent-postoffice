@@ -1,6 +1,7 @@
 import {randomUUID} from 'node:crypto';
 import {readFileSync, realpathSync} from 'node:fs';
 import {pathToFileURL} from 'node:url';
+import {setTimeout as sleep} from 'node:timers/promises';
 import {createPiRoundClient, readDescriptor, isCreated} from './office_pi_round.mjs';
 import {nativeDescriptor} from './office_socket.mjs';
 import {reportClaudeUsage} from './office_claude_usage.mjs';
@@ -31,6 +32,17 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
     if (collectUsage && ['SessionStart', 'UserPromptSubmit'].includes(event.hook_event_name)) await reportClaudeUsage(client, event);
     if (mode === 'wait' || mode === 'prepare') {
       if (!['SessionStart', 'Stop'].includes(event.hook_event_name)) return {status: 'unknown', reason: 'event'};
+      const awaitFrames = async options => {
+        let retryMs = 250;
+        while (windowOpen()) {
+          const got = await client.awaitFrames(options);
+          // A daemon restart closes an idle wait. Retrying this read cannot submit another round.
+          if (mode === 'prepare' || got?.unknown !== true) return got;
+          await sleep(retryMs);
+          retryMs = Math.min(retryMs * 2, 5000);
+        }
+        return null;
+      };
       const skip = new Set();
       while (true) {
         if (!windowOpen()) return {status: 'window_closed'};
@@ -76,14 +88,15 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
         if (mode === 'prepare') return {status: 'unknown', reason: 'pending', text: pending.text};
         if (pending.recoveryFailed) return {status: 'unknown', reason: 'recover'};
         skip.add(pending.frame.due_key);
-        const waited = await client.awaitFrames({waitMs, skip: [...skip]});
+        const waited = await awaitFrames({waitMs, skip: [...skip]});
+        if (!windowOpen()) return {status: 'window_closed'};
         if (!good(waited) || !Array.isArray(waited.frames)) return {status: 'unknown', reason: 'await'};
         for (const f of waited.frames) if (nonempty(f?.due_key)) skip.add(f.due_key);
       }
       while (true) {
       let frame;
       do {
-        const received = await client.awaitFrames({waitMs});
+        const received = await awaitFrames({waitMs});
         if (!windowOpen()) return {status: 'window_closed'};
         if (!good(received) || !Array.isArray(received.frames)) return {status: 'unknown', reason: 'await'};
         const units = Array.isArray(received.units) ? received.units : [];

@@ -105,7 +105,7 @@ struct LaunchScript {
             let ret = p[2] == "return"
             desk.beginAction("review:" + p[1], .review(workRef: p[1], subRef: sub, decision: ret ? .return : .accept), text: ret ? tr("需要补一页说明", "Needs one more page of explanation") : "")
         case "offline-host":              // 走真路径：和宿主页"全部下线"同一份清单
-            let items = groupedByHost(desk.hosts.value?.bindings ?? [], harness: \.harness).first { $0.name.lowercased() == p[1].lowercased() }?.items ?? []
+            let items = groupedByHost(desk.hosts.value?.threads ?? [], harness: \.harness).first { $0.name.lowercased() == p[1].lowercased() }?.items.flatMap(\.bindings) ?? []
             desk.askOffline(title: tr("全部下线 · ", "Take all offline · ") + p[1], bindings: items)
         default: return
         }

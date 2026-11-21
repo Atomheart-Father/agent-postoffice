@@ -77,6 +77,9 @@ public struct HostBinding: Sendable, Equatable, Identifiable {
     public let actor: String
     public let hostSessionRef: String?
     public let harness: String?
+    public let position: String?
+    public var mailbox: String { position ?? actor }
+    public let deliveryPending: Int?
     /// nil = 来源未知（后端给 null）；有值 = 后端给的一句话 / 一个状态词，原样显示。
     public let quota: String?
     public var id: String { bindingID }
@@ -91,12 +94,14 @@ public struct HostBinding: Sendable, Equatable, Identifiable {
         default: q = nil          // null / 缺 = 未知
         }
         return HostBinding(bindingID: bid, actor: actor, hostSessionRef: r["host_session_ref"] as? String,
-                           harness: r["harness"] as? String, quota: q)
+                           harness: r["harness"] as? String, position: r["position"] as? String,
+                           deliveryPending: r["delivery_pending"] as? Int, quota: q)
     }
 }
 
 public struct HostPage: Sendable, Equatable {
     public let bindings: [HostBinding]
+    public var threads: [HostThread] { HostThread.derive(bindings) }
 
     public static func parse(_ r: [String: Any]) -> HostPage? {
         guard let rows = (r["windows"] ?? r["bindings"]) as? [[String: Any]] else { return nil }

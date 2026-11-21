@@ -113,7 +113,6 @@ private struct LetterLine: View {
     let holders: [String: [String]]
     var target: String? = nil
     var canReply = true
-    var showFlight = false
     @State private var expanded = false
 
     var body: some View {
@@ -134,8 +133,7 @@ private struct LetterLine: View {
             HStack(spacing: 8) {
                 if let kind = Self.kind(letter) { Chip(text: kind, style: letter.needsReply && canReply ? .red : .plain) }      // 红只给"等老板回"的信；别人信箱里的不红
                 if letter.system { Chip(text: tr("系统", "System")) }
-                if showFlight { flightChip }
-                else {   // accepted 后端没报 = 未知，不是"没受理"
+                if letter.letterClass != "notice" {
                     Text(letter.accepted.map { $0 ? tr("已受理", "Accepted") : tr("未受理", "Not accepted") } ?? tr("受理 未知", "Acceptance unknown")).font(Theme.Font.small).foregroundStyle(Theme.ink2)
                 }
             }
@@ -166,15 +164,6 @@ private struct LetterLine: View {
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay(alignment: .bottom) { Rule() }
-    }
-
-    /// 在送 = 还没了结（terminal 为 false）且没被受理。一个标签说清：在送（= 未受理）/ 说不准 / 已受理；已了结的不画。
-    @ViewBuilder private var flightChip: some View {
-        switch letter.flight {
-        case .inFlight: Chip(text: tr("在送 · 未受理", "In flight · not accepted"), style: .mid)
-        case .unsure: Chip(text: tr("在送 未知", "In flight unknown"), style: .dashed)
-        case .settled: if letter.accepted == true { Text(tr("已受理", "Accepted")).font(Theme.Font.small).foregroundStyle(Theme.ink2) }
-        }
     }
 
     /// 只给认得的类；不认识的类不画标签（不默认成"告知"）。
@@ -262,10 +251,9 @@ private struct SeatDrawer: View {
         let panel = desk.seatMail[addr] ?? .loading
         Sec(title: tr("信箱", "Mailbox"), count: panel.value.map { b in "\(b.letters.count)" } ?? tr("未知", "Unknown"))
         PanelBody(panel: panel) { box in
-            Text(flightText(panel)).font(Theme.Font.small).foregroundStyle(Theme.ink2).padding(.bottom, 4)       // 在送数只在这里写一次
             if box.letters.isEmpty { Text(tr("0 封", "0 letters")).font(Theme.Font.body).foregroundStyle(Theme.ink3) }
             if !box.complete { Text(tr("只读到 \(box.letters.count) 封，后端共 \(box.count) 封", "Read \(box.letters.count) \(pl(box.letters.count, "letter")); the office has \(box.count)")).font(Theme.Font.small).foregroundStyle(Theme.ink2).padding(.bottom, 8) }
-            ForEach(box.letters) { LetterLine(desk: desk, letter: $0, holders: desk.holders, target: addr, canReply: false, showFlight: true) }
+            ForEach(box.letters) { LetterLine(desk: desk, letter: $0, holders: desk.holders, target: addr, canReply: false) }
         }
     }
 }
@@ -303,8 +291,7 @@ private struct ProjectDetailView: View {
                 if p.to.hasPrefix("employee-") {     // 个人：标题是岗位名 / 项目经理 / 个人身份，完整 id 只在这里出现
                     PersonName(id: p.to, holders: desk.holders, context: title == tr("经理", "Managers") ? .manager : .person, full: true)
                 } else {
-                    Text(p.name.isEmpty ? p.to : p.name).font(Theme.Font.bodyBold).lineLimit(2)
-                    if !p.name.isEmpty { Text(p.to).font(Theme.Font.mono).foregroundStyle(Theme.ink3).lineLimit(1) }
+                    Text(p.to).font(Theme.Font.bodyBold).lineLimit(2)
                 }
                 if !p.roles.isEmpty { HStack(spacing: 8) { ForEach(p.roles, id: \.self) { Chip(text: $0) } } }
             }

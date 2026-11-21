@@ -40,16 +40,14 @@ struct OfflineConfirm: View {
 
     var body: some View {
         ConfirmFrame(title: draft.title) {
-            Text(tr("会下线 \(draft.bindings.count) 个线程", "Will take \(draft.bindings.count) \(pl(draft.bindings.count, "thread")) offline")).font(Theme.Font.small).foregroundStyle(Theme.ink3).padding(.bottom, 6)
+            Text(tr("会解除 \(draft.bindings.count) 个绑定", "Will remove \(draft.bindings.count) \(pl(draft.bindings.count, "binding"))")).font(Theme.Font.small).foregroundStyle(Theme.ink3).padding(.bottom, 6)
             if desk.offlineStarted { tally.padding(.bottom, 8) }
             ForEach(draft.bindings) { b in
                 let key = "unbind:" + b.bindingID
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 10) {
-                        Text(b.actor).font(Theme.Font.bodyBold).lineLimit(1)
+                        Text(desk.seatName(b.mailbox)).font(Theme.Font.bodyBold).lineLimit(1)
                         Text(b.bindingID).font(Theme.Font.mono).foregroundStyle(Theme.ink3).lineLimit(1)
-                        Spacer(minLength: 0)
-                        Text(hostName(b.harness)).font(Theme.Font.small).foregroundStyle(Theme.ink3)
                     }
                     if let a = desk.actions[key] { status(a, key) }
                     if desk.offlineFinished { Text(stillOnline(b) ? tr("仍在线", "Still online") : tr("已下线", "Offline")).font(Theme.Font.small).foregroundStyle(Theme.ink3) }

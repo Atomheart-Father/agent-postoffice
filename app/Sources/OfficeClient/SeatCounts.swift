@@ -48,7 +48,7 @@ public struct SeatCounts: Sendable, Equatable {
         var hits = Set<String>()
         for seat in p.positions {
             let alias = seat.to.hasPrefix("@") ? String(seat.to.dropFirst()) : seat.to
-            if alias == name || (!seat.name.isEmpty && seat.name == name) { hits.insert(seat.to) }
+            if alias == name { hits.insert(seat.to) }
         }
         return hits.count == 1 ? hits.first : nil
     }
