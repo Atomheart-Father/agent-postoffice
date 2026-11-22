@@ -185,7 +185,7 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
             if (!result?.acquired || !pooled || pooled.destroyed) {
                 if (pooled) pooled.destroy();
                 pooled = null;
-                return result?.error === 'socket_error' || result?.error === 'socket_closed' ? result : false;
+                return result?.error ? result : false;
             }
             leased = true;
             leaseSocket = pooled;

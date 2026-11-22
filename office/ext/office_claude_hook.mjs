@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
-import {readFileSync, realpathSync} from 'node:fs';
+import {appendFileSync, mkdirSync, readFileSync, realpathSync} from 'node:fs';
+import {basename, dirname, join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {createPiRoundClient, readDescriptor, isCreated} from './office_pi_round.mjs';
@@ -20,7 +21,8 @@ async function reconnect(windowOpen, call, disconnected) {
 async function locked(client, fn, windowOpen) {
   while (true) {
     const acquired = await reconnect(windowOpen, () => client.acquireSerial(), result =>
-      result?.error === 'socket_error' || result?.error === 'socket_closed');
+      ['busy', 'socket_error', 'socket_closed'].includes(result?.error));
+    if (windowOpen && acquired?.error) throw Error('serial acquire: ' + acquired.error);
     if (acquired !== true) return null;
     try { return await fn(); }
     catch (error) {
@@ -237,17 +239,31 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
 }
 
 if (import.meta.main ?? (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href)) {
+  const mode = process.argv[2];
+  let descriptorPath;
+  const logExit = reason => {
+    if (!descriptorPath || !['wait', 'stop'].includes(mode)) return;
+    const dir = join(dirname(descriptorPath), '..', 'logs');
+    try {
+      mkdirSync(dir, {recursive:true, mode:0o700});
+      appendFileSync(join(dir, 'claude-hook.log'),
+        `${new Date().toISOString()} ${basename(descriptorPath, '.endpoint.json')} ${process.pid} ${mode} ${JSON.stringify(reason)}\n`, {mode:0o600});
+    } catch { /* Diagnostics must not change native hook output. */ }
+  };
   try {
     const input = JSON.parse(readFileSync(0, 'utf8'));
-    const descriptorPath = nativeDescriptor(null, 'claude', input.session_id);
+    descriptorPath = nativeDescriptor(null, 'claude', input.session_id);
     const parent = process.ppid;
     const args = {event: input, descriptorPath, windowOpen: () => parent > 1 && process.ppid === parent};
-    if (process.argv[2] === 'stop') {
+    if (['wait', 'stop'].includes(mode))
+      process.once('SIGTERM', () => { logExit('SIGTERM'); process.exit(143); });
+    if (mode === 'stop') {
       const done = await handleClaudeHook({...args, mode: 'observe'});
-      if (!['finished', 'unknown'].includes(done.status) || (done.status === 'unknown' && done.reason !== 'no_pending'))
+      if (args.windowOpen() && done.status !== 'finished' && done.reason !== 'no_pending')
         throw Error('stop remains unknown: ' + done.reason);
     }
-    const result = await handleClaudeHook({...args, mode: process.argv[2] === 'stop' ? 'wait' : process.argv[2]});
+    const result = await handleClaudeHook({...args, mode: mode === 'stop' ? 'wait' : mode});
+    logExit(args.windowOpen() ? result.reason || result.status : 'window_closed');
     if (result.status === 'handoff') { process.stderr.write(result.text + '\n'); process.exitCode = 2; }
-  } catch (e) { process.stderr.write('Office hook unknown: ' + e.message + '\n'); process.exitCode = 1; }
+  } catch (e) { logExit(e.message); process.stderr.write('Office hook unknown: ' + e.message + '\n'); process.exitCode = 1; }
 }
