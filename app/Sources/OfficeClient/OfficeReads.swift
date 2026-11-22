@@ -297,7 +297,8 @@ public struct OfficeReads: Sendable {
             }
             // 有一封读不懂就是整页读不懂：宁可"未知"，也不把少了的行当成零。
             guard letters.count == rows.count else { return nil }
-            return Inbox(box: box, count: r["count"] as? Int ?? letters.count, letters: letters)
+            return Inbox(box: box, count: r["count"] as? Int ?? letters.count,
+                         letters: letters.sorted { $0.createdAt > $1.createdAt })
         }
     }
 

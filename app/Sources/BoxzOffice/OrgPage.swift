@@ -182,14 +182,16 @@ private struct SeatRow: View {
                     .help(tr("在宿主页查看 \(host) 会话", "View \(host) session on Hosts"))
                 }
             }
-            HStack(spacing: 12) {
-                if let active = party.activeWorkCount {
-                    Text(tr("进行中 Work \(active)", "Active Work \(active)"))
-                    if let submitted = party.submittedWorkCount, submitted > 0 { Text(tr("待审 \(submitted)", "In review \(submitted)")) }
-                } else { Text(tr("进行中 Work 未知", "Active Work unknown")) }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 12) {
+                    if let active = party.activeWorkCount {
+                        Text(tr("进行中 Work \(active)", "Active Work \(active)"))
+                        if let submitted = party.submittedWorkCount, submitted > 0 { Text(tr("待审 \(submitted)", "In review \(submitted)")) }
+                    } else { Text(tr("进行中 Work 未知", "Active Work unknown")) }
+                }
                 Text(deliveryText(desk.deliveryPending(mailbox)))
             }
-            .font(Theme.Font.small).foregroundStyle(Theme.ink3).lineLimit(1)
+            .font(Theme.Font.small).foregroundStyle(Theme.ink3)
             ForEach(personalMailboxes, id: \.self) { address in
                 if let count = desk.deliveryPending(address), count > 0 {
                     Button { desk.openSeat(address) } label: {

@@ -59,6 +59,15 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
           if (!s) return {cleared: true};
           if (mode === 'prepare') {
             // A queued Codex item can outlive its deadline. Recover only after the host confirms its absence.
+            if (codexNative && s.frame.kind === 'idle_started' && s.phase === 'handed'
+                && s.text?.split('\n', 1)[0] === absentMarker) {
+              const current = await client.awaitFrames({unit:s.unit, waitMs:0});
+              if (good(current) && Array.isArray(current.frames) && current.frames.some(f => f.kind === 'idle_started'
+                  && f.unit === s.unit && f.due_key === s.frame.due_key
+                  && nonempty(f.attempt_key) && f.attempt_key !== s.attempt)) {
+                await client.serialState('clear'); return {cleared:true};
+              }
+            }
             if (s.frame.kind === 'batch_round' && s.text?.split('\n', 1)[0] === absentMarker) {
               let round = await client.roundState(s.unit, s.token);
               const ours = row => good(row) && row.binding_id === d.bindingId && row.binding_gen === d.generation;
