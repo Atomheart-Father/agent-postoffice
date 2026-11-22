@@ -7,7 +7,7 @@ mutable working copy). Loading those bytes and verifying their digest live in ON
 Views (all bounded; a partial answer says so and how to continue):
   lines=[start,end] (1-based, inclusive) · search="text" · compare_data=<other version bytes> (unified diff,
   itself paged with cursor/limit/has_more over diff lines: a long diff is read the same way as text)
-  cursor=<line to continue from>. Text is UTF-8; anything else is reported as binary with its size -- never decoded
+  cursor=<line number or returned long-line continuation>. Text is UTF-8; anything else is reported as binary with its size -- never decoded
   as if it were text, never claimed to be previewable."""
 import difflib, re
 
@@ -52,9 +52,13 @@ def check_view(lines, search, cursor, limit):
             raise ArtifactReadRefused("invalid_request", "lines 须为 [start, end]（从 1 开始，start ≤ end）", en="lines must be [start, end] (from 1, start <= end)")
     if search is not None and (not isinstance(search, str) or not search or len(search) > 500):
         raise ArtifactReadRefused("invalid_request", "search 须为 1..500 字符的文本", en="search must be text of 1..500 characters")
-    for name, v in (("cursor", cursor), ("limit", limit)):
-        if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 1):
-            raise ArtifactReadRefused("invalid_request", f"{name} 必须是 ≥1 的整数", en=f"{name} must be an integer >= 1")
+    valid_cursor = (isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 1 or
+                    isinstance(cursor, str) and re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", cursor))
+    if cursor is not None and (not valid_cursor or search is not None and isinstance(cursor, str)):
+        raise ArtifactReadRefused("invalid_request", "cursor 须为行号或返回的续读游标", en="cursor must be a line number or a returned continuation cursor")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ArtifactReadRefused("invalid_request", "limit 必须是 ≥1 的整数", en="limit must be an integer >= 1")
+
 
 
 def _text_or_none(data):
@@ -66,36 +70,34 @@ def _text_or_none(data):
         return None
 
 
-def _page(lines, first, last, *, cut_oversized):
-    """从 `lines` 取 `[first..last]` 这一段，受 `MAX_BYTES` 约束；返回 `(out, end, cut)`。
-
-    正文视图与差异视图用的是**同一段翻页算术**：从第 `first` 行起、最多到 `last` 行，
-    每行按 UTF-8 字节计（+1 是换行），累计超过 `MAX_BYTES` 就停在已给出的行上；
-    `end` 是真正给到的最后一行（1 起），游标据此前进。
-
-    两个调用方只有一处不同，因此这是一条**参数**而不是第二份循环：
-
-    · `cut_oversized=True`（差异）：**单行**就超上限时，有界切片并回报"这一行没给完"
-      （`line_truncated`），保证游标前进、不死循环，也不越过声明的上限；
-    · `cut_oversized=False`（正文）：保持既有行为 —— 空页时把这一行整行给出。
-      这是**已知的不一致**，不是笔误：正文视图从没有过切片分支，改它会改变读者拿到的内容
-      （从整行变成片段），所以先只把算术合并、把差别显式写在这里，等谁要统一时只改这一处。
-    """
-    out, used, end, cut = [], 0, first - 1, None
+def _page(lines, first, last, offset=0):
+    """Page whole lines when possible; continue an oversized line at a UTF-8 byte boundary."""
+    out, used, end, continuation = [], 0, first - 1, None
     for i in range(first - 1, last):
-        raw = lines[i]
-        b = len(raw.encode("utf-8")) + 1
-        if out and used + b > MAX_BYTES:
+        raw = lines[i].encode("utf-8")
+        start = offset if i == first - 1 else 0
+        if start:
+            try:
+                if start >= len(raw):
+                    raise ValueError()
+                raw[:start].decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                raise ArtifactReadRefused("invalid_request", "无效的续读游标", en="Invalid continuation cursor")
+        remaining = raw[start:]
+        if out and used + len(remaining) + 1 > MAX_BYTES:
             break
-        if cut_oversized and not out and b > MAX_BYTES:
-            keep = max(1, MAX_BYTES - 128)
-            frag = raw.encode("utf-8")[:keep].decode("utf-8", "ignore")
-            out.append(frag); used = len(frag.encode("utf-8")) + 1
-            end = i + 1
-            cut = {"line": i + 1, "kept_bytes": len(frag.encode("utf-8")), "line_bytes": b}
+        if len(remaining) + 1 > MAX_BYTES:
+            fragment = remaining[:MAX_BYTES - 1].decode("utf-8", "ignore")
+            consumed = len(fragment.encode("utf-8"))
+            out.append(fragment); end = i + 1
+            continuation = {"line": end, "offset": start + consumed, "kept_bytes": consumed, "line_bytes": len(raw) + 1}
             break
-        out.append(raw); used += b; end = i + 1
-    return out, end, cut
+        out.append(remaining.decode("utf-8")); used += len(remaining) + 1; end = i + 1
+    return out, end, continuation
+
+
+def _cursor(cursor):
+    return tuple(map(int, cursor.split(":"))) if isinstance(cursor, str) else (cursor or 1, 0)
 
 
 def view(data, *, lines=None, search=None, cursor=None, limit=None, compare_data=None):
@@ -120,54 +122,57 @@ def view(data, *, lines=None, search=None, cursor=None, limit=None, compare_data
         # ★ W209：diff 也按**行**分页，用的就是正文那一套字段与读法
         #   （`cursor` / `limit` / `has_more` / `start_line` / `end_line`）：以前这里一次答完，
         #   超过 MAX_BYTES 就只剩前一段，**没有继续查看的路**（W204 明确报出的合同差额）。
-        #   · `cursor` = 差异行号（1 起），从这一行开始给；`limit` = 这一页最多几行（有上限）；
-        #   · `has_more` / `cursor` 与正文视图同一个语义，页面可以用同一套「继续读」；
-        #   · 每页仍然字节有界（MAX_BYTES），而且**至少给一行** ⇒ 游标一定前进，不存在"卡住不动"；
-        #   · `truncated` 保留为同一事实的旧名（= has_more），老消费方仍然不会把片段当完整。
+        # 普通页面按行号续读；超长行返回含 UTF-8 字节偏移的续读游标。
+        # truncated 仍与 has_more 同义，老消费方不会把片段当完整。
         diff = list(difflib.unified_diff(other.splitlines(), all_lines, "before", "after", lineterm="", n=2))
         dtotal = len(diff)
         want = min(limit or DEFAULT_LINES, MAX_LINES)
-        first = cursor or 1
-        if dtotal and first > dtotal:
+        first, offset = _cursor(cursor)
+        if (dtotal and first > dtotal) or (offset and not dtotal):
             raise ArtifactReadRefused("invalid_request",
                                       f"起始行 {first} 超出末尾（差异共 {dtotal} 行）",
                                       en=f"Start line {first} is past the end ({dtotal} diff lines)")
         last = min(dtotal, first + want - 1) if dtotal else 0
-        # ★ R3-W209.1 ③：**单行**就超过回答上限时，不能把整行塞回去（那会越过声明的 128 KiB
-        #   上限），也不能停在原地（那是空页 + 还有更多 ⇒ 死循环）。有界切片 + 明说没给完，
-        #   游标照常前进。这段算术与正文视图共用 `_page`（差别只有 `cut_oversized`）。
-        out, end, cut = _page(diff, first, last, cut_oversized=True)
-        more = end < dtotal
+        out, end, cut = _page(diff, first, last, offset)
+        more = bool(cut) or end < dtotal
+        next_cursor = f"{cut['line']}:{cut['offset']}" if cut else end + 1 if more else None
         return {"kind": "diff", "comparable": True, "changed": bool(diff), "content": "\n".join(out),
                 "start_line": first if dtotal else 0, "end_line": end,
                 "diff_lines_total": dtotal,
                 "total_lines": total,                 # 这一版文件的行数（**不是**差异行数，原意保留）
-                "has_more": more, "cursor": end + 1 if more else None,
+                "has_more": more, "cursor": next_cursor,
                 # 这一段是不是完整：后面还有行，或者这一页里有一行只给了开头
                 "truncated": bool(more or cut),
                 "line_truncated": cut,                # 被切片的那一行（没有就是 null）
                 "size": size}
     if search is not None:
         start = cursor or 1
-        matches, scanned_to = [], start - 1
+        matches, used, next_cursor = [], 0, None
         for i in range(start - 1, total):
-            scanned_to = i + 1
             if search in all_lines[i]:
-                matches.append({"line": i + 1, "text": all_lines[i][:500]})
-                if len(matches) >= MAX_MATCHES:
+                excerpt = all_lines[i][:500]
+                cost = len(excerpt.encode("utf-8")) + 1
+                if len(matches) >= MAX_MATCHES or used + cost > MAX_BYTES:
+                    next_cursor = i + 1
                     break
-        more = scanned_to < total and len(matches) >= MAX_MATCHES
+                matches.append({"line": i + 1, "text": excerpt})
+                used += cost
         return {"kind": "search", "query": search, "matches": matches, "total_lines": total,
-                "has_more": more, "cursor": scanned_to + 1 if more else None}
+                "has_more": next_cursor is not None, "cursor": next_cursor}
     want = min(limit or DEFAULT_LINES, MAX_LINES)
+    first, offset = _cursor(cursor)
     if lines is not None:
-        first, last = lines[0], min(lines[1], total)
+        if cursor is None:
+            first = lines[0]
+        if first < lines[0] or first > lines[1]:
+            raise ArtifactReadRefused("invalid_request", "cursor 超出行范围", en="cursor is outside the requested lines")
+        last = min(lines[1], total)
     else:
-        first = cursor or 1
         last = min(total, first + want - 1)
-    if total and first > total:
+    if (total and first > total) or (offset and not total):
         raise ArtifactReadRefused("invalid_request", f"起始行 {first} 超出末尾（共 {total} 行）", en=f"Start line {first} is past the end ({total} lines)")
-    out, end, _cut = _page(all_lines, first, last, cut_oversized=False)
-    more = end < (last if lines is not None else total)
+    out, end, cut = _page(all_lines, first, last, offset)
+    more = bool(cut) or end < (last if lines is not None else total)
+    next_cursor = f"{cut['line']}:{cut['offset']}" if cut else end + 1 if more else None
     return {"kind": "text", "total_lines": total, "start_line": first if total else 0, "end_line": end,
-            "content": "\n".join(out), "has_more": more, "cursor": end + 1 if more else None, "size": size}
+            "content": "\n".join(out), "has_more": more, "cursor": next_cursor, "size": size}

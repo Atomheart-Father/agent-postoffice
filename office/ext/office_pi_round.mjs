@@ -162,7 +162,11 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
     releaseSerial: () => sock.releaseSerial(),
     async serialState(op, state) {
       const out = await sock.serialRequest({op: `host.serial.${op}`, ...(state ? {state} : {})});
-      if (!out || out.ok === false) throw Error('serial state unknown');
+      if (!out || out.ok === false) {
+        const error = Error('serial state unknown');
+        error.serialReadDisconnected = op === 'read' && ['socket_error', 'socket_closed'].includes(out?.error);
+        throw error;
+      }
       return out;
     },
 

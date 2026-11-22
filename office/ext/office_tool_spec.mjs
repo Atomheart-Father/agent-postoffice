@@ -397,11 +397,7 @@ export const OFFICE_TOOLS = [
 				work_ref: S("office_work_read/work_ref"),
 				sub_ref: S("office_work_read/sub_ref"),
 				path: S("office_work_read/path"),
-				// Same shape and same defaults as r/artifact_read's own check_view: cursor is the
-				// line to continue from, limit the page size — both optional integers >= 1, so a
-				// call without them is byte-for-byte what it always was. One op, one view, no
-				// second page protocol.
-				cursor: I("office_work_read/cursor"),
+				cursor: { anyOf: [{ type: "integer", minimum: 1 }, { type: "string" }], ...textFields("office_work_read/cursor") },
 				limit: I("office_work_read/limit"),
 			},
 			required: [],

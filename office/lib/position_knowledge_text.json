@@ -12,6 +12,7 @@
     "when_invalid": {"zh": "when 必须是至多 {max} 个非空字符串（项目引用或路径前缀，路径不含 ..）：{why}", "en": "when must be at most {max} non-empty strings (project refs or path prefixes, no ..): {why}"},
     "entry_not_found": {"zh": "没有这条岗位经验：{id}", "en": "No such knowledge entry: {id}"},
     "snapshot_not_found": {"zh": "该岗位没有第 {ver} 号快照", "en": "This position has no snapshot number {ver}"},
+    "snapshot_metadata_missing": {"zh": "第 {ver} 号旧快照缺少适用范围和理由，不能安全恢复；仍可读取原文", "en": "Snapshot {ver} lacks scope and reason metadata and cannot safely be restored; its text remains readable"},
     "stale": {"zh": "{what}已变（你读到的是 {expected}，现在是 {current}）；先读取现状再改", "en": "{what} changed (you read {expected}, it is {current}); read the current state first"},
     "entry_too_long": {"zh": "单条岗位经验最多 {limit} 字（这条 {chars} 字，原条目 {before} 字）：要么拆成几条，要么不比原来长", "en": "One knowledge entry is at most {limit} characters ({chars} here, was {before}); split it, or keep it no longer than before"},
     "over_limit": {"zh": "岗位经验会超过 {limit} 字上限，且这一版比现在长（{before} → {chars} 字）：请先合并或删除，再重试", "en": "Position knowledge would exceed the {limit}-character limit and is longer than it is now ({before} → {chars}); merge or remove entries first"}

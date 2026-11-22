@@ -1,15 +1,4 @@
-"""岗位知识：条目 + 代码合并 + 硬上限，以及送进上下文的本岗摘要（产品 §11、后端 §3.2 knowledge.update）。
-
-一个小而深的纯模块：只拿 sqlite 连接做事，不依赖 Core（拒绝用本模块的 `Refused`，由调用方译成
-`CoreError`）。合并规则原样沿用 `58ad7d2c~1` 的 `knowledge_render / knowledge_split / knowledge_chars`
-与 `instructions_knowledge_update`（K-id 岗位内递增永不复用；超限只许变短；restore 越限放行且旧 id 退役）。
-与旧实现不同的只有三处：现行状态存进 `knowledge` 表（不再回放 `actions`）；整版快照存进
-`knowledge_snapshot` 表（与条目同一事务；两张表的建表语句只在 storage.py 一处）；每条可带 `when`（项目引用 / 路径前缀）。
-所有对外文字在 `position_knowledge_text.json`。
-
-上下文合同（`summary`）：只传**本岗**的职责和**通用**条目（`when` 为空者），总字数不超过 `LIMIT`；
-装不下的只记条数并指向读口；`when` 命中的条目只在派工时由 `select` 取；历史与快照永远不进上下文。
-"""
+"""岗位知识条目、可恢复的版本快照、通用摘要与派工匹配。"""
 import json
 import posixpath
 from pathlib import Path
@@ -37,7 +26,7 @@ class Refused(Exception):
         self.zh, self.en = say("zh"), say("en")
 
 
-# ------------------------------------------------------------------ 渲染 / 拆分（整版正文是派生物）
+# ------------------------------------------------------------------ 渲染（整版正文是派生物）
 def render(position, entries):
     """条目 → 整版正文（确定性：同一批条目永远同一份字节）。`id/why/when` 不进正文。"""
     order, by_sec = [], {}
@@ -50,31 +39,9 @@ def render(position, entries):
     lines = ["# " + TEXT["title"]["zh"].format(role=position)]
     for sec in order:
         lines += ["", "## " + sec]
-        # 续行缩进两格：条目里自带 `- ` 子项时，不缩进 split 会把它当成下一条（render→split 凭空多条）。
+        # 续行保持缩进，旧版本读取快照也能区分条目和子项。
         lines += ["- " + t.replace("\n", "\n  ") for t in by_sec[sec] if t]
     return "\n".join(lines) + "\n"
-
-
-def split(text):
-    """整版正文 → 条目（只给 restore 用）：`##` 分节、列 0 的 `- ` 起条，续行拼回；不猜、不切句。"""
-    entries, section, cur = [], DEFAULT_SECTION, None
-
-    def flush():
-        if cur is not None and cur.strip():
-            entries.append({"section": section, "text": cur.strip()})
-
-    for raw in (text or "").splitlines():
-        line = raw.rstrip()
-        if line.startswith("## "):
-            flush()
-            cur, section = None, line[3:].strip() or DEFAULT_SECTION
-        elif line.startswith("- "):
-            flush()
-            cur = line[2:].strip()
-        elif cur is not None and line.strip() and not line.startswith("# "):
-            cur += "\n" + line.strip()
-    flush()
-    return entries
 
 
 # ------------------------------------------------------------------ when：确定性匹配
@@ -106,7 +73,7 @@ def normalize_when(when):
             seg = _path_segments(it)
             if seg is None:
                 raise Refused("invalid_request", "when_invalid", max=WHEN_MAX, why=it)
-            it = "/".join(seg)
+            it = "/".join(seg) if len(seg) > 1 else "./" + seg[0]
         else:
             it = it.lower()
         if it not in out:
@@ -119,7 +86,7 @@ def _hits(when, project_ref, paths):
     segs = [s for s in (_path_segments(p) for p in (paths or ())) if s]
     for w in when:
         if _is_path(w):
-            ws = tuple(w.split("/"))
+            ws = _path_segments(w)
             if any(s[:len(ws)] == ws for s in segs):      # 按段前缀：office/lib 不命中 office/library
                 return True
         elif ref and w == ref:
@@ -159,11 +126,25 @@ def read(conn, position):
             "snapshots": [s["ver"] for s in snaps]}
 
 
-def snapshot_text(conn, position, ver):
+def _snapshot(conn, position, ver):
     r = conn.execute("SELECT text FROM knowledge_snapshot WHERE position=? AND ver=?", (position, ver)).fetchone()
     if r is None:
         raise Refused("not_found", "snapshot_not_found", ver=ver)
-    return r["text"]
+    raw = r["text"]
+    marker = "# office-knowledge-metadata-v1 "
+    body, sep, metadata = raw.rpartition("\n" + marker)
+    if sep:
+        try:
+            entries = json.loads(metadata)
+            if isinstance(entries, list):
+                return {"text": body + "\n", "entries": entries}
+        except (ValueError, TypeError):
+            pass
+    return {"text": raw}
+
+
+def snapshot_text(conn, position, ver):
+    return _snapshot(conn, position, ver)["text"]
 
 
 # ------------------------------------------------------------------ 写
@@ -227,12 +208,15 @@ def _apply(conn, position, actor, now, *, op, id=None, text=None, section=None, 
         if expected_version != pos_ver:
             raise Refused("stale", "stale", what="position", expected=expected_version,
                           current=pos_ver)
-        parts = split(snapshot_text(conn, position, to_version))
+        parts = _snapshot(conn, position, to_version).get("entries")
+        if not isinstance(parts, list):
+            raise Refused("capability_missing", "snapshot_metadata_missing", ver=to_version)
         conn.execute("UPDATE knowledge SET removed_at=? WHERE position=? AND removed_at IS NULL", (now, position))
         nid = _next_id(conn, position)
         for i, part in enumerate(parts):
             conn.execute("INSERT INTO knowledge VALUES(?,?,?,?,?,?,?,?,?,NULL)",
-                         (position, "K%d" % (nid + i), part["section"], part["text"], "", "[]", 1, actor, now))
+                         (position, "K%d" % (nid + i), part["section"], part["text"], part["why"],
+                          json.dumps(part["when"], ensure_ascii=False), 1, actor, now))
         after_entries = _live(conn, position)
     elif op == "add":
         body = _text(text, op)
@@ -274,7 +258,9 @@ def _apply(conn, position, actor, now, *, op, id=None, text=None, section=None, 
         oldest = sorted(after_entries, key=lambda e: (e["updated_at"], e["id"]))[:5]
         raise Refused("invalid_request", "over_limit", limit=LIMIT, before=before, chars=after,
                       oldest=[{"id": e["id"], "chars": len(e["text"]), "updated_at": e["updated_at"]} for e in oldest])
-    conn.execute("INSERT INTO knowledge_snapshot VALUES(?,?,?)", (position, now_ver, body_after))
+    metadata = [{k: e[k] for k in ("section", "text", "why", "when")} for e in after_entries]
+    snapshot = body_after + "# office-knowledge-metadata-v1 " + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+    conn.execute("INSERT INTO knowledge_snapshot VALUES(?,?,?)", (position, now_ver, snapshot))
     return {"ok": True, "position": position, "op": op, "id": changed, "version": now_ver,
             "entry_version": next((e["version"] for e in after_entries if e["id"] == changed), None),
             "chars": after, "limit": LIMIT, "entries": len(after_entries), "updated_by": actor, "updated_at": now}

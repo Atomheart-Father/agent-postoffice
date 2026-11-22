@@ -1,11 +1,4 @@
-"""申请的项与执行、通知，以及交还与岗位事实（申请/审批本体在 `office_core.request_*`）。
-
-申请拆成项（`_request_items`），每一项谁能批看 `_item_power`：用户、本项目的经理（凭 `project.manage`）、
-管理员；只有经理换人是严格项，只有用户能批。项目归属只看 Core 的统一判定
-`_position_management_project`。`_request_execute` 是六种申请（holder/grant/revoke/project/deactivate/retire）
-唯一的执行处，申请当场执行与审批放行共用；公开的 project.create / grant.create / grant.revoke 只是提申请（`_request_as_op`）。
-还有：`handover_return`（交还）、`handover_return_terminal`（宿主转述）、`_holder_bind_target` / `_session_facts`（目标解析）。Core 持有连接、事务、判权、幂等与授权锁；本文件不保存第二份岗位/授权事实。
-"""
+"""申请权限、执行、通知和岗位交还；状态由 Core 的事务持有。"""
 import hashlib
 import json
 import os
@@ -53,19 +46,21 @@ def handover_return_terminal(planned, *, position, **retired):
 class HandoverOperations:
     """交还与岗位绑定事实（在 Core 的显式契约上）；申请/审批本体已退役。"""
 
-    def _session_facts(self, conn, session_ref):
+    def _session_facts(self, conn, session_ref, actor=None):
         """受控登记的会话事实（凭据关联用）：只认 `bindings` 里同 `host_session_ref` 的
         active 行；多个登记代次/实例不一致 ⇒ None（不可核，不按最近活动挑一个）。"""
         rows = conn.execute(
-            "SELECT generation, instance FROM bindings WHERE host_session_ref=? AND state='active'"
-            " AND revoked_at IS NULL ORDER BY binding_id", (session_ref,)).fetchall()
+            "SELECT binding_id, actor, generation, instance FROM bindings b WHERE host_session_ref=? AND state='active'"
+            " AND revoked_at IS NULL AND (? IS NULL OR actor=?)"
+            " AND NOT EXISTS (SELECT 1 FROM position_holders p WHERE p.position=b.actor) ORDER BY binding_id",
+            (session_ref, actor, actor)).fetchall()
         if not rows:
             return None
-        pairs = {(r["generation"], r["instance"]) for r in rows}
+        pairs = {(r["binding_id"], r["actor"], r["generation"], r["instance"]) for r in rows}
         if len(pairs) > 1:
             return None                     # 同一会话两套凭据 ⇒ 不可核，不猜
-        gen, inst = pairs.pop()
-        return {"generation": gen, "instance": inst, "sessions": [session_ref]}
+        binding, actor, gen, inst = pairs.pop()
+        return {"binding_id": binding, "generation": gen, "instance": inst, "sessions": [session_ref]}
 
     def _holder_bind_target(self, conn, to_ref, rparams=None, now_ts=None):
         """解析 holder 交接的目标会话：申请里已有 `target_session_ref` ⇒ 只重核那一个
@@ -74,7 +69,9 @@ class HandoverOperations:
         不按最近活动/心跳挑，不自动升级给上级。"""
         recorded = (rparams or {}).get("target_session_ref")
         if recorded:
-            facts = self._session_facts(conn, recorded)
+            target = to_ref.strip().lstrip("@")
+            person = target if target != recorded and not self._is_position_address(conn, target) else None
+            facts = self._session_facts(conn, recorded, person)
             if facts is None:
                 raise self.CoreError("stale",
                                      f"原申请的目标会话 {recorded!r} 已不可核（换代/撤权）：请重新提交申请",
@@ -82,13 +79,14 @@ class HandoverOperations:
                                      reason_code="target_session_changed")
             want_g = (rparams or {}).get("target_generation")
             want_i = (rparams or {}).get("target_instance")
-            if (want_g is not None and want_g != facts["generation"]) or \
+            want_b = (rparams or {}).get("target_binding_id")
+            if (want_b is not None and want_b != facts["binding_id"]) or \
+                    (want_g is not None and want_g != facts["generation"]) or \
                     (want_i is not None and want_i != facts["instance"]):
                 raise self.CoreError("stale",
                                      "原申请的目标会话代次/实例已变化：不按新会话顶替，请重新提交申请",
                                      en="The request's target session generation/instance changed; refusing to substitute another session",
                                      reason_code="target_session_changed")
-            target = to_ref.strip().lstrip("@")
             if target != recorded and not conn.execute(
                     "SELECT 1 FROM bindings WHERE host_session_ref=? AND actor=? AND state='active' AND revoked_at IS NULL",
                     (recorded, target)).fetchone():
@@ -121,13 +119,38 @@ class HandoverOperations:
                                  f"{ref!r} 有多个受控活会话：{sessions}；请用 target_session_ref 明确目标",
                                  en=f"{ref!r} has several controlled live sessions: {sessions}; name the target with target_session_ref",
                                  reason_code="ambiguous_session", sessions=sessions)
-        facts = self._session_facts(conn, sessions[0])
+        facts = self._session_facts(conn, sessions[0], ref)
         if facts is None:
             raise self.CoreError("conflict",
                                  f"{ref!r} 的会话 {sessions[0]!r} 凭据不可核（登记冲突）",
                                  en=f"The session {sessions[0]!r} of {ref!r} has unverifiable credentials",
                                  reason_code="session_credentials_ambiguous")
         return {"session_ref": sessions[0], **facts}
+
+    def _request_person(self, conn, actor):
+        if not self._is_position_address(conn, actor):
+            return actor
+        row = conn.execute(
+            "SELECT p.holder FROM position_holders p JOIN bindings b ON b.binding_id=p.position"
+            " JOIN bindings h ON h.actor=p.holder AND h.host_session_ref=b.host_session_ref"
+            " AND h.state='active' AND h.revoked_at IS NULL"
+            " WHERE p.position=? AND b.state='active' AND b.revoked_at IS NULL"
+            " AND b.host_session_ref IS NOT NULL AND b.host_session_ref<>''", (actor,)).fetchone()
+        return row[0] if row else None
+
+    def _request_operator(self, conn, actor):
+        person = self._request_person(conn, actor)
+        if person is None:
+            raise self.CoreError("unauthorized_attempt", "无法核实岗位会话的经办人", en="Cannot verify the person operating this position session", reason_code="operator_unverifiable")
+        return person
+
+    def _request_is_own(self, conn, actor, applicant, person=None):
+        current = self._request_person(conn, actor)
+        if person:
+            return bool(current and current == person)
+        if self._is_position_address(conn, applicant):
+            return actor == applicant or bool(current and current == self._request_person(conn, applicant))
+        return current == applicant
 
     _TEXT_NO_OPERATOR = TEXT["no_operator"]
 
@@ -224,7 +247,8 @@ class HandoverOperations:
                 (cursor or 2**63 - 1, state, state))
             for row in rows:
                 params = json.loads(row["params_json"])
-                own = row["applicant"] == actor
+                person = json.loads(row["result_json"] or "{}").get("applicant_person")
+                own = self._request_is_own(conn, actor, row["applicant"], person)
                 power = {}
                 if not own and row["decider_ref"] in (None, actor):
                     try:
@@ -246,7 +270,7 @@ class HandoverOperations:
                     "target": row["to_ref"],
                     "params": {k: v for k, v in params.items() if k not in (
                         "quotes", "session_ref", "target_session_ref", "target_instance", "target_generation",
-                        "target_binding_event")},
+                        "target_binding_event", "target_binding_id")},
                     "actionable_items": actionable if pending else [],
                 })
                 last_rowid = row["rowid"]
@@ -427,19 +451,27 @@ class HandoverOperations:
     def _request_notify(self, conn, ref, applicant, kind, target, reason, items, now_ts):
         """项目项送本项目经理，组织项送管理员，严格项送用户。每人只收到自己能批的项。"""
         user = {self._request_user()} - {None}
-        gov = self._approval_admins(conn)[1] or user
-        who = {}
+        gov = {a for a in self._approval_admins(conn)[1] if self._is_position_address(conn, a)}
+        person, who = self._request_person(conn, applicant), {}
         for item in items:
-            candidates = user if item[2] else gov
-            if item[1]:
-                candidates = {g["subject_ref"] for g in self._project_grants(conn, item[1], now_ts)} or user
-            if kind == "read_mail":
-                candidates = {name for name in candidates - {applicant} if target not in self._principals(name, conn)}
-            for name in candidates:
-                if self._item_power(conn, name, item, now_ts):
-                    who.setdefault(name, []).append(TEXT["items"][item[0]])
-        if kind == "read_mail" and not who:
-            who = {name: [TEXT["items"][kind]] for name in user}
+            managers = {g["subject_ref"] for g in self._project_grants(conn, item[1], now_ts)} if item[1] else set()
+            for candidates in (managers, gov, user):
+                valid = []
+                for name in candidates:
+                    if (self._request_is_own(conn, name, applicant, person)
+                            or self._is_position_address(conn, name) and not self._request_person(conn, name)
+                            or kind == "read_mail" and target in self._principals(name, conn)):
+                        continue
+                    try:
+                        self._request_hard_refusal(conn, name, kind, target)
+                    except self.CoreError:
+                        continue
+                    if self._item_power(conn, name, item, now_ts):
+                        valid.append(name)
+                if valid:
+                    for name in valid:
+                        who.setdefault(name, []).append(TEXT["items"][item[0]])
+                    break
         for name, mine in sorted(who.items()):
             if name != applicant:
                 self._request_letter(conn, name, ref, "pending", now_ts, applicant=applicant, kind=kind,

@@ -236,7 +236,7 @@ class PositionOperations:
                 restricted = project["visibility"] == "private" and ref not in managed
                 works = []
                 if roster or restricted:
-                    works = list(conn.execute("SELECT project_ref, assignee_ref, reviewer_ref FROM work "
+                    works = list(conn.execute("SELECT project_ref, assignee_ref, reviewer_ref, state FROM work "
                                               "WHERE project_ref=?", (ref,)))
                 if restricted:
                     works = [w for w in works if work_policy.may_read_work(conn, actor, w, project, holders=held)]
@@ -249,8 +249,14 @@ class PositionOperations:
                         or project["name"].casefold().startswith(query)):
                     managers = sorted({g["subject_ref"] for g in self._project_grants(conn, ref, now_ts)})
                     summary = {"project_ref": ref, "name": project["name"],
-                               "managers": [c for name in managers if (c := self._directory_contact(conn, name))]}
+                               "managers": [c for name in managers if (c := self._directory_contact(conn, name, include_holder=roster))]}
                     if roster:
+                        for contact in positions + summary["managers"]:
+                            name = contact["to"].removeprefix("@")
+                            for state in ("Active", "Submitted"):
+                                contact[state.lower() + "_work_count"] = (
+                                    sum(w["assignee_ref"] == name and w["state"] == state for w in works)
+                                    if not restricted else None)
                         people = {}
                         for work in works:
                             for role in ("assignee", "reviewer"):
@@ -372,8 +378,8 @@ class PositionOperations:
 
     def _position_welcome(self, conn, position, recipient, change, now_ts):
         pk = _mod("position_knowledge.py")
-        knowledge = pk.read(conn, position)["entries"]
-        duties = pk.duties_of(self._position_spec(conn, position))
+        summary = pk.summary(conn, position, self._position_spec(conn, position))
+        knowledge, duties = summary["knowledge"]["entries"], summary["duties"]
         if not (knowledge or duties):
             return
         fact = "position-welcome:%s:%s" % (position, change)

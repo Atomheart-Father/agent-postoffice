@@ -111,20 +111,15 @@ private struct ProjectColumn: View {
     let spacing: CGFloat
 
     var body: some View {
-        let seats = desk.seatCounts      // 没读全 = nil；归不到唯一席位的项目整个不给数 → 每行"进行中 Work 未知"
-        let counts: (String) -> SeatCount? = { seats?.count(project: project.ref, to: $0) }
         let hasRows = !project.managers.isEmpty || !project.positions.isEmpty
         VStack(alignment: .leading, spacing: 0) {
             Button { desk.drawer = .project(project.ref) } label: { head(hasRows: hasRows) }.buttonStyle(.plain).focusRing()
-            // 平铺在项目线上（后端没有汇报关系的读口，不画上下级）；同一个人只一行：经理标签并到他的岗位行。
+            // 按 Core 返回的授权地址和岗位地址平铺；只合并完全相同的地址。
             let seatsList = ProjectSeats.entries(project)
             let threads = desk.hosts.value?.threads ?? []
             ForEach(Array(seatsList.enumerated()), id: \.element.id) { i, s in
-                let addresses = s.addresses(in: threads)
-                let mailbox = addresses.count == 1 ? addresses[0] : s.party.to
                 SeatRow(desk: desk, entry: s, isLast: i == seatsList.count - 1,
-                        counts: s.countable ? counts(s.party.to) : nil, addresses: addresses,
-                        threads: threads.filter { $0.carries(s.party.to) }, deliveryPending: desk.deliveryPending(mailbox))
+                        threads: threads.filter { $0.carries(s.party.to) })
             }
         }
     }
@@ -162,28 +157,20 @@ private struct SeatRow: View {
     @ObservedObject var desk: DeskModel
     let entry: SeatEntry
     let isLast: Bool
-    let counts: SeatCount?
-    let addresses: [String]
     let threads: [HostThread]
-    let deliveryPending: Int?
 
     var body: some View {
         let lampLeft: CGFloat = 24, lineX: CGFloat = 5.5
         let party = entry.party
+        let mailbox = party.to
+        let personalMailboxes = Set(threads.flatMap(\.bindings)
+            .filter { $0.position == nil && $0.actor == party.holder && $0.mailbox != mailbox }.map(\.mailbox)).sorted()
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 9) {
-                if addresses.isEmpty {
-                    Button { desk.openSeat(party.to) } label: {
-                        Text(tr("未登记岗位地址", "No position address")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
-                    }
-                    .buttonStyle(.plain).focusRing()
+                Button { desk.openSeat(party.to) } label: {
+                    Text(party.to).font(Theme.Font.rowTitle).tracking(-0.17).lineLimit(1).help(party.to)
                 }
-                ForEach(addresses, id: \.self) { address in
-                    Button { desk.openSeat(address) } label: {
-                        Text(address).font(Theme.Font.rowTitle).tracking(-0.17).lineLimit(1).help(address)
-                    }
-                    .buttonStyle(.plain).focusRing()
-                }
+                .buttonStyle(.plain).focusRing()
                 if entry.isManager { Text(tr("经理", "Manager")).font(Theme.Font.small).foregroundStyle(Theme.ink3) }
                 if party.isVacant { Text(tr("空缺", "Vacant")).font(Theme.Font.small).foregroundStyle(Theme.ink3) }
                 ForEach(threads) { thread in
@@ -196,13 +183,22 @@ private struct SeatRow: View {
                 }
             }
             HStack(spacing: 12) {
-                if entry.countable {
-                    if let c = counts { Text(tr("进行中 Work \(c.active)", "Active Work \(c.active)")); if c.submitted > 0 { Text(tr("待审 \(c.submitted)", "In review \(c.submitted)")) } }
-                    else { Text(tr("进行中 Work 未知", "Active Work unknown")) }
-                }
-                Text(deliveryText(deliveryPending))
+                if let active = party.activeWorkCount {
+                    Text(tr("进行中 Work \(active)", "Active Work \(active)"))
+                    if let submitted = party.submittedWorkCount, submitted > 0 { Text(tr("待审 \(submitted)", "In review \(submitted)")) }
+                } else { Text(tr("进行中 Work 未知", "Active Work unknown")) }
+                Text(deliveryText(desk.deliveryPending(mailbox)))
             }
             .font(Theme.Font.small).foregroundStyle(Theme.ink3).lineLimit(1)
+            ForEach(personalMailboxes, id: \.self) { address in
+                if let count = desk.deliveryPending(address), count > 0 {
+                    Button { desk.openSeat(address) } label: {
+                        Text(tr("个人待投递 \(count)", "Personal delivery pending: \(count)"))
+                            .font(Theme.Font.small).foregroundStyle(Theme.ink3).underline()
+                    }
+                    .buttonStyle(.plain).focusRing()
+                }
+            }
         }
         .padding(.leading, lampLeft + 22).padding(.vertical, 9)
         .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)

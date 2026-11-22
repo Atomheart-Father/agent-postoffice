@@ -40,6 +40,13 @@ class GrantOperations:
             return (f"授权范围 {ref!r} 指向的项目不存在", f"scope {ref!r} refers to a project that does not exist")
         return None
 
+    def _check_manager_position(self, conn, position, project_ref):
+        row = conn.execute("SELECT project_ref FROM position_holders WHERE position=?", (position,)).fetchone()
+        if row is None:
+            raise self.CoreError("unauthorized_attempt", "项目经理必须是已登记岗位", en="Project manager must be a registered position", reason_code="not_a_principal")
+        if position in self._governance_positions() or row["project_ref"] != project_ref:
+            raise self.CoreError("invalid_request", "经理岗位须属于本项目，组织管理员岗不能兼任", en="Manager position must belong to this project and cannot be an organization administrator", reason_code="position_project_mismatch")
+
     def _validate_project_grant(self, conn, params):
         subject_ref, scope, actions = params["subject_ref"], params.get("scope"), params.get("actions")
         try:      # ★ W401：到期时间在唯一写入口归一（解析不了的拒绝，不原样存）
@@ -51,11 +58,6 @@ class GrantOperations:
                 "`...T...Z` 或带 ±HH:MM 偏移的写法；留空表示不设到期",
                 en="expires_at must be local `YYYY-MM-DD HH:MM:SS`, an ISO `...T...Z`, or carry a ±HH:MM offset; leave it empty for no expiry",
                 field="expires_at") from e
-        if not self._is_registered_principal(subject_ref, conn):
-            # 拒绝类别照旧是 unauthorized_attempt：交接"批准失败回滚到 pending"的合同钉的就是它
-            raise self.CoreError("unauthorized_attempt",
-                                 f"subject_ref {subject_ref!r} 不是已登记主体", en=f"subject_ref {subject_ref!r} is not a registered principal",
-                                 subject_ref=subject_ref, reason_code="not_a_principal")
         if not isinstance(scope, (list, tuple)) or len(scope) != 1:
             raise self.CoreError("invalid_request", "scope 是且只是一个项目引用", en="scope is exactly one project reference")
         for ref in scope:
@@ -64,6 +66,7 @@ class GrantOperations:
             if bad:
                 raise self.CoreError("invalid_request", bad[0], en=bad[1], field="scope", ref=ref,
                                      reason_code="unresolvable_scope")
+        self._check_manager_position(conn, subject_ref, scope[0])
         unknown = [a for a in actions if not isinstance(a, str) or a not in ACTIONS] if isinstance(actions, (list, tuple)) and actions else None
         if unknown is None or unknown:
             raise self.CoreError("invalid_request",

@@ -79,7 +79,8 @@ def arm(conn, *, unit: str, binding_id: str, generation: int, due_at: float,
                                 # `asked_key`：有一次未结账的询问在等回执。turn_end 只是刷新到期
                                 # 时刻，不清它 —— 清了等待就变成每一次都是新的，正是 32220768 的
                                 # 75 轮。
-                                "asked_key": asked},
+                                "asked_key": asked,
+                                **({"launch_failed": asked} if asked and payload.get("launch_failed") == asked else {})},
                        binding_id=binding_id, binding_gen=int(generation), now_ts=now_ts)
 
 
@@ -98,7 +99,7 @@ def _attempts(conn, binding_id: str, generation: int) -> list:
 
 def settle(conn, *, unit: str, binding_id: str, generation: int, due_version: int,
            actionable: list, attempt_key: str | None = None, now_ts: float | None = None,
-           retry_seconds: float = 30.0, max_attempts: int = MAX_ATTEMPTS) -> dict:
+           retry_seconds: float = 30.0, max_attempts: int = MAX_ATTEMPTS, retry_pending=False) -> dict:
     """The segment's check came due: decide from Core's current facts, write in this transaction.
 
     `due_version` is the version read **before** the caller re-read Core's actionable facts, and it
@@ -144,6 +145,9 @@ def settle(conn, *, unit: str, binding_id: str, generation: int, due_version: in
     if attempt_key in used:
         return {"decision": "already_attempted", "version": row["version"], "ref": None}
     if pending:
+        if retry_pending and attempt_key == pending:
+            deferred = due_mod.push_back(conn, "idle_check", subject, at + max(1.0, float(retry_seconds)), now_ts=at)
+            return {"decision": "round_pending", "version": deferred["version"], "ref": None, "attempt_key": pending}
         return {"decision": "already_attempted", "version": row["version"], "ref": None,
                 "asked_key": pending}
     if len(used) >= max(1, int(max_attempts)):
@@ -216,6 +220,7 @@ def record_attempt(conn, *, binding_id: str | None = None, generation: int | Non
     # 这一问**结了账**：清掉"等待回执"的现场，段内计数让位给 attempts（下一次是新的一问）。
     payload.pop("asked", None)
     payload.pop("asked_key", None)
+    payload.pop("launch_failed", None)
     due_mod.set_payload(conn, "idle_check", subject, payload, now_ts=at)
     if next_due_at is not None:
         due_mod.arm(conn, "idle_check", subject, float(next_due_at),

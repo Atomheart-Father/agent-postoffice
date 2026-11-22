@@ -88,7 +88,7 @@ class Handler:
 def drain(store, *, on_batch: Handler | None = None, on_tool: Handler | None = None,
           on_idle: Handler | None = None, on_wait: Handler | None = None,
           on_model: Handler | None = None,
-          now_ts: float | None = None, limit: int = DEFAULT_LIMIT) -> dict:
+          now_ts: float | None = None, limit: int = DEFAULT_LIMIT, rows=None) -> dict:
     """Settle the rows that are due **right now**, one transaction each; return post-commit actions.
 
     `store` is a `storage.Storage` (anything with `transaction()`); this module never opens its own
@@ -114,7 +114,7 @@ def drain(store, *, on_batch: Handler | None = None, on_tool: Handler | None = N
         # scheduler from waking on rows whose meaning nobody has registered yet.
         return out
     with store.transaction(read_only=True) as conn:
-        due_now = due_mod.due_rows(conn, at, kinds=registered)
+        due_now = due_mod.due_rows(conn, at, kinds=registered) if rows is None else rows
         total = len(due_now)
         selected = due_now[:max(1, int(limit))]
         # Versions are read here, before any gather: a handler's observation describes the row at
@@ -224,6 +224,8 @@ class IdleHandler(Handler):
     def apply(self, conn, row, facts, at):
         from delivery import idle as idle_mod
         kwargs = {"retry_seconds": self.retry_seconds}
+        if row.get('_retry_pending'):
+            kwargs['retry_pending'] = True
         if self.max_attempts is not None:
             kwargs["max_attempts"] = self.max_attempts
         if quota_blocked(conn, row["binding_id"], row["binding_gen"]):

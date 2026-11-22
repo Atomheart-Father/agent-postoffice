@@ -206,6 +206,7 @@ class Officed:
         #: 提交后派发器（`delivery.dispatch.wake_host(...)`）；没装就只攒在内存里。
         self.dispatch = None
         self._handed = {}
+        self._failed = {}
         self._frame_lock = threading.Lock()
         self._host_serial_guard = threading.Lock()
         self._host_serial = {}
@@ -373,6 +374,11 @@ class Officed:
                                        "host_session_ref": session_ref, "descriptor": str(self.descriptor_path_for(binding))}}
 
     # ---------------------------------------------------------------- identity
+    def _serial_path(self, binding):
+        key = json.dumps([binding.binding_id, binding.generation, binding.instance,
+                          binding.host_session_ref], ensure_ascii=False, separators=(',', ':')).encode()
+        return self.descriptor_dir / '.claude-wake' / (hashlib.sha256(key).hexdigest() + '.json')
+
     def resolve(self, token):
         """持有凭据 → binding。**唯一**的“由连接定位受信上下文”的地方（线路不指定身份）。"""
         if not isinstance(token, str) or not token:
@@ -474,15 +480,12 @@ class Officed:
                             if lease.acquire(timeout=3):
                                 held = lease
                                 holder = binding
-                                key_bytes = json.dumps([binding.binding_id, binding.generation,
-                                    binding.instance, binding.host_session_ref], ensure_ascii=False,
-                                    separators=(',', ':')).encode()
                                 state_dir = self.descriptor_dir / '.claude-wake'
                                 state_dir.mkdir(mode=0o700, exist_ok=True)
                                 st = state_dir.lstat()
                                 if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
                                     raise ValueError('unsafe state directory')
-                                state_file = state_dir / (hashlib.sha256(key_bytes).hexdigest() + '.json')
+                                state_file = self._serial_path(binding)
                                 result = {"ok": True, "result": {"acquired": True}}
                             else:
                                 result = {"ok": False, "code": "busy"}
@@ -631,6 +634,7 @@ class Officed:
     def _rearm(self):
         """提交/登记之后重算最早的到期时刻，并把等待者叫醒（绝对时刻，不累加相对等待）。"""
         with self._wake:
+            self._failed.clear()
             self._next_due_at = self._earliest_due_at()
             self._due_seq += 1
             self._wake.notify_all()
@@ -639,10 +643,11 @@ class Officed:
         """最早一个 armed 行的**绝对** due_at；没有 ⇒ None（那就无限等下一次提交）。"""
         try:
             with self.core._txn(read_only=True) as conn:
-                row = conn.execute(
-                    "SELECT due_at FROM due WHERE state='armed'"
-                    " ORDER BY due_at, due_key LIMIT 1").fetchone()
-                return None if row is None else float(row["due_at"])
+                rows = conn.execute("SELECT due_key, due_at, kind, version FROM due WHERE state='armed'"
+                                    " ORDER BY due_at, due_key")
+                return next((float(r['due_at']) for r in rows if self.handlers.get(r['kind']) is not None
+                             and self._handed.get(r['due_key']) != r['version']
+                             and self._failed.get(r['due_key']) != r['version']), None)
         except Exception:                                          # noqa: BLE001
             return None
 
@@ -678,30 +683,60 @@ class Officed:
             handed = self._consume_due()
             with self._wake:
                 if not handed:
-                    # 没有可交的（已交接过）——把下一个绝对时刻交回，不等同一个瞬间。
-                    nxt = self._earliest_due_at()
-                    self._next_due_at = nxt if nxt is not None and nxt > time.time() else None
-                    if self._next_due_at is None:
-                        self._wake.wait()
-            continue
+                    self._next_due_at = self._earliest_due_at()
 
     def _consume_due(self):
-        """把已到期、且**这一版还没交接过**的 armed 行读出来（A 的集成点取走处理）。
-
-        daemon 只读，不写业务事实：是不是真的该提醒、要发什么信，是投递的判断；转态（`fire`）
-        也由消费者做。交接按 `(due_key, version)`，所以同一版只交一次。
-        """
+        """把选中的到期版本交给 worker，按本批处理结果记账。"""
         try:
             with self.core._txn(read_only=True) as conn:
-                rows = [r for r in due_mod.due_rows(conn)
-                        if self._handed.get(r["due_key"]) != int(r["version"])]
+                kinds = [kind for kind, handler in self.handlers.items() if handler is not None]
+                rows = [r for r in due_mod.due_rows(conn, kinds=kinds)
+                        if self._handed.get(r["due_key"]) != int(r["version"])
+                        and self._failed.get(r["due_key"]) != int(r["version"])]
+                for row in rows:
+                    key = row['payload'].get('asked_key') if row['kind'] == 'idle_check' else None
+                    locate = getattr(self.dispatch, 'frame_path', None)
+                    if not key or not callable(locate):
+                        continue
+                    try:
+                        if self.core._attempt_entry(conn, (row['binding_id'], row['binding_gen']), key):
+                            continue
+                        binding = next((b for b in self._bindings if b.binding_id == row['binding_id']
+                                        and b.generation == row['binding_gen']), None)
+                        if binding is None or not binding.host_session_ref:
+                            continue
+                        if binding.ctx.get('surface') in ('codex', 'claude'):
+                            try:
+                                self._serial_path(binding).lstat()
+                                continue
+                            except FileNotFoundError:
+                                pass
+                        unit = row['payload'].get('unit') or row['owner_ref']
+                        if row['payload'].get('launch_failed') == key and unit not in self._carried_units(binding):
+                            continue
+                        path = Path(locate(unit, 'idle_started', row['due_key']))
+                        path.lstat()
+                        if row['payload'].get('launch_failed') == key:
+                            frame = json.loads(path.read_text(encoding='utf-8'))
+                            if (frame.get('kind'), frame.get('unit'), frame.get('due_key'), frame.get('attempt_key')) == ('idle_started', unit, row['due_key'], key):
+                                row['_retry_pending'] = True
+                    except FileNotFoundError:
+                        row['_retry_pending'] = True
+                    except (OSError, TypeError, ValueError, AttributeError):
+                        pass
         except Exception:                                          # noqa: BLE001
             return []
-        for r in rows:
-            self._handed[r["due_key"]] = int(r["version"])
+        more = len(rows) > 64
+        rows = rows[:64]
         # 交给投递层去**转态**：`worker.drain` 每行一个写事务，返回动作在提交之后才执行。
         # daemon 自己不写 due 行 —— 否则唤醒路径就成了第二个转态者。
-        actions, more = self._drain(len(rows))
+        outcome = self._drain(rows)
+        versions = {r['due_key']: int(r['version']) for r in rows}
+        for item in outcome.get('handled', []):
+            self._handed[item['due_key']] = versions[item['due_key']]
+        for key, _error in outcome.get('failed', []):
+            self._failed[key] = versions[key]
+        actions = outcome.get('actions', [])
         if actions:
             self._dispatch(actions)
         if more:
@@ -711,17 +746,17 @@ class Officed:
                 self._wake.notify_all()
         return rows
 
-    def _drain(self, limit, now_ts=None):
+    def _drain(self, rows, now_ts=None):
         """有 handler 就结算一次到期项；没有 handler 就什么都不读（空表是诚实的答案）。
 
         `drain` 自己开写事务（一次最多 64 行），**不要**在外面再包一层事务；它返回的动作只在
         提交之后才执行，所以这里只把它们排进待办，不在事务里唤宿主。
         """
         handlers = getattr(self, "handlers", None)
-        if not handlers or not limit:
-            return [], 0
+        if not handlers or not rows:
+            return {}
         try:
-            kw = {"limit": max(1, min(64, limit))}
+            kw = {"limit": 64, "rows": rows}
             if now_ts is not None:
                 kw["now_ts"] = now_ts
             # `build_handlers` 的键是 kind（`batch`/`tool_hang`/`idle_check`），
@@ -734,10 +769,10 @@ class Officed:
             out = worker_mod.drain(self.store, **kw)
         except Exception as exc:                                   # noqa: BLE001
             self._log("drain 失败：%s: %s" % (type(exc).__name__, exc))
-            return [], 0
+            return {"failed": [(row['due_key'], str(exc)) for row in rows]}
         for key, err in out.get("failed") or []:
             self._log("到期项未结算 %s：%s" % (key, err))
-        return list(out.get("actions") or []), int(out.get("more") or 0)
+        return out
 
     def ack_action(self, action, binding):
         """Commit a receipt only while the same trusted session still carries its unit."""
@@ -778,8 +813,22 @@ class Officed:
             is_position = self.core._is_position_address(conn, name)
         return (self.home / "positions" / name) if is_position else (self.home / name)
 
+    def _codex_launch_failure(self, action, binding):
+        if action.get('kind') != 'idle_started':
+            return
+        with self.core._txn() as conn:
+            row = due_mod.get(conn, action['due_key'])
+            attempt = action.get('attempt_key')
+            if (not row or row['state'] != 'armed' or row['binding_id'] != binding.binding_id
+                    or row['binding_gen'] != binding.generation or row['payload'].get('asked_key') != attempt
+                    or self.core._attempt_entry(conn, (binding.binding_id, binding.generation), attempt)):
+                return
+            payload = dict(row['payload']); payload['launch_failed'] = attempt
+            due_mod.push_back(conn, 'idle_check', row['subject_ref'], max(row['due_at'], time.time() + 30))
+            due_mod.set_payload(conn, 'idle_check', row['subject_ref'], payload)
+
     def _dispatch(self, actions):
-        """提交后把动作写成唤醒帧（`<box_dir>/wake/`）。失败按动作记一行，不影响已经提交的事实。"""
+        """提交后写持久帧，再启动对应的 Codex 消费者。"""
         sender = getattr(self, "dispatch", None)
         if sender is None or not actions:
             return []
@@ -788,18 +837,25 @@ class Officed:
             try:
                 with self._frame_lock:
                     written.append(sender(action))
-                for binding in self._bindings:
-                    if (binding.ctx.get("surface") == "codex" and binding.host_session_ref
-                            and action.get("unit") in self._carried_units(binding)):
+            except Exception as exc:                               # noqa: BLE001
+                self._log("唤醒帧未写出 %s：%s: %s"
+                          % (action.get("due_key"), type(exc).__name__, exc))
+                continue
+            for binding in self._bindings:
+                if (binding.ctx.get("surface") == "codex" and binding.host_session_ref
+                        and action.get("unit") in self._carried_units(binding)):
+                    try:
                         subprocess.Popen(["node", str(_HERE / "ext/office_codex_delivery.mjs"), "send",
                                           binding.host_session_ref, action["due_key"]],
                                          env={**os.environ, "POSTOFFICE_HOME": str(self.home)},
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            except Exception as exc:                               # noqa: BLE001
-                self._log("唤醒帧未写出 %s：%s: %s"
-                          % (action.get("due_key"), type(exc).__name__, exc))
+                    except OSError as exc:
+                        try:
+                            self._codex_launch_failure(action, binding)
+                        except Exception as record_exc:
+                            self._log("Codex 失败记账异常 %s：%s" % (action.get("due_key"), record_exc))
+                        self._log("Codex 消费者未启动 %s：%s" % (action.get("due_key"), exc))
         if written:
-            # 有帧可交付：同一条 Condition 上叫醒等待者（`round.await` 与 waker 共用一个信号）。
             with self._wake:
                 self._due_seq += 1
                 self._wake.notify_all()

@@ -86,7 +86,6 @@ final class DeskModel: ObservableObject {
     // 刷新时算一次的派生事实（视图只读，不在每次渲染里重算）
     @Published private(set) var holders: [String: [String]] = [:]
     /// 席位名下的件数；归不到唯一席位 / 没读全都是 nil（未知）。
-    @Published private(set) var seatCounts: SeatCounts?
     /// 没挂在任何项目花名册上的活动绑定：R2 窗口减花名册（不是后端给的列表）。任何一边没读到 = 未知。
     @Published private(set) var unassigned: Panel<[HostBinding]> = .loading
 
@@ -199,7 +198,6 @@ final class DeskModel: ObservableObject {
 
     private func deriveFacts() {
         holders = PersonLabel.holders(projects.value ?? [])
-        seatCounts = projects.value.flatMap { ps in work.value.flatMap { SeatCounts(projects: ps, works: $0) } }
         if case .done(let h) = hosts, case .done(let p) = projects {
             unassigned = .done(Unassigned.derive(hosts: h, projects: p))
         } else { unassigned = .loading }

@@ -242,8 +242,8 @@
 					"zh": "一个项目引用，例如 prj-2。"
 				},
 				"subject_ref": {
-					"en": "Grantee: a mailbox or a position",
-					"zh": "被授权人：员工信箱名或岗位"
+					"en": "Grantee: the manager's @position in this project",
+					"zh": "被授权岗位：本项目的 @经理岗位"
 				}
 			}
 		},
@@ -480,12 +480,12 @@
 					"zh": "可选：至多 8 个项目引用（prj-3）或路径前缀（office/lib）；给了则只随匹配的派工送达。通用条目不填"
 				},
 				"expected_version": {
-					"en": "The version you read (replace, remove, restore), sent back unchanged",
-					"zh": "你读到的版本号（replace、remove、restore 时给），原样带回"
+					"en": "For replace/remove use that entry’s version; for restore use the current position version from the read result.",
+					"zh": "replace、remove 填该条目的版本；restore 填读取结果中的当前岗位版本。"
 				},
 				"to_version": {
-					"en": "Snapshot number to restore (restore only)",
-					"zh": "要恢复到的快照号（仅 restore）"
+					"en": "Snapshot number to restore (restore only). Old text-only snapshots remain readable but cannot be restored without scope and reason metadata.",
+					"zh": "要恢复的快照号（仅 restore）。旧纯文本快照仍可读，但缺少适用范围与原因时不能恢复。"
 				}
 			}
 		},
@@ -508,8 +508,8 @@
 					"zh": "项目名称"
 				},
 				"owner_ref": {
-					"en": "Owner mailbox or position. A position's authority follows its current holder.",
-					"zh": "负责人的信箱或岗位名。授权随岗位现任走。"
+					"en": "Registered @position to manage the new project. Authority follows its current holder.",
+					"zh": "已登记的 @经理岗位。管理权随岗位现任走。"
 				},
 				"visibility": {
 					"en": "Optional: shared (default, readable by company staff) / private",
@@ -686,8 +686,8 @@
 			},
 			"parameters": {
 				"cursor": {
-					"en": "Previous page's cursor.",
-					"zh": "上一页的 cursor。"
+					"en": "Previous page’s cursor (line number or long-line continuation); pass it unchanged.",
+					"zh": "上一页的 cursor（行号或长行续读标记），原样传回。"
 				},
 				"limit": {
 					"en": "Maximum lines, subject to the byte cap. has_more signals another page.",

@@ -60,15 +60,17 @@ const KEEP_EMPTY = new Set(["items", "your_roles", "available_actions", "work_pa
  *  time a signature in this wave claimed something the body did not do (after the daemon client's
  *  and `runEntry`'s `timeoutMs`, and `writeActivity`'s `sessionID`).
  */
-export function compact(v) {
-	if (Array.isArray(v)) return v.map((x) => compact(x)).filter((x) => x !== undefined);
+export function compact(v, knowledge = false) {
+	if (Array.isArray(v)) return v.map((x) => compact(x, knowledge)).filter((x) => x !== undefined);
 	if (v && typeof v === "object") {
+		knowledge ||= typeof v.position === "string" && (Array.isArray(v.entries) && Array.isArray(v.snapshots)
+			|| ["add", "replace", "remove", "restore"].includes(v.op) && "entry_version" in v);
 		const out = {};
 		for (const [k, x] of Object.entries(v)) {
 			if (INTERNAL.has(k) || (k === "acted_at_ts" && v.acted_at)) continue;
-			if (k === "version" && Number.isInteger(x)) continue;   // Work CAS version; content versions are strings
+			if (k === "version" && Number.isInteger(x) && !knowledge) continue;   // Work CAS version
 			if (x === false && QUIET_FALSE.has(k)) continue;
-			const c = compact(x);
+			const c = compact(x, knowledge);
 			if (c === undefined) continue;
 			const rosterPositions = k === "positions" && Array.isArray(v.work_participants);
 			if (!KEEP_EMPTY.has(k) && !rosterPositions

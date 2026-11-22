@@ -144,6 +144,8 @@ function parse(argv) {
 
 /** The tool's own schema decides the type of each flag; this only moves text into it. */
 function coerce(prop, raw) {
+	const integerBranch = prop?.anyOf?.find((branch) => branch.type === "integer");
+	if (integerBranch && Number.isFinite(Number(raw))) return coerce(integerBranch, raw);
 	const type = prop?.type;
 	if (type === "object") {
 		try { return JSON.parse(raw); } catch { return raw; }

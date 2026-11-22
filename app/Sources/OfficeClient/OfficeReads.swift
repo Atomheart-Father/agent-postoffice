@@ -56,6 +56,8 @@ public struct Party: Sendable, Equatable, Identifiable {
     public let roles: [String]
     /// 只认后端明确返回的空岗位；没返回 holder 不等于空缺。
     public internal(set) var isVacant = false
+    public internal(set) var activeWorkCount: Int? = nil
+    public internal(set) var submittedWorkCount: Int? = nil
     public var id: String { to + "/" + roles.joined(separator: ",") }
 }
 
@@ -218,7 +220,9 @@ public struct OfficeReads: Sendable {
         (raw as? [[String: Any]] ?? []).map { p in
             Party(to: p["to"] as? String ?? "",
                   holder: p["holder"] as? String, roles: p["roles"] as? [String] ?? [],
-                  isVacant: p["kind"] as? String == "position" && p["holder"] is NSNull)
+                  isVacant: p["kind"] as? String == "position" && p["holder"] is NSNull,
+                  activeWorkCount: p["active_work_count"] as? Int,
+                  submittedWorkCount: p["submitted_work_count"] as? Int)
         }
     }
 

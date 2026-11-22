@@ -9,9 +9,26 @@ import {reportClaudeUsage} from './office_claude_usage.mjs';
 const good = x => x && typeof x === 'object' && x.ok !== false && !x.refused;
 const nonempty = x => typeof x === 'string' && x.length > 0;
 
-async function locked(client, fn) {
-  if (!await client.acquireSerial()) return null;
-  try { return await fn(); } finally { await client.releaseSerial(); }
+async function reconnect(windowOpen, call, disconnected) {
+  for (let delay = 250; !windowOpen || windowOpen(); delay = Math.min(delay * 2, 5000)) {
+    const result = await call();
+    if (!windowOpen || !disconnected(result)) return result;
+    await sleep(delay);
+  }
+  return null;
+}
+async function locked(client, fn, windowOpen) {
+  while (true) {
+    const acquired = await reconnect(windowOpen, () => client.acquireSerial(), result =>
+      result?.error === 'socket_error' || result?.error === 'socket_closed');
+    if (acquired !== true) return null;
+    try { return await fn(); }
+    catch (error) {
+      if (!windowOpen || !error.serialReadDisconnected) throw error;
+    } finally { await client.releaseSerial(); }
+    if (!windowOpen()) return null;
+    await sleep(250);
+  }
 }
 function exactPrompt(prompt, text) {
   if (!nonempty(prompt)) return false;
@@ -32,17 +49,8 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
     if (collectUsage && ['SessionStart', 'UserPromptSubmit'].includes(event.hook_event_name)) await reportClaudeUsage(client, event);
     if (mode === 'wait' || mode === 'prepare') {
       if (!['SessionStart', 'Stop'].includes(event.hook_event_name)) return {status: 'unknown', reason: 'event'};
-      const awaitFrames = async options => {
-        let retryMs = 250;
-        while (windowOpen()) {
-          const got = await client.awaitFrames(options);
-          // A daemon restart closes an idle wait. Retrying this read cannot submit another round.
-          if (mode === 'prepare' || got?.unknown !== true) return got;
-          await sleep(retryMs);
-          retryMs = Math.min(retryMs * 2, 5000);
-        }
-        return null;
-      };
+      const waitWindow = mode === 'wait' ? windowOpen : undefined;
+      const awaitFrames = options => reconnect(waitWindow, () => client.awaitFrames(options), got => got?.unknown === true);
       const skip = new Set();
       while (true) {
         if (!windowOpen()) return {status: 'window_closed'};
@@ -82,7 +90,7 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
             await client.serialState('clear'); return {cleared: true};
           }
           return s;
-        });
+        }, waitWindow);
         if (!pending) return {status: 'unknown', reason: 'busy'};
         if (pending.cleared) break;
         if (mode === 'prepare') return {status: 'unknown', reason: 'pending', text: pending.text};
@@ -136,7 +144,7 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
         const text = `[Office wake ${codexNative ? batch.token : randomUUID()}]\n${frame.text}`;
         await client.serialState('write', {session, unit: frame.unit, frame, token: batch.token, owner: owner.owner_token, attempt, text, phase: 'handed'});
         return {status: 'handoff', text};
-      });
+      }, waitWindow);
       if (result?.status === 'stale_frame') continue;
       return result || {status: 'unknown', reason: 'busy'};
       }
@@ -215,7 +223,7 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
         return {status: 'finished'};
       }
       return {status: 'unknown', reason: 'event'};
-    }) || {status: 'unknown', reason: 'busy'};
+    }, event.hook_event_name === 'Stop' && !codexNative ? windowOpen : undefined) || {status: 'unknown', reason: 'busy'};
   } finally { client.close(); }
 }
 

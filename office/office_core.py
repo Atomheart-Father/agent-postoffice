@@ -603,32 +603,21 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         return False
 
     # ---------------------------------------------------------------- 治理与授权
-    def _governance_actors(self, conn):
-        """**权威治理判据**：治理只来自受控上下文 → 当前有效岗位绑定 → 会话，外加静态治理身份。
+    def _governance_positions(self):
+        return self._gov_static | set(getattr(self.resolver, "governance_actors", ()) or ())
 
-        答案在一次事务里恒定（bindings / position_holders / resolver 配置都只由本事务的写入
-        改变），按连接缓存，不跨请求、不跨事务。
-        """
+    def _governance_actors(self, conn):
+        """配置的治理岗位及其当前有效任职，只在本次事务缓存。"""
         cached = self._gov_cache.get(conn)
         if cached is not None:
             return cached
-        base = set(self._gov_static)
-        if self.resolver is not None:
-            base |= set(getattr(self.resolver, "governance_actors", ()) or ())
         out = set()
-        for ref in base:
-            if not isinstance(ref, str) or not ref:
-                continue
-            # 岗位条目展开成**此刻的现任**（`position_holders` 是库里的登记事实，不需要 resolver；
-            # 有 resolver 时仍先问它 —— 组织配置比库表更权威，两边都是既有判据，不新写）。
-            if self.resolver is not None and hasattr(self.resolver, "is_role") \
-                    and self.resolver.is_role(ref):
-                out |= set(self._live_holders(conn, ref))
-                continue
+        for ref in self._governance_positions():
             if self._is_position_address(conn, ref):
-                out |= set(self._live_holders(conn, ref))
-                continue
-            out.add(ref)
+                holders = self._live_holders(conn, ref)
+                if holders:
+                    out.update(holders)
+                    out.add(ref)
         self._gov_cache[conn] = out
         return out
 
@@ -646,13 +635,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         if not actor:
             return False
         return actor in self._governance_actors(conn)
-
-    def _subject_clause(actors):
-        """`subject_ref IN (?,?,…)` 的占位串（至少一个，空则退化为不可能匹配）。"""
-        actors = [a for a in (actors or ()) if isinstance(a, str) and a]
-        if not actors:
-            return "(NULL)", ()
-        return "(%s)" % ",".join("?" * len(actors)), tuple(actors)
 
     def _is_position_address(self, conn, name):
         """这是不是**岗位地址**：`position_holders` 有一行，或统一解析表里的非人名地址。
@@ -902,12 +884,12 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
 
     def _project_grants(self, conn, project_ref=None, now_ts=None):
         rows = conn.execute(
-            "SELECT DISTINCT project_ref, subject_ref, expires_at FROM grants"
-            " WHERE project_ref IS NOT NULL AND revoked_at IS NULL"
-            " AND (? IS NULL OR project_ref=?) AND json(actions_json)=json_array(?)",
+            "SELECT DISTINCT g.project_ref, g.subject_ref, g.expires_at FROM grants g"
+            " JOIN position_holders p ON (p.position, p.project_ref)=(g.subject_ref, g.project_ref)"
+            " WHERE g.revoked_at IS NULL AND (? IS NULL OR g.project_ref=?) AND json(g.actions_json)=json_array(?)",
             (project_ref, project_ref, PROJECT_MANAGE))
-        now = self._now(now_ts)
-        return [row for row in rows if not self._expiry_expired(row["expires_at"], now)]
+        now, administrators = self._now(now_ts), self._governance_positions()
+        return [row for row in rows if row["subject_ref"] not in administrators and not self._expiry_expired(row["expires_at"], now)]
 
     def _position_management_project(self, conn, position, *, project_ref=None, now_ts=None):
         """返回普通岗位所属项目。组织岗位和持有在效项目管理权的岗位走组织审批。"""
@@ -933,28 +915,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
 
     def request_create(self, actor, *, kind, reason, target=None, position=None, params=None,
                        quotes=None, create=None, act_key, now_ts=None):
-        """提一条申请（A2）：**有授权当场执行**，否则待批 —— 同一张 `handover_requests`。
-
-        组织层面的事走第 3 档申请，项目内的岗位事务由经理凭 `project.manage` 当场办。
-
-        · `grant`：`target` 是授权主体，`params={scope,actions,project_ref?,expires_at?}`（动作只能是 `project.manage`，范围就是一个项目；不能给自己）；
-        · `holder`：`position` + `target`（接任人名，省略则是调用方当前会话），申请时**锁定**目标会话与代次（批准时再核，变了 ⇒
-          `target_session_changed`，申请留在原地）。`create={position:{duties,reports_to},
-          project:{name,owner_ref,workspace_refs,…}}` 是**新岗位**：批准时同一事务先写岗位（和项目），再绑定、发上岗信；
-          新岗位属于哪个项目写在 `create.position.project_ref`，新项目的负责人 `owner_ref` 同一事务拿到它的 `project.manage`；
-        · `revoke`：`target` 是要收回的授权号（`grant_ref`）；
-        · `project`：`target` 是新项目的负责人，`params={name,workspace_refs,description?,visibility?,…}`，批准同一事务建项目并给负责人 `project.manage`；
-        · `deactivate`：`target` 是被停用的人（停用自己不用申请，直接 `identity.deactivate`）；
-        · `retire`：`position` 是要撤的岗位，`params={cancel_work?}`；
-        · `unbind`：`target` 是别人的绑定号，提交时锁定它的代次，批准时再核（变了 ⇒ `binding_changed`，申请留在原地），执行复用 `binding.revoke` 的同一写入；
-        · `read_mail`：`target` 是对方信箱，`params={letter_ids}`，只读点名的这几封（要都在该信箱里），批准后一直可读、可撤销；项目岗位的信箱由本项目经理批，其余管理员独立判断、拿不准转用户；不通知信箱主人；
-        · `broadcast`：`target` 是标题，`params={body}`；严格项（只有用户批，没有常驻授权），批准的同一事务里发一封只落箱、不唤醒的公告。
-
-        申请拆成若干**项**（`_request_items`，每项各有谁能批见 `_item_power`）：创建者对全部项都有权
-        （用户、本项目的经理）⇒ 同一事务执行、直接 `done`；否则
-        `pending`（不过期），各审批人只收到自己能批的那一项。同一申请（同申请人/动作/目标/参数）重复提交只算一次。
-        旧调用的 `quotes` 字段保留兼容，不参与审批判定。
-        """
+        """有权当场执行，否则待批；每项审批、版本和重试都保存在同一申请。"""
         self._check_actor(actor)
         if kind not in self._REQUEST_KINDS:
             raise CoreError("invalid_request", "kind 只能是 %s" % " / ".join(self._REQUEST_KINDS),
@@ -962,7 +923,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         appoint_self = kind == "holder" and target is None
         target = (actor if appoint_self else
                   ((target if isinstance(target, str) else "") or (position if kind == "retire" else "") or "").strip())
-        target = target.lstrip("@") if kind in ("retire", "read_mail") else target
+        target = target.removeprefix("@") if kind in ("retire", "read_mail", "project", "grant") else target
         if not target:
             raise CoreError("invalid_request", "target 必填", en="target is required", field="target")
         reason = reason.strip() if isinstance(reason, str) else ""
@@ -1023,6 +984,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                     conn, actor, "request.create", act_key, payload)
                 if replay is not None:
                     return replay
+                applicant_person = self._request_operator(conn, actor)
                 now = self._now(now_ts)
                 pos = ((position or "").lstrip("@").strip()) if kind in ("holder", "retire") else ""
                 if kind in ("holder", "retire") and not pos:
@@ -1044,7 +1006,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                     if create:
                         self._position_create_fields(conn, spec)
                     tgt = self._holder_bind_target(conn, target, rparams, now_ts=now_ts)
-                    rparams.update(target_session_ref=tgt["session_ref"], target_generation=tgt["generation"],
+                    rparams.update(target_session_ref=tgt["session_ref"], target_binding_id=tgt["binding_id"], target_generation=tgt["generation"],
                                    target_instance=tgt["instance"])
                 if kind in ("unbind", "broadcast", "read_mail", "join"):
                     self._request_prepare(conn, actor, kind, target, rparams)
@@ -1069,11 +1031,11 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                     execution = self._request_execute(conn, actor, kind, pos, target, rparams, now, now_ts,
                                                       "request-execute:%s" % ref)
                 state = "done" if execution is not None else "pending"
-                routes_to_project = all(item[1] is not None for item in items)
+                routes_to_project = any(item[1] is not None for item in items)
                 decider = (None if execution is not None or routes_to_project
                            or (self._governance_actors(conn) and not any(i[2] for i in items))
                            else self._request_user())
-                outcome = self.canonical_json({"execution": execution, "by_user": actor == self._request_user()} if execution else {})
+                outcome = self.canonical_json({"applicant_person": applicant_person, **({"execution": execution, "by_user": actor == self._request_user()} if execution else {})})
                 if completing:
                     conn.execute(
                         "UPDATE handover_requests SET state=?,updated_at=?,result_json=?,decider_ref=NULL,"
@@ -1098,16 +1060,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
 
     def request_decide(self, actor, *, request_ref, decision, reason="", basis=None, quotes=None,
                        expected_version=None, act_key, now_ts=None):
-        """决定一条申请（A2）：approve / refuse / to_user —— 同一记录、同一事务。
-
-        · **批自己的申请** ⇒ `unauthorized_attempt`（申请留在原地）；审批人就是受控入口校验过的 `actor`，同一事务记下；
-        · 用户 = `config.panel.operator`（老板）；管理员在自身权限范围内独立决定。
-        · 申请按项（`_request_items`）批：对某一项有权（`_item_power`）的人只批那一项，全部项批完才在同一事务里执行；
-          本项目的经理批落在自己项目里的项；严格项（经理岗位换人）只有用户能批；
-          没有权的人 ⇒ `not_approver`（第 3 档，找管理员；拿不准转用户）；
-        · `to_user`：同一行申请的 `decider_ref` 切到用户并给用户一封系统信，此后只有用户能决定；
-        · refuse 是终态，申请人收到原因。
-        """
+        """按现有权限、版本和事务决定申请；不能决定自己提交的申请。"""
         with self._authority_lock():
             self._check_actor(actor)
             if decision not in ("approve", "refuse", "to_user"):
@@ -1122,9 +1075,11 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                     conn, actor, "request.decide", act_key, params)
                 if replay is not None:
                     return replay
+                self._request_operator(conn, actor)
                 row = self._request_row(conn, request_ref)
                 self._request_pending(row, request_ref)
-                if actor == row["applicant"]:
+                person = json.loads(row["result_json"] or "{}").get("applicant_person")
+                if self._request_is_own(conn, actor, row["applicant"], person):
                     raise CoreError("unauthorized_attempt",
                                      "不能决定自己的申请", en="you cannot decide your own request",
                                      request_ref=request_ref, reason_code="own_request")
@@ -1227,12 +1182,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             raise CoreError("invalid_request", "workspace_refs 至少一个真实工作空间引用",
                             en="workspace_refs needs at least one real workspace reference",
                             field="workspace_refs")
-        self.check_ref(owner_ref, "owner_ref")
-        if not self._is_registered_principal(owner_ref, conn):
-            raise CoreError("unauthorized_attempt",
-                            "owner_ref %r 不是已登记 Actor/Role" % owner_ref,
-                            en="owner_ref %r is not a registered Actor/Role" % owner_ref,
-                            owner_ref=owner_ref, reason_code="not_a_principal")
+        owner_ref = owner_ref.strip().removeprefix("@") if isinstance(owner_ref, str) else None
+        self._check_manager_position(conn, owner_ref, None)
         # 引用校验一遍、落库一遍（同一批）：`registered_refs` 是唯一登记依据，
         # 库内 project_refs 不参与 —— 新项目不能拿自己塞进去的行当来源。
         ref_rows, seen = [], set()
@@ -1265,6 +1216,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         for kind, ref in ref_rows:
             conn.execute("INSERT INTO project_refs(project_ref, kind, ref) VALUES(?,?,?)",
                          (project_ref, kind, ref))
+        conn.execute("UPDATE position_holders SET project_ref=? WHERE position=?", (project_ref, owner_ref))
         self._grant_insert(conn, actor, {"subject_ref": owner_ref, "scope": [project_ref], "actions": [PROJECT_MANAGE],
                                          "project_ref": project_ref, "expires_at": None}, now_ts)
         result = {"ok": True, "project_ref": project_ref, "project_version": 1,

@@ -64,20 +64,18 @@ def _roles_of(conn, actor, row, *, can_manage):
 
 
 def _resolve_person(conn, name, what):
-    """派工对象：人名或岗位地址。空的两个都不成立 —— 不猜"大概是谁"。"""
-    require_text((name or '').strip(), what)
-    name = name.strip()
+    """将通讯录的 @岗位解析为 Work 使用的同一岗位引用。"""
+    name = name.strip() if isinstance(name, str) else name
+    require_text(name, what)
     if name.startswith("@"):
-        hit = conn.execute("SELECT 1 FROM position_holders WHERE position=? LIMIT 1",
-                           (name,)).fetchone()
-        if hit is None:
+        name = name[1:]
+        if conn.execute("SELECT 1 FROM position_holders WHERE position=?", (name,)).fetchone() is None:
             raise ResultRefused("not_found", "岗位 %r 未登记" % name,
                                 en="position %r is not registered" % name, field=what)
-        return name
     return name
 
 
-def _review_mode(row_reviewer):
+def _review_mode(conn, row_reviewer):
     """审核安排：给了审核人就要审；没给就是免审。只在包含 `none` 时才叫 none。"""
     if row_reviewer in (None, "", "none"):
         return "none", None
@@ -85,7 +83,7 @@ def _review_mode(row_reviewer):
         raise ResultRefused("invalid_request", "review 是审核人的名字（字符串）；免审就不传",
                             en="review is the reviewer's name (a string); omit it for no review",
                             field="review")
-    return "reviewer", row_reviewer
+    return "reviewer", _resolve_person(conn, row_reviewer, "review")
 
 
 def _scope_list(conn, prow, scope):
@@ -141,7 +139,7 @@ def create(storage, conn, actor, *, project_ref, objective, assignee, review=Non
                                % actor, project_ref=project_ref, reason_code="not_project_manager",
                             needs="project.manage")
     who = _resolve_person(conn, assignee, "assignee")
-    mode, reviewer = _review_mode(review)
+    mode, reviewer = _review_mode(conn, review)
     scopes = _scope_list(conn, prow, scope)
     refs, rels = _check_additions(conn, actor, project_ref, references, relations, manage)
 
@@ -550,7 +548,7 @@ def update(storage, conn, actor, *, work_ref, action, expected_version=None, ass
         payload.update(to=who, scope=scopes, **{"from": row["assignee_ref"]})
     elif action == "reviewer":
         _require_manage(manage, row["project_ref"], "改审核安排", "change the reviewer", work_ref)
-        mode, reviewer = _review_mode(review)
+        mode, reviewer = _review_mode(conn, review)
         sets = {"review_mode": mode, "reviewer_ref": reviewer}
         payload.update(mode=mode, to=reviewer)
     elif action == "edit":
@@ -807,6 +805,7 @@ def withdraw(storage, conn, actor, *, work_ref, sub_ref, expected_version=None, 
         raise ResultRefused("unauthorized_attempt", "只能撤回本人的提交",
                             en="you can only withdraw your own submission",
                             sub_ref=sub_ref, reason_code="not_submitter", needs="submitter")
+    _require_open(row, work_ref, "撤回")
     require_version(row, expected_version, work_ref)
     now = now_text(now_ts)
     conn.execute("UPDATE subs SET state=? WHERE sub_ref=?", ("withdrawn", sub_ref))

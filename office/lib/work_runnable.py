@@ -170,9 +170,6 @@ def runnable_work(conn, actor, unit=None, *, now_ts=None):
             if not mine:
                 skip(SKIP_NOT_MINE)
                 continue
-            if sub is not None:
-                skip(SKIP_WAITING_REVIEW)
-                continue
             action = "publish"
 
         item = {"work_ref": ref, "action": action, "state": row["state"],
