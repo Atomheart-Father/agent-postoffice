@@ -138,13 +138,13 @@ def candidates(conn, box, *, only=None, exclude=None, own_round=None):
 
 
 def pending_delivery_count(conn, box):
-    """Count letters waiting for a native turn, including refs already frozen for that turn."""
+    """Count queued or in-flight letters whose delivery is still pending."""
     from delivery import due
 
     batch = due.get(conn, due.due_key("batch", box))
     waiting = sum(item["kind"] in FORMAL_KINDS and item["created_at"] is not None
                   for item in candidates(conn, box)) if batch and batch["state"] == "armed" else 0
-    return waiting + len(_reserved_refs(conn, box))
+    return waiting + len(_reserved_refs(conn, box, include_unknown=False))
 
 
 def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
@@ -205,15 +205,16 @@ def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
                       "unread": False}, bad)
 
 
-def _reserved_refs(conn, box, own_round=None):
+def _reserved_refs(conn, box, own_round=None, *, include_unknown=True):
     """Unaccepted handoffs, including Codex unknowns released by older versions."""
     rows = conn.execute(
         "SELECT rr.ref FROM round_ref rr JOIN round r ON r.token=rr.token"
         " JOIN letter_states s ON (s.box,s.letter_id)=(rr.box,rr.ref)"
         " WHERE rr.box=? AND rr.token IS NOT ? AND s.state='delivered' AND s.accepted_at IS NULL"
+        " AND (? OR r.state<>'unknown')"
         " AND (rr.ref_state='active' OR (r.channel='codex' AND r.state='unknown' AND NOT EXISTS"
         " (SELECT 1 FROM round_ref newer WHERE newer.box=rr.box AND newer.ref=rr.ref AND newer.attempt>rr.attempt)))"
-        " ORDER BY rr.rowid", (box, own_round))
+        " ORDER BY rr.rowid", (box, own_round, include_unknown))
     return list(dict.fromkeys(row[0] for row in rows))
 
 
