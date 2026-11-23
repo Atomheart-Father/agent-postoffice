@@ -267,20 +267,13 @@ def _apply(conn, position, actor, now, *, op, id=None, text=None, section=None, 
 
 
 # ------------------------------------------------------------------ 上下文合同
-def duties_of(spec):
-    """从该岗位在组织配置里的登记（`aliases.<role>`）取职责 `role.duties[]`。"""
-    role = spec.get("role") if isinstance(spec, dict) else None
-    role = role if isinstance(role, dict) else {}
-    return [d.strip() for d in (role.get("duties") or []) if isinstance(d, str) and d.strip()]
-
-
 def summary(conn, position, spec):
     """送进 `office.context` 的**本岗**摘要：职责 + 通用条目（`when` 为空），总字数不超过 `LIMIT`。
 
     只读本岗自己的行；别的岗位、历史、快照都不碰。装不下的按序截断并记 `omitted`（读口取全）；
     有 `when` 的条目只数个数（`scoped`），随派工送达。
     """
-    duties = duties_of(spec)
+    duties = [d.strip() for d in ((spec or {}).get("duties") or []) if isinstance(d, str) and d.strip()]
     entries = _live(conn, position)
     general = [e for e in entries if not e["when"]]
     shown, used = [], 0
@@ -293,26 +286,6 @@ def summary(conn, position, spec):
     return {"duties": duties,
             "knowledge": {"entries": shown, "chars": used, "limit": LIMIT,
                           "omitted": len(general) - len(shown), "scoped": len(entries) - len(general)}}
-
-
-def navigation_lines(positions, zh=True):
-    """`navigation` 里的职责与经验行（同一份事实的正文渲染，文字来自文字文件）。"""
-    lang = "zh" if zh else "en"
-    nav, out = TEXT["navigation"], []
-    sep = "；" if zh else "; "
-    for p in positions:
-        if p.get("duties"):
-            out.append(nav["duties"][lang].format(role=p["role"], duties=sep.join(p["duties"])))
-        k = p.get("knowledge") or {}
-        if k.get("entries"):
-            out.append(nav["knowledge"][lang].format(role=p["role"], count=len(k["entries"]),
-                                                      chars=k["chars"], limit=k["limit"]))
-            out += ["- " + e["text"].replace("\n", " ") for e in k["entries"]]
-        if k.get("omitted"):
-            out.append(nav["omitted"][lang].format(n=k["omitted"]))
-        if k.get("scoped"):
-            out.append(nav["scoped"][lang].format(n=k["scoped"]))
-    return out
 
 
 def dispatch_lines(conn, roles, project_ref=None, paths=()):

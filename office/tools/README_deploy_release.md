@@ -14,8 +14,6 @@ python <新发布目录>/office/tools/install_release.py --home "${POSTOFFICE_HO
 
 一次发布按同一个固定包切换后端和全局宿主入口。先备份配置、确认当前回合结束，再切换服务、更新入口并用宿主原生方式重载。检查现有宿主已发现新入口、实际工具或版本回执正常后，将旧包和已确认的重复 Office 入口移出加载目录。未重连的原会话单独记下实际加载状态。
 
-OpenCode 2 全局入口在 `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/office-postoffice/index.ts`。升级后通过宿主原生方式重载，再用受控身份回读业务数据和 `release.status` 的加载版本。Pi 仍用原生扩展、Claude Code 仍用原生插件及钩子，Codex 仍用原生 MCP 和用户级钩子。
-
-安装生成 `UserPromptSubmit`、`PostModelRequest` 与 `Stop` 三条用户级钩子，保留其他钩子。新命令需经 Codex 原生信任，命令完全相同的重装会保留原条目。`/hooks` 用于 Codex 终端，桌面按客户端实际显示的审阅入口操作。原文关联、实际运行回执和轮次结束分别由这三个事件提供。`PostModelRequest` 同时报告本会话、本回合已落盘且带原生 response_id 的用量；无可靠 Work 回执时为未归属。
+OpenCode 2 全局入口在 `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/office-postoffice/index.ts`。Pi 使用原生扩展，Claude Code 使用原生插件及钩子。Codex 的工具走 MCP，收信走原生队列。安装会移除旧的 Office Codex 钩子并保留用户其他钩子。升级后通过宿主原生方式重载，再用受控身份回读业务数据和 `release.status` 的加载版本。各宿主的收信时机见[投递验收](../TESTING.md#mail-delivery-by-host)。
 
 本机 App 复用同一个安装目录下 `sock/` 的受控描述符。双击安装目录中的 `BOXZ OFFICE.app` 便会连接旁边的服务。显式指定 `BOXZ_OFFICE_HOME` 或 `POSTOFFICE_HOME` 可接隔离实例。

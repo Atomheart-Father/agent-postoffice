@@ -20,11 +20,5 @@
   "dispatch": "{role} 岗位里与这件 Work 相关的经验：",
   "review_followup": {"zh": "如这次改正有可复用的经验，承办人可用 office_position_knowledge_update 补一条；没有可跳过。", "en": "If the correction offers a reusable lesson, the assignee can add it with office_position_knowledge_update. Otherwise skip it."},
   "what": {"entry": {"zh": "这条经验", "en": "This entry"}, "position": {"zh": "岗位经验", "en": "Position knowledge"}},
-  "navigation": {
-    "duties": {"zh": "{role} 职责：{duties}", "en": "{role} duties: {duties}"},
-    "knowledge": {"zh": "{role} 经验（{count} 条，{chars}/{limit} 字）：", "en": "{role} practice ({count} entries, {chars}/{limit} chars):"},
-    "omitted": {"zh": "  还有 {n} 条放不进这里，用 office_position_knowledge_read 读。", "en": "  {n} more do not fit here; read them with office_position_knowledge_read."},
-    "scoped": {"zh": "  另有 {n} 条按项目或路径触发的经验，随相关派工送达。", "en": "  {n} more entries are tied to a project or path and arrive with the matching work."}
-  },
   "welcome": {"subject": "岗位资料：%s", "duties": "你的职责：%s"}
 }

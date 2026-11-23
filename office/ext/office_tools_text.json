@@ -27,14 +27,6 @@
 		"unknown_tool": {
 			"en": "Unknown tool {work}",
 			"zh": "未知工具 {work}"
-		},
-		"view_ambiguous": {
-			"en": "This session saw submission {sub} in several different states (v{versions}); open it again with office_work_get, then decide.",
-			"zh": "你在本会话里看过 {sub} 的几个不同状态（v{versions}）；请重新 office_work_get 确认后再判定。"
-		},
-		"view_required": {
-			"en": "Open {work} with office_work_get first to see submission {sub} (this session has not seen it yet).",
-			"zh": "先用 office_work_get 打开 {work}，确认你要审核的提交 {sub}（本会话还没看过它）。"
 		}
 	},
 	"validate": {

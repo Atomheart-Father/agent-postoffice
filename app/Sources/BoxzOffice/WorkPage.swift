@@ -12,18 +12,29 @@ struct WorkPage: View {
         PageScaffold {
             PageTitle(title: "Work", fixture: simulated) { stats }
             Text(tr("已完成 Work 分析", "Completed-Work analysis")).font(Theme.Font.small).foregroundStyle(Theme.ink3).padding(.top, 2)
-            PanelBody(panel: desk.work) { list in
-                if reviewOpen { reviewList.padding(.top, 18) }
-                if let tab = desk.currentWorkTab {
-                    ProjectTabs(desk: desk, current: tab, items: list.items.filter { $0.state == .done }).padding(.top, 26)
+            if reviewOpen { reviewList.padding(.top, 18) }
+            if let tab = desk.currentWorkTab {
+                ProjectTabs(desk: desk, current: tab).padding(.top, 26)
+                PanelBody(panel: desk.completed) { list in
+                    Text(tr("本页 \(list.items.count) / 共 \(list.total)", "This page \(list.items.count) / \(list.total) total")).font(Theme.Font.small).foregroundStyle(Theme.ink3).padding(.top, 12)
                     graph()
-                } else {
-                    PanelBody(panel: desk.projects) { _ in
-                        Text(tr("0 件活", "0 works")).font(Theme.Font.body).foregroundStyle(Theme.ink3).padding(.top, 40)
+                    HStack {
+                        if desk.completedCursor != nil { BoxButton(title: tr("回到首页", "First page")) { Task { await desk.loadCompleted(cursor: nil) } } }
+                        if list.hasMore, let next = list.nextCursor { BoxButton(title: tr("下一页", "Next page")) { Task { await desk.loadCompleted(cursor: next) } } }
+                    }.padding(.top, 12)
+                }
+                if case .done = desk.completed, desk.completed.fact != nil {
+                    HStack {
+                        BoxButton(title: tr("重试", "Retry")) { Task { await desk.loadCompleted(cursor: desk.completedCursor) } }
+                        if desk.completedCursor != nil { BoxButton(title: tr("回到首页", "First page")) { Task { await desk.loadCompleted(cursor: nil) } } }
                     }
                 }
+            } else {
+                PanelBody(panel: desk.projects) { _ in
+                    Text(tr("0 个项目", "No projects")).font(Theme.Font.body).foregroundStyle(Theme.ink3).padding(.top, 40)
+                }
             }
-            ReadAt(desk: desk, what: "Work", fact: desk.work.fact).padding(.top, 40)
+            ReadAt(desk: desk, what: "Work", fact: desk.completed.fact).padding(.top, 40)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { if desk.workPicked.count >= 2 { CompareBar(desk: desk, refs: desk.workPicked) { desk.workPicked = [] } } }
     }
@@ -31,25 +42,27 @@ struct WorkPage: View {
     // MARK: 顶部：数 + 待你审核
 
     @ViewBuilder private var stats: some View {
-        if let w = desk.work.value {
-            let queue = desk.reviewQueue
-            HStack(alignment: .bottom, spacing: Theme.statGap) {
-                Stat(value: bounded(w.items.filter { $0.state == .done }.count, atLeast: w.hasMore), label: tr("已完成", "Done"))
-                Button { reviewOpen.toggle() } label: {
-                    Stat(value: bounded(queue.count, atLeast: w.hasMore), label: tr("待你审核", "Awaiting your review"))
-                        .overlay(alignment: .bottom) { Rectangle().fill(queue.isEmpty ? Theme.rule : Theme.ink).frame(height: Theme.Line.outline).offset(y: 6) }
-                }
-                .buttonStyle(.plain).disabled(queue.isEmpty).focusRing()
+        HStack(alignment: .bottom, spacing: Theme.statGap) {
+            if let w = desk.completed.value {
+                Stat(value: "\(w.total)", label: tr("本项目已完成", "Project completed"))
+            } else {
+                Stat(value: desk.completed.text { _ in "" }, label: tr("本项目已完成", "Project completed"))
             }
-        } else {
-            Stat(value: tr("未知", "Unknown"), label: tr("已完成", "Done"))
+            Button { reviewOpen.toggle() } label: {
+                Stat(value: desk.reviews.text { "\($0.total)" }, label: tr("待你审核", "Awaiting your review"))
+                    .overlay(alignment: .bottom) { Rectangle().fill(Theme.ink).frame(height: Theme.Line.outline).offset(y: 6) }
+            }
+            .buttonStyle(.plain).focusRing()
         }
     }
 
     /// 待你审核的活：点一件打开抽屉，通过 / 退回在那里（原来的审核入口）。
     private var reviewList: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(desk.reviewQueue) { w in
+            PanelBody(panel: desk.reviews) { page in
+              VStack(alignment: .leading, spacing: 0) {
+              if page.items.isEmpty { Text(tr("本页没有可审核的 Work", "No reviewable Work on this page")).foregroundStyle(Theme.ink3) }
+              ForEach(page.items) { w in
                 Button { desk.openWork(w.ref) } label: {
                     HStack(spacing: 12) {
                         WorkMark(state: w.state)
@@ -62,6 +75,18 @@ struct WorkPage: View {
                 }
                 .buttonStyle(.plain).focusRing()
                 .overlay(alignment: .bottom) { Rule() }
+              }
+              HStack {
+                  if desk.reviewCursor != nil { BoxButton(title: tr("回到首页", "First page")) { Task { await desk.loadReviews(cursor: nil) } } }
+                  if let next = page.nextCursor, page.hasMore { BoxButton(title: tr("下一页", "Next page")) { Task { await desk.loadReviews(cursor: next) } } }
+              }.padding(.top, 12)
+              }
+            }
+            if case .done = desk.reviews, desk.reviews.fact != nil {
+                HStack {
+                    BoxButton(title: tr("重试", "Retry")) { Task { await desk.loadReviews(cursor: desk.reviewCursor) } }
+                    if desk.reviewCursor != nil { BoxButton(title: tr("回到首页", "First page")) { Task { await desk.loadReviews(cursor: nil) } } }
+                }.padding(.top, 12)
             }
         }
         .frame(maxWidth: 640, alignment: .leading)
@@ -257,7 +282,7 @@ private struct CompareBar: View {
     private let labelW: CGFloat = 72, colW: CGFloat = 214
 
     var body: some View {
-        let items = refs.compactMap { r in (desk.work.value?.items.first { $0.ref == r }).map { NodeFacts(row: $0, desk: desk) } }
+        let items = refs.compactMap { r in desk.doneInTab.first { $0.ref == r }.map { NodeFacts(row: $0, desk: desk) } }
         VStack(alignment: .leading, spacing: 0) {
             Rectangle().fill(Theme.ink).frame(height: Theme.Line.hair)
             HStack(alignment: .top, spacing: 0) {
@@ -310,14 +335,12 @@ private struct CompareBar: View {
 private struct ProjectTabs: View {
     @ObservedObject var desk: DeskModel
     let current: String
-    let items: [WorkRow]            // 已完成的
     var body: some View {
         // 窗口窄了就换行，不裁切
         FlowLayout(spacing: 8) {
             ForEach(desk.workTabs, id: \.self) { ref in
                 let name = desk.projects.value?.first { $0.ref == ref }?.name
-                let n = items.filter { $0.projectRef == ref }.count
-                BoxButton(title: (name?.isEmpty == false ? name! : ref) + "  \(n)", primary: ref == current) { desk.workTab = ref }
+                BoxButton(title: name?.isEmpty == false ? name! : ref, primary: ref == current) { desk.workTab = ref }
             }
         }
     }

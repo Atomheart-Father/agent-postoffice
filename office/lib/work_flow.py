@@ -17,7 +17,7 @@ import json
 from position_knowledge import TEXT as KNOWLEDGE_TEXT
 from work_result import (ResultRefused, _work_row, record_result, digest_change_set, now_text,
                          change_set_of, require_actor, require_version, _positions_held)
-from work_runnable import _holders, _open_dependencies
+from work_runnable import _holders, _open_dependencies, same_submitter
 
 WORK_ACTIVE, WORK_SUBMITTED, WORK_DONE, WORK_CANCELLED = "Active", "Submitted", "Done", "Cancelled"
 SUB_EFFECTIVE, SUB_ACCEPTED, SUB_RETURNED, SUB_REPLACED = "effective", "accepted", "returned", "replaced"
@@ -195,7 +195,7 @@ def replay_key(work_ref, change_set, note, replaces, final):
 
 
 def publish(storage, conn, actor, *, work_ref, change_set, store_root, act_key, note="",
-            replaces=None, expected_version=None, final=False, now_ts=None, scope_covers=None):
+            replaces=None, expected_version=None, final=False, now_ts=None, scope_covers=None, operator=None):
     """交付一件 Work 的成果。返回这次提交的事实（含哪些下游因此被解开）。
 
     在**调用方的事务里**执行；不自己开事务、不提交。
@@ -207,6 +207,7 @@ def publish(storage, conn, actor, *, work_ref, change_set, store_root, act_key, 
     if replay is not None:
         return replay
 
+    person = operator() if operator else actor
     row, pending, now = plan(conn, actor, work_ref=work_ref, change_set=change_set,
                              expected_version=expected_version, replaces=replaces,
                              scope_covers=scope_covers, now_ts=now_ts)
@@ -224,7 +225,7 @@ def publish(storage, conn, actor, *, work_ref, change_set, store_root, act_key, 
     completed = bool(final) and (row["review_mode"] or "none") == "none"
     sets = {"state": WORK_DONE, "completion_basis": "final_unaudited"} if completed \
         else {"state": WORK_SUBMITTED if row["review_mode"] not in (None, "", "none") else row["state"]}
-    payload = {"sub_ref": recorded["sub_ref"], "change_set": recorded["change_set"],
+    payload = {"sub_ref": recorded["sub_ref"], "submitted_person": person, "change_set": recorded["change_set"],
                "note": note, "final": bool(final), "replaces": replaces}
     version = _bump(conn, row, "work.publish", payload, actor, now, act_key, sets)
     result = {"ok": True, "work_ref": work_ref, "sub_ref": recorded["sub_ref"],
@@ -256,7 +257,7 @@ def review_experience(conn, row):
 
 
 def review(storage, conn, actor, *, work_ref, sub_ref, decision, reason=None, evidence=None,
-           act_key, now_ts=None):
+           act_key, now_ts=None, operator=None):
     """对当前那一份提交作出判断（accept / return）。返回判定后的事实。
 
     accept **最终版**让 Work 完成并把下游解开；accept 中间版（`subs.final=0`）只把那一份记为通过，
@@ -283,7 +284,13 @@ def review(storage, conn, actor, *, work_ref, sub_ref, decision, reason=None, ev
                             en="%s is %s, not awaiting review" % (work_ref, row["state"]),
                             work_ref=work_ref, state=row["state"], reason_code="not_submitted")
     current = _require_current_sub(conn, row, sub_ref)
-    if current["submitted_by"] == actor:
+    person = operator() if operator else actor
+    own = same_submitter(conn, work_ref, sub_ref, current["submitted_by"], actor, person)
+    if own is None:
+        raise ResultRefused("unauthorized_attempt", "这份旧岗位提交无法核实经办人，请重新发布",
+                            en="This older position submission has no verified submitter. Publish it again.",
+                            sub_ref=sub_ref, reason_code="operator_unverifiable")
+    if own:
         raise ResultRefused("unauthorized_attempt", "不能审核自己提交的内容",
                             en="You cannot review your own submission",
                             sub_ref=sub_ref, reason_code="self_review", needs="reviewer")

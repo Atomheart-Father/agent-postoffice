@@ -13,9 +13,9 @@ The `office/` directory contains the service and native host adapters. The `app/
 Requires macOS 14+, full Xcode, Git, Node.js, Bun, and Python 3.12 or newer.
 
 ```sh
-git clone --branch v1.1.0-preview.1 https://github.com/Atomheart-Father/BOXZ-Office.git
+git clone --branch v1.1.0-preview.2 https://github.com/Atomheart-Father/BOXZ-Office.git
 cd BOXZ-Office
-release="$HOME/office-releases/office-1.1.0-preview.1"
+release="$HOME/office-releases/office-1.1.0-preview.2"
 mkdir -p "$HOME/office-releases"
 python3 office/tools/stage_release.py "$(git rev-parse HEAD)" "$release"
 python3 "$release/office/tools/install_release.py" --home "${POSTOFFICE_HOME:-$HOME/office11}"

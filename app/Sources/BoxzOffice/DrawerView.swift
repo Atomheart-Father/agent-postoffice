@@ -268,9 +268,9 @@ private struct ProjectDetailView: View {
         group(tr("经理", "Managers"), project.managers)
         group(tr("岗位", "Positions"), project.positions)
         group(tr("参与人", "Participants"), project.participants)
-        let works = desk.work.value?.items.filter { $0.projectRef == project.ref } ?? []
-        Sec(title: "Work", count: desk.work.value == nil ? tr("未知", "Unknown") : "\(works.count)")
-        ForEach(works) { w in
+        Sec(title: "Work", count: desk.projectWork.value.map { "\($0.items.count) / \($0.total)" } ?? tr("未知", "Unknown"))
+        PanelBody(panel: desk.projectWork) { list in
+          ForEach(list.items) { w in
             Button { desk.openWork(w.ref) } label: {
                 HStack(spacing: 10) {
                     WorkMark(state: w.state)
@@ -281,6 +281,17 @@ private struct ProjectDetailView: View {
                 .padding(.vertical, 6).contentShape(Rectangle())
             }
             .buttonStyle(.plain).focusRing()
+          }
+          HStack {
+              if desk.projectCursor != nil { BoxButton(title: tr("回到首页", "First page")) { Task { await desk.loadProjectWork(cursor: nil) } } }
+              if list.hasMore, let next = list.nextCursor { BoxButton(title: tr("下一页", "Next page")) { Task { await desk.loadProjectWork(cursor: next) } } }
+          }.padding(.top, 12)
+        }
+        if case .done = desk.projectWork, desk.projectWork.fact != nil {
+            HStack {
+                BoxButton(title: tr("重试", "Retry")) { Task { await desk.loadProjectWork(cursor: desk.projectCursor) } }
+                if desk.projectCursor != nil { BoxButton(title: tr("回到首页", "First page")) { Task { await desk.loadProjectWork(cursor: nil) } } }
+            }.padding(.top, 12)
         }
     }
 
@@ -452,8 +463,49 @@ private struct WorkDetailView: View {
             HStack { Text(s.ref).font(Theme.Font.mono); Spacer(); Chip(text: Labels.submissionState(s.state)) }
             Text(shortTime(s.createdAt)).font(Theme.Font.small.weight(.regular)).monospacedDigit().foregroundStyle(Theme.ink3).padding(.top, 2)
             if !s.note.isEmpty { Text(s.note).font(Theme.Font.f14).lineSpacing(3).padding(.top, 6).textSelection(.enabled) }
+            if let final = s.final { Text(final ? tr("最终成果", "Final delivery") : tr("阶段成果", "Interim delivery")).font(Theme.Font.small.weight(.semibold)) }
+            ForEach(s.files) { file in
+                SubmissionFileView(reads: desk.reads, subRef: s.ref, file: file).id(s.ref + ":" + file.ref)
+            }
         }
     }
+}
+
+private struct SubmissionFileView: View {
+    let reads: OfficeReads
+    let subRef: String
+    let file: SubmissionFile
+    @State private var open = false
+    @State private var cursor: String?
+    @State private var page: Panel<ArtifactPage> = .loading
+    @State private var request = 0
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(file.ref).font(Theme.Font.mono).textSelection(.enabled)
+            Text("\(file.op) · \(file.version ?? tr("版本未知", "Version unknown"))").font(Theme.Font.small).textSelection(.enabled)
+            if file.op != "delete" {
+                BoxButton(title: open ? tr("收起文件", "Close file") : tr("读取文件", "Read file")) {
+                    open.toggle()
+                    if open { cursor = nil; load() }
+                }
+                if open {
+                    PanelBody(panel: page) { value in
+                        Text(verbatim: value.content).font(Theme.Font.f14).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        if let next = value.cursor { BoxButton(title: tr("下一页", "Next page")) { cursor = next; load() } }
+                    }
+                    if page.value == nil, case .done = page { BoxButton(title: tr("重新读取", "Read again"), action: load) }
+                }
+            }
+        }.padding(.top, 6)
+        .task(id: request) {
+            guard open else { return }
+            let next = cursor
+            let result = await Task.detached { reads.artifactPage(subRef: subRef, path: file.ref, cursor: next) }.value
+            guard !Task.isCancelled else { return }
+            page = .done(result)
+        }
+    }
+    private func load() { page = .loading; request += 1 }
 }
 
 /// 一个角色格的 token：合计 + 入 / 出 / 缓存；缺的分量写"未知"。nil = 这个角色没有记录。

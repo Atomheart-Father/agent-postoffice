@@ -4,8 +4,7 @@
 
   · **事件**（`work_events`）—— 每一次受控动作写一条，payload 里就是那一次的原样字段
     （`sub_ref` / `review_ref` / `change_set` / `reason` / `evidence` / `from` / `to`）。这是
-    "谁、几点、做了什么、引用什么"的唯一出处；`subs` / `reviews` / `assignments` 是同一批
-    动作的落点，不是第二种说法。
+    "谁、几点、做了什么、引用什么"的唯一出处。
   · **审核轮次**（`reviews`）—— 每一轮是一条已作出的决定。它和事件不是两份：事件说"那一步
     发生了什么"，轮次说"这一份提交被怎么判的"。履历要回答后者，所以按提交归一次组。
   · **材料与关系**（`inputs` / `work_relations`）—— 当前还在的那些由 `work_business.get` 给；
@@ -18,8 +17,6 @@
 同一个人在两处得到不同答案，比少一个读口糟得多。
 """
 import json
-
-from work_runnable import runnable_work
 
 #: 事件 op → 履历里的一句话（不解析 payload 的措辞，只按 op 选词）。
 #: 词表以外的一律 `work.event`：宁可少描述一句，也不为未知 op 编一个说法。
@@ -211,9 +208,13 @@ def relation_changes(conn, work_ref, *, live_only=False, reverse=True, may_read=
     return {"mine": mine, "toward_me": toward_me}
 
 
+SPLIT_CACHE_INPUT = frozenset({"claude", "opencode", "pi"})
+
+
 def usage_sum(rows):
     """一组用量行的合计（履历卡与 `usage.read` 共用的唯一一份加法）。
 
+    入参是已记录的完整输入，缓存读是其中一项。旧记录未采集的缓存写不补猜。
     token 三格都是**一格缺则合计缺**（`None`）：宿主没报的不能当 0 加起来；
     `estimated_events` = 其中 `attribution="estimated"` 的条数（分母仍是 `events`）。
     """
@@ -225,6 +226,8 @@ def usage_sum(rows):
         tokens = out["tokens"]
         for key in tokens:
             value = r["tokens_" + key]
+            if key == "in" and value is not None and r["harness"] in SPLIT_CACHE_INPUT:
+                value += r["tokens_cache"] or 0
             tokens[key] = value if first else (
                 None if tokens[key] is None or value is None else tokens[key] + value)
     return out
@@ -269,18 +272,3 @@ def history(conn, work_ref, *, loc="zh", may_read=None):
             "released": [dict(r) for r in conn.execute(
                 "SELECT release_ref, version, source_commit, at FROM releases WHERE EXISTS"
                 " (SELECT 1 FROM json_each(work_refs_json) WHERE value=?) ORDER BY rowid", (work_ref,))]}
-
-
-def todo(conn, actor, *, unit=None, now_ts=None):
-    """我的待办 = **现在能动手**的那些 Work。判据与看门狗、与续办入口是同一份。
-
-    这里只换形状（按动作分组、给出计数），不另判一遍"算不算有活"：
-    同一个问题两处实现，迟早在"有等待"或"等审核"上给出两个答案。
-    """
-    got = runnable_work(conn, actor, unit, now_ts=now_ts)
-    by_action = {}
-    for item in got["items"]:
-        by_action.setdefault(item["action"], []).append(item)
-    return {"actor": got["actor"], "unit": got["unit"], "count": got["count"],
-            "items": got["items"], "by_action": by_action,
-            "skipped": got["skipped"], "at": got["at"]}

@@ -26,7 +26,11 @@ extension DeskModel {
 
     /// 版本冲突之后：重新读取，再清掉这一笔，让这一行带着新版本重新出现——由人重新点，不自动重发。
     func reloadAfterConflict(_ key: String) {
-        Task { await refresh(); book.actions[key] = nil }
+        Task {
+            await refresh()
+            if case .review(let ref, _, _) = book.actions[key]?.intent, workDetails[ref]?.value == nil { return }
+            book.actions[key] = nil
+        }
     }
 
     /// 发送（或对"未知"重试：键、内容、retry_ref 都不变）。

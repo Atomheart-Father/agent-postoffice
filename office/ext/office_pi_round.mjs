@@ -1,7 +1,7 @@
 // Pi 宿主侧的受控 round 客户端 + 等待/顺序判据（W439 首切片）。
 //
 // 为什么是这个文件：本树只保留了 Pi 原生片段，原来的 `office_daemon.mjs` 不在保留集里，
-// 而 `office_wake_loop.mjs` 需要它的客户端与四条判据（ready / awaitFrames / orderUnits /
+// 而 `office_wake_loop.mjs` 需要它的客户端与受控请求（awaitFrames /
 // created 形状）。这里**不另造入口**：传输仍是既有的 `office_socket.mjs`（一条受控 socket、
 // 一份方法表），本文件只提供该 socket 之上的业务投影。
 //
@@ -19,7 +19,7 @@
 //
 //   `host.event`（kind/ts/…）是 runtime 的路由；本层只负责把 op 发上去、把三态如实交回。
 
-import {createOfficeSocket} from "./office_socket.mjs";
+import {createOfficeSocket, openControlledEndpoint} from "./office_socket.mjs";
 import {readFileSync} from "node:fs";
 import {dirname, join} from "node:path";
 import {fileURLToPath} from "node:url";
@@ -36,10 +36,12 @@ const OPS = {
   runBegin: "round.run.begin",
   settle: "round.settle",
   consume: "round.consume",
+  endNative: "round.run.end",
   roundState: "round.payload",
   awaitRound: "round.await",
   wakeAck: "wake.ack",
   ownerRegister: "round.owner.register",
+  ownerShow: "round.owner.show",
   ownerRevoke: "round.owner.revoke",
   hostEvent: "host.event",
   usageRecord: "usage.record",
@@ -57,25 +59,7 @@ const TRANSPORT_UNKNOWN = new Set(["socket_error", "socket_closed", "no_socket_p
  * 描述符，不用它当授权（真正的判权在受控线路那一侧）。
  */
 export function readDescriptor(file) {
-  let text;
-  try {
-    text = readFileSync(String(file), "utf8");
-  } catch {
-    return null;
-  }
-  let d;
-  try {
-    d = JSON.parse(text);
-  } catch {
-    return null;                       // 半截写入/坏 JSON：当作"还不存在"
-  }
-  if (!d || typeof d !== "object" || Array.isArray(d)) return null;
-  if (typeof d.socketPath !== "string" || !d.socketPath) return null;
-  // 托管身份四字段（runtime 的单绑定形状）：缺任一项就不是受控描述符 ⇒ fail closed。
-  for (const k of ["actor", "bindingId", "generation", "instance"]) {
-    if (d[k] === undefined || d[k] === null || d[k] === "") return null;
-  }
-  return d;
+  return openControlledEndpoint({descriptor: String(file || ""), envDescriptor: ""}).endpoint ?? null;
 }
 
 /** 这条错误码是不是"结果未知"。放在这里而不是散在调用点：三态的分界只有一处。 */
@@ -85,13 +69,6 @@ const isTransportUnknown = (code) => TRANSPORT_UNKNOWN.has(String(code || ""));
 export const isCreated = (value) => value === true || value === 1;
 export const hasCreatedFact = (value) => isCreated(value) || value === false || value === 0;
 
-/** 投递单元的唯一顺序规则：个人箱在前，其余保持服务端给的次序。 */
-export function orderUnits(box, units) {
-  const list = Array.isArray(units) ? units.filter((u) => typeof u === "string" && u) : [];
-  if (!list.length) return [];
-  return list.includes(box) ? [box, ...list.filter((u) => u !== box)] : list;
-}
-
 /**
  * 受控 round 客户端。`socketPath` / `tokenFile` 来自本箱自己的端点描述符（由调用方给，不猜路径）。
  *
@@ -100,7 +77,7 @@ export function orderUnits(box, units) {
  */
 export function createPiRoundClient({ socketPath, tokenFile } = {}) {
   const sock = createOfficeSocket({ socketPath, tokenFile });
-  /** 本客户端代表的箱（身份回指）。`ready()` 确认身份之后才允许它代表这个箱发 `round.*`。 */
+  /** The local mailbox used to omit redundant unit fields and correlate host events. */
   let connBox = "";
 
   /** 同一个动作重试要带**同一个** act_key（幂等回读原记录）；没有业务线索时退化为 op 名。 */
@@ -131,7 +108,7 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
     const wire = { ...fields, op };
     delete wire.retry_ref;
     if (op === "host.event") wire.act_key = fields.act_key || actKeyFor(op, fields);
-    if (op.startsWith("round.")) {
+    if (op.startsWith("round.") && name !== "ownerRegister" && name !== "roundState") {
       const unit = wire.unit;
       if (!unit || unit === connBox) delete wire.unit;   // 个人箱的单元不发（缺省 = 本箱）
     }
@@ -147,6 +124,7 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
       const out = { ok: false, code, message: String(got.message || "") };
       if (got.reason_code) out.reason_code = got.reason_code;
       if (got.detail) out.detail = got.detail;
+      if (got.credential_changed) out.credential_changed = true;
       if (isTransportUnknown(code)) { out.unknown = true; out.retry_ref = retryRef; }
       return out;
     }
@@ -164,7 +142,9 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
       const out = await sock.serialRequest({op: `host.serial.${op}`, ...(state ? {state} : {})});
       if (!out || out.ok === false) {
         const error = Error('serial state unknown');
-        error.serialReadDisconnected = op === 'read' && ['socket_error', 'socket_closed'].includes(out?.error);
+        error.serialReadDisconnected = op === 'read' && (['socket_error', 'socket_closed'].includes(out?.error)
+          || (out?.error === 'unauthorized_attempt' && out.credential_changed));
+        error.serialWriteDisconnected = op === 'write' && ['socket_error', 'socket_closed'].includes(out?.error);
         throw error;
       }
       return out;
@@ -195,8 +175,8 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
         ...(beforeEnqueue ? {before_enqueue:true} : {}) }),
 
     /** **真正开始**：宿主的原生 start 已发生（同一尝试标识 + 持有绑定），再落 run-begin。 */
-    runBegin: (unit, roundToken, ownerToken, harnessRef) =>
-      call("runBegin", { unit, token: roundToken, owner_token: ownerToken, harness_ref: harnessRef }),
+    runBegin: (unit, roundToken, ownerToken, harnessRef, nativeText) =>
+      call("runBegin", { unit, token: roundToken, owner_token: ownerToken, harness_ref: harnessRef, native_text: nativeText }),
 
     /** 结算：accepted / rejected / unknown（未知走这里时不带 accepted 语义）。 */
     settle: (unit, roundToken, status = "accepted", harnessRef) =>
@@ -206,16 +186,15 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
     consume: (unit, event, ownerToken, roundToken) =>
       call("consume", { unit, event, owner_token: ownerToken, round_token: roundToken }),
 
+    endNative: (nativeRef) => call("endNative", {native_ref: nativeRef}),
+
     roundState: (unit, token) => call("roundState", { unit, token }),
 
-    /**
-     * 受控通知入口：服务端挂住等待（到期 / 新写入 / `wait_ms` 上限），把它**自己那个单元**的
-     * 帧原样交回（帧形状由投递层定）。`skip` 是"我手上正在处理的 due_key"，服务端不存状态。
-     * 客户端不起定时器、不轮询。
-     */
-    awaitFrames: ({waitMs, unit, skip} = {}) => {
+    /** Wait for the current binding's wake frames. `skip` belongs to the caller's in-flight work. */
+    awaitFrames: ({waitMs, unit, skip, toolMail} = {}) => {
       const fields = {wait_ms: waitMs};
       if (unit) fields.unit = unit;
+      if (toolMail) fields.tool_mail = true;
       if (Array.isArray(skip) && skip.length) fields.skip = skip.filter((k) => typeof k === "string" && k);
       return call("awaitRound", fields);
     },
@@ -229,8 +208,9 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
     /** 活动：只在状态变化时发，只发这一个键（哪些相位、什么含义由线方法自己定）。 */
 
 
-    ownerRegister: (unit) => call("ownerRegister", { unit }),
-    ownerRevoke: (unit) => call("ownerRevoke", { unit }),
+    ownerRegister: (unit, expected_owner_gen) => call("ownerRegister", { unit, ...(expected_owner_gen === undefined ? {} : {expected_owner_gen}) }),
+    ownerShow: (unit) => call("ownerShow", { unit }),
+    ownerRevoke: (unit, owner) => call("ownerRevoke", { unit, owner_token: owner.owner_token, owner_gen: owner.owner_gen }),
 
     /** `host.event`：kind/ts 与业务字段由调用方给（路由与字段表是 runtime 的）。 */
     hostEvent: (kind, ts, fields = {}) => call("hostEvent", { kind, ts, ...fields }),
@@ -243,28 +223,8 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
      */
     usageRecord: (entries, actKey) => call("usageRecord", { entries, act_key: actKey }),
 
-    close: () => sock.close(),
+    close: (options) => sock.close(options),
   };
-}
-
-/**
- * 就绪：**descriptor → 连上 → `identity.whoami` 一帧**。身份只从这一帧的顶层 `actor` 取
- * （`lib/binding.py::identity_whoami`），不从线路自报、不从描述符猜。
- *
- * 撤权/换代/换绑按同一条判据处理：原样抛出，保留在飞事实、不盲重投。
- */
-export async function ready(client, box) {
-  const who = await client.context();
-  if (!who || who.ok === false) {
-    throw new Error(`office.context failed: ${(who && who.code) || "unknown"}`);
-  }
-  const actor = who.actor;
-  if (actor !== box) throw new Error(`identity_mismatch: 连接身份 ${actor} ≠ 本宿主信箱 ${box}`);
-  if (who.binding_active === false) {
-    throw new Error("binding_inactive: 这条绑定的通道已失效（等宿主侧重新供给）");
-  }
-  if (typeof client.setConnBox === "function") client.setConnBox(box);
-  return who;
 }
 
 /**
@@ -325,12 +285,6 @@ export const HOST_EVENT_KINDS = new Set([
 ]);
 
 /**
- * Core 已退休的 kind：`idle` 不在闭集里。Core 对它答「已退休，改用 turn_end」，本层给**同一个**
- * 答复、一个字节不发（全仓零生产者、零业务读者，职责已由 `turn_end` 覆盖）。
- */
-export const HOST_EVENT_RETIRED = new Set(["idle"]);
-
-/**
  * 一条原生观测 → `host.event` 的线上帧。**字段表的唯一实现**：观测口与 wake loop 的尝试类事实
  * 都走这里，不各写一份。
  *
@@ -339,15 +293,10 @@ export const HOST_EVENT_RETIRED = new Set(["idle"]);
  * ⇒ `attempt_id`（真 Pi 取证 `5e05476a`：增量本身**不带任何 id**）；`turn_end`/`quota`/`loaded`
  * 是合法的无回合事件。身份字段一个都不进业务帧；`fields` 覆盖不了关联/`kind`/`ts`。
  *
- * @returns {{ok:true,ts:number,frame:object}|{ok:true,retired:true,reason:string,detail:string}
- *          |{ok:false,code:string,message:string}}
+ * @returns {{ok:true,ts:number,frame:object}|{ok:false,code:string,message:string}}
  */
 export function hostEventFrame(kind, ev = {}) {
   const k = String(kind || "");
-  if (HOST_EVENT_RETIRED.has(k)) {
-    return { ok: true, retired: true, reason: "idle_event_retired",
-      detail: "idle 已退休：职责由 turn_end 覆盖，改用 turn_end" };
-  }
   if (!HOST_EVENT_KINDS.has(k)) {
     return { ok: false, code: "event_kind_unknown", message: `host.event kind 不在规格 §3.2 闭集里: ${kind}` };
   }
@@ -393,7 +342,7 @@ export function hostEventFrame(kind, ev = {}) {
  * 本层不做判定、不维护 revision、不选模型：它发的是事实。
  */
 export function createPiHostEvents({ client, binding } = {}) {
-  /** 当前持有的绑定（来自 `ready()` 的 whoami；换绑/换代由调用方重新给一份）。只做本地校对。 */
+  /** The binding supplied by the caller for local event correlation. */
   let held = binding || null;
 
   return {
@@ -409,7 +358,7 @@ export function createPiHostEvents({ client, binding } = {}) {
     async observe(kind, ev = {}) {
       const k = String(kind || "");
       const shaped = hostEventFrame(k, ev);
-      if (shaped.ok === false || shaped.retired) return shaped;
+      if (shaped.ok === false) return shaped;
       if (typeof client?.hostEvent !== "function") {
         return { ok: false, code: "host_event_unavailable", message: "socket 客户端没有 host.event 口" };
       }

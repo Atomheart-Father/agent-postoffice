@@ -96,7 +96,7 @@ async function handle(msg) {
 			// Capabilities are unknown before the first whoami, so the table is the honest full set:
 			// hiding a management entry would hide it forever (no listChanged), and authorization is
 			// decided per call by Core anyway.
-			return { tools: toolSpecs(LOCALE, null, { neutral: true }).map(mcpTool) };
+			return { tools: toolSpecs(LOCALE).map(mcpTool) };
 		}
 		case "tools/call": {
 			const name = params?.name;

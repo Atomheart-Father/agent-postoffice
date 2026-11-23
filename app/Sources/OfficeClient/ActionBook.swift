@@ -144,7 +144,7 @@ public struct ActionBook: Equatable, Sendable {
         case .done(let d): a.phase = .done(d); held[key] = nil; refresh = true
         case .refused(let c, let m, let reason, let v):
             held[key] = nil; refresh = true
-            if reason == "version_conflict" || (c == "conflict" && v != nil) { a.phase = .versionChanged(currentVersion: v) }
+            if reason == "version_conflict" || reason == "sub_not_current" || (c == "conflict" && v != nil) { a.phase = .versionChanged(currentVersion: v) }
             else { a.phase = .refused(code: c, message: m) }
         case .unknown(let d, let r): a.phase = .unknown(detail: d); if let r { a.retryRef = r }; refresh = true
         case .notConnected(let d): a.phase = .notConnected(detail: d)

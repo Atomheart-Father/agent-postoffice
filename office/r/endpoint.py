@@ -21,6 +21,7 @@ import importlib.machinery
 import importlib.util
 import json
 import sys
+from functools import partial
 from pathlib import Path
 
 
@@ -155,7 +156,7 @@ class Endpoints:
 
     # ---------------------------------------------------------------- 一帧
     #: 线路只接受 spec public 的字段；内部形状（`recipients`/`letter_id`）不由外部给。
-        #: 两项端点胶水：交付时 `files` → `change_set`，读回时 `bytes` → 展示视图。
+    #: 交付时 `files` → `change_set`；读回时把流传给展示视图。
     #: 它们都在 `r/` 里，Core 不认识"文件"也不认识"视图"。
     @property
     def _artifacts(self):
@@ -172,14 +173,14 @@ class Endpoints:
         return self._publish_mod
 
     _WIRE_ONLY = {
-        "letter.send": {"op", "act_key", "to", "cc", "subject", "need", "body",
+        "letter.send": {"op", "act_key", "to", "cc", "subject", "intent", "need", "body",
                         "reply_to", "keep_open", "retry_ref"},
         "letter.archive": {"op", "act_key", "letter_id", "unit"},
         # `work.read` 的展示字段：读权与字节鉴别全在 Core 的 `work.read`（唯一判据），
-        # 分页/搜看形状全在 `r/artifact_read.view`（唯一投影器）。两者都不认这四个字段 ——
+        # 分页/搜看形状全在 `r/artifact_read.stream_view`（唯一投影器）。两者都不认这四个字段 ——
         # 原样透传只会被 Core 的签名校验拒掉（“请求含未知字段”），于是线路永远拿不到分页。
         # 分流在端点：先扣下来，Core 只收身份与定位（work_ref/sub_ref/path），
-        # 视图在 `_as_read_view` 里用**原有**分页调用现算。不另开 op，不重写投影器。
+        # 展示参数留给本模块交给 Core 的流式投影，不进 Core 业务签名。
         "work.read": {"op", "work_ref", "sub_ref", "path", "lines", "search", "cursor", "limit"},
     }
 
@@ -191,7 +192,7 @@ class Endpoints:
         out = dict(req)
         files = out.pop("files")
         work_ref = out.get("work_ref")
-        groups = out.pop("groups", None) or self._groups_for(work_ref, files)
+        groups = self._groups_for(work_ref, files)
         prepared = self._publisher.prepare_change_sets(
             groups, artifact_root=str(self.core._artifact_root()))
 
@@ -333,28 +334,13 @@ class Endpoints:
             groups.append((root or str(self.core.home), prefix, listing))
         return groups
 
-    def _as_read_view(self, result, req):
-        """`work.read` 的核心返回是字节；线路上的形状由 `r/artifact_read.view` 现算。"""
-        if not isinstance(result, dict) or not isinstance(result.get("bytes"), (bytes, bytearray)):
-            return result
-        data = bytes(result["bytes"])
-        view = self._artifacts.view(data, lines=req.get("lines"), search=req.get("search"),
-                                    cursor=req.get("cursor"), limit=req.get("limit"))
-        shown = {k: v for k, v in result.items() if k != "bytes"}
-        shown.update(view if isinstance(view, dict) else {"text": view})
-        return shown
-
     def dispatch(self, req, trusted_ctx):
         """One request → one frame. Never raises for a business refusal."""
         close_prepared = None         # 备好的临时对象/fd：无论 Core 怎么拒，都在 finally 收
         try:
-            view_args = None          # `work.read` 的展示字段：局部变量，不碰实例状态
-                                      # （dispatch 是多线程共用的，实例字段会跨请求串线）
-            if isinstance(req, dict) and "prepare" in req:
-                # 不是线路字段：只有本端点自己造的胶水才会带它。
-                raise self.mod.CoreError("invalid_request",
-                                         "prepare 是端点内部字段，线路不接受",
-                                         en="prepare is internal to the endpoint; the wire does not accept it")
+            if isinstance(req, dict) and (internal := {"prepare", "render", "groups"} & req.keys()):
+                raise self.mod.CoreError("invalid_request", f"线路不接受内部字段 {sorted(internal)}",
+                                         en=f"The wire does not accept internal fields {sorted(internal)}")
             op = req.get("op") if isinstance(req, dict) else None
             if op in self._WIRE_ONLY:
                 extra = sorted(set(req) - self._WIRE_ONLY[op])
@@ -384,13 +370,9 @@ class Endpoints:
             if op == "work.publish" and "files" in req:
                 req, close_prepared = self._with_prepared_change_set(req, trusted_ctx)
             if op == "work.read":
-                # 分流：这四个是展示字段，不进 Core。Core 的 `work.read` 只认身份与定位，
-                # 读权与字节鉴别全在那边；这里扣下后原样转交给 `_as_read_view` 的原有分页调用。
-                view_args = {k: req.get(k) for k in ("lines", "search", "cursor", "limit")}
-                req = {k: v for k, v in req.items() if k not in view_args}
+                options = {k: req.pop(k) for k in ("lines", "search", "cursor", "limit") if k in req}
+                req["render"] = partial(self._artifacts.stream_view, **options)
             result = self.core.handle(req, trusted_ctx)
-            if op == "work.read" and view_args is not None:
-                result = self._as_read_view(result, view_args)
         except self.mod.CoreError as exc:
             return self.refused(exc)
         except Exception as exc:                                   # noqa: BLE001

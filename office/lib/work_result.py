@@ -13,8 +13,7 @@
 任何人当时的工作树。页面后置 —— 这里只给可执行的事实，不做展示形状。
 
 库的布局是 schema 级事实：一项成果的字节就放在 `<store>/<sha256 hex>`，没有第二份副本。
-`r/artifact_read` 的读口用同一条规则（`load_object` / `digest_name`）；本模块不解版本令牌之外的
-任何东西，也不猜缺失的字节。
+本模块解析版本令牌并核对完整摘要，不猜缺失的字节。
 """
 import hashlib
 import json
@@ -71,7 +70,7 @@ def require_version(row, expected_version, work_ref=None):
 
 
 def _sub_row(conn, sub_ref):
-    """一次提交的行；没有就是 `not_found`（`authorize_read` 与 `read_by_path` 共用这一句）。"""
+    """一次提交的行；没有就是 `not_found`。"""
     sub = conn.execute("SELECT * FROM subs WHERE sub_ref=?", (sub_ref,)).fetchone()
     if sub is None:
         raise ResultRefused("not_found", "提交 %r 不存在" % sub_ref,
@@ -143,27 +142,29 @@ def check_ref_shape(ref, *, what="ref"):
     return ref
 
 
-def _store_path(store_root, exact_version):
-    return os.path.join(str(store_root), store_name(exact_version))
+def read_version(store_root, want, consume):
+    """Consume a stored version and verify its entire digest before returning a result."""
+    digest, size = hashlib.sha256(), 0
 
+    def chunks(fh):
+        nonlocal size
+        for block in iter(lambda: fh.read(256 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+            yield block
 
-def read_version(store_root, exact_version):
-    """库里这一版的字节；摘要求和令牌逐位相同，否则当作**没有这一份**。
-
-    没有就是没有（`missing`），字节对不上就是坏了（`mismatch`）—— 两种事实分开，因为它们要
-    人做的事不同：前者是"没交上来"，后者是"库里的东西不能信"。
-    """
-    path = _store_path(store_root, exact_version)
-    want = store_name(exact_version)
     try:
-        with open(path, "rb") as fh:
-            data = fh.read()
+        with open(os.path.join(str(store_root), want), "rb") as fh:
+            blocks = chunks(fh)
+            data = consume(blocks)
+            for _ in blocks:                 # Verify even bytes outside the requested page.
+                pass
     except OSError as e:
         return None, {"reason": MISSING, "detail": e.strerror or "unreadable"}
-    got = hashlib.sha256(data).hexdigest()
+    got = digest.hexdigest()
     if got != want:
         return None, {"reason": MISMATCH, "detail": got}
-    return data, {"reason": None, "bytes": len(data)}
+    return data, {"reason": None, "bytes": size}
 
 
 def verify_change_set(change_set, *, store_root):
@@ -178,8 +179,8 @@ def verify_change_set(change_set, *, store_root):
             entry["content_verified"] = False
             entry["content_check"] = {"reason": "delete_has_no_content"}
         else:
-            data, why = read_version(store_root, entry.get("exact_version"))
-            entry["content_verified"] = data is not None
+            _, why = read_version(store_root, store_name(entry.get("exact_version")), lambda _: None)
+            entry["content_verified"] = why["reason"] is None
             entry["content_check"] = why
         out.append(entry)
     return out
@@ -274,7 +275,7 @@ def require_read_work(conn, actor, row, prow, *, management=None, holders=None):
     """读权那道门：判据只有 `may_read_work` 一处，这句话也只有一处。
 
     **一件 Work 读得到 = 它的成果读得到**：展示层（`work.get`/`work.list`）与字节层
-    （`authorize_read`/`read_by_path`）问的是同一句，不给两套话术 —— 曾经一边说"读不到这件
+    （`read_by_path`）问的是同一句，不给两套话术 —— 曾经一边说"读不到这件
     Work"、一边说"读不到这件 Work 的成果"，同一次拒绝在日志里长得像两件事。
 
     `read_by_path` 必须在本门**之后**才判"这一项是什么"：否则没读权的人能从 `forbidden` 与
@@ -285,63 +286,16 @@ def require_read_work(conn, actor, row, prow, *, management=None, holders=None):
                             en="this Work is not readable by you", work_ref=row["work_ref"])
 
 
-def _housing(conn, sub):
-    """这份提交所属的 Work 行与项目行（两处都先要这两行；取法只此一处）。"""
-    row = _work_row(conn, sub["work_ref"], or_none=True)
+def _housing(conn, sub, row=None):
+    """这份提交所属的 Work 行与项目行。"""
+    if row is None:
+        row = _work_row(conn, sub["work_ref"], or_none=True)
     if row is None:
         raise ResultRefused("not_found", "提交 %r 不属于任何 Work" % sub["sub_ref"],
                             en="submission %r belongs to no Work" % sub["sub_ref"],
                             sub_ref=sub["sub_ref"])
     return row, conn.execute("SELECT * FROM projects WHERE project_ref=?",
                              (row["project_ref"],)).fetchone()
-
-
-def authorize_read(conn, actor, *, sub_ref, ref, exact_version, _facts=None, management=None,
-                   holders=None):
-    """批不批这一次读：提交存在、这一对在提交里、这个人读得到这件 Work。
-
-    **判据只有这一份**：`read_result` 调它拿事实，`lib/read_access` 那个入口名也委托到这里。
-    批了就能读、读得到就是批过 —— 两处各写一遍必然漂（一处放宽、另一处没改，就出现
-    "能读却读不到 / 读不到却能读"）。这里**不读字节**：判权和取字节是两件事，各自可单独用。
-    `_facts` 是**同模块内**的已取事实（sub/work/prow/changes，`read_by_path` 定位时顺手带出）；
-    判据本身一字不差 —— 传事实只是不把同一行查三遍，判权仍然在这里发生。
-    """
-    require_actor(actor)
-    # 形状先判：一个连令牌都不是的东西不该被报成"不在提交里"（那是两件不同的事）。
-    store_name(exact_version)
-    if _facts is not None:
-        sub, row, prow, changes = (_facts.get("sub"), _facts.get("work"),
-                                   _facts.get("prow"), _facts.get("changes"))
-    else:
-        sub = _sub_row(conn, sub_ref)
-        row, prow = _housing(conn, sub)
-        changes = change_set_of(sub["change_set_json"])
-    require_read_work(conn, actor, row, prow, management=management, holders=holders)
-    hit = next((c for c in changes if c.get("ref") == ref
-                and c.get("exact_version") == exact_version and c.get("op") != DELETE), None)
-    if hit is None:
-        raise ResultRefused("not_found", "%r@%r 不在提交 %r 里" % (ref, exact_version, sub_ref),
-                            en="%r@%r is not in submission %r" % (ref, exact_version, sub_ref),
-                            work_ref=row["work_ref"], sub_ref=sub_ref)
-    return {"work_ref": row["work_ref"], "sub_ref": sub_ref, "ref": ref,
-            "exact_version": exact_version, "project_ref": row["project_ref"]}
-
-
-def read_result(conn, actor, *, sub_ref, ref, exact_version, store_root, _facts=None,
-                management=None, holders=None):
-    """按（提交，文件，版本）把**那一份字节**读回来：先 `authorize_read`，再取字节并复核摘要。
-
-    五类拒绝分开：`invalid_request`（令牌形状）、`not_found`（没有这次提交/这一对不在提交里）、
-    `forbidden`（读不到这件 Work）、`mismatch`（库里的字节不是声明的这一版）。
-    """
-    facts = authorize_read(conn, actor, sub_ref=sub_ref, ref=ref, exact_version=exact_version,
-                           _facts=_facts, management=management, holders=holders)
-    data, why = read_version(store_root, exact_version)
-    if data is None:
-        raise ResultRefused("mismatch", "库里这一份字节与声明的版本不一致",
-                            en="the stored bytes for this version do not match",
-                            work_ref=facts["work_ref"], sub_ref=sub_ref, **why)
-    return {**facts, "bytes": data, "size": len(data), "content_verified": True}
 
 
 #: 挑一份提交的三种问法。**一个选择器**，差异写成显式参数 —— 三处各写一遍就是三个能漂的答案：
@@ -436,11 +390,8 @@ def _deleted_in_submission(conn, sub, ref):
         reason_code="deleted_in_submission", previous_sub_ref=prev)
 
 
-def read_by_path(conn, actor, *, work_ref=None, sub_ref=None, path=None, store_root,
-                 management=None, holders=None):
-    """工具那一层的读法：Work（+可选提交、+提交里的路径）→ 那一份字节。
-
-    与 `read_result` 同一条判据、同一份授权，只是多两步解析：哪一份提交、提交里哪一项。
+def read_by_path(conn, actor, *, work_ref=None, sub_ref=None, path=None, management=None, holders=None):
+    """定位并授权 Work 成果，返回不可变摘要供事务外读取。
     `path` 不唯一（多个范围下同名文件）时**不替调用方挑**，要求写完整 ref。
 
     **判权先于"这一项是什么"**：先 `_require_read`，再解析路径与项。否则没读权的人能靠回答
@@ -449,11 +400,13 @@ def read_by_path(conn, actor, *, work_ref=None, sub_ref=None, path=None, store_r
     三种"读不到"分开：这一项是**删除记录**（没有字节，旧版仍可读，`reason_code` 点名）/
     这一项**真的不在**这份提交里 / 这次提交或这件 Work **不存在**。
     """
+    row = None
     if sub_ref is None:
         if work_ref is None:
             raise ResultRefused("invalid_request", "需要 work_ref 或 sub_ref",
                                 en="work_ref or sub_ref is required", field="work_ref")
-        sub = pick_sub(conn, work_ref)
+        row = _work_row(conn, work_ref)
+        sub = pick_sub(conn, work_ref, row=row)
         if sub is None:
             raise ResultRefused("not_found",
                                 "%s 还没有待审或最终的提交（要读历史提交请给 sub_ref）" % work_ref,
@@ -461,11 +414,9 @@ def read_by_path(conn, actor, *, work_ref=None, sub_ref=None, path=None, store_r
                                    "earlier one)" % work_ref, work_ref=work_ref)
     else:
         sub = _sub_row(conn, sub_ref)
-    # 一次定位、一次判读：同一行 sub 只查一次，change_set 只解析一次；判权与字节核验
-    # 仍是 `_require_read`/`read_result` 那一份 —— 这里把定位顺手带出的事实递过去，
-    # 不是把判据搬过来。
+    # 先判读权，再按路径定位，以免向无权者泄露提交内容。
     changes = change_set_of(sub["change_set_json"])
-    row, prow = _housing(conn, sub)
+    row, prow = _housing(conn, sub, row=row)
     require_read_work(conn, actor, row, prow, management=management, holders=holders)  # 先判权
     if path is None:
         if len(changes) != 1:
@@ -480,7 +431,6 @@ def read_by_path(conn, actor, *, work_ref=None, sub_ref=None, path=None, store_r
                                % (path, sub["sub_ref"]), sub_ref=sub["sub_ref"], path=path)
     if (hit.get("op") or WRITE) == DELETE:
         _deleted_in_submission(conn, sub, hit["ref"])
-    facts = {"sub": sub, "work": row, "prow": prow, "changes": changes}
-    return read_result(conn, actor, sub_ref=sub["sub_ref"], ref=hit["ref"],
-                       exact_version=hit["exact_version"], store_root=store_root, _facts=facts,
-                       management=management, holders=holders)
+    exact_version = hit["exact_version"]
+    return {"work_ref": row["work_ref"], "sub_ref": sub["sub_ref"], "ref": hit["ref"],
+            "exact_version": exact_version, "project_ref": row["project_ref"], "_digest": store_name(exact_version)}

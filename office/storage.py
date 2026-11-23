@@ -365,10 +365,6 @@ CREATE TABLE IF NOT EXISTS work(
   created_at TEXT NOT NULL, created_by TEXT NOT NULL,
   -- 1.1 简化：自然约定、明确审核者（不再靠审核 Grant 编号）、等待说明、多工作空间交付范围
   acceptance_text TEXT, reviewer_ref TEXT, waiting_json TEXT, resource_scope_json TEXT);
-CREATE TABLE IF NOT EXISTS assignments(
-  assignment_ref TEXT PRIMARY KEY, work_ref TEXT NOT NULL, assignee_ref TEXT NOT NULL,
-  scope_ref TEXT NOT NULL, grant_ref TEXT, set_by TEXT NOT NULL, acted_at TEXT NOT NULL,
-  ended_at TEXT);
 CREATE TABLE IF NOT EXISTS subs(
   sub_ref TEXT PRIMARY KEY, work_ref TEXT NOT NULL, seq INTEGER NOT NULL,
   change_set_json TEXT NOT NULL, sub_digest TEXT NOT NULL, submitted_by TEXT NOT NULL,
@@ -547,6 +543,7 @@ CREATE TABLE IF NOT EXISTS releases(
 --   `entry_id` = sha(harness, session, 原生消息 ID)：宿主持久化的那条 entry id（Pi 的
 --   `turn_end` 的 `messageEntryId`），所以重复上报是同一个主键，天然只算一次。
 --   `tokens_in` / `tokens_out` / `tokens_cache` 三格，**NULL = 宿主没报**（不是 0）。
+--   分项上报的宿主，tokens_in 计未缓存输入及已知缓存写，tokens_cache 单存缓存读。
 --   cost 保留用于兼容旧数据库，当前用量不读写。
 --   `role_in_work` NULL = 归属不到承办/审核（照实留着，不挑一个安上）。
 --   `attribution` = measured | estimated | unassigned：仅在可信记录明确关联 Work 时才是 measured。
@@ -690,6 +687,7 @@ class Storage:
         if self._ready:
             return
         if _schema_is_current_readonly(self.db_path):
+            self._ensure_system_fact_index()
             self._ready = True
             return
 
@@ -757,7 +755,16 @@ class Storage:
         if not _schema_is_current_readonly(self.db_path):
             raise StorageError("schema_initialization_failed", "当前 Core schema 初始化后校验失败",
                                en="Current Core schema failed verification after initialization")
+        self._ensure_system_fact_index()
         self._ready = True
+
+    def _ensure_system_fact_index(self):
+        conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_letters_system_fact ON letters(from_actor, "
+                         "CASE WHEN json_valid(meta_json) THEN json_extract(meta_json,'$.fact_key') END)")
+        finally:
+            conn.close()
 
     def snapshot(self, dest, refs=()):
         """场景 8：本 home 存成 dest（须空）。库走 SQLite `backup()`——WAL 下拷文件会丢最近提交、

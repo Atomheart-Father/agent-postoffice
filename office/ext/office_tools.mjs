@@ -3,11 +3,8 @@
 // What this layer does, and nothing more (01_DESIGN §5, §5.3, §5.4):
 //   * builds the wire body from the tool's own business fields; identity, timestamps, keys, digests and
 //     underscore/internal fields never reach the wire from the model;
-//   * keeps session-local VIEWS: what this session last saw of a Work (version, pending submission). Later
-//     writes on that Work carry the matching expected_version automatically, so the model never copies
-//     versions. A review binds to the submission the model names; if this session holds several different
-//     observations of that same submission it asks to re-open instead of guessing. A view is not proof of
-//     reading -- it is only a concurrency baseline;
+//   * remembers the latest observed Work version for later writes. A review uses the submission named by
+//     the model and is checked directly by Core. The observed version is a concurrency baseline;
 //   * one idempotency key per logical action: `busy` is retried a bounded number of times with the SAME key;
 //     an outcome that is unknown (connection lost after sending) is reported as such, and an identical retry
 //     re-uses the original key, so it can never execute twice.
@@ -108,7 +105,8 @@ export function validateArgs(tool, args) {
 	const spec = tool.parameters ?? {};
 	const props = spec.properties ?? {};
 	const allowed = Object.keys(props);
-	const required = spec.required ?? [];
+	const required = tool.op === "letter.send" && args?.intent == null
+		? spec.required.map(k => k === "intent" ? "need" : k) : spec.required ?? [];
 	const given = Object.keys(args ?? {});
 	const unknown = given.filter((k) => !Object.hasOwn(props, k));
 	const missing = required.filter((k) => {
@@ -212,8 +210,6 @@ const fill = (key, values) => {
 };
 
 const MSG = {
-	view_required: (w, sub) => fill("view_required", { work: w, sub }),
-	view_ambiguous: (sub, vs) => fill("view_ambiguous", { sub, versions: vs.join(", v") }),
 	no_endpoint: () => fill("no_endpoint", {}),
 	unknown_tool: (n) => fill("unknown_tool", { name: n }),
 	retry_ref_invalid: () => fill("retry_ref_invalid", {}),
@@ -223,16 +219,24 @@ const MSG = {
 	outcome_unknown_write: () => fill("outcome_unknown_write", {}),
 };
 
+function publicTodo(todo) {
+	const items = todo.items.slice(0, 20).map(item => {
+		const chars = Array.from(item.objective || "");
+		return chars.length > 80 ? { ...item, objective: chars.slice(0, 80).join("") + "…" } : item;
+	});
+	return { ...todo, ...(todo.items.length > items.length ? { omitted: todo.items.length - items.length } : {}), items };
+}
+
 export function createOfficeTools({ endpoint, core, now = () => Date.now(), locale = () => DEFAULT_LOCALE } = {}) {
 	const trusted = trustedFrom(endpoint);
 	const say = (key, ...a) => MSG[key](...a)[normLocale(locale()) === "en" ? 1 : 0];
 	let seq = 0;
-	// work_ref -> [{version, sub_ref, at}] (most recent last). Session-local; lost on restart by design.
-	const views = new Map();
+	// work_ref -> latest observed version; session-local and lost on restart.
+	const versions = new Map();
 	// ★ W229 R3.3（R3-W229.3）：**非信件**写动作保留原来的同进程续接 —— 结果未知时同一份业务参数
 	//   再调一次复用同一个 act_key（Core 的 (actor, op, act_key) 幂等域会回放首次结果，不会建第二笔）。
 	//   成功一次之后这条记录删掉，所以"做完了再调一次"仍是新动作；进程重启后认不出（如实说）。
-	//   信件（send/reply）不走这条：它们只认带回来的 retry_ref —— 不带回执再发就是新的一封。
+	//   未决项保留原始请求；发信仍只通过 retry_ref 续接。
 	const unresolved = new Map();
 	INSTANCE_SEQ += 1;
 	const instanceTag = `${PROC_NONCE}${INSTANCE_SEQ.toString(36)}`;
@@ -242,61 +246,9 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 		return `${trusted.actor}:${op}:${now().toString(36)}:${seq}:${instanceTag}`;
 	}
 
-	/**
-	 * Record what this session last saw of one Work.
-	 *
-	 * Core's `work.get` answers with `work_ref` / `version` / `current_submission.sub_ref` at the top
-	 * level; it does not wrap them in a `view` object. Reading only `result.view` therefore recorded
-	 * nothing at all, so `baseline()` never had an entry and `work.review` was always refused with
-	 * `view_required` — a guard that could not be satisfied by the very call it tells you to make.
-	 */
 	function observe(result) {
-		const v = result?.view
-			?? (result && result.work_ref && Number.isInteger(result.version)
-				? { work_ref: result.work_ref, version: result.version,
-					sub_ref: result.current_submission?.sub_ref ?? null }
-				: undefined);
-		if (!v || !v.work_ref) return;
-		const list = views.get(v.work_ref) ?? [];
-		list.push({ version: v.version, sub_ref: v.sub_ref ?? null, at: now() });
-		// ★ W123：这次读取就是"我现在看到的是这个版本" —— 同一 sub_ref 的**旧观察让位给最新这条**。
-		//   否则 get(v2) → 自己改（own-write 同步又记一条 v3）→ 再 get 也只会往后追加，v2 永远留着，
-		//   baseline() 里 `versions.length > 1` 恒真 ⇒ 该 Sub 永久 view_ambiguous，重读多少次都救不回来。
-		//   别的 sub_ref 的历史保留（审其它 Sub 时才不会误用本 Sub 的观察）。
-		//   与 r/endpoint.py:296-304 的 fresh-get 替换语义对齐（两套表不合并：一个在 Pi 进程内，一个在
-		//   endpoint 宿主进程内，生命周期不同，只对齐语义）。
-		const sub = v.sub_ref ?? null;
-		const keep = list.filter((x, i) => x.sub_ref !== sub || i === list.length - 1);
-		views.set(v.work_ref, keep.slice(-8));
-	}
-
-	function latest(workRef) {
-		const list = views.get(workRef);
-		return list && list.length ? list[list.length - 1] : undefined;
-	}
-
-	/** expected_version this session may assert for a write; or an error the model can act on. */
-	function baseline(tool, body) {
-		const w = body.work_ref;
-		if (!w) return {};
-		if (tool.op === "work.review") {
-			const list = (views.get(w) ?? []).filter((o) => o.sub_ref === body.sub_ref);
-			if (!list.length) {
-				return { error: { ok: false, error: "view_required",
-					message: say("view_required", w, body.sub_ref), sent: false } };
-			}
-			const versions = [...new Set(list.map((o) => o.version))];
-			if (versions.length > 1) {
-				return { error: { ok: false, error: "view_ambiguous",
-					message: say("view_ambiguous", body.sub_ref, versions), sent: false } };
-			}
-			// The guard is what matters: this session must have seen that submission. The version is
-			// NOT sent -- `work.review` identifies its target by `sub_ref` and takes no
-			// `expected_version`, so asserting one was a field Core rejects.
-			return {};
-		}
-		const last = latest(w);
-		return last ? { expected_version: last.version } : {};
+		if (result?.work_ref && Number.isInteger(result.version) && result.version >= (versions.get(result.work_ref) ?? -Infinity))
+			versions.set(result.work_ref, result.version);
 	}
 
 	async function send(body) {
@@ -327,18 +279,18 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 				sent: false,
 			};
 		}
-		const body = buildBody(tool, args);
+		let body = buildBody(tool, args);
+		if (name === "office_letter_list") body.limit ??= 50;
+		if (body.op === "letter.read" && body.letter_id && body.direction !== "sent") body.accept_on_read = true;
 		if (tool.write) {
 			// ★ W229 R3：回执只在适配器里解释，绝不作为业务字段上线路。
 			const retryArg = typeof body.retry_ref === "string" ? body.retry_ref.trim() : "";
 			delete body.retry_ref;
-			const base = baseline(tool, body);
-			if (base.error) return base.error;
-			if (base.expected_version !== undefined) body.expected_version = base.expected_version;
-			const k = digest([name, body]);
-			// ★ W229 R3.2（R3-W229.2 第 ① 条）：**只有带回执才算续接**。
-			//   原来这里还有一条"内存里记着同一份业务参数就复用旧键"的暗轨（unresolved Map），
-			//   等于替用户判断"这次是不是同一次"，与产品语义（不带回执=新动作）相违，已删。
+			const usesReceipt = RETRY_OPS.has(tool.op), k = digest([name, body]);
+			const pending = !usesReceipt && unresolved.get(k);
+			if (pending) body = pending;
+			else if (tool.op !== "work.review" && versions.has(body.work_ref))
+				body.expected_version = versions.get(body.work_ref);
 			let actKey;
 			if (retryArg) {
 				// 续接：回执必须与**这次身份、这个动作、这份业务参数**一致（没有时间门）；
@@ -356,12 +308,14 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 				}
 				actKey = parsed.k;      // 回执自描述、无签名：它不是凭证/授权，只用来沿用原操作键；
 				                        // 真正拦住越界的是上面三项一致性 + Core 自己的身份与冲突保护。
-			} else if (RETRY_OPS.has(tool.op)) {
+			} else if (usesReceipt) {
 				actKey = mintKey(tool.op);      // 信件：不带回执就是新的一封（不替用户判"是不是同一次"）
 			} else {
-				actKey = unresolved.get(k) ?? mintKey(tool.op);   // 非信件：同进程同参数续接（原有保护）
+				actKey = pending?.act_key ?? mintKey(tool.op);
 			}
 			body.act_key = actKey;
+			const sentBody = pending || (!usesReceipt && structuredClone(body));
+			if (sentBody) body = sentBody;
 			let res;
 			for (let i = 0; ; i++) {
 				res = await send(body);
@@ -369,15 +323,10 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 				await sleep(BUSY_BACKOFF_MS * (i + 1));
 			}
 			if (res && res.ok === false && UNKNOWN.has(res.error)) {
-				if (!RETRY_OPS.has(tool.op)) unresolved.set(k, body.act_key);   // 非信件：同进程续接
-				// ★ W436（2026-11-19）：这里原来还写着 `cause: res.error` —— 全树零读者（`.cause` 一
-				//   处也没有：渲染器只印 `detail` / `reason_code` / `retry_ref` / `retry_hint`，没有
-				//   任何宿主分支看它）。它记的是"哪一条传输失败把结果变成未知"；模型要的是"这件事
-				//   生效了没有、接下来怎么做"，而那两个问题的答案在下面那两句 message/retry_* 里。
-				//   要把它给模型看，那是**加一行**的事（写进 `detail`），不是留一个没人读的键。
+				if (!usesReceipt) unresolved.set(k, sentBody);
 				const out = { ...res, error: "outcome_unknown",
-					message: say(RETRY_OPS.has(tool.op) ? "outcome_unknown_letter" : "outcome_unknown_write") };
-				if (RETRY_OPS.has(tool.op) && trusted?.actor) {
+					message: say(usesReceipt ? "outcome_unknown_letter" : "outcome_unknown_write") };
+				if (usesReceipt && trusted?.actor) {
 					// 给**同一次**操作的续接回执；模型主动新发（不带它）不受影响。
 					out.retry_ref = makeRetryRef({ actor: trusted.actor, op: tool.op, paramsDigest: k,
 						actKey: body.act_key, at: now() });
@@ -385,16 +334,9 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 				}
 				return out;
 			}
-			// ★ W229 R3.3：这一次已经有结果（不论成败）⇒ 撤掉非信件的续接记录，
-			//   所以"做完了再原样调一次"仍是一次新动作（不变）。
-			unresolved.delete(k);
-			if (res && res.ok === false && res.error === "stale" && body.work_ref) views.delete(body.work_ref);
-			if (res && res.ok !== false && res.work_ref && Number.isInteger(res.version)) {
-				// our own successful write is the newest thing this session has seen of that Work
-				const prev = latest(res.work_ref);
-				const pending = res.state === "Submitted" ? (res.sub_ref ?? prev?.sub_ref ?? null) : null;
-				observe({ view: { work_ref: res.work_ref, version: res.version, sub_ref: pending } });
-			}
+			// Busy and unsent retries do not resolve an earlier unknown write.
+			if (!pending || res?.ok !== false || (res.error !== "busy" && res.sent !== false)) unresolved.delete(k);
+			if (res?.ok !== false) observe(res);
 			return res;
 		}
 		let res = await send(body);
@@ -403,11 +345,10 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 			res = await send(body);
 		}
 		if (tool.op === "work.get" && res && res.ok !== false) observe(res);
+		if (tool.op === "work.runnable" && res?.ok !== false && Array.isArray(res?.items)) res = publicTodo(res);
+		if (tool.op === "work.get" && res?.ok !== false && Array.isArray(res?.todo?.items)) res = { ...res, todo: publicTodo(res.todo) };
 		return res;
 	}
 
-	// Only `callTool` is returned. The `names` array was a second copy of `TOOL_NAMES` (which lives
-	// with the table it derives from) and no caller read it; `_views` was the session's concurrency
-	// baseline exported for inspection, and nothing inspected it either.
 	return { callTool };
 }

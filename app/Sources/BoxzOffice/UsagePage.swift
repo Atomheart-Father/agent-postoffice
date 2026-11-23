@@ -14,6 +14,9 @@ struct UsagePage: View {
                     else {
                         hostStrip(groupedByHost(page.threads, harness: \.harness)).padding(.top, 34)
                         ThreadTable(threads: Self.ranked(page.threads), hosts: desk.hosts.value?.threads ?? []).padding(.top, 30)
+                        Text(tr("输入包含已记录的缓存读取。旧记录可能缺少缓存写入等分项。",
+                                "Input includes recorded cache reads. Older records may lack components such as cache writes."))
+                            .font(Theme.Font.sub).foregroundStyle(Theme.ink3).padding(.top, 12)
                     }
                 }
             }
@@ -21,7 +24,7 @@ struct UsagePage: View {
         }
     }
 
-    /// 只排序：入 + 出从多到少；"未知"排最后（不当 0）。缓存不进排序。
+    /// 按已记录的输入＋输出排序，未知排最后。
     static func ranked(_ all: [ThreadUsage]) -> [ThreadUsage] {
         all.enumerated().sorted { l, r in
             switch (l.element.cell.inOut, r.element.cell.inOut) {
@@ -100,7 +103,7 @@ private struct ThreadTable: View {
                 head(tr("入", "IN"), Self.wNum, .trailing)
                 head(tr("出", "OUT"), Self.wNum, .trailing)
                 head(tr("入+出", "IN+OUT"), Self.wNum, .trailing)
-                head(tr("缓存", "CACHE"), Self.wNum, .trailing)
+                head(tr("缓存读取", "CACHE READ"), Self.wNum, .trailing)
             }
             .padding(.horizontal, 10).frame(height: 34)
             .overlay(alignment: .bottom) { Rectangle().fill(Theme.ink).frame(height: Theme.Line.hair) }

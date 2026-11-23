@@ -29,7 +29,7 @@ import { outcomeOf, exitCodeOf, renderToolResult, OUTCOMES } from "../ext/office
 import { openSession, splitFlags } from "../ext/office_socket.mjs";
 import { installPiHome } from "../ext/office_pi_install.mjs";
 import { installOpenCode } from "../ext/office_opencode_install.mjs";
-import { installCodexHooks } from "../ext/office_codex_install.mjs";
+import { removeCodexHooks } from "../ext/office_codex_install.mjs";
 
 //: verb -> the tool it names, plus the positional arguments that verb takes (in order).
 //  This is argv shape only. Every field name, type and `required` comes from the tool's schema.
@@ -76,7 +76,7 @@ const VERBS = {
 
 //: Verbs this program answers itself: no tool, no wire, no session.
 const LOCAL_VERBS = {
-	"install codex-hooks": "[--home DIR]：按本机 Office 安装目录配置 Codex 用户级钩子",
+	"install codex-hooks": "[--home DIR]：清除 Office 安装的旧 Codex 投递钩子",
 	"install opencode": "[--home DIR]：安装或升级此固定发布包的 OpenCode 全局入口",
 	"install pi": "--home DIR：安装或升级 Pi 用户级入口",
 };
@@ -244,7 +244,7 @@ function main(argv) {
 	if (verb === "install opencode" || verb === "install codex-hooks") {
 		if (tail.length > (verb === "install opencode" ? 1 : 0) || tail[0]?.startsWith("--")) return fail(`${verb} [--home DIR]`);
 		try {
-			const result = verb === "install opencode" ? installOpenCode(tail[0], opts.home) : installCodexHooks(opts.home || undefined);
+			const result = verb === "install opencode" ? installOpenCode(tail[0], opts.home) : removeCodexHooks();
 			const version = result.version ? ` (${result.version})` : "";
 			process.stdout.write(opts.json ? JSON.stringify(result) + "\n" : `${result.state}: ${result.path}${version}\n`);
 		} catch (e) { fail(e.message); }
@@ -297,23 +297,10 @@ function main(argv) {
 	const office = createOfficeTools({ endpoint: session.endpoint, core: session.core,
 		locale: () => locale });
 
-	/**
-	 * `work review` needs this session to have seen the submission it judges: the adapter refuses
-	 * otherwise, because the version it asserts is a concurrency baseline, not a guess.
-	 *
-	 * In a long-lived host the earlier `office_work_get` provides that. The CLI is one process per
-	 * invocation, so nothing is remembered between commands and the review could never succeed.
-	 * Reading the Work first, in this same process, is exactly that step — same call the model would
-	 * make, same collected facts, so the baseline is real rather than asserted by hand.
-	 */
-	async function readForBaseline() {
-		if (spec.tool !== "office_work_review") return;
-		await office.callTool("office_work_get", { work_ref: args.work_ref });
-	}
-
-	readForBaseline().then(() => spec.op
+	const result = spec.op
 		? session.core.handle({ op: spec.op, ...args })
-		: office.callTool(spec.tool, args)).then((res) => {
+		: office.callTool(spec.tool, args);
+	result.then((res) => {
 		report(res, locale, opts.json);
 		process.exitCode = exitCodeOf(res);
 	}).catch((e) => {

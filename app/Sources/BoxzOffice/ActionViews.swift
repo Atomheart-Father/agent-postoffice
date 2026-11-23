@@ -6,6 +6,7 @@ import OfficeClient
 struct ActionBox: View {
     @ObservedObject var desk: DeskModel
     let key: String
+    var request: PendingRequest? = nil
 
     var body: some View {
         if let a = desk.actions[key] {
@@ -40,6 +41,10 @@ struct ActionBox: View {
 
     @ViewBuilder private func editor(_ a: ActionState) -> some View {
         Text(a.intent.title).font(Theme.Font.bodyBold)
+        if case .decide(let ref, let version, _) = a.intent {
+            if let request, request.ref == ref, request.version == version { requestParameters(request) }
+            else { Text(tr("申请版本已变化，请重新读取", "The request changed; reload it")).font(Theme.Font.small) }
+        }
         if let to = a.intent.recipient {
             Text(tr("收件人 \(to)", "To \(to)")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
             field(tr("主题", "Subject"), text: Binding(get: { desk.actions[key]?.subject ?? "" }, set: { desk.actions[key]?.subject = $0 }), lines: 1)
@@ -99,7 +104,7 @@ struct InboxTabs: View {
     }
 }
 
-/// 待批权限：数据现在来自夹具（R1 request.list 没上线），所以顶上一个"模拟数据"。决定走真的 request.decide；夹具里的假申请不能写，按钮禁用。
+/// 待批申请来自服务端；只有显式夹具会标记为模拟数据。
 struct RequestList: View {
     @ObservedObject var desk: DeskModel
     var body: some View {
@@ -108,7 +113,7 @@ struct RequestList: View {
                 if desk.isFixture { Chip(text: tr("模拟数据", "Sample data"), style: .dashed).padding(.bottom, 12) }
                 if page.items.isEmpty { Text(tr("0 条", "0 items")).font(Theme.Font.body).foregroundStyle(Theme.ink3) }
                 ForEach(page.items) { RequestRow(desk: desk, request: $0) }
-                if !page.complete { Text(tr("还有下一页，只读到 \(page.items.count) 条", "More pages exist; read \(page.items.count) only")).font(Theme.Font.small).foregroundStyle(Theme.ink2).padding(.top, 10) }
+                if !page.complete { Text(tr("还有下一页，当前仅显示前 \(page.items.count) 条", "More pages exist; only the first \(page.items.count) are shown")).font(Theme.Font.small).foregroundStyle(Theme.ink2).padding(.top, 10) }
             }
         }
     }
@@ -171,6 +176,7 @@ private struct RequestRow: View {
                 .font(Theme.Font.bodyBold).lineLimit(2)
             if !r.reason.isEmpty { Text(r.reason).font(Theme.Font.f14).foregroundStyle(Theme.ink2).fixedSize(horizontal: false, vertical: true) }
             if !r.details.isEmpty { Text(r.details.joined(separator: " · ")).font(Theme.Font.small).foregroundStyle(Theme.ink2) }
+            requestParameters(r)
             if let body = r.body {
                 DisclosureGroup(tr("正文", "Body")) {
                     Text(body).font(Theme.Font.f14).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
@@ -201,10 +207,21 @@ private struct RequestRow: View {
                 .help(blocked ? tr("模拟数据，不能写", "Sample data: cannot write") : "")
                 .padding(.top, 4)
             }
-            ActionBox(desk: desk, key: key)
+            ActionBox(desk: desk, key: key, request: r)
         }
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay(alignment: .bottom) { Rule() }
+    }
+}
+
+@ViewBuilder private func requestParameters(_ request: PendingRequest) -> some View {
+    if let cancel = request.cancelWork {
+        Text(cancel ? tr("撤岗时同时取消该岗位承办的未完成 Work；单独审核的 Work 须先换审或取消", "Retirement cancels unfinished Work assigned to this position; other Work it reviews must first be reassigned or cancelled") : tr("撤岗时不取消 Work；仍有未完成职责时须先处理", "Do not cancel Work; outstanding duties must be resolved first"))
+            .font(Theme.Font.f14.weight(.semibold))
+    }
+    if request.paramsText != "{}" {
+        Text(tr("申请参数", "Request parameters")).font(Theme.Font.small.weight(.semibold))
+        Text(verbatim: request.paramsText).font(Theme.Font.small).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
     }
 }

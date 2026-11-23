@@ -15,17 +15,20 @@
 "桌上那一份"在 `work_flow._current_sub`。同一件事不写第二份实现。
 """
 import json
+from bisect import bisect_right
+from functools import cache
+
+from lib.position import archived_recipients
 
 from work_history import (history as _history, material_changes as _material_changes,
-                          relation_changes as _relation_changes, review_view as _review_view,
-                          todo as _todo)
+                          relation_changes as _relation_changes, review_view as _review_view)
 from work_result import (ResultRefused, WRITE, change_set_of, may_read_work,
                          now_text, pick_sub, PICK_FINAL, require_actor, require_text,
                          require_version, _work_row)
 from work_flow import (WORK_ACTIVE, WORK_SUBMITTED, WORK_DONE, WORK_CANCELLED,
                        review_experience, _current_sub, _require_current_sub,
                        _require_open, _bump, _is_holder, _scopes)
-from work_runnable import _open_dependencies, _positions_held
+from work_runnable import _open_dependencies, _positions_held, runnable_work, same_submitter
 
 #: 关系词表：`belongs_to` / `modifies` / `waits_for` / `based_on` / `references`（后端规格 §4.2）。
 RELATIONS = ("belongs_to", "modifies", "waits_for", "based_on", "references")
@@ -45,7 +48,7 @@ def _project_row(conn, project_ref, *, or_none=False):
     return prow
 
 
-def _roles_of(conn, actor, row, *, can_manage):
+def _roles_of(conn, actor, row, *, can_manage, holders=None):
     """我在这件 Work 上是什么角色：`assignee` / `reviewer` / `manager` 的子集。
 
     承办与审核是本模块的现存事实（当前任职、当前审核人）；`manager` 只有调用方给的管理判据
@@ -53,7 +56,8 @@ def _roles_of(conn, actor, row, *, can_manage):
     是 `["manager"]`、在详情里是 `[]`，管理按钮一条都不给（实测）。
     """
     roles = set()
-    holders = _positions_held(conn, actor)
+    if holders is None:
+        holders = _positions_held(conn, actor)
     if row["assignee_ref"] == actor or row["assignee_ref"] in holders:
         roles.add("assignee")
     if row["reviewer_ref"] == actor or row["reviewer_ref"] in holders:
@@ -63,27 +67,26 @@ def _roles_of(conn, actor, row, *, can_manage):
     return roles
 
 
-def _resolve_person(conn, name, what):
-    """将通讯录的 @岗位解析为 Work 使用的同一岗位引用。"""
+def _resolve_person(conn, name, what, is_registered):
     name = name.strip() if isinstance(name, str) else name
     require_text(name, what)
-    if name.startswith("@"):
-        name = name[1:]
-        if conn.execute("SELECT 1 FROM position_holders WHERE position=?", (name,)).fetchone() is None:
-            raise ResultRefused("not_found", "岗位 %r 未登记" % name,
-                                en="position %r is not registered" % name, field=what)
+    position_only = name.startswith("@")
+    name = name.removeprefix("@")
+    if archived_recipients(conn, (name,)):
+        raise ResultRefused("conflict", "信箱 %r 已归档，请选择有效的责任地址" % name,
+                            en="Mailbox %r is archived. Choose an active address." % name,
+                            field=what, reason_code="mailbox_archived")
+    if not is_registered(name, conn, position_only=position_only):
+        raise ResultRefused("not_found", "责任地址 %r 未登记" % name,
+                            en="Responsibility address %r is not registered" % name, field=what,
+                            reason_code="position_unregistered" if position_only else "box_unregistered")
     return name
 
 
-def _review_mode(conn, row_reviewer):
-    """审核安排：给了审核人就要审；没给就是免审。只在包含 `none` 时才叫 none。"""
-    if row_reviewer in (None, "", "none"):
+def _review_mode(conn, reviewer, is_registered):
+    if reviewer in (None, "", "none"):
         return "none", None
-    if not isinstance(row_reviewer, str):
-        raise ResultRefused("invalid_request", "review 是审核人的名字（字符串）；免审就不传",
-                            en="review is the reviewer's name (a string); omit it for no review",
-                            field="review")
-    return "reviewer", _resolve_person(conn, row_reviewer, "review")
+    return "reviewer", _resolve_person(conn, reviewer, "review", is_registered)
 
 
 def _scope_list(conn, prow, scope):
@@ -114,7 +117,7 @@ def _scope_list(conn, prow, scope):
 
 def create(storage, conn, actor, *, project_ref, objective, assignee, review=None,
            acceptance=None, references=(), relations=(), scope=None, act_key,
-           now_ts=None, can_manage):
+           now_ts=None, can_manage, is_registered):
     """建一件 Work 并在**同一事务**里派工、定审核、挂关系。返回可直接执行的结果。
 
     `can_manage(project_ref) -> bool`：调用方在同一事务里给的判权（有没有本项目的 `project.manage`），
@@ -128,7 +131,7 @@ def create(storage, conn, actor, *, project_ref, objective, assignee, review=Non
               "relations": list(relations or ()), "scope": scope}
     replay, digest = storage.action_replay(conn, actor, "work.create", act_key, params)
     if replay is not None:
-        return replay
+        return replay, False
 
     prow = _project_row(conn, project_ref)
     manage = _given(can_manage, project_ref)
@@ -138,8 +141,8 @@ def create(storage, conn, actor, *, project_ref, objective, assignee, review=Non
                             en="%r holds no project.manage on this project and cannot create Work"
                                % actor, project_ref=project_ref, reason_code="not_project_manager",
                             needs="project.manage")
-    who = _resolve_person(conn, assignee, "assignee")
-    mode, reviewer = _review_mode(conn, review)
+    who = _resolve_person(conn, assignee, "assignee", is_registered)
+    mode, reviewer = _review_mode(conn, review, is_registered)
     scopes = _scope_list(conn, prow, scope)
     refs, rels = _check_additions(conn, actor, project_ref, references, relations, manage)
 
@@ -154,8 +157,6 @@ def create(storage, conn, actor, *, project_ref, objective, assignee, review=Non
         " VALUES(?,?,?,'[]',?,?,?,1,1,?,?,?,?,?,?)",
         (work_ref, project_ref, objective, scopes[0], mode, who, WORK_ACTIVE, now, actor,
          acceptance, reviewer, json.dumps(scopes, ensure_ascii=False)))
-    _insert_assignment(conn, work_ref, who, scopes[0], actor, now,
-                      _assignment_ref(work_ref))
     _insert_additions(conn, work_ref, refs, rels, actor, now, act_key)
     payload = {"objective": objective, "assignee": who, "reviewer": reviewer,
                "review_mode": mode, "scope": scopes, "relations": rels,
@@ -170,7 +171,7 @@ def create(storage, conn, actor, *, project_ref, objective, assignee, review=Non
               "review": {"mode": mode, "reviewer": reviewer}, "scope": scopes,
               "references": refs, "relations": rels, "created_at": now}
     storage.record_action(conn, actor, "work.create", act_key, digest, result, now_ts)
-    return result
+    return result, True
 
 
 def _given(judge, work_ref, what="管理判据"):
@@ -187,19 +188,6 @@ def _given(judge, work_ref, what="管理判据"):
                             en="this entry needs the caller to supply that judgement in the same "
                                "transaction", work_ref=work_ref, reason_code="no_authority_given")
     return judge
-
-
-def _insert_assignment(conn, work_ref, who, scope, actor, now, assignment_ref):
-    """派工落一行 —— `create` 与改派共用（引用形状由 `_assignment_ref` 定）。"""
-    conn.execute("INSERT INTO assignments(assignment_ref, work_ref, assignee_ref, scope_ref,"
-                 " grant_ref, set_by, acted_at) VALUES(?,?,?,?,NULL,?,?)",
-                 (assignment_ref, work_ref, who, scope, actor, now))
-
-
-def _assignment_ref(work_ref):
-    """派工引用：`A2-W1`（项目号 + Work 序号），与既有的编号形状一致。"""
-    prj, _, work = work_ref.rpartition("/")
-    return "A%s-W%s" % (prj.rsplit("-", 1)[-1], work[1:])
 
 
 # --------------------------------------------------------------------------- references / relations
@@ -326,7 +314,7 @@ def _check_relation(conn, item, actor, project_ref, may_read):
 # --------------------------------------------------------------------------- get
 
 def get(conn, actor, *, work_ref, now_ts=None, can_manage, history=False, loc="zh",
-        todo=False):
+        todo=False, person=None):
     """一件 Work 的现状：目标、责任、当前/最终提交、退回意见、参考、关系、角色、能做什么。
 
     形状是**一层的**：调用方不用再拼第二遍。允许动作按角色算一次（与按钮、与撤回/审核的
@@ -371,7 +359,7 @@ def get(conn, actor, *, work_ref, now_ts=None, can_manage, history=False, loc="z
         "relations": _relations(conn, work_ref, include_reverse=True,
                                  may_read=_other_readable(conn, actor, can_manage)),
         "your_roles": roles,
-        "available_actions": _available_actions(row, roles, current, actor),
+        "available_actions": _available_actions(conn, row, roles, current, actor, person or actor),
         "created_at": row["created_at"], "created_by": row["created_by"],
     }
     if ("assignee" in roles and row["completion_basis"] == "review_accept"
@@ -384,7 +372,7 @@ def get(conn, actor, *, work_ref, now_ts=None, can_manage, history=False, loc="z
         out_history["completion_basis"] = row["completion_basis"]
         out["history"] = out_history
     if todo:
-        out["todo"] = _todo(conn, actor, now_ts=now_ts)
+        out["todo"] = runnable_work(conn, actor, now_ts=now_ts, person=person)
     return out
 
 
@@ -470,7 +458,7 @@ def _relations(conn, work_ref, *, include_reverse=False, may_read=None):
             "belongs_to_all": parents, "reversed": children}
 
 
-def _available_actions(row, roles, current, actor):
+def _available_actions(conn, row, roles, current, actor, person):
     """能对这个 Work 做什么 —— 判据就是 `roles`（与撤回/审核/交付三处同一句话）。"""
     acts = []
     open_ = row["state"] in (WORK_ACTIVE, WORK_SUBMITTED)
@@ -482,7 +470,7 @@ def _available_actions(row, roles, current, actor):
         if row["waiting_json"]:
             acts.append("update:continue")
     if ("reviewer" in roles and current is not None and row["state"] == WORK_SUBMITTED
-            and current["submitted_by"] != actor):
+            and same_submitter(conn, row["work_ref"], current["sub_ref"], current["submitted_by"], actor, person) is False):
         acts.append("review")
     if "manager" in roles and open_:
         acts += [a for a in ("update:assign", "update:reviewer", "update:edit", "update:cancel",
@@ -505,10 +493,11 @@ UPDATE_ACTIONS = {
 
 def update(storage, conn, actor, *, work_ref, action, expected_version=None, assignee=None,
            scope=None, review=None, objective=None, acceptance=None, add=None, remove=None,
-           reason=None, on=None, note=None, act_key, now_ts=None, can_manage):
+           reason=None, on=None, note=None, act_key, now_ts=None, can_manage, is_registered):
     """改派 / 审核安排 / 修改约定 / 补参考与关系 / 等待 / 继续 / 取消。
 
     每一个动作都在**同一个事务**里：核权 → 核 CAS → 写一处 → 版本 +1 → 写事件 → 记幂等。
+    确实变更时返回旧行，供同事务的通知使用。
     """
     if action not in UPDATE_ACTIONS:
         raise ResultRefused("invalid_request", "action 只能是 %s" % sorted(UPDATE_ACTIONS),
@@ -526,7 +515,7 @@ def update(storage, conn, actor, *, work_ref, action, expected_version=None, ass
               "fields": given}
     replay, digest = storage.action_replay(conn, actor, "work.update", act_key, params)
     if replay is not None:
-        return replay
+        return replay, None
 
     row = _work_row(conn, work_ref)
     prow = _project_row(conn, row["project_ref"])
@@ -536,19 +525,24 @@ def update(storage, conn, actor, *, work_ref, action, expected_version=None, ass
     manage = _given(can_manage, work_ref)
     now = now_text(now_ts)
     sets, payload = {}, {"action": action}
+    changed = None
 
     if action == "assign":
         _require_manage(manage, row["project_ref"], "改派", "reassign", work_ref)
-        who = _resolve_person(conn, assignee, "assignee")
-        scopes = _scope_list(conn, prow, scope) if scope is not None else _scopes(row)
+        who = _resolve_person(conn, assignee, "assignee", is_registered)
+        previous_scopes = _scopes(row)
+        scopes = _scope_list(conn, prow, scope) if scope is not None else previous_scopes
+        changed = who != row["assignee_ref"] or scopes != previous_scopes
         sets = {"assignee_ref": who, "scope_ref": scopes[0],
                 "resource_scope_json": json.dumps(scopes, ensure_ascii=False)}
-        _insert_assignment(conn, work_ref, who, scopes[0], actor, now,
-                          "%s.%d" % (_assignment_ref(work_ref), row["version"] + 1))
         payload.update(to=who, scope=scopes, **{"from": row["assignee_ref"]})
     elif action == "reviewer":
         _require_manage(manage, row["project_ref"], "改审核安排", "change the reviewer", work_ref)
-        mode, reviewer = _review_mode(conn, review)
+        mode, reviewer = _review_mode(conn, review, is_registered)
+        if mode == "none" and row["state"] == WORK_SUBMITTED:
+            raise ResultRefused("conflict", "已有待审提交，请换审，或由提交人先撤回再设为免审",
+                                en="A submission awaits review. Assign a reviewer or have the submitter withdraw it first.",
+                                reason_code="pending_review_required", work_ref=work_ref)
         sets = {"review_mode": mode, "reviewer_ref": reviewer}
         payload.update(mode=mode, to=reviewer)
     elif action == "edit":
@@ -613,6 +607,7 @@ def update(storage, conn, actor, *, work_ref, action, expected_version=None, ass
             conn.execute("UPDATE work_relations SET removed_at=? WHERE id=?", (now, rid))
         payload.update(added=add_refs, removed=[ref for _, ref in rm_refs],
                        relations_added=add_rels, relations_removed=[rel for _, rel in rm_rels])
+        changed = bool(add_refs or rm_refs or add_rels or rm_rels)
         # 真从"被挡住"走到"可续"才给这条；发信归 Core，正文要说**撤回**（发信方别在这个
         # 层写）。★ 身份给的是**这一次解除事件**、不是"因为撤回"这个类别：同一条依赖可以
         # 撤回→加回→再撤回，那是两个合法事件。`relation_id`（加回是新 id）+ `version`
@@ -636,7 +631,10 @@ def update(storage, conn, actor, *, work_ref, action, expected_version=None, ass
             waiting["on"] = on
         if action == "wait":
             previous = _waiting(row) or {}
-            if "key" in previous:
+            changed = any(waiting.get(key) != previous.get(key) for key in ("reason", "on"))
+            if not changed:
+                waiting = previous
+            elif "key" in previous:
                 waiting["key"] = previous["key"]
             sets = {"waiting_json": json.dumps(waiting, ensure_ascii=False)}
             payload.update(waiting=waiting)
@@ -671,7 +669,9 @@ def update(storage, conn, actor, *, work_ref, action, expected_version=None, ass
     if action == "wait":
         result["was_waiting"] = payload["was_waiting"]
     storage.record_action(conn, actor, "work.update", act_key, digest, result, now_ts)
-    return result
+    if changed is None:
+        changed = any(row[key] != value for key, value in sets.items())
+    return result, row if changed else None
 
 
 # --------------------------------------------------------------------------- list
@@ -711,7 +711,7 @@ def _overview_roots(conn, visible, project_ref):
 
 
 def list_work(conn, actor, *, project_ref=None, role=None, state=None, limit=20, cursor=None, top_level=False,
-              now_ts=None, can_manage):
+              reviewable=False, person=None, now_ts=None, can_manage):
     """我相关的 Work（服务端过滤 + 分页）。`role` 缺省 = assigned + review + managed。
 
     `role="all"` 是"这个项目里我能打开的每一件"（私密项目逐件判权）。列表里没有的，要么我无权
@@ -729,6 +729,9 @@ def list_work(conn, actor, *, project_ref=None, role=None, state=None, limit=20,
     if not isinstance(top_level, bool):
         raise ResultRefused("invalid_request", "top_level 须为布尔值",
                             en="top_level must be a boolean", field="top_level")
+    if not isinstance(reviewable, bool):
+        raise ResultRefused("invalid_request", "reviewable 须为布尔值",
+                            en="reviewable must be a boolean", field="reviewable")
     states = None
     if state is not None:
         states = [state] if isinstance(state, str) else list(state)
@@ -739,31 +742,45 @@ def list_work(conn, actor, *, project_ref=None, role=None, state=None, limit=20,
                                 "state 只能是 Active/Submitted/Done/Cancelled，得到 %s" % bad,
                                 en="state must be Active/Submitted/Done/Cancelled, got %s" % bad,
                                 field="state")
-    manage = _given(can_manage, project_ref)
-
-    sql = "SELECT * FROM work"
-    args = []
+    manage = cache(_given(can_manage, project_ref))
+    project = cache(lambda ref: _project_row(conn, ref, or_none=True))
+    holders = _positions_held(conn, actor)
+    where, args = [], []
     if project_ref is not None:
         _project_row(conn, project_ref)
-        sql += " WHERE project_ref=?"
+        where.append("project_ref=?")
         args.append(project_ref)
-    sql += " ORDER BY created_at, work_ref"
+    if states is not None:
+        where.append("state IN (%s)" % ",".join("?" for _ in states))
+        args.extend(states)
+    if reviewable:
+        where.append("state=?")
+        args.append(WORK_SUBMITTED)
+    sql = "SELECT * FROM work"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
 
-    rows = conn.execute(sql, args).fetchall()
     picked = []
-    for row in rows:
-        if states is not None and row["state"] not in states:
-            continue
-        mine = _roles_of(conn, actor, row, can_manage=manage)
-        is_manager = "manager" in mine        # 同一判据只问一次（`_roles_of` 里已经问过）
+    current_of = {}
+    for row in conn.execute(sql + " ORDER BY created_at, work_ref", args):
+        mine = _roles_of(conn, actor, row, can_manage=manage, holders=holders)
+        is_manager = "manager" in mine
         if role == "all":
-            if not _may_read(conn, actor, row["work_ref"], manage):
+            if not may_read_work(conn, actor, row, project(row["project_ref"]),
+                                 management=manage, holders=holders):
                 continue
         elif not {"assigned": bool(mine & {"assignee"}), "review": bool(mine & {"reviewer"}),
                   "managed": is_manager}.get(role, bool(mine or is_manager)):
             # 四个角色一把尺：`assigned`/`review` 看我在不在那个角色上，`managed` 看管理权，
             # 不给 role 就看"我在这件 Work 上有没有事"。读不到就不是我的。
             continue
+        if reviewable:
+            if "reviewer" not in mine:
+                continue
+            current = _current_sub(conn, row)
+            if "review" not in _available_actions(conn, row, mine, current, actor, person or actor):
+                continue
+            current_of[row["work_ref"]] = current
         picked.append((row, sorted(mine)))
 
     if top_level and picked:
@@ -773,10 +790,18 @@ def list_work(conn, actor, *, project_ref=None, role=None, state=None, limit=20,
     total = len(picked)
     start = 0
     if cursor is not None:
-        refs = [r["work_ref"] for r, _ in picked]
-        start = refs.index(cursor) + 1 if cursor in refs else 0
+        anchor = _work_row(conn, cursor, or_none=True) if isinstance(cursor, str) else None
+        if (anchor is None or (project_ref is not None and anchor["project_ref"] != project_ref)
+                or not may_read_work(conn, actor, anchor, project(anchor["project_ref"]),
+                                     management=manage, holders=holders)):
+            raise ResultRefused("invalid_request", "此续页位置不可用，请省略 cursor 重新列出",
+                                en="This cursor is unavailable. Omit cursor to start the list again.", field="cursor")
+        # The anchor may have left the current filter since the previous page.
+        start = bisect_right(picked, (anchor["created_at"], anchor["work_ref"]),
+                             key=lambda item: (item[0]["created_at"], item[0]["work_ref"]))
     page = picked[start:start + limit]
-    current_of = {r["work_ref"]: _current_sub(conn, r) for r, _ in page}
+    if not reviewable:
+        current_of = {r["work_ref"]: _current_sub(conn, r) for r, _ in page}
     items = [{"work_ref": row["work_ref"], "project_ref": row["project_ref"],
               "objective": row["objective"], "state": row["state"],
               "assignee": row["assignee_ref"], "reviewer": row["reviewer_ref"],
@@ -798,7 +823,7 @@ def withdraw(storage, conn, actor, *, work_ref, sub_ref, expected_version=None, 
     params = {"work_ref": work_ref, "sub_ref": sub_ref, "expected_version": expected_version}
     replay, digest = storage.action_replay(conn, actor, "work.withdraw", act_key, params)
     if replay is not None:
-        return replay
+        return replay, False
     row = _work_row(conn, work_ref)
     current = _require_current_sub(conn, row, sub_ref)
     if current["submitted_by"] != actor:
@@ -814,4 +839,4 @@ def withdraw(storage, conn, actor, *, work_ref, sub_ref, expected_version=None, 
     result = {"ok": True, "work_ref": work_ref, "sub_ref": sub_ref, "version": version,
               "state": WORK_ACTIVE}
     storage.record_action(conn, actor, "work.withdraw", act_key, digest, result, now_ts)
-    return result
+    return result, True

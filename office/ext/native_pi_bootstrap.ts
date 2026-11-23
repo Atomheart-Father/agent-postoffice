@@ -201,7 +201,6 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     started?: Promise<any>; ending?: Promise<void>; outcome?: 'ok' | 'error'}>();
   let wakeLoopBox = '';
   let pendingAttemptKey = '';
-  let pausedAfterAbort = false;
   //: 本模块实例加载时（= 这一次回载的那一份产物）它的版本；没可信标识就为 null。
   const loadedVersion = releaseVersion(import.meta.url);
   const stopWakeLoop = () => {
@@ -244,10 +243,12 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
         diag: (m: string) => wakeLog('wake: ' + String(m)),
         diagFailure: (m: string) => wakeLog('wake-fail: ' + String(m)),
         host: {
-          canWake: () => !pausedAfterAbort && ctx.isIdle?.() !== false,
-          // ② 忙时不抢跑：Pi 在跑一轮时不许再起一轮。
-          // Core mail batches and the generic Work continuation share this Pi-native custom-message entry;
-          // this call itself is not a host acceptance receipt.
+          restoreAdmission: true,
+          receiptEntries: (eventCtx: any) => eventCtx?.sessionManager?.getBranch?.(),
+          saveReceipt: (receipt: any) => host.appendEntry('office.receipt', receipt),
+          canWake: () => ctx.isIdle?.() !== false,
+          toolBoundary: true,
+          // Idle wakes use the native custom message. Active mail is inserted at a tool boundary.
           triggerTurn: async (batchText: string, details: Record<string, unknown>) => {
             // 纯续工：把这次尝试的 attempt_key 记在这里，等原生 agent_start 时交回唤醒循环 ——
             // 它只认这一个（精确关联），不认"下一个起点"。
@@ -287,26 +288,28 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
         const reported = new Set<string>();
         const socket = createOfficeSocket({socketPath: desc.socketPath, tokenFile: desc.tokenFile});
         try {
-          let cursor: string | null = null;
-          do {
-            const page: any = await socket.handle({op: 'work.list', role: 'assigned', ...(cursor ? {cursor} : {})});
-            if (!page || page.ok === false) return;
-            for (const work of page.items || []) {
-              const status: any = await socket.handle({op: 'resource.status', target_kind: 'work', target_ref: work.work_ref});
-              for (const item of status?.items || []) {
-                if (resourceEvents !== hostEvents) return;
-                const {resource_ref, locator} = item;
-                if (item.kind !== 'skill' || item.digest || reported.has(resource_ref)
-                    || resolve(locator) !== locator || basename(locator) !== 'SKILL.md') continue;
-                const loaded = paths.has(locator);
-                if (!loaded && item.loaded !== true) continue;
-                reported.add(resource_ref);
-                await resourceEvents.observe('resource', {fields: {resource_ref, loaded,
-                  act_key: `pi:resource:${randomUUID()}`}});
+          for (const state of ['Active', 'Submitted']) {
+            let cursor: string | null = null;
+            do {
+              const page: any = await socket.handle({op: 'work.list', role: 'assigned', state, ...(cursor ? {cursor} : {})});
+              if (!page || page.ok === false) return;
+              for (const work of page.items || []) {
+                const status: any = await socket.handle({op: 'resource.status', target_kind: 'work', target_ref: work.work_ref});
+                for (const item of status?.items || []) {
+                  if (resourceEvents !== hostEvents) return;
+                  const {resource_ref, locator} = item;
+                  if (item.kind !== 'skill' || item.digest || reported.has(resource_ref)
+                      || resolve(locator) !== locator || basename(locator) !== 'SKILL.md') continue;
+                  const loaded = paths.has(locator);
+                  if (!loaded && item.loaded !== true) continue;
+                  reported.add(resource_ref);
+                  await resourceEvents.observe('resource', {fields: {resource_ref, loaded,
+                    act_key: `pi:resource:${randomUUID()}`}});
+                }
               }
-            }
-            cursor = page.next_cursor || null;
-          } while (cursor);
+              cursor = page.next_cursor || null;
+            } while (cursor);
+          }
         } finally { socket.close(); }
       };
       void reportSkills().catch((e) => wakeLog(`resource observation failed: ${String(e)}`));
@@ -415,10 +418,10 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     const usage: any = msg.usage;
     if (!usage || typeof usage !== 'object') return;
     const count = (v: any) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined);
-    const tokens = { in: count(usage.input), out: count(usage.output), cache: count(usage.cacheRead) };
-    // 三个数全是 0（或一个都没有）⇒ 这次没有**测得的**用量：不记。树内那个替身不发 usage 块时
-    // Pi 落盘的就是这样一份全 0 —— 把它记下来等于拿“没报”冒充“测到了”。
-    if (!(Number(tokens.in) || Number(tokens.out) || Number(tokens.cache))) return;
+    const input = count(usage.input);
+    const tokens = { in: input === undefined ? undefined : input + (count(usage.cacheWrite) ?? 0),
+      out: count(usage.output), cache: count(usage.cacheRead) };
+    if (!Object.values(tokens).some(Boolean)) return;
     const entry: any = { entry_id: entryId, tokens };
     const refs = new Set<string>();
     for (const result of Array.isArray(event?.toolResults) ? event.toolResults : []) {
@@ -434,7 +437,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
 
     observeOutcome(() => wakeLoop?.reportUsage?.([entry], `usage:pi:${entryId}`));
   };
-  on('turn_end', (event: any, ctx: any) => {
+  on('turn_end', async (event: any, ctx: any) => {
     for (const result of event?.toolResults || []) {
       finishTool(String(result?.toolCallId || ''), Boolean(result?.isError));
     }
@@ -446,6 +449,10 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     try { closed = wakeLoop?.turnClosed?.(currentTurnId); } catch { /* 观测不影响回合状态 */ }
     observe('turn_end', { turnId: currentTurnId, attemptId: closed && closed.attempt_id });
     reportUsage(event, ctx);
+    if (!ctx.signal?.aborted && event.outcome === 'completed' && event.toolResults?.length && Array.isArray(event.entries)) {
+      const draft = await wakeLoop?.insertAtToolBoundary(ctx);
+      if (draft) return {entries: [...event.entries, draft], continue: true};
+    }
   });
   // ★ W439 D2：模型产出的**唯一**原生事实是 assistant 的文本/思考增量（取证 `5e05476a`：
   //   `text_delta`/`thinking_delta` 只有 `{type, contentIndex, delta}`，没有任何 turn/run/增量 id）。
@@ -459,17 +466,16 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
   on('before_agent_start', async (event: any, ctx: any) => {
     try { await wakeLoop?.beforeAgentStart?.(event, ctx); } catch { /* 不伪造 run association */ }
   });
+  on('turn_start', async (_event: any, ctx: any) => {
+    await wakeLoop?.confirmToolBoundary(ctx);
+  });
   on('agent_start', async (_event: any, ctx: any) => {
     const attemptForStart = pendingAttemptKey;
     pendingAttemptKey = '';
     try { await wakeLoop?.agentStart?.(ctx, {pendingAttemptKey: attemptForStart}); }
     catch { /* Core 未确认则保留 unknown */ }
   });
-  on('input', (event: any) => {
-    if (event.source === 'interactive' || event.source === 'rpc') pausedAfterAbort = false;
-  });
   on('agent_settled', async (event: any, ctx: any) => {
-    if (event.aborted === true) pausedAfterAbort = true;
     try { await wakeLoop?.agentSettled?.(event, ctx); } catch { /* 同上 */ }
   });
   // 端点选好之后起循环（`session_start` 时描述符可能还没写，故也挂在选端点之后）。

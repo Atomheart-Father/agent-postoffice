@@ -109,7 +109,22 @@ def _pending_subs(conn, rows):
     return out
 
 
-def runnable_work(conn, actor, unit=None, *, now_ts=None):
+def same_submitter(conn, work_ref, sub_ref, submitted_by, actor, person):
+    if submitted_by == person:
+        return True
+    row = conn.execute("SELECT json_extract(payload_json,'$.submitted_person') FROM work_events"
+                       " WHERE work_ref=? AND op='work.publish'"
+                       " AND json_extract(payload_json,'$.sub_ref')=? LIMIT 1", (work_ref, sub_ref)).fetchone()
+    if row and row[0]:
+        return row[0] == person
+    if submitted_by == actor:
+        return True
+    if conn.execute("SELECT 1 FROM position_holders WHERE position=?", (submitted_by,)).fetchone():
+        return None
+    return False
+
+
+def runnable_work(conn, actor, unit=None, *, now_ts=None, person=None):
     """现在就能动手的 Work（看门狗与续办入口的唯一判据）。
 
     `conn` 必须是调用方**已有的**读事务/连接；`actor` 是受控入口给出的身份，不从正文自报；
@@ -125,7 +140,7 @@ def runnable_work(conn, actor, unit=None, *, now_ts=None):
         if unit != actor and unit not in _positions_held(conn, actor):
             return {"actor": actor, "unit": unit, "count": 0, "items": [],
                     "skipped": {SKIP_UNIT: 1}, "at": now_ts}
-    holders = _holders(conn, actor)
+    holders = {unit} if unit is not None else _holders(conn, actor)
     rows = _open_rows(conn, holders)
     deps = _open_dependencies(conn, [r["work_ref"] for r in rows])
     pend = _pending_subs(conn, rows)
@@ -160,7 +175,7 @@ def runnable_work(conn, actor, unit=None, *, now_ts=None):
                 # 在审状态却没有现行提交：事实对不上，不猜"该谁动手"。
                 skip(SKIP_NOT_MINE)
                 continue
-            if reviewing and sub[1] != actor:
+            if reviewing and same_submitter(conn, ref, *sub, actor, person or actor) is False:
                 action = "review"
             else:
                 # 承办人在等审核人的结论（含"自己交的不能自己审"）。

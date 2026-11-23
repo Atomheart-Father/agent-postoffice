@@ -13,6 +13,8 @@ public struct PendingRequest: Sendable, Equatable, Identifiable {
     public let position: String?
     public let reason: String
     public let details: [String]
+    public let cancelWork: Bool?
+    public let paramsText: String
     public let body: String?
     public let createdAt: String?
     /// nil = 后端没给（未知）；`[]` = 后端明确说没有。未知不画成"你批不了"。
@@ -44,13 +46,14 @@ public struct PendingRequest: Sendable, Equatable, Identifiable {
               let state = r["state"] as? String, let kind = r["kind"] as? String,
               let applicant = r["applicant"] as? String else { return nil }
         let params = r["params"] as? [String: Any] ?? [:]
+        let summaryParams = params.filter { $0.key != "body" }
         let proposed = (params["create"] as? [String: Any])?["position"] as? [String: Any]
         let scope = params["scope"] as? [String] ?? (params["scope"] as? String).map { [$0] } ?? []
         let details = [params["name"], params["action"], params["grant_ref"], proposed?["name"], proposed?["project_ref"]]
             .compactMap { $0 as? String } + scope + (params["letter_ids"] as? [String] ?? [])
         return PendingRequest(ref: ref, version: version, state: state, kind: kind, applicant: applicant,
                               target: r["target"] as? String, position: r["position"] as? String, reason: r["reason"] as? String ?? "",
-                              details: details, body: params["body"] as? String, createdAt: r["created_at"] as? String,
+                              details: details, cancelWork: kind == "retire" ? (params["cancel_work"] as? Bool ?? false) : nil, paramsText: (try? JSONSerialization.data(withJSONObject: summaryParams, options: [.prettyPrinted, .sortedKeys, .fragmentsAllowed])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}", body: params["body"] as? String, createdAt: r["created_at"] as? String,
                               items: itemNames(r["items"] ?? r["actionable_items"]),
                               approvable: approvableNames(r["actionable_items"] ?? r["approvable"] ?? (r["items"] is [String: Any] ? r["items"] : nil)),
                               approved: itemNames(r["approved"]), decider: r["decided_by"] as? String ?? r["decider_ref"] as? String ?? r["decider"] as? String)

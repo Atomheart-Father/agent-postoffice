@@ -21,8 +21,8 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import math
 import re
-import secrets
 import sqlite3
 import sys
 import threading
@@ -81,7 +81,7 @@ PROJECT_MANAGE = "project.manage"
 
 #: 通知类信件的发信人（业务事实，不是身份）。
 NOTICE_SENDER = "office"
-SYSTEM_MAIL_SENDER = "postoffice"
+from lib.mail import SYSTEM_MAIL_SENDER, letter_read_accepts
 
 WORK_ACTIVE = "Active"
 WORK_DONE = "Done"
@@ -92,7 +92,14 @@ SUB_EFFECTIVE = "effective"
 #: 读 op：act_key 被 pop（读不写动作账本）。
 _HANDLE_READ_OPS = frozenset({"office.context", "office.lookup", "letter.read", "work.runnable", "work.read",
                               "work.list", "work.get", "grant.show", "grant.list", "knowledge.read",
-                              "resource.status", "usage.read", "release.status", "request.list"})
+                              "resource.status", "usage.read", "release.status", "request.list",
+                              "round.owner.show", "round.payload"})
+
+def read_only_request(request, ctx):
+    """The read contract has one exception: opening an inbox letter may accept it."""
+    op = request.get("op")
+    return op in _HANDLE_READ_OPS and not (op == "letter.read" and letter_read_accepts(
+        request.get("letter_id"), request.get("direction", "inbox"), request.get("accept_on_read"), ctx.get("surface")))
 #: 由受控入口提供的字段，不算正文必填。
 
 #: 唯一分派表。未列即 invalid_request —— 闭集，不暴露 `_` 前缀。
@@ -439,13 +446,12 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
     _expiry_expired = staticmethod(_expiry_expired)
 
     # ================================================================ 基础设施
-    def __init__(self, home, resolver=None, governance_actors=None, registered_refs=None,
+    def __init__(self, home, governance_actors=None, registered_refs=None,
                  artifact_root=None):
         self.home = Path(home)
         self.artifact_root = Path(artifact_root) if artifact_root else (self.home / "artifacts")
         self.db_path = self.home / "office_core.db"
         self.storage = _storage_module().Storage(self.db_path)
-        self.resolver = resolver
         _rr = registered_refs or {}
         self.registered_refs = {k: set(_rr.get(k) or _rr.get(k + "_refs") or ())
                                for k in ("workspace", "group", "skill")}
@@ -569,42 +575,19 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             return set()
         return {k for k in got if isinstance(k, str) and k.strip()}
 
-    def _is_registered_principal(self, ref, conn=None):
-        """这个引用此刻是不是一个已登记的人或岗位。
-
-        只回答「登记过没有」，不授予任何权限；权威判据在各自的授权方法里。
-        1.1 的登记事实有三处：resolver（组织配置）、**库里的 `bindings`**（有活绑定的人名
-        就是已登记 —— officed 的 Core 没有 resolver，不认它会把"能给活会话发信的人"
-        判成未登记）、`position_holders`（岗位名）。
-        """
-        if not isinstance(ref, str) or not ref:
+    def _is_registered_principal(self, ref, conn, *, position_only=False):
+        """Registration comes from the current bindings, positions and configured governance names."""
+        if self._is_position_address(conn, ref):
+            return True
+        if position_only or not isinstance(ref, str) or not ref:
             return False
-        r = getattr(self, "resolver", None)
-        if r is not None and hasattr(r, "actor_exists") and r.actor_exists(ref):
-            return True
-        if r is not None and hasattr(r, "role_exists") and r.role_exists(ref):
-            return True
-        if ref in getattr(self, "_gov_static", ()):
-            return True
-        if conn is not None:
-            # 1.1 的登记事实：有**活绑定**的名字（人名绑定 actor≠binding_id，岗位绑定
-            # binding_id==actor==岗位名 —— 两种形状都算登记主体），或 `position_holders` 里的岗位。
-            try:
-                hit = conn.execute(
-                    "SELECT 1 FROM bindings WHERE actor=? AND state='active' AND revoked_at IS NULL"
-                    " LIMIT 1", (ref,)).fetchone()
-                if hit is None:
-                    hit = conn.execute(
-                        "SELECT 1 FROM position_holders WHERE position=? LIMIT 1", (ref,)).fetchone()
-                if hit is not None:
-                    return True
-            except Exception:                                    # noqa: BLE001 — 读不到登记不认
-                return False
-        return False
+        return ref in self._gov_static or conn.execute(
+            "SELECT 1 FROM bindings WHERE actor=? AND state='active' AND revoked_at IS NULL LIMIT 1",
+            (ref,)).fetchone() is not None
 
     # ---------------------------------------------------------------- 治理与授权
     def _governance_positions(self):
-        return self._gov_static | set(getattr(self.resolver, "governance_actors", ()) or ())
+        return self._gov_static
 
     def _governance_actors(self, conn):
         """配置的治理岗位及其当前有效任职，只在本次事务缓存。"""
@@ -637,46 +620,13 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         return actor in self._governance_actors(conn)
 
     def _is_position_address(self, conn, name):
-        """这是不是**岗位地址**：`position_holders` 有一行，或统一解析表里的非人名地址。
+        """A registered position may be vacant."""
+        return isinstance(name, str) and bool(name.strip()) and conn.execute(
+            "SELECT 1 FROM position_holders WHERE position=?", (name,)).fetchone() is not None
 
-        只问注册事实，不按目录/前缀/在线状态推断。`_position_exists` 就是这句话的另一个问法，
-        两处各写一遍会在加条件时走岔，所以只留这一份。
-        """
-        if not isinstance(name, str) or not name.strip():
-            return False
-        row = conn.execute("SELECT 1 FROM position_holders WHERE position=? LIMIT 1",
-                           (name,)).fetchone()
-        if row is not None:
-            return True
-        resolver = getattr(self, "resolver", None)
-        if resolver is None:
-            return False
-        try:
-            return bool(resolver.role_exists(name)) and not bool(resolver.actor_exists(name))
-        except Exception:                                          # noqa: BLE001
-            return False
-
-    def _principals(self, actor, conn=None):
-        """本人此刻承载的身份集合（人名 + 现任岗位名）：授权可见性与"指派给岗位"共用它。
-
-        岗位事实两个来源**都问**：resolver 的 `current_roles_of`（组织配置）与库里的
-        `position_holders`（登记事实）—— 没有 resolver 的启动（officed）也要能判"现任"。
-        """
-        out = {actor}
-        r = getattr(self, "resolver", None)
-        if r is not None and hasattr(r, "current_roles_of"):
-            try:
-                out |= set(r.current_roles_of(actor) or ())
-            except Exception:                                     # noqa: BLE001 — 解析失败不扩权
-                pass
-        if conn is not None:
-            try:
-                out |= {row["position"] for row in conn.execute(
-                    "SELECT position FROM position_holders WHERE holder=?", (actor,)).fetchall()
-                    if row["position"]}
-            except Exception:                                     # noqa: BLE001 — 读不到登记不扩权
-                pass
-        return out
+    def _principals(self, actor, conn):
+        return {actor} | {row[0] for row in conn.execute(
+            "SELECT position FROM position_holders WHERE holder=?", (actor,))}
 
     @contextlib.contextmanager
     def _authority_lock(self):
@@ -768,7 +718,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         payload = self._normalize_blank_optionals(getattr(self, method), payload)
         # 先核一次（未知/未登记 Binding 立刻拒），再把 ctx 挂为 pending：业务方法的每个事务
         # 都会在开头按当前事实重读它（闭合「校验一次、提交时已撤权」的窗）。
-        with self._txn() as conn:
+        read_only = read_only_request(request, tc)
+        with self._txn(read_only=read_only) as conn:
             actor = self._verify_trusted_ctx(conn, tc)
         return self._with_pending(tc, lambda: getattr(self, method)(actor, **payload))
 
@@ -1231,13 +1182,15 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         self._check_actor(actor)
         mod = _work_module("work_business.py", "office_work_business")
         with self._txn() as conn:
-            result = mod.create(self.storage, conn, actor, project_ref=project_ref,
-                                objective=objective, assignee=assignee, review=review,
-                                acceptance=acceptance, references=references,
-                                relations=relations, scope=scope, act_key=act_key,
-                                now_ts=now_ts, can_manage=partial(self._can_manage_project, conn, actor, now_ts=now_ts))
-            # 派工通知：与 Work 同一事务（`system_letter(conn=…)` 写在这条连接上），走既有 batch。
-            self._notify_work(conn, result, "assigned", objective, now_ts)
+            result, created = mod.create(
+                self.storage, conn, actor, project_ref=project_ref, objective=objective,
+                assignee=assignee, review=review, acceptance=acceptance, references=references,
+                relations=relations, scope=scope, act_key=act_key, now_ts=now_ts,
+                can_manage=partial(self._can_manage_project, conn, actor, now_ts=now_ts),
+                is_registered=self._is_registered_principal)
+            if created:
+                self._reset_idle_attempts(conn, now_ts)
+                self._notify_work(conn, result, "assigned", objective, now_ts)
             return result
 
     def work_update(self, actor, *, work_ref, action, expected_version=None, assignee=None,
@@ -1245,25 +1198,54 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                     remove=None, reason=None, on=None, note=None, act_key, now_ts=None):
         """改派/审核安排/修改约定/补参考关系/等待/继续/取消。一处判权、一处版本。"""
         self._check_actor(actor)
-        mod = _work_module("work_business.py", "office_work_business")
         with self._txn() as conn:
-            result = mod.update(self.storage, conn, actor, work_ref=work_ref, action=action,
-                                expected_version=expected_version, assignee=assignee,
-                                scope=scope, review=review, objective=objective,
-                                acceptance=acceptance, add=add, remove=remove, reason=reason,
-                                on=on, note=note, act_key=act_key, now_ts=now_ts,
-                                can_manage=partial(self._can_manage_project, conn, actor, now_ts=now_ts))
-            if result.get("action") == "assign":
-                self._notify_work(conn, result, "assigned", None, now_ts)
-            if result.get("action") == "wait" and result.get("was_waiting") is not None:
-                # D3 第一段：一处阻塞 → 负责经理的一封统筹信。`was_waiting` 是业务结果带出的
-                # 改之前事实；信写在这个事务里，重放被 fact_key 去重。
-                from delivery import coord
-                coord.notify_blocked(self, conn, work_ref,
-                                      was_waiting=bool(result["was_waiting"]), now_ts=now_ts)
-            # 等待解除 ⇒ 那件 Work 重新可下手：沿既有 due/通知，不另建调度。
-            self._notify_unblocked(conn, result.get("unblocked"), upstream_ref=work_ref, now_ts=now_ts)
+            return self._work_update_in_txn(
+                conn, actor, work_ref=work_ref, action=action, expected_version=expected_version,
+                assignee=assignee, scope=scope, review=review, objective=objective, acceptance=acceptance,
+                add=add, remove=remove, reason=reason, on=on, note=note, act_key=act_key, now_ts=now_ts)
+
+    def _work_update_in_txn(self, conn, actor, *, work_ref, action, reason=None, now_ts=None,
+                            retiring_position=None, **fields):
+        mod = _work_module("work_business.py", "office_work_business")
+        manage = partial(self._can_manage_project, conn, actor, now_ts=now_ts)
+        if retiring_position:  # The retirement entry point already authorized this cancellation.
+            manage = lambda _project: True
+        result, before = mod.update(self.storage, conn, actor, work_ref=work_ref, action=action,
+                                    reason=reason, now_ts=now_ts, can_manage=manage,
+                                    is_registered=self._is_registered_principal, **fields)
+        if before is None:
             return result
+        self._reset_idle_attempts(conn, now_ts)
+        if action == "assign":
+            if before["state"] == "Active" and before["assignee_ref"] != result["assignee"]:
+                self._notify_work(conn, result, "unassigned", reason, now_ts, recipient=before["assignee_ref"])
+            self._notify_work(conn, result, "assigned", None, now_ts)
+        elif action == "cancel":
+            recipient = before["reviewer_ref"] if before["state"] == "Submitted" else before["assignee_ref"]
+            if retiring_position and recipient == retiring_position:
+                holder = conn.execute("SELECT holder FROM position_holders WHERE position=?", (retiring_position,)).fetchone()
+                recipient = holder[0] if holder else None
+                if recipient == retiring_position or self._archived_recipients(conn, (recipient,)):
+                    recipient = None
+            if recipient:
+                self._notify_work(conn, result, "cancelled", reason, now_ts, recipient=recipient)
+        elif action == "reviewer" and result["state"] == "Submitted":
+            old_reviewer = before["reviewer_ref"]
+            if old_reviewer and old_reviewer != result["reviewer"]:
+                self._notify_work(conn, result, "review_unassigned", reason, now_ts, recipient=old_reviewer)
+            conn.execute("UPDATE letter_states SET state='archived',state_reason='obsolete'"
+                         " WHERE state IN ('delivered','read') AND letter_id IN"
+                         " (SELECT letter_id FROM letters WHERE from_actor=? AND json_valid(meta_json)"
+                         " AND json_extract(meta_json,'$.system')='work.review_requested'"
+                         " AND json_extract(meta_json,'$.work_ref')=?)", (self.SYSTEM_MAIL_SENDER, work_ref))
+            sub = conn.execute("SELECT sub_ref FROM subs WHERE work_ref=? AND state='effective'", (work_ref,)).fetchone()
+            if sub and result["reviewer"]:
+                self._notify_work(conn, {**result, "sub_ref": sub[0]}, "review_requested", None, now_ts)
+        elif action == "wait":
+            from delivery import coord
+            coord.notify_blocked(self, conn, work_ref, was_waiting=result["was_waiting"], now_ts=now_ts)
+        self._notify_unblocked(conn, result.get("unblocked"), upstream_ref=work_ref, now_ts=now_ts)
+        return result
 
     def work_withdraw(self, actor, *, work_ref, sub_ref, expected_version=None, act_key,
                       now_ts=None):
@@ -1271,20 +1253,38 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         self._check_actor(actor)
         mod = _work_module("work_business.py", "office_work_business")
         with self._txn() as conn:
-            return mod.withdraw(self.storage, conn, actor, work_ref=work_ref, sub_ref=sub_ref,
-                                expected_version=expected_version, act_key=act_key,
-                                now_ts=now_ts)
+            result, changed = mod.withdraw(
+                self.storage, conn, actor, work_ref=work_ref, sub_ref=sub_ref,
+                expected_version=expected_version, act_key=act_key, now_ts=now_ts)
+            if changed:
+                self._reset_idle_attempts(conn, now_ts)
+            return result
 
-    def _notified_work_of_attempt(self, conn, attempt_id, box):
-        """静默告警只从同一轮已受理的系统信找唯一 Work。"""
+    def _notified_work_of_attempt(self, conn, attempt_id, binding_id, generation):
+        """Read actionable items from the accepted attempt's actual round box."""
         rows = conn.execute(
-            "SELECT DISTINCT json_extract(l.meta_json, '$.work_ref') AS work_ref"
-            " FROM round_payload p JOIN round_ref rr ON rr.token=p.token"
+            "SELECT DISTINCT l.letter_id, l.from_actor, l.meta_json, l.need, ls.box, ls.state, ls.state_reason,"
+            " ls.accepted_at, ls.category, ls.content_override_json"
+            " FROM round_payload p JOIN round r ON r.token=p.token"
+            " JOIN round_ref rr ON rr.token=r.token AND rr.box=r.box"
             " JOIN letters l ON l.letter_id=rr.ref"
             " JOIN letter_states ls ON ls.letter_id=rr.ref AND ls.box=rr.box"
-            " WHERE p.attempt_key=? AND rr.box=? AND ls.accepted_at IS NOT NULL"
-            " AND json_type(l.meta_json, '$.work_ref')='text' LIMIT 2", (attempt_id, box)).fetchall()
-        return rows[0]["work_ref"] if len(rows) == 1 else None
+            " WHERE p.attempt_key=? AND p.binding_id=? AND p.binding_gen=?"
+            " AND r.binding_id=p.binding_id AND r.binding_gen=p.binding_gen AND r.state='accepted'"
+            " AND ls.accepted_at IS NOT NULL", (attempt_id, binding_id, generation)).fetchall()
+        facts = self._work_notice_facts(conn, [self._notice_work_ref(r["meta_json"]) for r in rows])
+        works, other = set(), False
+        for row in rows:
+            life = self._letter_lifecycle(row, row, facts=facts, box=row["box"])
+            ref = self._notice_work_ref(row["meta_json"])
+            if life["letter_class"] == "work_notice" and not life["terminal"]:
+                if ref:
+                    works.add(ref)
+                else:
+                    other = True
+            elif life["needs_reply"] and not life["terminal"]:
+                other = True
+        return sorted(works), other
 
     def release_record(self, actor, *, version, source_commit=None, work_refs, act_key,
                        now_ts=None):
@@ -1389,27 +1389,27 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             self.storage.record_action(conn, actor, "coord.respond", act_key, digest, out, now_ts)
             return out
 
-    def _notify_work(self, conn, result, event, detail, now_ts):
+    def _notify_work(self, conn, result, event, detail, now_ts, *, recipient=None):
         from delivery.round import MESSAGES
 
         work_ref = result["work_ref"]
-        row = conn.execute("SELECT project_ref, assignee_ref, objective FROM work WHERE work_ref=?",
+        row = conn.execute("SELECT project_ref, assignee_ref, reviewer_ref, objective FROM work WHERE work_ref=?",
                            (work_ref,)).fetchone()
-        who = result.get("assignee") or row["assignee_ref"]
-        materials = [r[0] for r in conn.execute(
-            "SELECT ref FROM inputs WHERE work_ref=? AND removed_at IS NULL ORDER BY seq",
-            (work_ref,))]
+        who = recipient or (row["reviewer_ref"] if event == "review_requested" else row["assignee_ref"])
         copy = MESSAGES["work_" + event]
-        fact = "work-%s:%s:%d" % (event, work_ref, result["version"])
+        body = copy["body"] % (work_ref, detail or row["objective"])
+        if event not in ("unassigned", "cancelled", "review_unassigned", "stage_accepted"):
+            materials = [r[0] for r in conn.execute(
+                "SELECT ref FROM inputs WHERE work_ref=? AND removed_at IS NULL ORDER BY seq", (work_ref,))]
+            body += self.dispatch_knowledge(conn, who, row["project_ref"], materials)
+        fact = "work-review:%s:%d" % (result["sub_ref"], result["version"]) if event == "review_requested" else "work-%s:%s:%d" % (event, work_ref, result["version"])
         self.system_letter(
-            letter_id="work-" + hashlib.sha256(fact.encode("utf-8")).hexdigest()[:16],
-            boxes=[who], subject=copy["subject"] % work_ref,
-            body=copy["body"] % (work_ref, detail or row["objective"])
-                 + self.dispatch_knowledge(conn, who, row["project_ref"], materials),
-            need=copy["need"], kind="work." + event, fact_key=fact, work_ref=work_ref, conn=conn, now_ts=now_ts)
+            letter_id="work-" + hashlib.sha256((fact + ":" + who).encode("utf-8")).hexdigest()[:16],
+            boxes=[who], subject=copy["subject"] % work_ref, body=body,
+            need=copy["need"], kind="work." + event, fact_key=fact, work_ref=work_ref, sub_ref=result.get("sub_ref") if event == "review_requested" else None, conn=conn, now_ts=now_ts)
 
     def work_list(self, actor, *, project_ref=None, role=None, state=None, limit=None,
-                  cursor=None, top_level=False, now_ts=None):
+                  cursor=None, top_level=False, reviewable=False, now_ts=None):
         """我相关的 Work（UI 的公共业务入口）：过滤、分页、逐项判权都在 `work_business.list_work`。
 
         `role=all` 仍是"这个项目里我能打开的每一件"（私密项目逐件判权），与 `work.get` 同一句话 ——
@@ -1420,6 +1420,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         with self._txn(read_only=True) as conn:
             return mod.list_work(conn, actor, project_ref=project_ref, role=role, state=state,
                                  limit=20 if limit is None else limit, cursor=cursor, top_level=top_level,
+                                 reviewable=reviewable, person=self._request_person(conn, actor) if reviewable is True else actor,
                                  now_ts=now_ts, can_manage=partial(self._can_manage_project, conn, actor, now_ts=now_ts))
 
     def work_get(self, actor, *, work_ref, now_ts=None, history=False, todo=False, loc=None):
@@ -1432,7 +1433,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         self._check_actor(actor)
         mod = _work_module("work_business.py", "office_work_business")
         with self._txn(read_only=True) as conn:
-            return mod.get(conn, actor, work_ref=work_ref, now_ts=now_ts,
+            return mod.get(conn, actor, work_ref=work_ref, now_ts=now_ts, person=self._request_person(conn, actor),
                            history=bool(history), todo=bool(todo),
                            can_manage=partial(self._can_manage_project, conn, actor, now_ts=now_ts),
                            loc=(loc or self._locale_of(self._config(), actor)))
@@ -1446,7 +1447,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         self._check_actor(actor)
         mod = _work_module("work_runnable.py", "office_work_runnable")
         with self._txn(read_only=True) as conn:
-            return mod.runnable_work(conn, actor, unit, now_ts=now_ts)
+            return mod.runnable_work(conn, actor, unit, now_ts=now_ts, person=self._request_person(conn, actor))
 
     def work_scope_of(self, work_ref):
         """这件 Work 的交付范围（`work.scope_ref`）：端点的 `files` 分组要用它定前缀。"""
@@ -1511,12 +1512,18 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             return False
         mod = _work_module("work_runnable.py", "office_work_runnable")
         with self._txn(read_only=True) as conn:
-            holders = (self._live_holders(conn, unit)
-                       if self._is_position_address(conn, unit) else [unit])
+            position = self._is_position_address(conn, unit)
+            holders = self._live_holders(conn, unit) if position else [unit]
             for who in holders:
-                if mod.runnable_work(conn, who, unit).get("count"):
+                if mod.runnable_work(conn, who, unit if position else None, person=who).get("count"):
                     return True
         return False
+
+    def _reset_idle_attempts(self, conn, now_ts):
+        ctx = self._pending_ctx_ctx() or {}
+        if ctx:
+            _idle_module().reset_attempts(conn, binding_id=ctx["binding_id"],
+                                          generation=ctx["generation"], now_ts=now_ts)
 
     def work_publish(self, actor, *, work_ref, change_set=None, act_key, note="", replaces=None,
                      expected_version=None, final=False, now_ts=None, prepare=None):
@@ -1537,22 +1544,15 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                                change_set=change_set, store_root=str(self._artifact_root()),
                                act_key=act_key, note=note, replaces=replaces,
                                expected_version=expected_version, final=bool(final),
-                               now_ts=now_ts, scope_covers=self.scope_covers)
+                               now_ts=now_ts, scope_covers=self.scope_covers,
+                               operator=lambda: self._request_operator(conn, actor))
             self._notify_unblocked(conn, result.get("unblocked"), upstream_ref=work_ref,
                                    now_ts=now_ts)
-            if before and result.get("state") == "Submitted" and result.get("version") == before["version"] + 1:
-                reviewer = before["reviewer_ref"]
-                people = self._live_holders(conn, reviewer) if self._is_position_address(conn, reviewer) else [reviewer]
-                runnable = _work_module("work_runnable.py", "office_work_runnable")
-                for b in conn.execute("SELECT binding_id,actor,generation FROM bindings WHERE state='active' AND revoked_at IS NULL"
-                                      " AND actor IN (SELECT value FROM json_each(?))", (json.dumps(people),)):
-                    idle = _idle_module().get(conn, b["binding_id"], b["generation"])
-                    if not idle or idle["state"] != "cleared":
-                        continue
-                    items = runnable.runnable_work(conn, b["actor"]).get("items", [])
-                    if any(i["work_ref"] == work_ref and i["action"] == "review" and i.get("sub_ref") == result.get("sub_ref") for i in items):
-                        _idle_module().arm(conn, unit=b["actor"], binding_id=b["binding_id"],
-                                           generation=b["generation"], due_at=time.time() if now_ts is None else float(now_ts))
+            advanced = before and result.get("version") == before["version"] + 1
+            if advanced:
+                self._reset_idle_attempts(conn, now_ts)
+            if advanced and result.get("state") == "Submitted":
+                self._notify_work(conn, result, "review_requested", None, now_ts)
             return result
 
     def work_review(self, actor, *, work_ref, sub_ref, decision, act_key, reason=None,
@@ -1561,26 +1561,36 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         self._check_actor(actor)
         mod = _work_module("work_flow.py", "office_work_flow")
         with self._txn() as conn:
+            before = conn.execute("SELECT version FROM work WHERE work_ref=?", (work_ref,)).fetchone()
             result = mod.review(self.storage, conn, actor, work_ref=work_ref, sub_ref=sub_ref,
                                 decision=decision, reason=reason, evidence=evidence,
-                                act_key=act_key, now_ts=now_ts)
-            if not _work_module("work_runnable.py", "office_work_runnable").runnable_work(conn, actor).get("count"):
-                for b in conn.execute("SELECT binding_id,generation FROM bindings WHERE actor=? AND state='active' AND revoked_at IS NULL", (actor,)):
-                    _idle_module().clear(conn, binding_id=b["binding_id"], generation=b["generation"], now_ts=now_ts)
-            if result.get("decision") == "return":
-                self._notify_work(conn, result, "returned", reason, now_ts)
+                                act_key=act_key, now_ts=now_ts, operator=lambda: self._request_operator(conn, actor))
+            if before and result.get("version") == before["version"] + 1:
+                self._reset_idle_attempts(conn, now_ts)
+                if result["decision"] == "return":
+                    self._notify_work(conn, result, "returned", reason, now_ts)
+                elif result["state"] == self.WORK_ACTIVE:
+                    self._notify_work(conn, result, "stage_accepted", result["sub_ref"], now_ts)
             self._notify_unblocked(conn, result.get("unblocked"), upstream_ref=work_ref,
                                    now_ts=now_ts)
             return result
 
-    def work_read(self, actor, *, work_ref=None, sub_ref=None, path=None):
-        """按（Work，路径，版本）读回那一份字节。展示形状由 `r/artifact_read.view` 现算。"""
+    def work_read(self, actor, *, work_ref=None, sub_ref=None, path=None, render=None):
+        """按（Work，路径，版本）读回那一份成果，由受控端点决定展示形状。"""
         self._check_actor(actor)
         mod = _work_module("work_result.py", "office_work_result")
+        if not callable(render):
+            raise CoreError("invalid_request", "成果读取需要受控展示入口", en="A controlled artifact view is required")
         with self._txn(read_only=True) as conn:
-            return mod.read_by_path(conn, actor, work_ref=work_ref, sub_ref=sub_ref, path=path,
-                                    store_root=str(self._artifact_root()),
-                                    management=partial(self._can_manage_project, conn, actor))
+            facts = mod.read_by_path(conn, actor, work_ref=work_ref, sub_ref=sub_ref, path=path,
+                                     management=partial(self._can_manage_project, conn, actor))
+        digest = facts.pop("_digest")
+        view, why = mod.read_version(self._artifact_root(), digest, render)
+        if why["reason"] is not None:
+            raise mod.ResultRefused("mismatch", "库里这一份字节与声明的版本不一致",
+                                    en="the stored bytes for this version do not match",
+                                    work_ref=facts["work_ref"], sub_ref=facts["sub_ref"], **why)
+        return {**facts, **view, "size": why["bytes"], "content_verified": True}
 
     def _artifact_refs(self, conn):
         """`subs.change_set_json` 里要求库里**必须还在**的对象地址（库外对象唯一的引用来源）。
@@ -1640,9 +1650,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         """`office.context` —— whoami 就是它，没有第二种形状。
 
         只读一次事务，字段全部来自受控身份 + 同源配置 + Core 事实：`actor`、`locale`、
-        `company`、`mailbox`、`positions`、`managers`、`capabilities`、`todo`、`loaded`、
-        `navigation`（`loaded` = 本窗口此刻加载的发布版本，没上报过就 `known=false`）。
-        `navigation` 是同一批事实的正文渲染，和字段一起出自这一处，不另给一份“给模型的版本”。
+        `company`、`mailbox`、`positions`、`managers`、`capabilities`、`todo`、`loaded`。
         """
         self._check_actor(actor)
         with self._txn(read_only=True) as conn:
@@ -1651,11 +1659,11 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             managers = self._managers_of(conn, actor, positions)
             locale = self._locale_of(cfg, actor)
             company = self._company_name(cfg)
-            caps = self.capabilities(actor, now_ts=now_ts)
+            caps = self.capabilities(actor, now_ts=now_ts, conn=conn)
             # W3：本窗口此刻加载的发布版本（暗 = 没上报过，不是旧版本）。读口只有 `loaded_version`：
             # 拿不到就 `known=false`（明确未知），不退化成"和发布记录不一致"。
             loaded = self.loaded_version(conn, (self._pending_ctx_ctx() or {}).get("binding_id"))
-            runnable = _work_module("work_runnable.py", "office_work_runnable").runnable_work(conn, actor)
+            runnable = _work_module("work_runnable.py", "office_work_runnable").runnable_work(conn, actor, person=self._request_person(conn, actor))
             todo = {"count": runnable["count"], "items": [
                 {"work_ref": item["work_ref"], "action": item["action"]}
                 for item in runnable["items"][:5]]}
@@ -1676,7 +1684,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             "todo": todo,
             "loaded": loaded,
         }
-        ctx["navigation"] = self._navigation(ctx)
         if admin_approval is not None:
             ctx["admin_approval"] = admin_approval
         return ctx
@@ -1708,7 +1715,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         return "en"
 
     def _managers_of(self, conn, actor, positions):
-        """直属上级：岗位定义里的 `reports_to`（`_position_spec`：以 `position_holders` 为准，未填回落 config）。"""
+        """直属上级：岗位登记里的 `reports_to`。"""
         out = []
         for p in positions:
             up = self._position_spec(conn, p["role"]).get("reports_to")
@@ -1717,43 +1724,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 if up not in [x["role"] for x in out]:
                     out.append({"role": up})
         return out
-
-    def _navigation(self, ctx):
-        """把同一批事实渲染成一段短正文（zh/en 各一份，不拼接旧章节）。"""
-        zh = ctx.get("locale") != "en"
-        sep = "、" if zh else ", "
-        lines = []
-        c = ctx.get("company")
-        lines.append(("你是 %s，%s 的 Office 员工。" % (ctx["actor"], c)) if (zh and c)
-                     else ("You are %s, an Office employee at %s." % (ctx["actor"], c)) if c
-                     else ("你是 %s，Office 员工。" % ctx["actor"]) if zh
-                     else ("You are %s, an Office employee." % ctx["actor"]))
-        pos = ctx.get("positions") or []
-        if pos:
-            names = sep.join(p["role"] for p in pos)
-            lines.append(("岗位：%s。" % names) if zh else ("Positions: %s." % names))
-        else:
-            lines.append("组织里没有为你登记岗位；按收到的工作和信件办事，不要自己推断上级。"
-                         if zh else
-                         "No position is registered for you; act on the work and mail you receive "
-                         "and do not infer a manager.")
-        if ctx.get("managers"):
-            names = sep.join("@" + m["role"] for m in ctx["managers"])
-            lines.append(("直属上级：%s。" % names) if zh else ("Reports to: %s." % names))
-        lines += self.position_navigation_lines(pos, zh)
-        todo = ctx["todo"]
-        if todo["items"]:
-            from delivery.round import MESSAGES
-
-            lines.append(MESSAGES["todo_context"]["zh" if zh else "en"] %
-                         (todo["count"], sep.join(item["work_ref"] for item in todo["items"])))
-        mb = ctx.get("mailbox") or {}
-        if mb.get("inbox"):
-            lines.append(("你的信箱：%s（已收信件在 %s；不必全盘搜索）。"
-                          % (mb["inbox"], mb.get("done") or mb["inbox"])) if zh else
-                         ("Your mailbox: %s (collected mail under %s; no need to search the disk)."
-                          % (mb["inbox"], mb.get("done") or mb["inbox"])))
-        return "\n".join(lines)
 
     # ================================================================ 信件与 due
     #: 受信来源只有这三种。声称（线路正文）与受信（入口固定）走两个键，永不互相冒充。
@@ -1768,7 +1738,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
     SUB_EFFECTIVE = SUB_EFFECTIVE
 
     def letter_send(self, actor, *, letter_id, subject, body, recipients, act_key, need=None,
-                    reply_to=None, keep_open=False, now_ts=None):
+                    intent=None, reply_to=None, keep_open=False, now_ts=None):
         """**对外入口**：一封普通信，走**已翻译好**的收件列表。
 
         公开线路给的是 `to` + `cc`；把它们翻成这张收件列表、并核对每个地址确实已登记，
@@ -1778,6 +1748,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
 
         信件与这一批收件箱的合批到期项在**同一事务**里提交；外部动作在提交之后。
         """
+        need = self._letter_send_need(intent, need)
         with self._txn() as conn:
             act_params = self._letter_act_params(
                 letter_id=letter_id, subject=subject, body=body, recipients=recipients,
@@ -2027,35 +1998,16 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             hints.setdefault(row["to_ref"], []).append(row["position"])
         return {box: sorted(set(names)) for box, names in hints.items()}
 
-    def _archived_recipients(self, conn, boxes):
-        """已归档、不再收新信的箱子（读 `box_archive`）。空集 = 都还能收。"""
-        if not boxes:
-            return []
-        rows = conn.execute(
-            "SELECT box FROM box_archive WHERE box IN (%s)" % ",".join("?" * len(boxes)),
-            tuple(boxes)).fetchall()
-        return sorted({r["box"] for r in rows})
-
-    # ---------------------------------------------------------------- due：内部守护
-    # 这两条不是线路 op（不在 `_HANDLE_OPS`）：调度器是它们唯一的调用者。
-    def due_next(self):
-        """下一次该看的事实：最早一个 armed 到期项（没有 ⇒ None）。只读，不写事实。"""
-        due_mod = _delivery_due_module()
-        with self._txn(read_only=True) as conn:
-            row = conn.execute(
-                "SELECT * FROM due WHERE state='armed' ORDER BY due_at, due_key LIMIT 1").fetchone()
-            return {"due": due_mod._out(row)}
-
     def host_event(self, actor, *, kind, ts, act_key, native_id=None, turn_id=None, outcome=None,
                    reason=None, attempt_id=None, status=None, limit_window=None,
-                   version=None, resource_ref=None, loaded=None, usable=None, now_ts=None):
+                   version=None, resource_ref=None, loaded=None, usable=None, attempt_only=False,
+                   terminal_ts=None, now_ts=None):
         """适配层上报的一条原生观测。**只有受信适配器**能到这里：身份仍只来自 trusted_ctx。
 
         旧代次直接丢弃（不报错、不记账）——一条来自已换任窗口的观测不是“错”，是“不作数”。
         D2 心跳：`round.started` 挂上「模型无动静」到期项（`model_silent`，产品 §17 初值 900 秒，
         与 `tool_hang` 同一张 due 表/同一个 drain）；`model_progress`（真实文本增量，带 ext 手里
         那个 `attempt_id`）只推后；`turn_end` 退休它。尝试没记过 ⇒ 缺事实路径不判（不挂不推不拒）。
-        `idle` 已退休（职责由 `turn_end` 覆盖），旧宿主得到明确答复。
 
         `quota` 的判定只问 `lib/watchdog.quota_decision`：可信耗尽阻止本窗口续投，
         经校验的后续真实执行才解除。状态按**这条
@@ -2069,7 +2021,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         if ts is None:
             raise CoreError("invalid_request", "host.event 需要 ts（原生时刻）",
                             en="host.event needs ts (the native timestamp)", field="ts")
-        if kind not in self.HOST_EVENT_KINDS and kind not in self.HOST_EVENT_RETIRED:
+        if kind not in self.HOST_EVENT_KINDS:
             raise CoreError("invalid_request",
                             f"host.event 的 kind 不在规格 §3.2 的闭集里：{kind!r}",
                             en=f"host.event kind {kind!r} is not in the spec §3.2 closed set",
@@ -2086,15 +2038,30 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         with self._txn() as conn:
             self._verify_trusted_ctx(conn, self._parse_trusted_ctx(self._pending_ctx_ctx()))
             binding = self._current_binding()
+            surface = (self._pending_ctx_ctx() or {}).get("surface")
+            if type(attempt_only) is not bool or (attempt_only and
+                    (surface != "codex" or kind != "turn_end" or not isinstance(attempt_id, str) or not attempt_id)):
+                raise CoreError("invalid_request", "attempt_only requires a Codex attempt end")
+            if terminal_ts is not None and (surface != "codex" or kind != "round.started"
+                    or not isinstance(turn_id, str) or not turn_id
+                    or type(terminal_ts) not in (int, float) or type(ts) not in (int, float)
+                    or not math.isfinite(terminal_ts) or not math.isfinite(ts) or terminal_ts < ts):
+                raise CoreError("invalid_request", "terminal_ts requires a completed Codex attempt")
             params = {"kind": kind, "ts": ts, "native_id": native_id, "turn_id": turn_id,
                       "outcome": outcome,
                       "reason": reason, "attempt_id": attempt_id, "status": status,
                       "limit_window": limit_window,
                       "version": version, "binding": binding, "resource_ref": resource_ref,
                       "loaded": loaded, "usable": usable}
+            if attempt_only:
+                params["attempt_only"] = True
+            if terminal_ts is not None:
+                params["terminal_ts"] = terminal_ts
             replay, digest = self.storage.action_replay(conn, actor, "host.event", act_key, params)
             if replay is not None:
-                return replay
+                return {**replay, "idempotent": True}
+            if attempt_only and (self._attempt_entry(conn, binding, attempt_id) or {}).get("kind") != "round.started":
+                raise CoreError("conflict", "the original attempt was not recorded", reason_code="attempt_not_recorded")
             result = {"ok": True, "kind": kind, "binding_id": binding[0],
                       "generation": binding[1]}
             if kind == "quota":
@@ -2128,15 +2095,10 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 result["outcome"] = outcome or "unknown"
             elif kind in ("round.started", "round.accepted"):
                 result.update(self._native_attempt(conn, binding, kind=kind, attempt_id=attempt_id,
-                                                   ts=ts, turn_id=turn_id))
-                if kind == "round.started" and result["native_attempt_recorded"]:
+                                                   ts=ts, turn_id=turn_id, terminal_ts=terminal_ts, now_ts=now_ts))
+                if kind == "round.started" and terminal_ts is None and result["native_attempt_recorded"]:
                     result["silence"] = self._silence_arm(conn, binding, attempt_id=attempt_id,
                                                           ts=ts, turn_id=turn_id, now_ts=now_ts)
-            elif kind in self.HOST_EVENT_RETIRED:
-                # 退休的 kind：不留分支、不写事实，但给出**明确答复**（旧宿主不必因为一次
-                # 版本差就以为自己的观测被吞了）。它仍走可信 ctx 与幂等（不成为旁路）。
-                result.update({"retired": True, "reason": "idle_event_retired",
-                               "detail": "idle 已退休，改用 turn_end"})
             elif native_progress:
                 result["quota_recovered"] = self._quota_activity(conn, binding, ts=ts)
             elif kind == "model_progress":
@@ -2161,10 +2123,9 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                                                              ts=ts, now_ts=now_ts)
             elif kind == "turn_end":
                 result["outcome"] = outcome or "unknown"
-                self._quota_activity(conn, binding, ts=ts, closed=True)
-                # ★ 忙转闲：解锁那一刻他正在轮里，投递侧不插队，靠这次 turn end 接上（D1 第二条入口）。回合结束
-                #   ⇒ 心跳到期项退休；认哪次尝试：带 attempt_id 用它，没带看本代次最近一次，都没有就不判。
-                which = self._model_attempt_for_clear(conn, binding, attempt_id)
+                if not attempt_only:
+                    self._quota_activity(conn, binding, ts=ts, closed=True)
+                which = self._model_attempt_for_clear(conn, binding, attempt_id, turn_id=turn_id, surface=surface)
                 if which:
                     closed = self._attempt_patch(conn, binding, which, turn_closed_at=float(ts))
                     result["silence"] = dict(self._silence_close(conn, binding, attempt_id=which,
@@ -2174,10 +2135,11 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                         result["silence"]["attempt_recorded"] = False
                 else:
                     result["silence"] = {"cleared": False, "reason": "no_single_armed_attempt"}
-                row = _idle_module().arm(conn, unit=actor, binding_id=binding[0],
-                                         generation=binding[1],
-                                         due_at=time.time() if now_ts is None else float(now_ts))
-                result["idle_armed"] = [row["due_key"]]
+                if not attempt_only:
+                    row = _idle_module().arm(conn, unit=actor, binding_id=binding[0],
+                                             generation=binding[1],
+                                             due_at=time.time() if now_ts is None else float(now_ts))
+                    result["idle_armed"] = [row["due_key"]]
             self.storage.record_action(conn, actor, "host.event", act_key, digest, result, now_ts)
             return result
 
@@ -2221,19 +2183,33 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             (binding[0], int(binding[1]), self.NATIVE_ATTEMPT_KEY,
              json.dumps(seen, ensure_ascii=False, sort_keys=True), time.time()))
 
-    def _native_attempt(self, conn, binding, *, kind, attempt_id, ts, turn_id=None):
-        """Store admission and native start for this binding generation."""
+    def _native_attempt(self, conn, binding, *, kind, attempt_id, ts, turn_id=None,
+                        terminal_ts=None, now_ts=None):
+        """Record a native start or merge its already-observed end in this transaction."""
         key = str(attempt_id)
         subject = re.match(r"^([^:#]+):([0-9]+)#", key)
         if subject and (str(binding[0]), int(binding[1])) != (subject[1], int(subject[2])):
             return {"native_attempt_recorded": False, "attempt_id": key,
                     "reason": "attempt_belongs_to_another_segment"}
         seen = self._attempt_book(conn, binding)
-        if (seen.get(key) or {}).get("kind") == "round.started":
-            return {"native_attempt_recorded": False, "attempt_id": key,
-                    "reason": "attempt_already_started"}
+        prior = seen.get(key) or {}
+        if prior.get("kind") == "round.started":
+            result = {"native_attempt_recorded": False, "attempt_id": key,
+                      "reason": "attempt_already_started"}
+            if terminal_ts is not None:
+                if prior.get("turn_id") not in (None, turn_id):
+                    raise CoreError("conflict", "the terminal observation does not match the original attempt",
+                                    reason_code="attempt_turn_mismatch")
+                if prior.get("turn_closed_at") is None:
+                    # A live observation can fall back to receipt time when native startedAt is absent.
+                    prior.update(ts=float(ts), turn_id=turn_id, turn_closed_at=float(terminal_ts))
+                    self._attempt_save(conn, binding, seen)
+                    result["silence"] = self._silence_close(conn, binding, attempt_id=key,
+                                                            ts=terminal_ts, now_ts=now_ts)
+            return result
         seen[key] = {"ts": float(ts), "turn_id": turn_id, "kind": kind,
-                     "last_activity_ts": float(ts), "turn_closed_at": None}
+                     "last_activity_ts": float(ts),
+                     "turn_closed_at": float(terminal_ts) if terminal_ts is not None else None}
         if len(seen) > self.NATIVE_ATTEMPT_KEEP:
             for old_key in sorted(seen, key=lambda k: seen[k].get("ts") or 0)[:-self.NATIVE_ATTEMPT_KEEP]:
                 seen.pop(old_key, None)
@@ -2310,15 +2286,18 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                                            self._silence_subject(binding, attempt_id)),
                 "cleared": row is not None}
 
-    def _model_attempt_for_clear(self, conn, binding, attempt_id):
+    def _model_attempt_for_clear(self, conn, binding, attempt_id, *, turn_id=None, surface=None):
         """`turn_end` 要关哪一段：事件带了 attempt_id 就用它（原生事实，最优先）。
 
-        没带就看这个绑定代次**恰好一条**还 armed 的 model_silent 行 —— 只有一个候选时这不是猜；
-        零条或多条都**不动**（缺事实路径不判：宁可让 handler 在到期时凭 native_attempts 判，
-        也不在这里替它挑一个）。
+        Codex 未携带 attempt_id 时只认唯一匹配 turn_id 的原生尝试；其他宿主沿用恰好一条
+        armed model_silent 的原合同。没有确切候选就不动。
         """
         if isinstance(attempt_id, str) and attempt_id:
             return attempt_id
+        if surface == "codex":
+            matches = [key for key, entry in self._attempt_book(conn, binding).items()
+                       if turn_id and entry.get("turn_id") == turn_id and entry.get("turn_closed_at") is None]
+            return matches[0] if len(matches) == 1 else None
         due_mod = _delivery_due_module()
         rows = conn.execute(
             "SELECT subject_ref FROM due WHERE kind='model_silent' AND state='armed'"
@@ -2339,11 +2318,9 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
     MODEL_SILENT_SECONDS = 900.0
     MODEL_SILENT_KIND = "model_silent"
 
-    #: `host.event` 的闭集（§3.2）：闭集外 ⇒ 拒并列出允许值。`idle` 已退休（职责被 `turn_end`
-    #: 覆盖），旧宿主仍发时得到明确的退休答复，不是静默丢弃。
+    #: Valid native host events.
     HOST_EVENT_KINDS = ("tool_start", "tool_progress", "tool_end", "turn_end", "quota", "loaded",
                         "model_progress", "round.started", "round.accepted", "resource")
-    HOST_EVENT_RETIRED = ("idle",)
 
     def _tool_call(self, binding, *, turn_id, native_id):
         """原生调用标识。缺 `turn_id` 或 `native_id` 就不是"双关联"，不受理。"""

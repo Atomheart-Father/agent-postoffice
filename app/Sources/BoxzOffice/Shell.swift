@@ -108,8 +108,10 @@ private struct BossButton: View {
                     Text(desk.whoami.text { $0 }).font(Theme.Font.small.weight(.semibold)).lineLimit(1)
                     Text(tr("待办", "To do")).font(Theme.Font.sub).foregroundStyle(Theme.ink3)
                 }
-                if let box = desk.inbox.value { CountBlock(n: box.waiting, lowerBound: !box.complete) }
-                else { FactText(panel: desk.inbox).font(Theme.Font.sub) }
+                if let box = desk.inbox.value, let requests = desk.requests.value {
+                    let approvals = requests.items.filter { $0.bossCanApprove == true }.count
+                    CountBlock(n: box.waiting + approvals, lowerBound: !box.complete || !requests.complete)
+                } else { Text(tr("未知", "Unknown")).font(Theme.Font.sub) }
             }
             .padding(.leading, 12).padding(.trailing, 6).frame(height: Theme.control)
             .background(hover ? Theme.paper2 : .clear, ignoresSafeAreaEdges: [])

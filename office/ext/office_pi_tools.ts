@@ -66,66 +66,45 @@ export default function officePiTools(pi: any, options: { scope?: "join" | "full
 		return l.office.callTool(name, args ?? {});
 	}
 
-	// Names this adapter has offered at least once. A name seen before but missing from the active set is a
-	// choice the employee made (Pi keeps that set), so it stays off; a name seen for the first time is on.
-	let seen: Set<string> | undefined;
-
-	function register(): string[] {
-		let active: string[] | undefined;
-		try { active = pi.getActiveTools(); } catch { active = undefined; }   // 加载期还没绑定
-		const list = toolSpecs(locale(), null).filter((s: any) => !s.local && (full || s.name === "office_request_create"));
-		const before = seen;
-		seen = new Set<string>([...(before ?? []), ...list.map((s: any) => s.name)]);
-		for (const spec of list) {
-			pi.registerTool({
-				name: spec.name,
-				label: spec.label,
-				description: full ? spec.description : TOOL_TEXT._office_join.description[locale()],
-				parameters: spec.parameters as never,
-				async execute(_id: string, params: Record<string, unknown>, _signal: any, _update: any, ctx: any) {
-					if (!full) {
-						const invalid = validateArgs(spec, params ?? {});
-						if (invalid) return renderToolResult(invalid, locale()) as never;
-						if (params?.kind !== "join") return renderToolResult({ok: false, error: "no_controlled_endpoint", sent: false}, locale()) as never;
-						const session = options.session?.(ctx);
-						if (!session?.ref || !session.session_ref) return renderToolResult({ok: false, error: "no_controlled_endpoint", sent: false}, locale()) as never;
-						const socket = createOfficeSocket({socketPath: join(home, "sock", "officed.sock")});
-						try {
-							const result = await socket.handle({op: "request.create", kind: "join", reason: params.reason,
-								native_session: {surface: "pi", ...session}, act_key: "join:" + randomUUID()});
-							return renderToolResult(result, locale()) as never;
-						} finally { socket.close(); }
-					}
-					return renderToolResult(await call(spec.name, params ?? {}), locale()) as never;
-				},
-			});
-		}
-		const names = list.map((s: any) => s.name);
-		const fresh = names.filter((n: string) => !(before ?? new Set<string>()).has(n));
-		//: 注册/激活的结论只有一个读者（bootstrap 的 `dbg()` 诊断行）：注册了几个、激活集写成什么、
-		//  设激活集失败时的原话。没有它，"load_ok 却 office=[]" 只能靠猜。
-		const status: { registered: number; active: string[] | null; error: string } =
-			{ registered: names.length, active: null, error: "" };
-		try {
-			// 非本扩展的工具原样保留；本扩展的：新见到的默认开，见过且已关的保持关。
-			// 读不到激活集（加载期/宿主未就绪）时**不能因此不激活**：注册了却不激活，模型看到的是
-			// "Tool ... not found"（而注册表里有），这正是 load_ok 却 office=[] 的那个现象。
-			const prev = active === undefined ? [] : active;
-			const next = [...new Set([...prev.filter((n: string) => !mine.has(n) || fresh.includes(n)), ...names])];
-			pi.setActiveTools(next);
-			status.active = next;
-		} catch (e) {
-			// 激活集设不了：注册本身照旧，下一次注册再试 —— 但**把原话留下**（诊断只有一个读者）。
-			status.error = String((e && (e as Error).message) || e);
-		}
-		(pi as any).__officeToolStatus = status;
-		return list.map((s: any) => s.name);
+	const list = toolSpecs(locale()).filter(s => full || s.name === "office_request_create");
+	for (const spec of list) {
+		pi.registerTool({
+			name: spec.name,
+			label: spec.label,
+			description: full ? spec.description : TOOL_TEXT._office_join.description[locale()],
+			parameters: spec.parameters as never,
+			async execute(_id: string, params: Record<string, unknown>, _signal: any, _update: any, ctx: any) {
+				if (!full) {
+					const invalid = validateArgs(spec, params ?? {});
+					if (invalid) return renderToolResult(invalid, locale()) as never;
+					if (params?.kind !== "join") return renderToolResult({ok: false, error: "no_controlled_endpoint", sent: false}, locale()) as never;
+					const session = options.session?.(ctx);
+					if (!session?.ref || !session.session_ref) return renderToolResult({ok: false, error: "no_controlled_endpoint", sent: false}, locale()) as never;
+					const socket = createOfficeSocket({socketPath: join(home, "sock", "officed.sock")});
+					try {
+						const result = await socket.handle({op: "request.create", kind: "join", reason: params.reason,
+							native_session: {surface: "pi", ...session}, act_key: "join:" + randomUUID()});
+						return renderToolResult(result, locale()) as never;
+					} finally { socket.close(); }
+				}
+				return renderToolResult(await call(spec.name, params ?? {}), locale()) as never;
+			},
+		});
 	}
-
-	const api = { register, current, call, names: () => [...TOOL_NAMES] };
-	// 装载即登记本作用域的工具面。这个调用原来漏了：工厂返回了 api 却没人调用 `register()`
-	// ⇒ 已绑定会话里 `load_ok`/`fullLoaded=true`/handlers=9，但 **一个工具都没登记**，
-	// 模型拿到的是 "Tool office_whoami not found"（真 Pi 1.5.0 实测）。
-	register();
-	return api;
+	const names = list.map(s => s.name);
+	//: 注册/激活的结论只有一个读者（bootstrap 的 `dbg()` 诊断行）：注册了几个、激活集写成什么、
+	//  设激活集失败时的原话。没有它，"load_ok 却 office=[]" 只能靠猜。
+	const status: { registered: number; active: string[] | null; error: string } =
+		{ registered: names.length, active: null, error: "" };
+	let prev: string[] = [];
+	try { prev = pi.getActiveTools() ?? []; } catch { /* Pi is still loading. */ }
+	try {
+		const next = [...new Set([...prev.filter(n => !mine.has(n)), ...names])];
+		pi.setActiveTools(next);
+		status.active = next;
+	} catch (e) {
+		// Registration can succeed before the host is ready to activate tools.
+		status.error = String((e && (e as Error).message) || e);
+	}
+	(pi as any).__officeToolStatus = status;
 }

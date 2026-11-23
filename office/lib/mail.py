@@ -3,6 +3,12 @@ import json
 import re
 
 
+SYSTEM_MAIL_SENDER = "postoffice"
+_WORK_NOTICE_SYSTEMS = {
+    "work.blocked", "work.assigned", "work.returned", "work.unblocked", "work.stage_accepted",
+    "work.review_requested", "work.unassigned", "work.review_unassigned", "work.cancelled",
+}
+
 NEED_PURE_NEG = frozenset({"仅告知", "无需回复", "无需单独回复", "不用回复", "无需操作", "无需处理",
                            "回执默认不答复", "默认不答复", "fyi", "fyionly",
                            "noreply", "noaction", "forinformation", "noactionrequired",
@@ -12,13 +18,18 @@ NEED_PURE_NEG = frozenset({"仅告知", "无需回复", "无需单独回复", "�
 _NEED_STRIP = re.compile(r"[\s，,。.;；:：!！?？（）()\[\]【】\"'“”‘’、/]+")
 
 
+def letter_read_accepts(letter_id, direction, accept_on_read, surface):
+    return bool(letter_id and direction == "inbox" and accept_on_read is True
+                and surface in ("pi", "opencode", "codex", "claude"))
+
+
 def normalize_need(text):
     """`需要：` 的值 → 用于整句相等的规范形（去空白/标点/大小写、去掉重复的 `需要：` 前缀）。"""
     v = re.sub(r"^(?:需要：)+", "", (text or "").strip()).strip()
     return _NEED_STRIP.sub("", v).lower()
-def informational_need(need):
+def informational_need(need, *, system=False):
     """告知类只由整句明确的纯否定/信息标记表达，混合内容保守地视为请求。"""
-    return normalize_need(need) in NEED_PURE_NEG
+    return (system and not (need or "").strip()) or normalize_need(need) in NEED_PURE_NEG
 
 
 def letter_fields(row, state, fields=("subject", "need", "body")):
@@ -33,6 +44,19 @@ def letter_fields(row, state, fields=("subject", "need", "body")):
 
 
 class MailOperations:
+    def _letter_send_need(self, intent, need):
+        if intent is None:
+            return need
+        if intent == "fyi" and (need is None or (isinstance(need, str) and informational_need(need))):
+            return "FYI"
+        if (intent == "request" and isinstance(need, str) and need.strip()
+                and not informational_need(need)):
+            return need
+        raise self.CoreError("invalid_request",
+                             "intent 选 fyi（省略 need，说明写在正文）或 request（need 填实际行动）",
+                             en="Choose intent=fyi (omit need, put details in the body) or intent=request (state the action in need)",
+                             field="intent")
+
     def _arm_batch_due(self, conn, recipients, *, touched, now_ts, need, informational=None):
         """Register or keep **one** `due(batch)` per logical unit, in this transaction (§1.3).
 
@@ -65,15 +89,10 @@ class MailOperations:
         """
         wanted = set(boxes)
         rows = conn.execute(
-            "SELECT letter_id, meta_json FROM letters WHERE from_actor=? AND meta_json IS NOT NULL",
-            (self.SYSTEM_MAIL_SENDER,)).fetchall()
+            "SELECT letter_id FROM letters WHERE from_actor=? AND "
+            "(CASE WHEN json_valid(meta_json) THEN json_extract(meta_json,'$.fact_key') END)=?",
+            (self.SYSTEM_MAIL_SENDER, fact_key)).fetchall()
         for row in rows:
-            try:
-                meta = json.loads(row["meta_json"] or "{}")
-            except ValueError:
-                continue
-            if not isinstance(meta, dict) or meta.get("fact_key") != fact_key:
-                continue
             if set(self._letter_boxes(conn, row["letter_id"])) == wanted:
                 return row["letter_id"]
         return None
@@ -92,7 +111,7 @@ class MailOperations:
                               if raw else row["body_sha256"])
         return out
     def system_letter(self, *, letter_id, boxes, subject, body, need="", kind, headers=None, now_ts=None,
-                      fact_key=None, work_ref=None, conn=None, _observed_ctx=None):
+                      fact_key=None, work_ref=None, sub_ref=None, conn=None, _observed_ctx=None):
         """邮局自己的系统信（闹钟、广播汇总、交接、对外发送被拒）：由持有 Core 的进程内宿主（邮差）记入同一信件账，
         发信人固定为 postoffice。不是线路操作（不在 handle 里），会话无法以它的名义发信。
         幂等 = letter_id + 正文；不是普通信（meta 标 system），不能被改撤。
@@ -120,6 +139,8 @@ class MailOperations:
         meta = {"system": kind, "export_headers": heads}
         if work_ref is not None:
             meta["work_ref"] = work_ref
+        if sub_ref is not None:
+            meta["sub_ref"] = sub_ref
         if fact_key is not None:
             # §1.3 "`meta_json.fact_key` 按事实及责任去重": the fact, plus who must act on it, is
             # what makes two sends the same send. Stored beside `system` so a reader can answer
@@ -167,15 +188,8 @@ class MailOperations:
                     added[b] = heads[b]
             if added:
                 self._merge_export_headers(conn, letter_id, added)
-            # An empty `need` on a **system** letter is not an underspecified request: the Office is
-            # the author, so a blank `need` says "nothing is being asked". Arming a deadline for it
-            # opens a round whose only content is a notice — the "a notice must not start a round"
-            # rule, broken by the one writer that could state it plainly. A letter from a person with
-            # a blank `need` keeps the conservative reading, because the cost there is one extra
-            # check instead of mail that never wakes anyone.
-            self._arm_batch_due(conn, [{"box": b} for b in added], touched=list(added),
-                                now_ts=now_num, need=need,
-                                informational=True if not (need or "").strip() else None)
+            self._arm_batch_due(conn, [{"box": b} for b in added], touched=list(added), now_ts=now_num, need=need,
+                                informational=informational_need(need, system=True))
         return {"letter_id": letter_id, "body_sha256": calc, "boxes": boxes}
     def _letter_boxes(self, conn, letter_id):
         return [r["box"] for r in conn.execute(
@@ -291,26 +305,7 @@ class MailOperations:
 
     @classmethod
     def _letter_lifecycle(cls, row, st, facts=None, box=None):
-        """★ W362：一封信"对**这个收件人**还要不要动作"——**派生值**，不新状态、不新写入。
-
-        `state` / `state_reason` 仍是 Core 的权威列（归档就是归档）；这里只回答"那是不是意味着
-        这个人还得动手"，并且**只从已有业务动作推导**：
-
-          · 抄送副本（`category='cc'`）→ `cc`，写入即不需要动作；
-          · Work 系统通知（`meta.notice`，发件人是 office）→ `work_notice`，**由 Work 状态终结**：
-            `state='archived'` 且 `state_reason='obsolete'`（`_obsolete_notices` 写的）就算终结；
-          · 回执通知（导出信头有 `回执：`）→ `receipt`，**通道受理之后**才算不需要动作；
-          · 系统岗位资料或 `需要：` 整句纯否定 → `notice`，无需回复，**通道受理之后**终结；
-          · 其余 → `request`：由收件方回复（`state_reason='replied'`）或归档后终结。
-
-        ★ 退回 R3-W362.1 ①：「写入即终结」会让投影在**投递之前**把它从 inbox 抽走（批窗 90 秒、
-        邮差每拍都投影），收件人永远收不到。票面第 1 条写的是「通道**受理**即终结」，所以判据是
-        `letter_states.accepted_at`（Core 记的受理事实，见 `letter_accept`）。`cc` 例外：它不是
-        待投递项（`round_begin` 明确跳过抄送副本），写入即终结不会抽走任何会被投递的东西。
-
-        返回 `{"letter_class","terminal","terminal_reason","needs_reply","accepted"}`。**未知就是不知道**：
-        普通信的 `need` 缺失/读不懂时按请求类处理（保守：宁可多算一件待办，也不把真请求静默掉）。
-        """
+        """Derive this recipient's class and reply status from current content and receipts."""
         # The recipient this judgment is FOR. A single-letter read passes the `letter_states` row
         # (which carries `box`); a list read passes a joined row that does not, so the caller names
         # it. Without it the direction-sensitive notices below cannot tell whose box this is.
@@ -337,24 +332,15 @@ class MailOperations:
         if category == "cc":
             klass = "cc"
         elif (meta.get("notice") and row["from_actor"] == cls.NOTICE_SENDER
-              or meta.get("system") == "work.blocked" and row["from_actor"] == cls.SYSTEM_MAIL_SENDER):
+              or meta.get("system") in _WORK_NOTICE_SYSTEMS and row["from_actor"] == cls.SYSTEM_MAIL_SENDER):
             klass = "work_notice"
         elif any(h.startswith("回执：") for h in own_heads):
             klass = "receipt"
-        elif (informational_need(row["need"] or "")
+        elif (informational_need(letter_fields(row, st, ("need",))["need"],
+                                 system=row["from_actor"] == cls.SYSTEM_MAIL_SENDER)
               or meta.get("system") == "position.welcome" and row["from_actor"] == cls.SYSTEM_MAIL_SENDER):
             klass = "notice"
         def verdict(terminal, terminal_reason=None, *, needs_reply=False):
-            """One letter verdict for **this** recipient. Five branches below return it.
-
-            ★ W436: they used to spell the five keys out one by one, while
-              `_work_notice_lifecycle` next door already had exactly this closure and a docstring
-              saying why ("spelling it out per branch is how one of them ends up with
-              `needs_reply: True` and quietly becomes a todo"). The risk is not hypothetical: this
-              function's last branch is the only one that says `needs_reply=True`, and a copy that
-              kept the default from a neighbour turns a notice into a todo — a letter the recipient
-              is told to answer when nobody asks them anything.
-            """
             return {"letter_class": klass, "terminal": terminal,
                     "terminal_reason": terminal_reason,
                     "needs_reply": needs_reply, "accepted": accepted}
@@ -462,17 +448,6 @@ class MailOperations:
                 why[r["letter_id"]] = life["terminal_reason"]
         return done, why, kind, state, needs_reply
 
-    def letter_read(self, actor, *, letter_id=None, target=None, direction="inbox", include_archived=False,
-                    cursor=None, limit=None, now_ts=None):
-        """读信箱（列表或单封）。纯读：`_letter_read` 走 `_txn(read_only=True)`，读完即返回。
-
-        （W381 的"读完记一条看过提醒"已随文件时代退场：1.1 里投递走 `round.begin`/due 行，
-        没有任何入口写 `mailbox.remind`，"未看提醒"判据恒空 ⇒ 记账恒不发生。保留一个恒空
-        的判据加一个恒不发生的写入，就是两处永远要一起读的旧代码。）
-        """
-        return self._letter_read(actor, letter_id=letter_id, target=target, direction=direction,
-                                 include_archived=include_archived, cursor=cursor, limit=limit, now_ts=now_ts)
-
     BODY_PAGE_CHARS, BODY_PAGE_MAX = 8000, 20000
 
     @classmethod
@@ -496,28 +471,18 @@ class MailOperations:
         return {"body": body[start - 1:end], "body_page": {
             "start": start, "end": end, "total_chars": n, "has_more": end < n, "cursor": end + 1 if end < n else None}}
 
-    def _letter_recipient_unit(self, conn, actor, letter_id, default_box):
-        """这封单件信该从哪个单元读：个人箱优先，其次**自己此刻正承载的岗位单元**。
+    def _letter_recipient_unit(self, conn, actor, letter_id, default_box, allowed=None):
+        """Select the carried primary copy first, then cc; prefer the actor within each category."""
+        rows = conn.execute("SELECT box FROM letter_states WHERE letter_id=?"
+                            " AND COALESCE(category,'') IN ('','to','cc')"
+                            " ORDER BY COALESCE(category='cc',0), box!=?, box",
+                            (letter_id, default_box))
+        return next((box for (box,) in rows if (allowed is None or box in allowed)
+                     and self._may_accept_for(conn, box, actor)), default_box)
 
-        `actor` 是承办人，信可能寄给**岗位**（岗位不持有会话，现任才持有）。判据不新造：
-        `_may_accept_for` 就是受理/terminal/round 用的那一条（当前绑定同一 `host_session_ref`）。
-        找不到就原样返回 `default_box` —— 后面的拒绝与提示一个字不变。
-        """
-        rows = conn.execute("SELECT box FROM letter_states WHERE letter_id=? ORDER BY box",
-                            (letter_id,)).fetchall()
-        boxes = [r["box"] for r in rows]
-        if default_box in boxes:
-            return default_box
-        for candidate in boxes:
-            if candidate == actor or not self._is_position_address(conn, candidate):
-                continue
-            if self._may_accept_for(conn, candidate, actor):
-                return candidate
-        return default_box
-
-    def _letter_read(self, actor, *, letter_id=None, target=None, direction="inbox", include_archived=False,
-                     cursor=None, limit=None, now_ts=None):
-        """`letter_read` 的实现体：纯读（历史行为逐字不变）。"""
+    def letter_read(self, actor, *, letter_id=None, target=None, direction="inbox", include_archived=False,
+                    cursor=None, limit=None, accept_on_read=False, now_ts=None):
+        """A native tool opening an inbound letter can record delivery in the same transaction."""
         self._check_actor(actor)
         if direction not in ("inbox", "sent"):
             raise self.CoreError("invalid_request", "direction 必须是 inbox 或 sent",
@@ -526,17 +491,12 @@ class MailOperations:
         if not isinstance(box, str) or not box.strip():
             raise self.CoreError("invalid_request", "target 必须是非空信箱名", en="target must be a non-empty mailbox name")
         box = box.strip().removeprefix("@")
-        with self._txn(read_only=True) as conn:
-            # 单封读的收件单元：工具面没有 `unit` 字段，所以**从这个信件的实际合法收件单元读**。
-            # 同一条判据（当前受控会话正承载该岗位，`_may_accept_for`）在同一个只读事务里复核；
-            # 个人箱那一条**逐字不变**（有就直接用），另一个会话仍然被拒。不新增岗位读 op。
+        receipt = letter_read_accepts(letter_id, direction, accept_on_read, (self._pending_ctx_ctx() or {}).get("surface"))
+        with self._txn(read_only=not receipt) as conn:
             if letter_id and target is None and direction != "sent":
                 box = self._letter_recipient_unit(conn, actor, letter_id, box)
             is_position_box = self._is_position_address(conn, box)
             if (direction != "sent" or not letter_id) and box != actor:
-                if not is_position_box and self.resolver is not None and not self.resolver.actor_exists(box):
-                    raise self.CoreError("not_found", "没有这个信箱：%s" % box,
-                                         en="No such mailbox: %s" % box, field="target", box=box)
                 can_read_position = is_position_box and (
                     self._on_duty(conn, actor, box) or self._may_accept_for(conn, box, actor))
                 if (not can_read_position and actor != self._request_user()
@@ -611,6 +571,11 @@ class MailOperations:
                 if st["state"] == "archived" and not include_archived:
                     raise self.CoreError("not_found", "该信件在本箱已归档（默认读路径不返回）", en="This letter is archived in this box (the default read path does not return it)", letter_id=letter_id)
                 c = self._letter_content(row, st)
+                page = self._body_page(c["body"], cursor, limit)
+                if (receipt and st["state"] == "delivered" and st["accepted_at"] is None
+                        and st["category"] != "cc" and self._may_accept_for(conn, box, actor)):
+                    accepted = self._record_round_letter_accept(conn, actor, box, letter_id, "direct_read", now_ts)
+                    st = {**st, "accepted_at": accepted["accepted_at"], "accepted_channel": accepted["channel"]}
                 heads = self._imported_header_lines(row["meta_json"], box)
                 _life = self._letter_lifecycle(
                     row, st,
@@ -618,7 +583,7 @@ class MailOperations:
                 return {"ok": True, "box": box, "state": st["state"], "letter": {
                     "letter_id": row["letter_id"], "from": row["from_actor"],
                     "created_at": row["created_at"], "subject": c["subject"], "need": c["need"],
-                    **self._body_page(c["body"], cursor, limit), "body_sha256": c["body_sha256"],
+                    **page, "body_sha256": c["body_sha256"],
                     "content_version": c["content_version"], "category": st["category"] or "to",
                     "logical_address": st["logical_address"],
                     "headers": heads,
@@ -629,24 +594,46 @@ class MailOperations:
                                          if "accepted_channel" in st.keys() else None),
                     "system": row["from_actor"] == self.NOTICE_SENDER or self._derived_meta(row["meta_json"]),
                     "system_kind": self._system_kind(row["meta_json"])}}
-            # ★ W362：派生生命周期要读 `state_reason`（终结原因）—— 同一行已有列，只是之前没取。
-            sql = ("SELECT l.*, s.state, s.logical_address, s.category, s.content_override_json,"
-                   " s.content_version, s.state_reason, s.accepted_at, s.accepted_channel"
-                   " FROM letters l"
-                   " JOIN letter_states s ON s.letter_id=l.letter_id WHERE s.box=?")
+            paged = limit is not None or cursor is not None
+            where = " FROM letter_states s JOIN letters l USING(letter_id) WHERE s.box=?"
             if not include_archived:
-                sql += " AND s.state<>'archived'"
-            sql += " ORDER BY l.created_at, l.letter_id"
-            rows = conn.execute(sql, (box,)).fetchall()
+                where += " AND s.state<>'archived'"
+            params = [box]
+            if paged:
+                if limit is not None and (type(limit) is not int or not 1 <= limit <= 200):
+                    raise self.CoreError("invalid_request", "limit 须为 1..200 的整数",
+                                         en="limit must be an integer 1..200", field="limit")
+                limit = limit or 50
+                count = conn.execute("SELECT count(*)" + where, params).fetchone()[0]
+                if cursor is not None:
+                    anchor = (conn.execute("SELECT l.created_at, l.letter_id FROM letter_states s"
+                                           " JOIN letters l USING(letter_id) WHERE s.box=? AND l.letter_id=?",
+                                           (box, cursor)).fetchone() if isinstance(cursor, str) else None)
+                    if anchor is None:
+                        raise self.CoreError("invalid_request", "请使用本箱列表返回的 next_cursor",
+                                             en="Use this inbox's next_cursor", field="cursor")
+                    where += " AND (l.created_at,l.letter_id)<(?,?)"
+                    params.extend(anchor)
+            order = " ORDER BY l.created_at, l.letter_id"
+            if paged:
+                order = " ORDER BY l.created_at DESC, l.letter_id DESC LIMIT ?"
+                params.append(limit + 1)
+            rows = conn.execute(
+                "SELECT l.letter_id, l.from_actor, l.created_at, l.subject, l.need, l.meta_json, l.body_sha256,"
+                " CASE WHEN s.content_override_json IS NOT NULL THEN l.body END AS body,"
+                " s.state, s.logical_address, s.category, s.content_override_json, s.content_version,"
+                " s.state_reason, s.accepted_at, s.accepted_channel" + where + order, params).fetchall()
+            more = paged and len(rows) > limit
+            if more:
+                rows.pop()
             _facts = self._work_notice_facts(conn, [self._notice_work_ref(r["meta_json"]) for r in rows])
             out = []
             for r in rows:
-                c = self._letter_content(r, r)
-                # ★ W160：列表读口也要给出 `category`（主送 `to` / 抄送副本 `cc`）——
-                #   单封读口 `letter_read(letter_id=…)` 一直就有这个字段，列表没有。
-                #   后果是任何按列表渲染"待办"的面都只能靠文件猜，cc 副本于是和主送同形
-                #   （沿用原信 need=回复，看起来就是一份要回复的待办）。这是**同一个事实**的
-                #   两个读口，不新增状态、不新增 op。
+                if r["content_override_json"]:
+                    c = self._letter_content(r, r)
+                else:
+                    c = {**letter_fields(r, r, ("subject", "need")), "body_sha256": r["body_sha256"],
+                         "content_version": r["content_version"] or 1}
                 heads = self._imported_header_lines(r["meta_json"], box)
                 out.append({"letter_id": r["letter_id"], "from": r["from_actor"], "created_at": r["created_at"],
                             "subject": c["subject"], "body_sha256": c["body_sha256"],
@@ -662,7 +649,10 @@ class MailOperations:
                                                  if "accepted_channel" in r.keys() else None),
                             "system": r["from_actor"] == self.NOTICE_SENDER or self._derived_meta(r["meta_json"]),
                             "system_kind": self._system_kind(r["meta_json"])})
-            return {"ok": True, "box": box, "count": len(rows), "letters": out}
+            result = {"ok": True, "box": box, "count": count if paged else len(rows), "letters": out}
+            if paged:
+                result.update(has_more=more, next_cursor=rows[-1]["letter_id"] if more else None)
+            return result
 
     @staticmethod
     def _system_kind(raw):
@@ -677,13 +667,18 @@ class MailOperations:
         """Link the sent reply and file only the recipient unit that this session can answer for."""
         if not isinstance(reply_to, str) or reply_to == letter_id:
             return {"original": "not_filed"}
-        box = self._letter_recipient_unit(conn, actor, reply_to, actor)
-        original = conn.execute(
-            "SELECT 1 FROM letter_states s JOIN letters l ON l.letter_id=s.letter_id"
-            " WHERE s.letter_id=? AND s.box=? AND s.retracted_at IS NULL AND l.from_actor NOT IN (?,?)",
-            (reply_to, box, self.NOTICE_SENDER, self.SYSTEM_MAIL_SENDER)).fetchone()
-        if original is None:
+        originals = conn.execute(
+            "SELECT s.box FROM letter_states s JOIN letters l ON l.letter_id=s.letter_id"
+            " WHERE s.letter_id=? AND COALESCE(s.category,'to')='to' AND s.retracted_at IS NULL"
+            " AND l.from_actor NOT IN (?,?)",
+            (reply_to, self.NOTICE_SENDER, self.SYSTEM_MAIL_SENDER)).fetchall()
+        boxes = [r["box"] for r in originals if self._may_accept_for(conn, r["box"], actor)]
+        if not boxes:
             return {"original": "not_filed"}
+        if actor not in boxes and len(boxes) > 1:
+            raise self.CoreError("invalid_request", "请从要回复的主送岗位发信",
+                                 en="Reply using the intended primary recipient position", letter_id=reply_to)
+        box = self._letter_recipient_unit(conn, actor, reply_to, actor, boxes)
         self._merge_export_headers(conn, letter_id, {
             r["box"]: ["回复原信：" + reply_to] for r in recipients if r.get("category") != "cc"
         })
@@ -705,23 +700,7 @@ class MailOperations:
         return ref if isinstance(ref, str) and ref else None
     @classmethod
     def _work_notice_facts(cls, conn, work_refs):
-        """★ W375：`work_notice` 终结判据所需的**既有事实**，一次批量取好。
-
-        为什么要有它：`work_notice` 的"还要不要动作"不能只看 `letter_states`（`_obsolete_notices`
-        只扫 `actionable` 的提醒），它取决于 **Work 现在是什么状态**。一箱上千封通知逐封查 Work
-        会把读口放大成 N 次查询；这里用一条 IN 查询把 `{work_ref: facts}` 取齐，判据仍是
-        `_letter_lifecycle` 那一份，读口只负责喂事实。
-
-        返回值里每个条目：
-          · `state`        —— Work 状态（Done/Cancelled/Active…），Work 不存在 ⇒ 无此键；
-          · `assignee`     —— 现承办人；
-          · `reviewer`     —— 现审核人（`_current_reviewer` 同一口径需要 grant 解析，这里只给库列，
-                              审核类通知的"换人"判定仍走 `_notice_current` 的既有判据）；
-          · `sub`          —— 当前待审提交 `sub_ref`（没有 ⇒ None）；
-          · `waiting`      —— `waiting_json` 是否还有内容（`wait_resolved` 判"等待是否结束"用）。
-
-        **只读**：不新增表/列/写入；Work 不存在时也如实返回（调用方据此判"指向的 Work 没了"）。
-        """
+        """Batch the current Work, waiting segment and effective submission facts used in mail."""
         refs = [r for r in {str(x) for x in (work_refs or ()) if x}]
         out = {}
         if not refs:
@@ -742,145 +721,61 @@ class MailOperations:
         found = list(out)
         for i in range(0, len(found), 500):
             chunk = found[i:i + 500]
-            q = ("SELECT work_ref, sub_ref FROM subs WHERE state=? AND work_ref IN (%s)"
+            q = ("SELECT work_ref, sub_ref, submitted_by FROM subs WHERE state=? AND work_ref IN (%s)"
                  % ",".join("?" * len(chunk)))
             for r in conn.execute(q, [cls.SUB_EFFECTIVE] + chunk).fetchall():
                 out[r["work_ref"]]["sub"] = r["sub_ref"]
+                reviewer = out[r["work_ref"]]["reviewer"]
+                holder = conn.execute("SELECT holder FROM position_holders WHERE position=?", (reviewer,)).fetchone()
+                person = holder[0] if holder else reviewer
+                if person:
+                    from office_core import _work_module
+                    same = _work_module("work_runnable.py", "office_work_runnable").same_submitter(
+                        conn, r["work_ref"], r["sub_ref"], r["submitted_by"], reviewer, person)
+                    out[r["work_ref"]]["review_unavailable"] = same is not False
         return out
     @classmethod
     def _work_notice_lifecycle(cls, row, *, classified_notice, box=None, archived, reason,
                                accepted, facts=None):
-        """★ W375：Work 系统通知"对收件人还要不要动作"——由 **Work 状态**与通知自身种类判定。
-
-        既有事实派生，不新增字段或写入：
-
-          1. `_obsolete_notices` 写下的 `archived`+`obsolete` ⇒ 终结（`work_obsolete`）；
-          2. `meta.actionable is False` 的纯知会（如 done）⇒ 终结；
-          3. `cancelled` 是例外：它是发给旧承办人的停手动作，Work 已取消也仍要送达；受理或归档后终结；
-          4. 其他通知指向的 Work 已 Done/Cancelled ⇒ 终结；否则仍未终结。
-
-        `facts` 由调用方用 `_work_notice_facts()` 批量备好；没给就**不猜**（只按 1、2 判），
-        免得在读口之外多开查询。判不出类别的情形一律保守：仍算待办。
-        """
+        """Decide whether a Work notice still needs delivery or action."""
         def verdict(terminal, terminal_reason=None):
-            """One notice verdict. A notice never asks for a **reply**: its appeal is a Work event,
-            so ``needs_reply`` is always False and ``terminal`` says whether that event still asks
-            the recipient to act. Six branches return this shape; spelling it out per branch is how
-            one of them ends up with `needs_reply: True` and quietly becomes a todo."""
             return {"letter_class": "work_notice", "terminal": terminal,
                     "terminal_reason": terminal_reason, "needs_reply": False,
                     "accepted": accepted}
 
         click = classified_notice if isinstance(classified_notice, dict) else {}
-        if archived and reason == "obsolete":
+        system = click.get("system") or ""
+        notice = click.get("notice")
+        if not notice and system in _WORK_NOTICE_SYSTEMS:
+            notice = "assigned" if system == "work.unblocked" else system.removeprefix("work.")
+        if (archived and reason == "obsolete") or click.get("actionable") is False:
             return verdict(True, "work_obsolete")
-        if click.get("actionable") is False:
-            # 纯知会类（如 done）：写入时就写的是"不需要动作"，不存在"等谁去做"。
-            return verdict(True, "work_obsolete")
-        if click.get("notice") == "cancelled":
-            # 取消后的责任人需要收到一次停手动作；受理后不再开启新一轮，已归档也保持终结。
+        f = (facts or {}).get(click.get("work_ref")) or {}
+        if notice in ("cancelled", "unassigned", "review_unassigned"):
+            if (notice == "unassigned" and f.get("assignee") == box
+                    or notice == "review_unassigned" and f.get("state") == "Submitted" and f.get("reviewer") == box):
+                return verdict(True, "work_obsolete")
             if archived:
-                return verdict(True, "work_obsolete" if reason == "obsolete" else "archived")
+                return verdict(True, "archived")
             return verdict(bool(accepted), "accepted_notice" if accepted else None)
-        work_ref = click.get("work_ref")
-        f = (facts or {}).get(work_ref) if isinstance(facts, dict) else None
-        if isinstance(f, dict):
-            if f.get("state") in (cls.WORK_DONE, cls.WORK_CANCELLED):
+        if f:
+            state, assignee = f.get("state"), f.get("assignee")
+            if state in (cls.WORK_DONE, cls.WORK_CANCELLED):
                 return verdict(True, "work_obsolete")
-            if (click.get("system") == "work.blocked"
-                    and f["wait_key"] != str(click.get("fact_key") or "").removesuffix(":escalated")):
+            if system == "work.blocked" and f["wait_key"] != str(click.get("fact_key") or "").removesuffix(":escalated"):
                 return verdict(True, "work_obsolete")
-            # ★ W436：两条**方向相反**的提醒，判据也是反的。跟“这票现在归谁”直接相关，
-            #   而不是「Work 还在不在」：
-            #     · `unassigned`（停手）—— 现在归我了，就没有什么要停了；
-            #     · `assigned` / `returned` / `invalidated`（去做）—— 现在不归我了，就不是我的事。
-            #   以前这里只判 Done/Cancelled，于是「改派回来」那一刻旧的 `unassigned` 永远留在
-            #   待办里（实测：dev 的 Work 先改派给 qa 再改派回来，inbox 里两封都算 needs_you，
-            #   其中一封写着“已改派给 qa”，而那张票此刻正归 dev）。`notice_current` 一直是对的
-            #   （`assignee_ref != box`），缺的是这条派生读值 —— 同一件事两个判据，一个少了一档。
-            assignee = f.get("assignee")
-            if isinstance(assignee, str) and isinstance(box, str) and box:
-                if click.get("notice") == "unassigned" and assignee == box:
+            if notice in ("assigned", "returned", "invalidated", "stage_accepted"):
+                if state != cls.WORK_ACTIVE or isinstance(assignee, str) and box and assignee != box:
                     return verdict(True, "work_obsolete")
-                if click.get("notice") in ("assigned", "returned", "invalidated") \
-                        and assignee != box:
-                    return verdict(True, "work_obsolete")
-            # `returned` / `invalidated`：这两条只在 Work **回到执行中**时才成立
-            #   （`work.review` 退回、`work.edit` 作废提交，都在 `sets["state"] = WORK_ACTIVE`
-            #   之后才发它们）。所以"票已经不在 Active"意味着这条提醒所指的那次退回/作废早已被
-            #   后续动作取代 —— 与 `_notice_current` 的 `state == self.WORK_ACTIVE` 同义。
-            #   ★ W436：以前这里不看 state，于是落在 `verdict(False)`；实测生产库 2743 封这类通知里
-            #   Work 在 Submitted 的有 0 封（提交时 `_obsolete_notices(box=actor)` 会把旧的收掉），
-            #   所以这不是一个能被走到的分支 —— 但两支判据对同一输入给出相反的答案，本身就是缺陷：
-            #   下一个人改动 `work.submit` 的通知收纳时，这里静默地变成错的。
-            if click.get("notice") in ("returned", "invalidated"):
-                if f.get("state") != cls.WORK_ACTIVE:
-                    return verdict(True, "work_obsolete")
-            # 等待结束提醒：`wait_resolved` 说的正是「你等的那个已经不在了」——
-            #   它成立的条件是**这票仍在等你、等待说明还在**。等待已被解除（`work.continue`）、
-            #   或 Work 已离开 Active，这条提醒就没有行动价值了。
-            #   判据与 `_notice_current` 的同一支逐字同义（`assignee == box AND state == ACTIVE
-            #   AND waiting_json`），只是这里是批量读值。
-            #   ★ W436：这一支以前完全缺失，于是失效的 `wait_resolved` 落到末尾
-            #   的 `verdict(False)` —— `work_notice` + `terminal=False` ⇒ `delivery_kind_from_lifecycle`
-            #   归一成 `formal` ⇒ 一条「等待已经结束」的提醒被当成正式信投出去。同一件事的两个判据，
-            #   一个有这一档、一个没有。
-            if click.get("notice") == "wait_resolved":
-                if f.get("state") != cls.WORK_ACTIVE or not f.get("waiting"):
-                    return verdict(True, "work_obsolete")
-            # 待审提醒：审核对象已被新提交取代（换人/换段）⇒ 这条提醒已经没有行动价值。
-            # 判据与 `_notice_current` 同义（`sub_ref` 对不上当前 effective 提交），只是批量版。
-            if click.get("notice") == "review_requested":
+            if notice == "wait_resolved" and (state != cls.WORK_ACTIVE or not f.get("waiting")):
+                return verdict(True, "work_obsolete")
+            if notice == "review_requested":
                 want = click.get("sub_ref")
-                if want and f.get("sub") and want != f.get("sub"):
+                if state != "Submitted" or f.get("reviewer") != box or f.get("review_unavailable") or want and want != f.get("sub"):
                     return verdict(True, "work_obsolete")
         return verdict(False)
     def letter_accept(self, actor, *, letter_id, channel, act_key, unit=None, now_ts=None):
-        """★ W362：记下"这个箱的通道**真的**受理了这封信"（通道 + 时间），幂等。
-
-        为什么这一事实必须进 Core：票面与收敛清单第 1 行要的是"受理事实归 Core，各通道只留
-        限流/幂等本地缓存，不作判据"。以前"送到人眼前没有"只存在于各通道自己的账里，于是投影
-        与提醒只能在那里各判一遍（判据必然漂移）；而"写入即终结"又把**没送到**的信当成已了结，
-        投影会在投递前把它从 inbox 抽走。
-
-        判据（谁能写）：`actor` 就是这封信在这一箱的收件人 —— 受理是**收件人那一侧**的事实，
-        发信人不能替对方声称"已受理"。`channel` 是通道名（pi_rpc / claude_hook / notify / …）。
-
-        幂等：**第一次**受理写时间与通道，之后重复报告不覆盖（"什么时候第一次送到"是历史事实）。
-        重放同一 (actor, op, act_key) 走既有幂等域，返回首次结果。
-
-        ## 岗位信（W409 单元 / W432 绑定事实）
-        岗位是纯逻辑地址，Core 里它的 `letter_states.box` 是**岗位名**，不是会话名
-        （实测 `letter_states=[('L1','app.dev',None)]`）。因此"执行该岗位的会话"替它记受理时，
-        `actor` 与 `box` 天然不同名 —— 但这**不是**放宽收件人判据，而是**同一句合同**：
-
-          · 谁在收信：这封信投进的那一箱（`letter_states.box`，可能是个人箱或岗位）；
-          · 谁能替它记：**此刻在执行那个箱的那个会话**（个人箱就是本人；岗位则必须由
-            Core 的绑定事实指出"这个受控会话正在执行这个岗位"）。
-
-        ## `unit`：这条受理**替哪一个投递单元**记（W436，与 `round.begin` 同一份单元合同）
-        一封信可以同时投进**多个**箱（个人 + 若干岗位，或两个岗位）。只按"这个会话在执行
-        哪几个箱"挑第一个是不成立的：B 在 `e5c9ddfd` 上的反例正是 dev 同时承载 `app.dev` 与
-        `app.qa`、一信投两岗位时，两次不同 `act_key` 的受理都落到 `app.dev`；个人箱同时在收件
-        列表时会因"先按 box==actor 试"而永远轮不到岗位。这两条都是同一个缺陷：
-        **受理没有表达"本次实际投递单元"**。
-
-        所以加可选 `unit`（缺省 None = 既有行为，逐字不变）：
-          · `unit` 给了 ⇒ 它必须**真的在这封信的收件箱里**（`letter_states.box == unit`），
-            否则 `forbidden`（不猜、不回落）；
-          · 并必须通过下面同一套"谁能替它记"的判据（个人箱 = `unit == actor`；岗位 = Core
-            绑定事实指出本会话正在执行它）；
-          · 幂等摘要里**包含 unit** ⇒ 同一 act_key 不可能被用来给不同单元表态
-            （那是两个不同的业务动作，不能算一次重放）；不同 act_key 各记各的单元。
-
-        判据全部在同一事务内重核（不接受正文自报、不把岗位冒充 actor、不在解绑/改派后降级）：
-          1. `unit` 给了 ⇒ 只认它（并在下面按同一套判据核"本会话能否替它记"）；
-          2. 没给 `unit` ⇒ 先按 `box == actor` 试（个人信完全不变，零行为差异），
-             否则在"本会话承载的、且在这封信收件箱里的"候选里取**唯一**一个 ——
-             多于一个就 `invalid_request`（**不替调用方猜**是哪个单元，那正是 B 的反例）；
-          3. 其余 ⇒ 仍然 `forbidden`（**不**回落个人箱）。
-        `letter.accept` 的 op 名、幂等域、审计、首次时间语义一概不变。
-        """
+        """Record the first delivery receipt for an exact current recipient, with replay."""
         self._check_actor(actor)
         if not isinstance(channel, str) or not channel.strip() or "\n" in channel:
             raise self.CoreError("invalid_request", "channel 必须是非空单行字符串",
@@ -897,20 +792,24 @@ class MailOperations:
             if replay is not None:
                 return replay
             box, st = self._letter_recipient_state(conn, actor, letter_id, unit)
-            now = self._now(now_ts)
-            already = st["accepted_at"] is not None
-            if not already:
-                conn.execute("UPDATE letter_states SET accepted_at=?, accepted_channel=? "
-                             "WHERE letter_id=? AND box=?", (now, channel, letter_id, box))
-            result = {"ok": True, "letter_id": letter_id, "box": box,
-                      "accepted_at": (st["accepted_at"] if already else now),
-                      "channel": (st["accepted_channel"] if already else channel),
-                      "already_accepted": already, "acted_at": now}
-            if box != actor:
-                # 只多一个**事实**字段：受理记在哪个箱（个人信不出现，形状逐字不变）
-                result["accepted_for_holder"] = box
+            result = self._write_letter_accept(conn, actor, box, letter_id, st, channel, now_ts)
             self.storage.record_action(conn, actor, "letter.accept", act_key, digest, result, now_ts)
             return result
+
+    def _write_letter_accept(self, conn, actor, box, letter_id, state, channel, now_ts):
+        now = self._now(now_ts)
+        already = state["accepted_at"] is not None
+        if not already:
+            conn.execute("UPDATE letter_states SET accepted_at=?, accepted_channel=? "
+                         "WHERE letter_id=? AND box=?", (now, channel, letter_id, box))
+        result = {"ok": True, "letter_id": letter_id, "box": box,
+                  "accepted_at": state["accepted_at"] if already else now,
+                  "channel": state["accepted_channel"] if already else channel,
+                  "already_accepted": already, "acted_at": now}
+        if box != actor:
+            result["accepted_for_holder"] = box
+        return result
+
     def _carried_position_units(self, conn, binding_id):
         rows = conn.execute(
             "SELECT target.binding_id FROM bindings target"

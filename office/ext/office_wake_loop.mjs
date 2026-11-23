@@ -1,47 +1,12 @@
 import {createHash, randomUUID} from "node:crypto";
+import {setTimeout as delay} from "node:timers/promises";
 // ★ W439 首切片：本树只保留 Pi 原生片段，`office_daemon.mjs` 不在保留集里。这里改用
 //   **既有 socket 模块**之上的 Pi 侧投影（`office_pi_round.mjs`）：同一条受控 socket、一份方法表，
 //   不造第二入口、不轮询。客户端仍由调用方注入（夹具可以传自己的）。
-import {ready, orderUnits, isCreated, hasCreatedFact, hostEventFrame} from "./office_pi_round.mjs";
+import {isCreated, hasCreatedFact, hostEventFrame} from "./office_pi_round.mjs";
 
-/**
- * 岗位信唤醒 → 精确 Pi custom batch message 的**唯一条生命周期**（W431/W436）。
- * 发送前必须通过 Core payload 硬门；sendMessage 本身不是宿主受理回执。
- *
- * A 2026-11-16 的六条要求，逐条对应实现：
- *
- *  ① **长期空闲后新信到达能传递选中的 batch text**
- *     会话级持续等待（`start()` 起、`stop()` 收），不是"安全点等 1.5 秒就完"。
- *     Core `round.begin` 选定并呈现一份 batch text；发送前记录 anchor payload；精确 before-start
- *     记录 admission，Pi 顺序对应的 agent_start 记录 run-begin/accepted，settled 才消费。
- *
- *  ② **忙时不抢跑**
- *     本模块从 Pi 的 `agent_start` / `agent_settled` 事实维护忙闲；忙时不起轮、不投递，
- *     只把"有货"记下来等下一次原生空闲事件。
- *
- *  ③ **关闭可退出**
- *     `stop()` 幂等；等待循环用 **await 间隔 + 可中断睡眠**，不 `setInterval` 裸奔；
- *     停止时关闭受控 socket 打断 `round.await`，然后在 `finally` 撤销 owner。
- *
- *  ④ **失败/unknown 有界退避**
- *     失败按指数退避（有上限），`units_unknown` 不当成"没岗位"（照样去问 Core）。
- *
- *  ⑤ **重复唤醒不自激、不重复投递**
- *     `wake` 到"起轮"之间有 **in-flight 闸**，且同一批 `due_units` 不重复起轮
- *     （起轮前按服务端 `due_units` 逐个调用 Core `round.begin`；`created:false` 就记一次 empty，不空转）。
- *
- *  ⑥ **只用隔离会话与夹具，不触碰生产原窗、不部署**
- *     本模块不读环境里的"当前会话"任何全局状态，所有输入都由调用方注入
- *     （`client` / `box` / `host`），所以可以在夹具里整条跑。
- *
- *  ⑦ **会话空闲时续做现有 Work**
- *     只在 Pi 原生 `agent_settled` 安全点询问 Core `work.todo`；仅当 Core 当前返回可执行/待审项时，
- *     通过同一个原生 `triggerTurn` 发通用续工提示。客户端不挑 Work、不读邮箱、不维护监测器或工作账本；
- *     Core 判为 waiting/无项/未知时不触发。
- *
- * ★ 不复制选信规则：这一层**只**决定"要不要起一轮""要不要现在去问 Core"，
- *   送哪几封永远由 Core 的 `round.begin`（`client.begin`）决定。
- */
+// Core selects and owns each batch. The native adapter only chooses a safe
+// point to hand it over, reports receipt, and separately reports execution end.
 
 /** 默认参数（都可由调用方覆盖，便于夹具里把时间压到毫秒级）。 */
 const DEFAULTS = {
@@ -54,18 +19,9 @@ const DEFAULTS = {
   modelProgressMinMs: 1000,
 };
 
-/** 可中断睡眠（`stop()` 能立刻打断，不留悬空计时器）。 */
-function sleep(ms, signal) {
-  return new Promise((resolve) => {
-    if (signal && signal.aborted) return resolve();
-    const t = setTimeout(finish, Math.max(0, ms | 0));
-    function finish() {
-      clearTimeout(t);
-      if (signal) signal.removeEventListener("abort", finish);
-      resolve();
-    }
-    if (signal) signal.addEventListener("abort", finish, { once: true });
-  });
+async function sleep(ms, signal) {
+  try { await delay(ms, undefined, {signal}); }
+  catch (error) { if (!signal.aborted) throw error; }
 }
 
 /**
@@ -91,19 +47,17 @@ export function createWakeLoop({
   const state = {
     running: false,
     stopped: false,
-    /** 在飞的那次等待的取消器。 */
-    abort: null,
+    awaitingFrames: false,
     /** 主循环睡眠的关闭信号。 */
     stopController: new AbortController(),
     /** 连续 empty wake 次数（用于把间隔放长）。 */
-    emptyWake: 0,
     awaitFailures: 0,
-    /** 最近一次失败原因（诊断用，不参与判定）。 */
-    lastError: "",
-    /** ★ 忙时收到、还没处理的 wake（不丢：空闲后立刻处理，不等下一帧）。 */
+    /** Pi 正在执行时收到、尚未交给工具边界的邮件帧。 */
     pending: null,
     /** ★ Core batch 已 begun；native wake 的 admission/consume 仍未知时保留此槽。 */
     inflightRound: null,
+    runningBatches: [],
+    restoredReceipts: false,
     //: 本趟已看过、但**不能回执**的帧（在飞 / 拒帧）：它们仍在盘上，服务端每趟都会再给一遍。
     //  `skip`（服务端不存状态，由宿主给）就是为这个存在的；不清空它，循环会空转（实测 4 连发）。
     //  一轮落定（agentSettled）后清空：那时它们才该被重新看待。
@@ -114,12 +68,6 @@ export function createWakeLoop({
     //  只给个人箱注册 ⇒ 岗位单元（人承岗、unit 是岗位）会在 `record_payload` 处被
     //  `unauthorized_attempt/owner_unregistered` 拒掉（真打实撞）。
     ownerTokens: new Map(),
-    /** 受控 Core owner token（只在本会话 wake loop 生命周期内持有）。 */
-    ownerToken: null,
-    /** round.owner.register 返回的 Core 权威 binding facts；不从 whoami/descriptor 猜。 */
-    ownerFacts: null,
-    /** 来自本 socket 的 identity.whoami，不从唤醒消息或扩展请求体推断。 */
-    identity: null,
     /** triggerTurn 请求数（仅诊断/夹具，不是 Pi run 或 Core admission 证据）。 */
     turnRequests: 0,
     /** The module owns the current Pi busy/idle projection from native lifecycle events. */
@@ -127,14 +75,61 @@ export function createWakeLoop({
     /** 原生回合关门标识与本端在跑的尝试：模型增量靠这两件关联与节流（D2）。 */
     closedTurn: "",
     activeAttempt: "",
-    modelProgress: {attemptId: "", turn: "", sent: 0, lastMs: 0, suppressed: 0},
+    modelProgress: {attemptId: "", turn: "", lastMs: 0},
     /** A host-settled edge must interrupt the post-wake wait when busy mail is pending. */
     wakeWaiter: null,
   };
 
+  async function persistReceipt(batch, ctx, done = false) {
+    if (!host.saveReceipt) return;
+    const owner = state.ownerTokens.get(batch.unit);
+    if (!owner) return;
+    const {unit, token, anchorRef, selectedRefs, attemptKey, dueKey, batchSha256, sessionFile, associationId, harnessRef, end} = batch;
+    try {
+      await host.saveReceipt({unit, token, anchorRef, selectedRefs, attemptKey, dueKey, batchSha256, sessionFile,
+        associationId, harnessRef, actor: owner.actor, bindingId: owner.binding_id,
+        generation: owner.binding_gen, instance: owner.instance,
+        ...(end ? {end: {type: "agent_settled", aborted: end.aborted}} : {}), done}, ctx);
+    } catch (e) {
+      diagFailure(`session could not save the observed Office receipt: ${e.message}`, ctx);
+    }
+  }
+
+  async function restoreReceipts(ctx) {
+    if (state.restoredReceipts || !host.receiptEntries) return;
+    const entries = await host.receiptEntries(ctx);
+    if (!Array.isArray(entries)) return;
+    const latest = new Map();
+    for (const e of entries) if (e.type === "custom" && e.customType === "office.receipt" && e.data?.token) latest.set(e.data.token, e.data);
+    const personal = state.ownerTokens.get(box);
+    let retry = false;
+    for (const saved of latest.values()) {
+      if (saved.done || saved.sessionFile !== sessionFileFor(ctx) || !saved.harnessRef || !saved.unit || !saved.token) continue;
+      if (saved.actor !== personal.actor || saved.bindingId !== personal.binding_id
+          || saved.generation !== personal.binding_gen || saved.instance !== personal.instance) continue;
+      if (state.runningBatches.some(batch => batch.token === saved.token)) continue;
+      const entry = entries.findLast(e => e.type === "custom_message" && typeof e.content === "string"
+        && matchesMessage(e, {...saved, text: e.content}));
+      const text = host.receiptText ? await host.receiptText(saved, ctx) : entry?.content;
+      if (typeof text !== "string" || sha256Text(text) !== saved.batchSha256) continue;
+      if (!await registerOwner(ctx, saved.unit)) {
+        const prior = await client.roundState(saved.unit, saved.token);
+        if (prior?.reason_code !== "unit_not_carried") retry = true;
+        continue;
+      }
+      const end = saved.end?.type === "agent_settled" && typeof saved.end.aborted === "boolean"
+        ? {type: "agent_settled", aborted: saved.end.aborted} : undefined;
+      state.runningBatches.push({...saved, text, ownerToken: state.ownerTokens.get(saved.unit).owner_token,
+        end, accepted: false, restored: true});
+    }
+    state.restoredReceipts = !retry;
+  }
+
   function requestPendingWake() {
     state.wakeWaiter?.();
   }
+
+  let receiptFlush;
 
   const hostUnavailable = () => state.busy || host.canWake?.() === false;
 
@@ -169,123 +164,46 @@ export function createWakeLoop({
     } catch (e) {
       diagFailure(`pre-send rejection failed (${detail}): ${String((e && e.message) || e)}`, ctx);
     }
-    state.inflightRound = {unit, token};
     return false;
   }
 
-  async function handleWake(ctx, dueUnitsForThisWake = null, channel = "poll", carriedText = "", carriedRefs = null, dueKey = null, frame = null) {
-    if (state.inflightRound) {
-      diag("wake deferred: an earlier Core batch remains unresolved", ctx);
-      return cfg.backoffMaxMs;
-    }
-    if (!state.ownerToken) {
-      diagFailure("wake skipped: no Core round owner", ctx);
-      return cfg.backoffMaxMs;
-    }
-    if (!state.ownerFacts) {
-      diagFailure("wake skipped: Core owner returned no trusted binding facts", ctx);
-      return cfg.backoffMaxMs;
-    }
-    state.emptyWake = 0;
-    // ★ 按 wake 帧的 due_units 逐个调用 Core `round.begin`，个人箱优先。**这一层不选信**：
-    //   送哪几封完全由 Core 决定。
-    let batch = null;
+  async function handleWake(ctx, frame, appendAtBoundary) {
+    const {unit, text, due_key: dueKey, refs: frameRefs} = frame;
+    const owner = state.ownerTokens.get(unit);
+    if (state.inflightRound || !owner) return;
+    let batch;
     try {
-      // ★ runtime 2026-11-16 定的用法：**按 wake 帧的 `due_units` 逐个 begin**。
-      //   `due_units` 是"本次真正到期的单元"，服务端已经按 `carried_units` 扇出过；
-      //   我再去问 `positionUnits` 拿全集就会**多问不该问的单元**（也更容易撞无谓的 unauthorized）。
-      //   现行服务端保证 wake 帧里带 `due_units`；缺失说明对面不是现行服务端 ⇒ 如实报，不自造列表。
-      //   客户端不再另问 positionUnits，避免复制服务端的单元扇出/选信规则。
-      const list = Array.isArray(dueUnitsForThisWake) ? dueUnitsForThisWake.slice() : null;
-      if (list === null) {
-        diagFailure("wake frame carried no due_units: 对面不是现行服务端（不猜全集）", ctx);
-        return cfg.backoffMaxMs;
-      }
-      if (!list.length) {
-        // 空 due_units 是合法的（hold / 刚写过）：不当成"没有单元"，直接一轮 empty。
-        state.emptyWake += 1;
-        diag("wake with empty due_units (hold / just-written)", ctx);
-        return Math.min(cfg.backoffMaxMs, cfg.backoffBaseMs * Math.pow(2, Math.min(state.emptyWake, 5)));
-      }
-      // ★ 逐个询问 Core；任何请求结果未知/畸形/拒绝时立即停，不能冒险继续选别的单元。
-      const ordered = orderUnits(box, list);
-      let last = null;
-      for (const unit of ordered) {
-        let got = null;
-        try {
-          got = await client.begin(unit, channel, frame && frame.unit === unit ? frame : null);
-        } catch (e) {
-          state.lastError = String((e && e.message) || e);
-          state.inflightRound = {unit, token: null};
-          diagFailure(`begin ${unit} outcome unknown; stop selecting and retain association: ${state.lastError}`, ctx);
-          return cfg.backoffMaxMs;
-        }
-        if (!got || typeof got !== "object" || !hasCreatedFact(got.created) || got.refused === true) {
-          const knownCreated = Boolean(got && isCreated(got.created));
-          const token = knownCreated && typeof got.token === "string" && got.token ? got.token : null;
-          state.inflightRound = {unit, token};
-          diagFailure(`begin ${unit} returned malformed/refused facts; retain unknown`, ctx);
-          if (token) await retainUnknown(state.inflightRound,
-            "round.begin created a batch with malformed projection", ctx);
-          return cfg.backoffMaxMs;
-        }
-        if (isCreated(got.created)) { batch = { ...got, unit }; break; }
-        if (!last || unit === box) last = got;
-      }
-      if (!batch) batch = last;
+      batch = await client.begin(unit, frame.kind, frame);
     } catch (e) {
-      state.lastError = String((e && e.message) || e);
-      diagFailure(`wake fetch failed: ${state.lastError}`, ctx);
-      return Math.min(cfg.backoffMaxMs, cfg.backoffBaseMs * Math.pow(2, state.emptyWake + 1));
+      diagFailure(`round.begin outcome unknown: ${e.message}`, ctx);
+      return cfg.backoffBaseMs;
     }
-    if (!batch || !isCreated(batch.created)) {
-      // 有 wake 但 Core 说没有可出发项：不空转（把它当一次 empty wake）
-      state.emptyWake += 1;
-      diag(`wake but Core created=false (${(batch && batch.reason) || "?"})`, ctx);
-      // ★ Core 说没货 ⇒ 退避再问（不能立刻重问：空箱时以极高频率打服务端，实测 72 次）
-      return Math.min(cfg.backoffMaxMs, cfg.backoffBaseMs * Math.pow(2, Math.min(state.emptyWake, 5)));
+    if (!hasCreatedFact(batch?.created) || batch.refused) {
+      diagFailure(`round.begin refused or did not confirm the batch for ${unit}`, ctx);
+      return cfg.backoffBaseMs;
     }
-
-    // ① 只把经过硬门记录的精确 batch.text 发给 Pi；sendMessage 仍不是宿主受理回执。
-    //   before_agent_start 精确匹配后只记 admission；run/accepted 等同会话 agent_start。
-    const unit = batch.unit || batch.box || box;
+    if (!isCreated(batch.created)) return;
     const token = batch.token;
     if (typeof token !== "string" || !token) {
-      state.inflightRound = {unit, token: null};
       diagFailure("round.begin created a batch without a token; retain unknown", ctx);
       return cfg.backoffMaxMs;
     }
-    if (state.stopped) return 0;
+    if (state.stopped) { await settleUnsent(unit, token, "host stopped before payload", ctx); return 0; }
     const deliver = batch.deliver;
     const carry = batch.carry;
-    // 正文由**投递层写一次**（`delivery.round.batch_text`，用刚冻结的 refs），帧原样搬过来；
-    //  宿主只携带原文。所以这里**只有帧那一份**：没有"回落到 begin 投影"，更没有按 refs 重渲染 ——
-    //  那两条都会变成第二个"这批信说什么"的答案。帧没给正文 ⇒ 硬门在 onWakeFrame 处就停住。
-    const text = typeof carriedText === "string" ? carriedText : "";
     const selectedRefs = Array.isArray(deliver) && Array.isArray(carry) ? [...deliver, ...carry] : [];
     const contentHashes = batch.content_sha256;
     const hashesComplete = contentHashes && typeof contentHashes === "object"
       && Object.keys(contentHashes).length === selectedRefs.length
       && selectedRefs.every((ref) => typeof ref === "string" && /^[a-f0-9]{64}$/i.test(contentHashes[ref] || ""));
     const refsUnique = new Set(selectedRefs).size === selectedRefs.length;
-    // 帧带来的正文是**按帧自己的 refs** 生成的；而 `round.begin`
-    //   会在同一拍重新冻结一份选择。两者必须是同一份，否则会出现"发送的是旧版本正文，受理的却是后选
-    //   的对象"。只有在帧真的带了 refs 时才比（空的帧不冒充一致），比的是集合相等，不是包含。
-    const frameRefs = Array.isArray(carriedRefs) ? carriedRefs.filter((r) => typeof r === "string" && r) : null;
-    const refsSameSource = !frameRefs || !frameRefs.length
-      || (frameRefs.length === selectedRefs.length
-          && new Set(frameRefs).size === frameRefs.length
-          && frameRefs.every((r) => selectedRefs.includes(r)));
-    const identity = state.identity;
-    const ownerFacts = state.ownerFacts;
-    let sessionFile = "";
+    const refsSameSource = frameRefs.length === selectedRefs.length
+      && new Set(frameRefs).size === frameRefs.length && frameRefs.every(ref => selectedRefs.includes(ref));
+    const sessionFile = sessionFileFor(ctx);
     let instanceId = "";
-    try { sessionFile = typeof host.sessionRef === "function" ? String(host.sessionRef(ctx) || "") : ""; }
-    catch { sessionFile = ""; }
     try { instanceId = typeof host.instanceId === "function" ? String(host.instanceId(ctx) || "") : ""; }
     catch { instanceId = ""; }
-    const bindingId = ownerFacts && ownerFacts.binding_id;
-    const bindingGen = ownerFacts && ownerFacts.binding_gen;
+    const {binding_id: bindingId, binding_gen: bindingGen} = owner;
     // ★ W439：这条硬门的原句只说"投影不全"，**不说是哪一项** —— 真机上就是这么盲了半小时。
     //   同一个判断改成逐项点名（行为不变，只是让失败可读）。
     const gaps = [];
@@ -296,11 +214,6 @@ export function createWakeLoop({
     if (!refsSameSource) gaps.push("frame_refs_vs_frozen");
     if (!hashesComplete) gaps.push("content_sha256");
     if (typeof text !== "string" || !text.length) gaps.push("text");
-    if (!identity || identity.actor !== box) gaps.push("identity_actor");
-    if (!ownerFacts) gaps.push("owner_facts");
-    if (Number.isInteger(identity && identity.generation) && identity.generation !== bindingGen) gaps.push("identity_gen_vs_owner_gen");
-    if (typeof bindingId !== "string" || !bindingId) gaps.push("owner_binding_id");
-    if (!Number.isInteger(bindingGen) || bindingGen <= 0) gaps.push("owner_binding_gen");
     if (!instanceId) gaps.push("instance_id");
     if (!sessionFile) gaps.push("session_file");
     if (gaps.length) {
@@ -321,8 +234,7 @@ export function createWakeLoop({
     try {
       payload = await client.recordPayload(unit, token, anchorRef, attemptKey, text);
     } catch (e) {
-      state.lastError = String((e && e.message) || e);
-      diagFailure(`round.record_payload failed; no message sent: ${state.lastError}`, ctx);
+      diagFailure(`round.record_payload failed; no message sent: ${String(e?.message || e)}`, ctx);
       await settleUnsent(unit, token, "round.record_payload failed", ctx);
       return cfg.backoffMaxMs;
     }
@@ -332,7 +244,8 @@ export function createWakeLoop({
       await settleUnsent(unit, token, "payload capture gate refused", ctx);
       return cfg.backoffMaxMs;
     }
-    if (hostUnavailable()) {
+    if (state.stopped) { await settleUnsent(unit, token, "host stopped before dispatch", ctx); return 0; }
+    if (!appendAtBoundary && !host.acceptWhileBusy && hostUnavailable()) {
       await settleUnsent(unit, token, "the host cannot start a round now", ctx);
       return 0;
     }
@@ -342,20 +255,24 @@ export function createWakeLoop({
       officeWakeId: associationId, officeRoundToken: token, officeAnchorRef: anchorRef,
       officeAttemptKey: attemptKey, officeSelectedRefs: selectedRefs, officeBatchSha256: batchSha256,
     };
-    state.inflightRound = {
-      unit, token, anchorRef, selectedRefs, attemptKey, requestKey, dueKey,
-      text, batchSha256, sessionFile, associationId, messageDetails,
-      dispatchAttempted: true, beforeStartSeen: false, admissionRecorded: false,
-      runBegan: false, accepted: false, sawStart: false, sequenceInvalidated: false,
-      unknownSettleAttempted: false, consumeInFlight: false,
+    const current = state.inflightRound = {
+      unit, token, anchorRef, selectedRefs, attemptKey, dueKey,
+      text, batchSha256, sessionFile, associationId, ownerToken: owner.owner_token,
+      beforeStartSeen: false, admissionRecorded: false,
+      accepted: false, sawStart: false, sequenceInvalidated: false,
+      toolBoundary: Boolean(appendAtBoundary),
     };
     try {
+      if (appendAtBoundary) {
+        appendAtBoundary({type: "custom_message", customType: "office-wake", content: text, display: true, details: messageDetails});
+        return 0;
+      }
       await host.triggerTurn(text, messageDetails);
       state.turnRequests += 1;
     } catch (e) {
-      if (!state.inflightRound) return 0; // Core rejected the batch before native enqueue.
-      state.lastError = String((e && e.message) || e);
-      diagFailure(`Pi sendMessage outcome unknown; retain in-flight batch: ${state.lastError}`, ctx);
+      if (state.inflightRound !== current) return 0;
+      if (e?.notSent) { state.inflightRound = null; await settleUnsent(unit, token, "host stopped before dispatch", ctx); return 0; }
+      await retainUnknown(current, `native submission outcome unknown: ${String(e?.message || e)}`, ctx);
       return cfg.backoffMaxMs;
     }
     diag("exact batch text submitted to Pi; awaiting matching host event", ctx);
@@ -375,44 +292,41 @@ export function createWakeLoop({
    */
   async function tick(ctx) {
     if (state.stopped) return 0;
-    const ac = new AbortController();
-    state.abort = ac;
-    let got = null;
+    let got, failure;
+    state.awaitingFrames = true;
     try {
       got = await client.awaitFrames({waitMs: cfg.waitMs, skip: [...state.awaitSkip]});
-      state.lastError = "";
     } catch (e) {
-      // ④ 有界退避：失败不清零、也不无限放大。
-      state.lastError = String((e && e.message) || e);
-      diagFailure(`wake wait failed: ${state.lastError}`, ctx);
-      const wait = Math.min(cfg.backoffMaxMs, cfg.backoffBaseMs * Math.pow(2, Math.min(state.awaitFailures, 6)));
-      state.awaitFailures += 1;
-      return ac.signal.aborted ? 0 : wait;
+      failure = String(e?.message || e);
     } finally {
-      if (state.abort === ac) state.abort = null;
+      state.awaitingFrames = false;
     }
     if (state.stopped) return 0;
     if (!got || got.ok === false) {
-      // 拒绝（有 code）与未知（读不到）都不起轮。未知按未知保留，进同一有界退避。
-      const wait = Math.min(cfg.backoffMaxMs, cfg.backoffBaseMs * Math.pow(2, Math.min(state.awaitFailures, 6)));
+      diagFailure(failure ? `wake wait failed: ${failure}` : `wake wait refused/unknown: ${got?.code || "no_result"}`, ctx);
+      const wait = Math.min(cfg.backoffMaxMs, cfg.backoffBaseMs * 2 ** Math.min(state.awaitFailures, 6));
       state.awaitFailures += 1;
-      diagFailure(`wake wait refused/unknown: ${(got && got.code) || "no_result"}`, ctx);
       return wait;
     }
     state.awaitFailures = 0;
     const frames = Array.isArray(got.frames) ? got.frames : [];
     // 到点没有帧是正常的一次等待（`round.await` 本身就阻塞），立刻再挂一次即可，不空转。
     if (!frames.length) return 0;
+    let backoff = 0;
     for (const frame of frames) {
       if (state.stopped || state.inflightRound || state.pendingIdle) break;
       const dueKey = (frame && frame.due_key) || "";
+      if (host.toolBoundary && frame?.kind === "batch_round" && hostUnavailable()) {
+        state.pending = frame;
+        return 0;
+      }
       let verdict = "failed";
       try {
         verdict = await onWakeFrame(frame, ctx);
       } catch (e) {
-        state.lastError = String((e && e.message) || e);
-        diagFailure(`frame handling failed: ${state.lastError} due_key=${dueKey}`, ctx);
+        diagFailure(`frame handling failed: ${String(e?.message || e)} due_key=${dueKey}`, ctx);
       }
+      if (typeof verdict === "number" && verdict > 0) { backoff = Math.max(backoff, verdict); continue; }
       if (verdict !== "batch_handled" && verdict !== "turn_requested") {
         if (verdict === "work_check_unavailable") return cfg.backoffBaseMs;
         const skipped = verdict === "obsolete_work" ? frame.attempt_key : dueKey;
@@ -420,7 +334,7 @@ export function createWakeLoop({
         diag(`frame not acked (${verdict}) due_key=${dueKey}`, ctx);
       }
     }
-    return 0;
+    return backoff;
   }
 
   /** Pi 的原生 pre-start 事件（形状严格；不匹配就什么都不记）。 */
@@ -437,86 +351,53 @@ export function createWakeLoop({
   }
 
   async function registerOwner(ctx, unit = box) {
-    const key = String(unit || box);
-    const known = state.ownerTokens.get(key);
-    if (known) {
-      state.ownerToken = known.token;
-      state.ownerFacts = known.facts;
-      return true;
-    }
-    if (state.ownerToken && key === box) return true;      // 兼容：启动时已按本箱登记过
+    if (state.ownerTokens.has(unit)) return true;
     try {
-      if (typeof client.ownerRegister !== "function") throw new Error("client.ownerRegister missing");
-      const got = await client.ownerRegister(key);
-      if (!got || typeof got.owner_token !== "string" || !got.owner_token) {
-        throw new Error(`round.owner.register returned no owner_token: ${JSON.stringify(got)}`);
+      const prior = host.conditionalOwner ? await client.ownerShow(unit) : null;
+      if (state.stopped) return false;
+      if (host.conditionalOwner && (!prior || prior.ok === false || (prior.registered !== false && !Number.isInteger(prior.owner_gen))))
+        throw new Error("round.owner.show did not confirm the current generation");
+      const owner = await client.ownerRegister(unit, host.conditionalOwner ? (prior.registered ? prior.owner_gen : 0) : undefined);
+      const personal = state.ownerTokens.get(box);
+      if (owner?.actor !== box || owner.box !== unit || !owner.owner_token || !owner.binding_id
+          || !Number.isInteger(owner.binding_gen) || owner.binding_gen <= 0 || !owner.instance
+          || (personal && (owner.binding_id !== personal.binding_id || owner.binding_gen !== personal.binding_gen
+                           || owner.instance !== personal.instance))) {
+        throw new Error("round.owner.register did not confirm this session's identity");
       }
-      state.ownerToken = got.owner_token;
-      const factsOk = typeof got.binding_id === "string" && Boolean(got.binding_id)
-        && Number.isInteger(got.binding_gen) && got.binding_gen > 0
-        && typeof got.instance === "string" && Boolean(got.instance);
-      state.ownerFacts = factsOk ? {
-        binding_id: got.binding_id, binding_gen: got.binding_gen, instance: got.instance,
-      } : null;
-      if (state.ownerFacts && state.identity && Number.isInteger(state.identity.generation)
-          && state.identity.generation !== state.ownerFacts.binding_gen) {
-        state.ownerFacts = null;
-      }
-      if (!state.ownerFacts) {
-        diagFailure("round.owner.register lacks consistent trusted binding facts; sending stays disabled", ctx);
-      }
-      state.ownerTokens.set(key, {token: state.ownerToken, facts: state.ownerFacts});
-      diag(`Core round owner registered for unit=${key}`, ctx);
+      state.ownerTokens.set(unit, owner);
+      diag(`Core round owner registered for unit=${unit}`, ctx);
       return true;
     } catch (e) {
-      state.lastError = String((e && e.message) || e);
-      diagFailure(`round owner registration failed: ${state.lastError}`, ctx);
+      diagFailure(`round owner registration failed: ${String(e?.message || e)}`, ctx);
       return false;
     }
   }
 
   /** 持续等待的主循环（**只在 start() 里跑**，stop() 立刻退）。 */
   async function run(ctx) {
-    // ★ 先确认身份再等待：`ready()` 顺带把 connBox 定下来（`round.*` 的 box 恒为本箱）。
-    //   不可达/未就绪时有界重试；没有身份快照绝不开始 round 或发送正文。
     let ownerRetryMs = cfg.backoffBaseMs;
-    let readyRetryMs = cfg.backoffBaseMs;
     try {
       while (!state.stopped) {
-        if (!state.identity) {
-          try {
-            state.identity = await ready(client, box);
-            readyRetryMs = cfg.backoffBaseMs;
-            diag("native Pi Core identity ready", ctx);
-          } catch (e) {
-            state.lastError = String((e && e.message) || e);
-            diagFailure(`wake loop not ready: ${state.lastError}`, ctx);
-            await sleep(readyRetryMs, state.stopController.signal);
-            readyRetryMs = Math.min(cfg.backoffMaxMs, readyRetryMs * 2);
-            continue;
-          }
-        }
-        if (!state.ownerToken) {
-          if (!(await registerOwner(ctx))) {
-            await sleep(ownerRetryMs, state.stopController.signal);
-            ownerRetryMs = Math.min(cfg.backoffMaxMs, ownerRetryMs * 2);
-            continue;
-          }
-          ownerRetryMs = cfg.backoffBaseMs;
-        }
-        if (state.stopped) break;
-        if (state.inflightRound || state.pendingIdle || hostUnavailable()) {
-          await waitForNextTick(cfg.waitMs);
+        if (!await registerOwner(ctx)) {
+          await sleep(ownerRetryMs, state.stopController.signal);
+          ownerRetryMs = Math.min(cfg.backoffMaxMs, ownerRetryMs * 2);
           continue;
         }
-        let next = 0;
+        ownerRetryMs = cfg.backoffBaseMs;
+        if (state.stopped) break;
+        client.setConnBox?.(box);
+        let next = cfg.backoffBaseMs;
         try {
-          next = await tick(ctx);
+          await restoreReceipts(ctx);
+          await flushNativeReceipts(ctx);
+          next = cfg.backoffMaxMs;
+          const blocked = state.inflightRound || state.pendingIdle || state.pending
+            || (!host.toolBoundary && !host.acceptWhileBusy && hostUnavailable());
+          next = blocked ? cfg.waitMs : await tick(ctx);
         } catch (e) {
           // 任何未预期异常都不许把循环打死（否则"关闭可退出"变成"静默死掉"）
-          state.lastError = String((e && e.message) || e);
-          diagFailure(`wake loop error: ${state.lastError}`, ctx);
-          next = cfg.backoffMaxMs;
+          diagFailure(`wake loop error: ${String(e?.message || e)}`, ctx);
         }
         if (state.stopped) break;
         // ★ 等待本身是阻塞的（`round.await`）；这里只保证 `next` 不合法时不至于负值。
@@ -524,19 +405,16 @@ export function createWakeLoop({
         await waitForNextTick(wait);
       }
     } finally {
-      const units = state.ownerTokens.size ? [...state.ownerTokens.keys()] : (state.ownerToken ? [box] : []);
-      for (const unit of units) {
+      for (const [unit, owner] of state.ownerTokens) {
         try {
-          await client.ownerRevoke(unit);
+          await client.ownerRevoke(unit, owner);
           diag(`Core round owner revoked for unit=${unit}`, ctx);
         } catch (e) {
-          state.lastError = String((e && e.message) || e);
-          diagFailure(`round owner revoke failed for unit=${unit}: ${state.lastError}`, ctx);
+          diagFailure(`round owner revoke failed for unit=${unit}: ${String(e?.message || e)}`, ctx);
         }
       }
       state.ownerTokens.clear();
-      state.ownerToken = null;
-      state.ownerFacts = null;
+      await client.close?.({final:true});
       state.running = false;
     }
   }
@@ -547,41 +425,38 @@ export function createWakeLoop({
   }
 
   async function retainUnknown(cur, reason, ctx) {
-    if (!cur) return false;
+    if (!cur || cur.sequenceInvalidated) return false;
     cur.sequenceInvalidated = true;
-    cur.unknownReason = reason;
+    if (state.inflightRound === cur) {
+      state.inflightRound = null;
+      requestPendingWake();
+    }
     diagFailure(`${reason}; retain the Office batch as unknown`, ctx);
-    if (cur.unknownSettleAttempted || cur.accepted) return false;
-    cur.unknownSettleAttempted = true;
+    if (cur.accepted) return false;
     try {
       const result = await client.settle(cur.unit, cur.token, "unknown", cur.harnessRef);
-      cur.unknownSettleRecorded = Boolean(result && result.ok !== false && result.token === cur.token &&
+      const recorded = Boolean(result && result.ok !== false && result.token === cur.token &&
         (result.state === "unknown" || result.result === "unknown"));
-      if (!cur.unknownSettleRecorded) {
-        diagFailure("round.settle(unknown) was not confirmed; retain local association", ctx);
+      if (!recorded) {
+        diagFailure("round.settle(unknown) was not confirmed", ctx);
       }
-      return cur.unknownSettleRecorded;
+      return recorded;
     } catch (e) {
-      state.lastError = String((e && e.message) || e);
-      diagFailure(`round.settle(unknown) failed; retain local association: ${state.lastError}`, ctx);
+      diagFailure(`round.settle(unknown) failed: ${String(e?.message || e)}`, ctx);
       return false;
     }
   }
 
-  function matchesBeforeStart(event, cur) {
-    const message = event && event.message;
+  function matchesMessage(message, cur) {
     const details = message && message.details;
-    return Boolean(cur && cur.dispatchAttempted && event?.messageType === "custom"
-      && message?.customType === "office-wake"
+    return Boolean(cur && message?.customType === "office-wake"
       && details?.officeWakeId === cur.associationId
       && details?.officeRoundToken === cur.token
       && details?.officeAnchorRef === cur.anchorRef
       && details?.officeAttemptKey === cur.attemptKey
       && details?.officeBatchSha256 === cur.batchSha256
       && sameStrings(details?.officeSelectedRefs, cur.selectedRefs)
-      && typeof message.content === "string"
-      && message.content === cur.text
-      && sha256Text(message.content) === cur.batchSha256);
+      && message.content === cur.text);
   }
 
   /**
@@ -589,35 +464,23 @@ export function createWakeLoop({
    *
    * 两个入口进的是同一个体，只是"谁说自己提交了"不同：
    *  - `beforeAgentStart`：Pi 的原生 `before_agent_start`（自定义消息形状，`matchesBeforeStart` 严格校验）；
-   *  - `submittedExact`：没有 pre-start 原生事件的宿主（Codex）自报"我刚把这一份原文交出去"，
+   *  - `submittedExact`：OpenCode 在原生入队前报出同一会话和正文，
    *    只认正文逐字相同 + 同一会话 —— 不伪造 Pi 的事件形状，也不多一个判据。
    */
-  async function admitExact({text, event = null, viaPiEvent = false, nativeMessageId}, ctx) {
+  async function admitExact({text, event = null, viaPiEvent = false, nativeMessageId, beforeEnqueue = Boolean(nativeMessageId)}, ctx) {
     const cur = state.inflightRound;
     if (!cur) return false;
     const matches = viaPiEvent
-      ? matchesBeforeStart(event, cur)
-      : (typeof text === "string" && text === cur.text && sha256Text(text) === cur.batchSha256);
+      ? event?.messageType === "custom" && matchesMessage(event.message, cur)
+      : text === cur.text;
     const sessionFile = sessionFileFor(ctx);
     const sameSession = Boolean(sessionFile && sessionFile === cur.sessionFile);
-    if (cur.beforeStartSeen) {
-      if (!matches || !sameSession) {
-        // Pi's next before-start proves the prior prepareRun did not reach agent_start/settled.
-        // Do not let a later agent_start or settled event be attributed to the old Office batch.
-        await retainUnknown(cur, !sameSession
-          ? "host session changed after the batch before-start"
-          : "a nonmatching before-start followed the batch before-start", ctx);
-      }
-      return false; // duplicate exact hooks are not a second admission
-    }
-    if (!sameSession) {
-      await retainUnknown(cur, "host session differs from the dispatched batch", ctx);
+    if (!sameSession || !matches) {
+      await retainUnknown(cur, sameSession ? "a nonmatching before-start superseded the dispatched batch"
+        : "host session differs from the dispatched batch", ctx);
       return false;
     }
-    if (!matches || cur.sequenceInvalidated) {
-      await retainUnknown(cur, "a nonmatching before-start superseded the dispatched batch", ctx);
-      return false;
-    }
+    if (cur.beforeStartSeen) return false;
 
     cur.beforeStartSeen = true;
     const fallback = {
@@ -630,7 +493,7 @@ export function createWakeLoop({
     const harnessRef = nativeMessageId || `content_time:${fallback.session_file}|${fallback.submitted_at}|${fallback.batch_sha256}`;
     cur.harnessRef = harnessRef;
     try {
-      const admission = await client.recordAdmission(cur.unit, cur.token, harnessRef, fallback, Boolean(nativeMessageId));
+      const admission = await client.recordAdmission(cur.unit, cur.token, harnessRef, fallback, beforeEnqueue);
       if (admission?.reason === "stale_frame") {
         state.inflightRound = null;
         return false;
@@ -642,9 +505,14 @@ export function createWakeLoop({
       diag("exact batch matched the host submission; admission recorded; awaiting the native start", ctx);
       return true;
     } catch (e) {
-      state.lastError = String((e && e.message) || e);
-      await retainUnknown(cur, `matched batch admission remains unknown: ${state.lastError}`, ctx);
-      return false;
+      const detail = String(e?.message || e);
+      if (beforeEnqueue) {
+        state.inflightRound = null;
+        await settleUnsent(cur.unit, cur.token, `native pre-enqueue admission failed: ${detail}`, ctx);
+        return false;
+      }
+      diagFailure(`matched batch admission awaits native start: ${detail}`, ctx);
+      return true;
     }
   }
 
@@ -662,9 +530,13 @@ export function createWakeLoop({
       await ackFrame(idle, ctx);
       return true;
     }
+    return recordNativeStart(ctx);
+  }
+
+  async function recordNativeStart(ctx, modelStarting = true) {
     const cur = state.inflightRound;
     if (!cur || cur.sequenceInvalidated) return false;
-    if (!cur.beforeStartSeen || !cur.admissionRecorded) {
+    if (!cur.beforeStartSeen) {
       await retainUnknown(cur, "Pi agent_start arrived without a matched preceding before_agent_start", ctx);
       return false;
     }
@@ -677,23 +549,33 @@ export function createWakeLoop({
     // By Pi 1.5's single-run ordering, this is the start immediately following the exact
     // before_agent_start. A later before-start would already have invalidated this association.
     cur.sawStart = true;
-    state.activeAttempt = cur.attemptKey;      // 同一次尝试：`round.started` 那个键不是唯一来源
+    if (modelStarting) state.activeAttempt = cur.attemptKey;
+    state.runningBatches.push(cur);
+    await persistReceipt(cur, ctx);
+    const received = await recordNativeReceipt(cur, ctx, modelStarting);
+    if (state.inflightRound === cur) state.inflightRound = null;
+    state.awaitSkip.clear();
+    requestPendingWake();
+    return received;
+  }
+
+  async function recordNativeReceipt(cur, ctx, modelStarting = false) {
     try {
-      const run = await client.runBegin(cur.unit, cur.token, state.ownerToken, cur.harnessRef);
+      if ((!cur.restored || host.restoreAdmission) && !cur.admissionRecorded && !hasRecorded(await client.recordAdmission(cur.unit, cur.token, cur.harnessRef)))
+        throw new Error("round.record_admission did not confirm the native start");
+      cur.admissionRecorded = true;
+      const run = await client.runBegin(cur.unit, cur.token, cur.ownerToken, cur.harnessRef, cur.restored ? cur.text : undefined);
       if (!hasRecorded(run)) throw new Error("round.run_begin did not record the matched host run");
-      cur.runBegan = true;
-      const settled = await client.settle(cur.unit, cur.token, "accepted", cur.harnessRef);
-      if (!acceptedSettle(settled)) throw new Error("round.settle did not confirm accepted");
+      if (!cur.restored && !acceptedSettle(await client.settle(cur.unit, cur.token, "accepted", cur.harnessRef)))
+        throw new Error("round.settle did not confirm accepted");
+      cur.coreSettled = run.run_state === "settled";
       cur.accepted = true;
-      // 产品 §9「模型无进展」也盖**普通业务轮**：复用这一次尝试已有的键（`record_payload` 那次），
-      // 不新造第二次尝试、不开平行通知 —— 起轮/进展/结束仍是同一条链。
-      await reportAttemptStarted(cur.attemptKey, ctx);
+      if (modelStarting) await reportAttemptStarted(cur.attemptKey, ctx);
       diag("matched native start recorded run-begin and accepted settle", ctx);
       await ackFrame(cur, ctx);
       return true;
     } catch (e) {
-      state.lastError = String((e && e.message) || e);
-      await retainUnknown(cur, `matched Pi agent_start lifecycle remains unknown: ${state.lastError}`, ctx);
+      diagFailure(`native receipt could not be recorded: ${String(e?.message || e)}`, ctx);
       return false;
     }
   }
@@ -717,7 +599,7 @@ export function createWakeLoop({
    */
   async function sendAttemptEvent(kind, attemptId, ts) {
     const shaped = hostEventFrame(kind, {attemptId, ts});
-    if (shaped.ok === false || shaped.retired) return shaped;
+    if (shaped.ok === false) return shaped;
     return await client.hostEvent(kind, shaped.ts, shaped.frame);
   }
 
@@ -781,81 +663,100 @@ export function createWakeLoop({
     }
     const nowMs = Number.isFinite(ev.nowMs) ? ev.nowMs : Date.now();
     const slot = state.modelProgress;
-    const firstOfTurn = slot.attemptId !== attemptId || slot.turn !== turn || !slot.sent;
+    const firstOfTurn = slot.attemptId !== attemptId || slot.turn !== turn;
     if (!firstOfTurn && nowMs - slot.lastMs < cfg.modelProgressMinMs) {
-      slot.suppressed += 1;
       return { ok: true, throttled: true, attempt_id: attemptId };
     }
     slot.attemptId = attemptId;
     slot.turn = turn;
-    slot.sent += 1;
     slot.lastMs = nowMs;
     return sendAttemptEvent("model_progress", attemptId, Math.floor(nowMs / 1000));
   }
 
+  async function insertAtToolBoundary(ctx) {
+    const pending = state.pending;
+    if (!pending) return;
+    let entry;
+    try {
+      const current = await client.awaitFrames({unit: pending.unit, waitMs: 0});
+      const frame = current?.frames?.find(f => f.due_key === pending.due_key);
+      if (frame) await onWakeFrame(frame, ctx, (draft) => { entry = draft; });
+      return entry;
+    } finally {
+      state.pending = null;
+    }
+  }
+
+  async function confirmToolBoundary(ctx, modelStarting = true) {
+    const cur = state.inflightRound;
+    if (!cur?.toolBoundary || cur.beforeStartSeen || cur.sequenceInvalidated) return;
+    if (sessionFileFor(ctx) !== cur.sessionFile) return retainUnknown(cur, "Pi session changed at tool boundary", ctx);
+    const entries = ctx?.sessionManager?.getEntries?.();
+    if (!Array.isArray(entries)) return retainUnknown(cur, "Pi tool-boundary transcript unavailable", ctx);
+    const entry = entries.findLast((item) => item.type === "custom_message" && matchesMessage(item, cur));
+    if (!entry) {
+      if (!modelStarting && await settleUnsent(cur.unit, cur.token, "Pi did not append the tool-boundary entry", ctx)) {
+        state.inflightRound = null;
+      }
+      return;
+    }
+    if (await admitExact({text: entry.content, nativeMessageId: entry.id, beforeEnqueue: false}, ctx)) {
+      await recordNativeStart(ctx, false);
+    }
+  }
+
   async function agentSettled(event, ctx) {
+    await confirmToolBoundary(ctx, false);
+    state.pending = null;
     state.busy = false;
     state.activeAttempt = "";
-    state.modelProgress = {attemptId: "", turn: "", sent: 0, lastMs: 0, suppressed: 0};
+    state.modelProgress = {attemptId: "", turn: "", lastMs: 0};
     state.pendingIdle = null;
-    const cur = state.inflightRound;
-    if (!cur) {
-      state.awaitSkip.clear();
-      requestPendingWake(); // An unrelated host run may have been the only reason mail was deferred.
+    state.awaitSkip.clear();
+    requestPendingWake();
+    if (typeof event?.aborted !== "boolean") {
+      diagFailure("agent_settled lacks a native aborted fact", ctx);
       return false;
     }
-    if (cur.sequenceInvalidated) {
-      if (cur.sawStart && cur.unknownSettleRecorded && sessionFileFor(ctx) === cur.sessionFile) {
-        state.inflightRound = null;
-        state.awaitSkip.clear();
-        requestPendingWake();
+    for (const batch of state.runningBatches)
+      if (!batch.end && !batch.restored && batch.sessionFile === sessionFileFor(ctx)) {
+        batch.end = {...event, type: "agent_settled"};
+        await persistReceipt(batch, ctx);
       }
-      return false;
-    }
-    if (!cur.beforeStartSeen || !cur.sawStart || !cur.runBegan || !cur.accepted) {
-      await retainUnknown(cur, "agent_settled is not tied to a valid admitted Office batch", ctx);
-      return false;
-    }
-    if (cur.consumeInFlight) return false;
-    const sessionFile = sessionFileFor(ctx);
-    if (!sessionFile || sessionFile !== cur.sessionFile) {
-      await retainUnknown(cur, "agent_settled session differs from the admitted batch", ctx);
-      return false;
-    }
-    if (!event || typeof event !== "object" || typeof event.aborted !== "boolean") {
-      await retainUnknown(cur, "agent_settled lacks Pi's boolean aborted fact", ctx);
-      return false;
-    }
-    cur.consumeInFlight = true;
-    cur.aborted = event.aborted;
-    try {
-      // Preserve Pi's event facts, including aborted, without inferring a run id.
-      const exactEvent = {...event, type: "agent_settled"};
-      const result = await client.consume(cur.unit, exactEvent, state.ownerToken, cur.token);
-      if (!hasRecorded(result)) {
-        await retainUnknown(cur, "round.consume did not record the matched agent_settled", ctx);
-        return false;
+    return flushNativeReceipts(ctx);
+  }
+
+  function flushNativeReceipts(ctx) {
+    const pending = state.runningBatches.filter(batch => (!batch.accepted || batch.end) && batch !== state.inflightRound
+      && batch.sessionFile === sessionFileFor(ctx));
+    if (!pending.length) return false;
+    return receiptFlush ??= (async () => {
+      let recorded = false;
+      for (const batch of pending) {
+        try {
+          if (!batch.accepted && !await recordNativeReceipt(batch, ctx, !batch.end && state.activeAttempt === batch.attemptKey)) continue;
+          if (!batch.end && !batch.restored) continue;
+          if (batch.end && !batch.coreSettled
+              && !hasRecorded(await client.consume(batch.unit, batch.end, batch.ownerToken, batch.token))) {
+            diagFailure("round.consume did not record the matched agent_settled", ctx);
+            continue;
+          }
+          await persistReceipt(batch, ctx, true);
+          state.runningBatches.splice(state.runningBatches.indexOf(batch), 1);
+          recorded = true;
+        } catch (e) {
+          diagFailure(`round.consume failed: ${e.message}`, ctx);
+        }
       }
-      state.inflightRound = null;
-      state.awaitSkip.clear();
-      requestPendingWake();
-      diag("round.consume recorded for the matched owner/token/session", ctx);
-      return true;
-    } catch (e) {
-      state.lastError = String((e && e.message) || e);
-      await retainUnknown(cur, `round.consume failed; retain unknown: ${state.lastError}`, ctx);
-      return false;
-    } finally {
-      if (state.inflightRound === cur) cur.consumeInFlight = false;
-    }
+      return recorded;
+    })().finally(() => { receiptFlush = null; });
   }
 
   async function lifecycleBoundary(name, ctx, action) {
     try {
       return await action();
     } catch (e) {
-      state.lastError = String((e && e.message) || e);
-      const detail = `${name} handler failed: ${state.lastError}`;
+      const detail = `${name} handler failed: ${String(e?.message || e)}`;
       if (state.inflightRound) {
         try { await retainUnknown(state.inflightRound, detail, ctx); }
         catch (retainError) {
@@ -868,35 +769,24 @@ export function createWakeLoop({
     }
   }
 
-  /**
-   * S2 文件帧入口（v1）。帧只带来**唤醒的事实**，不带来批次的正文：
-   * `batch_round` 仍走既有 Core 取件（`round.begin`，正文由 Core 的 payload 给），`idle_started` 的
-   * 正文本来就是投递自己的句子。`v`/`kind` 的形状检查在读帧那一层（`office_pi_wake_frames.mjs`）。
-   *
-   * 「已在飞一轮就不再起第二个」这条判据在宿主这一侧：Core 只会在同一次尝试上收到 already_attempted，
-   * 但宿主多发一次 turn 是实打实的成本。
-   */
-  async function onWakeFrame(frame, ctx) {
-    // ★ W439：在 A 之下"帧没正文/没 due_key"正常**永远不该**发生，
-    //  所以它不能是一个静默兜底：停住的同时**出声**，并把回执键带上，才查得到是哪一条 due 出的帧。
+  // Batch frames carry Core's frozen text. Idle frames carry only a Work prompt.
+  async function onWakeFrame(frame, ctx, appendAtBoundary = null) {
     const due = (frame && typeof frame.due_key === "string") ? frame.due_key : "(no due_key)";
     const reject = (reason) => {
       diagFailure(`frame rejected: ${reason} due_key=${due}`, ctx);
       return "bad_frame";
     };
     if (!frame || typeof frame.kind !== "string" || !frame.kind) return reject("no kind");
-    // ★ W439：硬门在**帧边界**上按帧自己的事实判 —— `kind` 认识、
-    //  `due_key` 非空（回执键）、`text` 非空（两类帧都带正文）、`batch_round` 还要 `refs` 非空。
-    //  空 text 只会在"投递侧真的没写"时出现，那是真缺陷：停住、不猜、不自己拼。
     if (typeof frame.due_key !== "string" || !frame.due_key) return reject("empty due_key");
     if (typeof frame.text !== "string" || !frame.text) return reject("empty frame text");
     if (frame.kind === "batch_round" && !(Array.isArray(frame.refs) && frame.refs.length)) return reject("empty refs");
-    if (hostUnavailable()) return "host_busy";
+    const waitForIdle = !appendAtBoundary && (frame.kind !== "batch_round" || !host.acceptWhileBusy);
+    if (waitForIdle && hostUnavailable()) return "host_busy";
     const unit = typeof frame.unit === "string" && frame.unit ? frame.unit : box;
     if (typeof host.beforeBegin === "function" && ["batch_round", "idle_started"].includes(frame.kind)) {
-      await host.beforeBegin(ctx);
+      await host.beforeBegin(ctx, frame);
       if (state.stopped || !state.running || state.inflightRound) return "not_running";
-      if (hostUnavailable()) return "host_busy";
+      if (waitForIdle && hostUnavailable()) return "host_busy";
     }
     if (frame.kind === "batch_round") {
       if (state.stopped || !state.running) return "not_running";
@@ -907,19 +797,13 @@ export function createWakeLoop({
         diagFailure(`no channel ownership for unit=${unit}; frame left unacked`, ctx);
         return "no_owner";
       }
-      // 这一帧就是"这个单元有到期项"的事实；正文仍由 Core 在 `round.begin` 里给（不在这里渲染第二遍）。
-      // ★ W439：批次须从 Core 领取。
-      //   取不到就按既有失败路径记一行、帧保持"已取走" —— **绝不**在没有 `round.begin` 时自己渲染批次：
-      //   那就是"这批信说什么"的第二个答案。
-      await handleWake(ctx, [unit], frame.kind, typeof frame.text === "string" ? frame.text : "",
-        Array.isArray(frame.refs) ? frame.refs : null, frame.due_key, {...frame, unit});
-      return "batch_handled";
+      return await handleWake(ctx, {...frame, unit}, appendAtBoundary) || "batch_handled";
     }
     if (frame.kind === "idle_started") {
       if (state.inflightRound) return "already_inflight";
       if (typeof frame.text !== "string" || !frame.text) return reject("empty idle text");
       if (typeof host.triggerTurn !== "function") return "no_trigger_turn";
-      const current = await client.workRunnable(unit);
+      const current = await client.workRunnable(unit === box ? undefined : unit);
       if (current?.ok === false || !Number.isInteger(current?.count)) return "work_check_unavailable";
       if (current.count === 0) return "obsolete_work";
       if (state.stopped || hostUnavailable()) return "host_busy";
@@ -962,6 +846,8 @@ export function createWakeLoop({
       "agent_start", ctx, () => agentStart(ctx, info)),
     agentSettled: (event, ctx) => lifecycleBoundary(
       "agent_settled", ctx, () => agentSettled(event, ctx)),
+    insertAtToolBoundary,
+    confirmToolBoundary,
     /** 宿主回合结束（Pi `turn_end`）：这一回合的增量到此为止。 */
     turnClosed: (turnId) => turnClosed(turnId),
     /** 模型增量（`text_delta`/`thinking_delta`）：关联本端在跑的尝试，节流后上行。 */
@@ -975,19 +861,15 @@ export function createWakeLoop({
       if (state.stopped) return;
       state.stopped = true;
       state.running = false;
-      const longPollInFlight = Boolean(state.abort);
-      try { state.stopController.abort(); } catch { /* 忽略 */ }
-      try { if (state.abort) state.abort.abort(); } catch { /* 忽略 */ }
-      if (longPollInFlight) {
+      state.stopController.abort();
+      if (state.awaitingFrames) {
         try {
           const closed = client.close?.();
           if (closed && typeof closed.catch === "function") closed.catch(() => {});
         } catch { /* close 失败不改变 unknown round 状态 */ }
       }
     },
-    /** 诊断快照（夹具断言用；**不**作为产品判定）。★ W436：只留真的有人在读的字段 ——
-     *  `stopped` / `emptyWake` / `lastError` 三个曾经也在里面，全仓零读者（它们本身在循环里
-     *  照旧被读写，只是没有人从快照里看），删掉。 */
+    /** Diagnostic snapshot for host tests. */
     stats() {
       return {
         running: state.running,

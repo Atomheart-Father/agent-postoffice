@@ -168,49 +168,13 @@ class RoundOperations:
                                  reason_code="round_selection_unavailable") from exc
 
     def _selection_timing(self):
-        """`(normal_window, max_formal_batch)` for this round selection — the policy's values.
-
-        ★ W436: this used to read the section out of the resolver's config by hand, with its own
-          per-key defaults (90 / 20) and its own validity rule (non-int, negative or zero ⇒ take the
-          default) — so the selector owned a second copy of defaults and of "what counts as valid" for
-          the same keys `policy_snapshot` owns. Measured fork: with
-          `timing.normal_window = "x"`, the waiter (`delivery/round.wait_timing`) raises
-          `PolicySnapshotError` while that expression planned with `(90, 20)` — one side announcing a
-          window the other would not use, which is the defect `wait_timing` exists to prevent.
-
-          The values now come from `policy_snapshot.resolve_timing` — the same pure resolver
-          `read_policy` uses, so the same key set, the same retired-key handling and the same
-          `DEFAULT_TIMING`. Feeding it the **resolver's current config section** rather than reading the
-          file is deliberate: Core's `home` is the database directory and may differ from the config root
-          (`open_core(home, db_home=…)`), while the resolver already holds this home's current
-          `config.json` — so this asks the fact owner instead of guessing a path.
-
-          The old expression also turned `max_formal_batch: 0` into 20. That is gone with the rest: the
-          policy's contract says a timing value is any non-negative int, so 0 is **legal** and this
-          function now returns it. It is also what the waiter already does — `wait_timing` hands
-          `max_formal_batch` straight to `delivery_rule` (`officed.py`), where 0 means "no formal letter
-          leaves this round". Substituting 20 here would be the third opinion about one config value,
-          and the specific one that makes a waiter and a selector disagree. `delivery_rule` owns what
-          zero means for selection; this function only reports the policy.
-        """
         from policy_snapshot import resolve_timing
-        config = getattr(self.resolver, "config", None)
-        if not isinstance(config, dict) or not config:
-            # CLI（`Core(home)`）与 officed 自建 Core 时没有 resolver —— 读**同一处**配置事实
-            # （`<home>/config.json`，Core 已有的读口）。否则现场配的 `normal_window`（例如 0）
-            # 会被代码默认悄悄盖掉：选信窗口与现场配置不一致，而且两边都没报错。
-            config = self._config()
-        section = config.get("timing") if isinstance(config, dict) else None
         try:
-            values, _legacy, _retired = resolve_timing(section)
-        except Exception as e:                                  # noqa: BLE001
-            # An invalid section is an exception on the waiter's side too; planning with invented
-            # defaults is exactly the disagreement this shared parser exists to end.
-            raise self.CoreError(
-                "invalid_request",
-                f"config.json 的 timing 段无效：{e}",
-                en=f"config.json's timing section is invalid: {e}",
-                reason_code="invalid_timing") from e
+            values = resolve_timing(self._config().get("timing"))
+        except ValueError as e:
+            raise self.CoreError("invalid_request", f"config.json 的 timing 段无效：{e}",
+                                 en=f"config.json's timing section is invalid: {e}",
+                                 reason_code="invalid_timing") from e
         return values["normal_window"], values["max_formal_batch"]
 
     def _round_unit_identity(self, conn, actor, unit):
@@ -232,8 +196,8 @@ class RoundOperations:
                                  reason_code="round_binding_unavailable")
         return unit, binding_id, generation, instance
 
-    def _round_owner_verify_conn(self, conn, unit, owner_token, binding_id, generation, instance):
-        if not isinstance(owner_token, str) or not owner_token:
+    def _round_owner_verify_conn(self, conn, unit, owner_token, binding_id, generation, instance, *, native=False):
+        if not native and (not isinstance(owner_token, str) or not owner_token):
             raise self.CoreError("unauthorized_attempt", "owner_token 缺失", en="owner_token is missing",
                                  reason_code="owner_token_missing")
         row = conn.execute("SELECT * FROM channel_owner WHERE box=?", (unit,)).fetchone()
@@ -241,7 +205,7 @@ class RoundOperations:
             raise self.CoreError("unauthorized_attempt", "该投递单元没有现役通道 ownership",
                                  en="No active channel ownership is registered for this unit",
                                  reason_code="owner_unregistered", unit=unit)
-        if hashlib.sha256(owner_token.encode("utf-8")).hexdigest() != row["token_sha"]:
+        if not native and hashlib.sha256(owner_token.encode("utf-8")).hexdigest() != row["token_sha"]:
             raise self.CoreError("unauthorized_attempt", "owner_token 不匹配",
                                  en="owner_token does not match", reason_code="owner_token_mismatch")
         if (row["binding_id"], row["binding_gen"], row["instance"]) != (
@@ -251,13 +215,16 @@ class RoundOperations:
                                  reason_code="owner_binding_stale", unit=unit)
         return row
 
-    def round_owner_register(self, actor, *, unit=None):
+    def round_owner_register(self, actor, *, unit=None, expected_owner_gen=None):
         import secrets
         with self._txn() as conn:
             unit, binding_id, generation, instance = self._round_unit_identity(conn, actor, unit)
             previous = conn.execute("SELECT COALESCE(MAX(owner_gen),0) AS n FROM channel_owner WHERE box=?",
                                     (unit,)).fetchone()
-            owner_gen = int(previous["n"] or 0) + 1
+            current = int(previous["n"] or 0)
+            if expected_owner_gen is not None and (type(expected_owner_gen) is not int or expected_owner_gen != current):
+                raise self.CoreError("conflict", "通道 ownership 已变更", en="Channel ownership changed", reason_code="owner_changed")
+            owner_gen = current + 1
             token = secrets.token_hex(32)
             now = time.time()
             conn.execute(
@@ -267,14 +234,16 @@ class RoundOperations:
                 " owner_gen=excluded.owner_gen,created_at=excluded.created_at,revoked_at=NULL",
                 (unit, instance, binding_id, generation, hashlib.sha256(token.encode()).hexdigest(),
                  owner_gen, now))
-        return {"box": unit, "instance": instance, "binding_id": binding_id,
+        return {"actor": actor, "box": unit, "instance": instance, "binding_id": binding_id,
                 "binding_gen": generation, "owner_gen": owner_gen, "owner_token": token}
 
-    def round_owner_revoke(self, actor, *, unit=None):
+    def round_owner_revoke(self, actor, *, owner_token, owner_gen, unit=None):
         with self._txn() as conn:
-            unit, _binding_id, _generation, _instance = self._round_unit_identity(conn, actor, unit)
-            cur = conn.execute("UPDATE channel_owner SET revoked_at=? WHERE box=? AND revoked_at IS NULL",
-                               (time.time(), unit))
+            unit, binding_id, generation, instance = self._round_unit_identity(conn, actor, unit)
+            digest = hashlib.sha256(owner_token.encode()).hexdigest() if isinstance(owner_token, str) else ""
+            cur = conn.execute("UPDATE channel_owner SET revoked_at=? WHERE box=? AND revoked_at IS NULL"
+                               " AND binding_id=? AND binding_gen=? AND instance=? AND owner_gen=? AND token_sha=?",
+                               (time.time(), unit, binding_id, generation, instance, owner_gen, digest))
             return {"box": unit, "revoked": int(cur.rowcount or 0)}
 
     def round_owner_show(self, actor, *, unit=None):
@@ -295,8 +264,6 @@ class RoundOperations:
 
         "释放"只是"这些 ref 不再占着这个箱"，不是作废这一轮：`settle` 取的是本轮**全部** refs
         （不按 `ref_state` 过滤），所以晚到的 `accepted` 仍会把每一封记成受理。
-        `round.recover` 不走这里（它按 `result_ts` 批量处理同一时刻标 unknown 的所有轮），
-        但写下的与这里是同一行 SQL、同一语义。
         """
         released = [r["ref"] for r in conn.execute(
             "SELECT ref FROM round_ref WHERE token=? AND ref_state='active'",
@@ -322,7 +289,7 @@ class RoundOperations:
         return self.CoreError("not_found", "round token does not belong to this unit",
                               en="round token does not belong to this unit", round_token=token)
 
-    def round_run_begin(self, actor, *, token, owner_token, unit=None, harness_ref=None):
+    def round_run_begin(self, actor, *, token, owner_token=None, unit=None, harness_ref=None, native_text=None):
         round_token = token
         if not isinstance(round_token, str) or not round_token:
             raise self.CoreError("invalid_request", "round_token must be non-empty",
@@ -332,34 +299,54 @@ class RoundOperations:
                                  en="harness_ref must be a string when supplied", field="harness_ref")
         with self._txn() as conn:
             unit, binding_id, generation, instance = self._round_unit_identity(conn, actor, unit)
-            owner = self._round_owner_verify_conn(conn, unit, owner_token, binding_id, generation, instance)
+            native = native_text is not None
+            if not native:
+                owner = self._round_owner_verify_conn(conn, unit, owner_token, binding_id, generation, instance)
             round_row = conn.execute("SELECT * FROM round WHERE token=?", (round_token,)).fetchone()
             if round_row is None or round_row["box"] != unit:
                 raise self._round_not_in_unit(round_token)
-            if round_row["state"] not in ("begun", "accepted"):
+            if round_row["state"] not in ("begun", "accepted") and not (native and round_row["state"] == "unknown"):
                 return {"recorded": False, "refused": True,
                         "reason": "round state does not permit run begin", "state": round_row["state"]}
             if (round_row["binding_id"], round_row["binding_gen"]) != (binding_id, generation):
                 return {"recorded": False, "refused": True,
                         "reason": "round binding changed", "reason_code": "round_binding_stale"}
-            if round_row["run_state"] in ("settled", "not_run"):
-                return {"recorded": False, "refused": True,
-                        "reason": "run already ended", "run_state": round_row["run_state"]}
             if round_row["proto"] != "inst:" + instance:
                 return {"recorded": False, "refused": True,
                         "reason": "run instance differs from or is absent in round scope",
                         "reason_code": "instance_mismatch"}
+            surface = (self._pending_ctx_ctx() or {}).get("surface")
+            if native and (
+                    not (surface == "codex" and round_row["channel"] == "codex" or
+                         surface in ("pi", "opencode") and round_row["channel"] == "batch_round" and conn.execute(
+                             "SELECT 1 FROM round_ref WHERE token=? AND harness_ref=?", (token, harness_ref)).fetchone())
+                    or not harness_ref or not isinstance(native_text, str) or not conn.execute(
+                        "SELECT 1 FROM round_payload WHERE token=? AND payload_text=?", (token, native_text)).fetchone()
+                    or conn.execute("SELECT 1 FROM round_ref WHERE token=? AND harness_ref IS NOT NULL "
+                                    "AND harness_ref!=?", (token, harness_ref)).fetchone()):
+                return {"recorded": False, "refused": True, "reason_code": "native_receipt_mismatch"}
+            if native:
+                owner = self._round_owner_verify_conn(conn, unit, owner_token, binding_id, generation, instance,
+                                                     native=surface == "codex")
+            if round_row["run_state"] in ("settled", "not_run"):
+                replay = native and round_row["state"] == "accepted" and round_row["run_state"] == "settled"
+                return {"recorded": replay, "refused": not replay, "idempotent": replay,
+                        "reason": "run already ended", "run_state": round_row["run_state"]}
             now = time.time()
             existing = conn.execute("SELECT owner_gen,instance FROM channel_run WHERE token=?",
                                      (round_token,)).fetchone()
-            if existing is not None and (existing["owner_gen"], existing["instance"]) != (
-                    owner["owner_gen"], instance):
+            if existing is not None and (existing["instance"] != instance or (
+                    not native and existing["owner_gen"] != owner["owner_gen"])):
                 return {"recorded": False, "refused": True,
                         "reason": "run ownership is already fixed to another channel"}
+            if native:
+                self._round_settle_in_tx(conn, actor, token=token, unit=unit, status="accepted", harness_ref=harness_ref)
             if harness_ref is not None:
                 conn.execute("UPDATE round_ref SET harness_ref=COALESCE(harness_ref,?) WHERE token=?",
                              (_round_harness_ref_value(harness_ref), round_token))
             if existing is not None and round_row["run_state"] in ("running", "unknown"):
+                if native and surface in ("pi", "opencode"):
+                    conn.execute("UPDATE channel_run SET owner_gen=? WHERE token=?", (owner["owner_gen"], round_token))
                 return {"recorded": True, "refused": False, "idempotent": True, "token": round_token,
                         "owner_gen": owner["owner_gen"], "instance": instance, "run_state": round_row["run_state"]}
             conn.execute("INSERT INTO channel_run(token,box,owner_gen,instance,announced_ts) VALUES(?,?,?,?,?) "
@@ -423,9 +410,10 @@ class RoundOperations:
         return {"token": round_token, "run_state": state, "created": 1,
                 "run_instance": instance, "released_refs": released}
 
-    def round_run_end(self, actor, *, token, state="settled", unit=None, instance=_ROUND_UNSET):
+    def round_run_end(self, actor, *, token=None, state="settled", unit=None, instance=_ROUND_UNSET,
+                      native_ref=None):
         round_token = token
-        if not isinstance(round_token, str) or not round_token:
+        if native_ref is None and (not isinstance(round_token, str) or not round_token):
             raise self.CoreError("invalid_request", "round_token must be non-empty",
                                  en="round_token must be non-empty", field="round_token")
         if state not in ("settled", "not_run"):
@@ -437,6 +425,24 @@ class RoundOperations:
             raise self.CoreError("invalid_request", "explicit instance must be non-empty",
                                  en="explicit instance must be non-empty", field="instance")
         with self._txn() as conn:
+            if native_ref is not None:
+                _unit, binding_id, generation, current_instance = self._round_unit_identity(conn, actor, None)
+                if (token is not None or state != "settled" or not isinstance(native_ref, str) or not native_ref
+                        or instance not in (None, current_instance)):
+                    raise self.CoreError("invalid_request", "invalid native completion reference")
+                rows = conn.execute(
+                    "SELECT DISTINCT r.token,r.box FROM round r JOIN round_ref rr ON rr.token=r.token"
+                    " WHERE r.binding_id=? AND r.binding_gen=? AND r.run_instance=?"
+                    " AND r.run_state IN ('running','unknown') AND rr.harness_ref=?",
+                    (binding_id, generation, current_instance, native_ref)).fetchall()
+                recorded = []
+                for row in rows:
+                    if self._may_accept_for(conn, row["box"], actor):
+                        out = self._round_run_end_tx(conn, actor, row["box"], row["token"], current_instance,
+                                                     state, time.time(), allow_unknown=True)
+                        if out.get("created"):
+                            recorded.append(row["token"])
+                return {"recorded": recorded}
             return self._round_run_end_tx(conn, actor, unit, round_token, instance, state, time.time())
 
 
@@ -444,34 +450,29 @@ class RoundOperations:
         """Mark only this authorized unit's expired begun rounds unknown, preserving late settle."""
         with self._txn() as conn:
             unit, _binding_id, _generation, _instance = self._round_unit_identity(conn, actor, unit)
-            now = time.time()
-            rows = conn.execute(
-                "SELECT token FROM round WHERE box=? AND state='begun' AND deadline_ts<=? ORDER BY begun_ts,token",
-                (unit, now)).fetchall()
-            released = []
-            if rows:
-                conn.execute(
-                    "UPDATE round SET state='unknown',result='unknown',result_src='recover',result_ts=?,"
-                    "counted=CASE WHEN counted>0 THEN counted ELSE 1 END,fx_done=1 "
-                    "WHERE box=? AND state='begun' AND deadline_ts<=?",
-                    (now, unit, now))
-                # ★ 恢复次序：**recover 自己释放** refs。轮已经不再 live，宿主那边再想要
-                # `round.run.end(not_run)` 只会被 `round_not_live` 拒（那是事实：这轮不是活的）；
-                # 若把释放留给它，refs 就永远卡在 active —— 这些信既不算办完、也不许新信进来
-                # （§7.1#10 "未知不压新信"）。释放放在这里，晚到的 `accepted` 仍然有效：
-                # `settle` 取的是本轮的**全部** refs，不按 `ref_state` 过滤。
-                for row in rows:
-                    released += [r["ref"] for r in conn.execute(
-                        "SELECT ref FROM round_ref WHERE token=? AND ref_state='active'",
-                        (row["token"],)).fetchall()]
-                conn.execute(
-                    "UPDATE round_ref SET ref_state='released'"
-                    " WHERE ref_state='active' AND token IN"
-                    " (SELECT token FROM round WHERE box=? AND state='unknown'"
-                    "   AND result_src='recover' AND result_ts=?)",
-                    (unit, now))
-            return {"box": unit, "recovered": len(rows),
-                    "tokens": [row["token"] for row in rows], "released_refs": released}
+            return self._recover_rounds(conn, unit, time.time())
+
+    def _recover_rounds(self, conn, unit, now, *, unsent_only=False):
+        # The scheduler can only recover a definite pre-send orphan. All native sends first
+        # capture their payload. An explicit host recovery may also report a missing receipt.
+        scope = " AND state='begun'"
+        if unsent_only:
+            scope = (" AND state IN ('begun','unknown') AND run_state IS NULL"
+                     " AND NOT EXISTS (SELECT 1 FROM round_payload p WHERE p.token=round.token)"
+                     " AND NOT EXISTS (SELECT 1 FROM round_ref rr WHERE rr.token=round.token"
+                     " AND rr.harness_ref IS NOT NULL)")
+        status = "rejected" if unsent_only else "unknown"
+        rows = conn.execute(
+            "UPDATE round SET state=?,result=?,result_src='recover',result_ts=?,fx_done=1,"
+            " counted=MAX(counted,?) WHERE box=? AND deadline_ts<=?" + scope
+            + " RETURNING token,begun_ts,channel",
+            (status, status, now, int(not unsent_only), unit, now)).fetchall()
+        rows.sort(key=lambda row: (row["begun_ts"], row["token"]))
+        # An absent Codex history entry can still arrive later. Keep its own refs reserved.
+        released = [ref for row in rows if unsent_only or row["channel"] != "codex"
+                    for ref in self._release_round_refs(conn, row["token"])]
+        return {"box": unit, "recovered": len(rows), "tokens": [row["token"] for row in rows],
+                "released_refs": released}
 
     def round_consume(self, actor, *, round_token, owner_token, event, reported_instance, unit=None):
         if not isinstance(event, dict):
@@ -567,6 +568,12 @@ class RoundOperations:
             # `AttributeError`，从受控入口看就是一条 `busy` —— 真实的拒绝被自己的记账步骤吞掉。
             self._release_round_refs(conn, token)
         elif status == "accepted":
+            if row["channel"] == "native_delivery":
+                ctx = self._pending_ctx_ctx() or {}
+                if (not harness_ref or ctx.get("surface") != "claude"
+                        or not conn.execute("SELECT 1 FROM round_ref WHERE token=? AND harness_ref=?",
+                                            (token, harness_ref)).fetchone()):
+                    raise self.CoreError("invalid_request", "A native mail receipt is required")
             conn.execute("UPDATE round_ref SET dup_risk=1 WHERE token=? AND ref_state='superseded'",
                          (token,))
             for ref in refs:
@@ -596,17 +603,7 @@ class RoundOperations:
         replay, digest = self.storage.action_replay(conn, actor, "letter.accept", act_key, params)
         if replay is not None:
             return replay
-        now = self._now(now_ts)
-        already = state["accepted_at"] is not None
-        if not already:
-            conn.execute("UPDATE letter_states SET accepted_at=?,accepted_channel=? "
-                         "WHERE letter_id=? AND box=?", (now, channel, letter_id, unit))
-        result = {"ok": True, "letter_id": letter_id, "box": unit,
-                  "accepted_at": state["accepted_at"] if already else now,
-                  "channel": state["accepted_channel"] if already else channel,
-                  "already_accepted": already, "acted_at": now}
-        if unit != actor:
-            result["accepted_for_holder"] = unit
+        result = self._write_letter_accept(conn, actor, unit, letter_id, state, channel, now_ts)
         self.storage.record_action(conn, actor, "letter.accept", act_key, digest, result, now_ts)
         return result
 
@@ -620,10 +617,13 @@ class RoundOperations:
             raise self.CoreError("invalid_request", "before_enqueue must be a boolean", field="before_enqueue")
         value = _round_harness_ref_value(harness_ref, fallback)
         with self._txn() as conn:
-            unit, binding_id, generation, _instance = self._round_unit_identity(conn, actor, unit)
-            row = conn.execute("SELECT box,binding_id,binding_gen,state,run_state FROM round WHERE token=?", (token,)).fetchone()
+            unit, binding_id, generation, instance = self._round_unit_identity(conn, actor, unit)
+            row = conn.execute("SELECT box,binding_id,binding_gen,state,run_state,proto FROM round WHERE token=?", (token,)).fetchone()
             if row is None or row["box"] != unit:
                 raise self._round_not_in_unit(token)
+            if (row["binding_id"], row["binding_gen"], row["proto"]) != (binding_id, generation, "inst:" + instance) or conn.execute(
+                    "SELECT 1 FROM round_ref WHERE token=? AND harness_ref IS NOT NULL AND harness_ref!=?", (token, value)).fetchone():
+                return {"token": token, "recorded": False, "reason": "admission_mismatch"}
             if before_enqueue:
                 from delivery import due, selection
                 # OpenCode can still reject the prompt at this point, before publishing it to the session.
@@ -671,13 +671,17 @@ class RoundOperations:
         now = time.time()
         with self._txn() as conn:
             unit, current_binding_id, current_gen, instance = self._round_unit_identity(conn, actor, unit)
-            round_row = conn.execute("SELECT box,binding_id,binding_gen FROM round WHERE token=?", (token,)).fetchone()
+            round_row = conn.execute("SELECT box,binding_id,binding_gen,state,result_src FROM round WHERE token=?",
+                                     (token,)).fetchone()
             if round_row is None or round_row["box"] != unit:
                 raise self._round_not_in_unit(token)
             if (round_row["binding_id"], round_row["binding_gen"]) != (current_binding_id, current_gen):
                 raise self.CoreError("stale", "round binding no longer matches the current trusted binding",
                                      en="round binding no longer matches the current trusted binding",
                                      reason_code="round_binding_stale", token=token)
+            if (round_row["state"], round_row["result_src"]) == ("rejected", "recover"):
+                raise self.CoreError("stale", "unsubmitted round expired before payload capture",
+                                     reason_code="round_not_live", token=token)
             owner = conn.execute("SELECT instance,binding_id,binding_gen FROM channel_owner "
                                  "WHERE box=? AND revoked_at IS NULL", (unit,)).fetchone()
             if owner is None or (owner["instance"], owner["binding_id"], owner["binding_gen"]) != (
@@ -740,24 +744,21 @@ class RoundOperations:
             raise self.CoreError("invalid_request", "ref must be non-empty when supplied",
                                  en="ref must be non-empty when supplied", field="ref")
         with self._txn(read_only=True) as conn:
-            unit, _binding_id, _generation, _instance = self._round_unit_identity(conn, actor, unit)
             round_row = conn.execute(
-                "SELECT box,binding_id,binding_gen,state,run_state,result_src,deadline_ts FROM round WHERE token=?",
+                "SELECT box,binding_id,binding_gen,state,run_state,result_src,deadline_ts,channel FROM round WHERE token=?",
                 (token,)).fetchone()
+            if unit is None and round_row is not None:
+                unit = round_row["box"]
+            unit, _binding_id, _generation, _instance = self._round_unit_identity(conn, actor, unit)
             if round_row is None or round_row["box"] != unit:
                 raise self._round_not_in_unit(token)
-            sql = ("SELECT token,ref,attempt_key,payload_text,payload_sha256,payload_bytes,capture_reason,"
+            sql = ("SELECT token,ref,attempt_key,payload_text AS text,payload_sha256,payload_bytes,capture_reason,"
                    "binding_id,binding_gen,owner_instance,captured_at FROM round_payload WHERE token=?")
             args = [token]
             if ref is not None:
                 sql += " AND ref=?"
                 args.append(ref)
-            payloads = []
-            for row in conn.execute(sql + " ORDER BY ref,attempt_key", args):
-                item = dict(row)
-                item["text"] = item.get("payload_text")
-                item["payload_text_marker"] = item["text"][:60] if isinstance(item["text"], str) else None
-                payloads.append(item)
+            payloads = [dict(row) for row in conn.execute(sql + " ORDER BY ref,attempt_key", args)]
             return {"token": token, **dict(round_row), "count": len(payloads), "payloads": payloads}
 
     def round_ref_facts_controlled(self, actor, refs, *, unit=None,

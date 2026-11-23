@@ -134,7 +134,7 @@ _DRAIN_ARG = {"batch": "batch", "tool_hang": "tool", "idle_check": "idle",
 
 
 def build_handlers(core, *, observe=None, notify=None, begin_round=None,
-                   actionable=None, start_round=None, attempt_key=None, carried=None):
+                   actionable=None, attempt_key=None, carried=None):
     """按宿主能给的东西装配到期处理器；给不出的那种就**不注册**（那一类到期项留在表里）。
 
     三个 handler 的业务判断全在 `delivery.worker` 里，这里只做接线：
@@ -163,8 +163,6 @@ def build_handlers(core, *, observe=None, notify=None, begin_round=None,
     #   只有真的起过（`record_attempt`）或关段才推进。宿主能给**跨拍稳定**的原生标识时
     #   仍可显式传入。
     if actionable is not None:
-        # `start_round` 已从 IdleHandler 退场：`apply` 只问不做（`round_pending` + push_back），
-        # 轮由宿主在 action 之后建，建成了再 `record_attempt`。参数保留只为兼容旧调用点。
         out["idle_check"] = worker_mod.IdleHandler(actionable=actionable,
                                                    attempt_key=attempt_key)
     # ★ D3 第二段：「继续等到 X」到期重读。要的只有 Core 自己
@@ -410,7 +408,6 @@ class Officed:
                     break
                 t = threading.Thread(target=self._serve_conn, args=(conn,), daemon=True)
                 t.start()
-                self._threads.append(t)
         finally:
             try:
                 srv.close()
@@ -597,10 +594,15 @@ class Officed:
             return self._issue_personal_binding(req, b)
         if req.get("op") in self._WAKE_OPS:
             frame = self._wake_op(req, b)
-            self._rearm()
+            receipt = frame.get("result") or {}
+            if receipt.get("taken") and not receipt.get("idempotent"):
+                self._rearm()
             return frame
         frame = self.ep.dispatch(req, dict(b.ctx))
-        if frame.get("ok") or frame.get("code") not in ("internal",):
+        op, result = req.get("op"), frame.get("result") or {}
+        unchanged_due = (op == "usage.record" or (op == "host.event" and result.get("idempotent"))
+                         or (op == "round.run.end" and req.get("native_ref") is not None and result.get("recorded") == []))
+        if frame.get("ok") and not unchanged_due and not core_mod.read_only_request(req, b.ctx):
             self._rearm()
         done = (frame.get("result") or {}).get("executed") or {}
         if req.get("op") == "request.decide" and done.get("op") == "identity.join":
@@ -634,7 +636,6 @@ class Officed:
     def _rearm(self):
         """提交/登记之后重算最早的到期时刻，并把等待者叫醒（绝对时刻，不累加相对等待）。"""
         with self._wake:
-            self._failed.clear()
             self._next_due_at = self._earliest_due_at()
             self._due_seq += 1
             self._wake.notify_all()
@@ -645,11 +646,18 @@ class Officed:
             with self.core._txn(read_only=True) as conn:
                 rows = conn.execute("SELECT due_key, due_at, kind, version FROM due WHERE state='armed'"
                                     " ORDER BY due_at, due_key")
-                return next((float(r['due_at']) for r in rows if self.handlers.get(r['kind']) is not None
-                             and self._handed.get(r['due_key']) != r['version']
-                             and self._failed.get(r['due_key']) != r['version']), None)
-        except Exception:                                          # noqa: BLE001
-            return None
+                return min((max(float(r['due_at']), self._retry_at(r)) for r in rows
+                            if self.handlers.get(r['kind']) is not None
+                            and self._handed.get(r['due_key']) != r['version']), default=None)
+        except Exception as exc:                                   # noqa: BLE001
+            self._log(f"读取投递期限失败，将重试：{exc}")
+            return time.time() + self.DUE_RETRY_SECONDS
+
+    DUE_RETRY_SECONDS = 2.0
+
+    def _retry_at(self, row):
+        version, retry_at = self._failed.get(row['due_key'], (None, 0))
+        return retry_at if version == row['version'] else 0
 
     def _start_waker(self):
         # 启动时先把最早的**绝对** due_at 算出来：否则 `_next_due_at` 是 None，循环会无限等待，
@@ -658,17 +666,52 @@ class Officed:
         t = threading.Thread(target=self._wake_loop, daemon=True)
         t.start()
         self._threads.append(t)
+        poller = threading.Thread(target=self._poll_codex, daemon=True)
+        poller.start()
+        self._threads.append(poller)
+
+    def _poll_codex(self):
+        """Follow native Codex turns on one bounded worker, including queued items after restart."""
+        while not self._stop.wait(10):
+            sessions = set()
+            for binding in self._bindings:
+                if binding.ctx.get("surface") != "codex" or not binding.host_session_ref or binding.host_session_ref in sessions:
+                    continue
+                if self._stop.is_set():
+                    return
+                try:
+                    units = self._carried_units(binding)
+                    if not units:
+                        continue
+                    with self.core._txn(read_only=True) as conn:
+                        outstanding = conn.execute(
+                            "SELECT token,begun_ts, EXISTS(SELECT 1 FROM round_payload p WHERE p.token=round.token) AS captured, "
+                            "(SELECT CASE WHEN COUNT(*)=COUNT(rr.harness_ref) AND COUNT(DISTINCT rr.harness_ref)=1 "
+                            " THEN MIN(rr.harness_ref) END FROM round_ref rr WHERE rr.token=round.token) AS native_ref "
+                            "FROM round WHERE binding_id=? AND binding_gen=? AND channel='codex' AND "
+                            "(state='begun' OR run_state IN ('running','unknown') OR (state='unknown'"
+                            " AND EXISTS(SELECT 1 FROM round_payload p WHERE p.token=round.token)"
+                            " AND EXISTS(SELECT 1 FROM round_ref r JOIN letter_states l ON l.letter_id=r.ref AND l.box=r.box"
+                            " WHERE r.token=round.token AND l.accepted_at IS NULL AND l.state='delivered')))",
+                            (binding.binding_id, binding.generation)).fetchall()
+                    if not (outstanding or self._serial_path(binding).exists()
+                            or any(self.core.work_actionable(unit) for unit in units)
+                            or any(f.get('kind') == 'batch_round' for f in self._frames_of(units, binding))):
+                        continue
+                    sessions.add(binding.host_session_ref)
+                    subprocess.run(self._codex_command(binding, "poll", json.dumps([dict(row) for row in outstanding if row["captured"]])), env=self._codex_env(),
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=20)
+                except Exception as exc:  # one unavailable binding must not stop other observations
+                    self._log("Codex 原生回执读取失败 %s：%s" % (binding.host_session_ref, exc))
+
+    def _codex_command(self, binding, mode, *args):
+        return ["node", str(_HERE / "ext/office_codex_delivery.mjs"), mode, binding.host_session_ref, *args]
+
+    def _codex_env(self):
+        return {**os.environ, "POSTOFFICE_HOME": str(self.home)}
 
     def _wake_loop(self):
-        """单一等待循环：`Condition.wait(timeout = due_at - now)`，醒来即交班，然后重新等。
-
-        要点（实测过的三种错法都避免）：
-        * **绝对** `due_at`，不是“上一轮算出来的相对秒数”反复累加 —— 累加会漂移，而且每次都
-          把已经过去的时间再等一遍；
-        * 没有到期项时**无限等** `Condition`，不 `wait(1.0)` 空转；
-        * 到期后只**读一次**并把行交给消费者（`take_due`），不在这里 `fire`/改行，也不拿同一批
-          due 重新计算下一轮 —— 转态由投递消费者做，做完它会提交并 notify。
-        """
+        """Sleep until the earliest deadline or an explicit rearm."""
         while not self._stop.is_set():
             with self._wake:
                 due_at = self._next_due_at
@@ -684,15 +727,17 @@ class Officed:
             with self._wake:
                 if not handed:
                     self._next_due_at = self._earliest_due_at()
+                    if handed is None:
+                        self._next_due_at = max(self._next_due_at or 0, time.time() + self.DUE_RETRY_SECONDS)
 
     def _consume_due(self):
         """把选中的到期版本交给 worker，按本批处理结果记账。"""
         try:
             with self.core._txn(read_only=True) as conn:
                 kinds = [kind for kind, handler in self.handlers.items() if handler is not None]
-                rows = [r for r in due_mod.due_rows(conn, kinds=kinds)
-                        if self._handed.get(r["due_key"]) != int(r["version"])
-                        and self._failed.get(r["due_key"]) != int(r["version"])]
+                now = time.time()
+                rows = [r for r in due_mod.due_rows(conn, now, kinds=kinds)
+                        if self._handed.get(r["due_key"]) != r["version"] and self._retry_at(r) <= now]
                 for row in rows:
                     key = row['payload'].get('asked_key') if row['kind'] == 'idle_check' else None
                     locate = getattr(self.dispatch, 'frame_path', None)
@@ -724,8 +769,9 @@ class Officed:
                         row['_retry_pending'] = True
                     except (OSError, TypeError, ValueError, AttributeError):
                         pass
-        except Exception:                                          # noqa: BLE001
-            return []
+        except Exception as exc:                                   # noqa: BLE001
+            self._log(f"读取到期任务失败，将重试：{exc}")
+            return None
         more = len(rows) > 64
         rows = rows[:64]
         # 交给投递层去**转态**：`worker.drain` 每行一个写事务，返回动作在提交之后才执行。
@@ -734,8 +780,9 @@ class Officed:
         versions = {r['due_key']: int(r['version']) for r in rows}
         for item in outcome.get('handled', []):
             self._handed[item['due_key']] = versions[item['due_key']]
+            self._failed.pop(item['due_key'], None)
         for key, _error in outcome.get('failed', []):
-            self._failed[key] = versions[key]
+            self._failed[key] = versions[key], time.time() + self.DUE_RETRY_SECONDS
         actions = outcome.get('actions', [])
         if actions:
             self._dispatch(actions)
@@ -785,7 +832,16 @@ class Officed:
             if unit != actor and unit not in self.core._carried_position_units(conn, binding.binding_id):
                 return None
             if kind == "batch_round" and isinstance(action.get("due_version"), int):
-                return due_mod.clear_batch(conn, unit, expected_version=action["due_version"])
+                row = due_mod.get(conn, action["due_key"])
+                if not row or row["state"] != "armed" or row["version"] != action["due_version"]:
+                    return None
+                window, limit = self.core._selection_timing()
+                plan = selection_mod.select(conn, unit, window=window, batch=limit)
+                if plan["deliver"] or plan["hold_until"] is not None:
+                    return due_mod.push_back(conn, "batch", unit, plan["hold_until"] or time.time())
+                if plan.get("in_round"):
+                    return row
+                return due_mod.clear_batch(conn, unit, expected_version=row["version"])
             if kind == "idle_started":
                 key, due_key = action["attempt_key"], action["due_key"]
                 identity = (binding.binding_id, binding.generation)
@@ -841,13 +897,15 @@ class Officed:
                 self._log("唤醒帧未写出 %s：%s: %s"
                           % (action.get("due_key"), type(exc).__name__, exc))
                 continue
+            sent_to = set()
             for binding in self._bindings:
-                if (binding.ctx.get("surface") == "codex" and binding.host_session_ref
+                ref = binding.host_session_ref
+                if (binding.ctx.get("surface") == "codex" and ref and ref not in sent_to
                         and action.get("unit") in self._carried_units(binding)):
+                    sent_to.add(ref)
                     try:
-                        subprocess.Popen(["node", str(_HERE / "ext/office_codex_delivery.mjs"), "send",
-                                          binding.host_session_ref, action["due_key"]],
-                                         env={**os.environ, "POSTOFFICE_HOME": str(self.home)},
+                        subprocess.Popen(self._codex_command(binding, "send", action["due_key"]),
+                                         env=self._codex_env(),
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
                     except OSError as exc:
                         try:
@@ -865,7 +923,7 @@ class Officed:
     #: 帧文件仍是持久记录（`delivery/dispatch.py` 的边界不变：socket 是宿主→Core 方向）。
     #: 下面两个 op 只是让**宿主自己在同一条连接上**取帧并回执，于是不必给 daemon 编一个
     #: 监听侧身份，也不必让宿主去猜 `<home>/<unit>/wake/` 在哪。
-    _WAKE_OPS = ("wake.take", "wake.ack", "round.await")
+    _WAKE_OPS = ("wake.ack", "round.await")
 
     def _wake_frames(self, unit, limit=8):
         """读这个单元的唤醒帧，**不删**：删不删由回执决定（帧在 = 还没被确认取走）。"""
@@ -939,27 +997,10 @@ class Officed:
         return self._frames_of(units, binding, skip)              # 超点前最后一帧也要交给宿主
 
     def _ack_ready(self, frame, binding):
-        """这一帧**能不能**结账 —— 只看属于它自己的那一轮，且要有**真实原生起轮**。
+        """Acknowledge only the current binding's exact frame after native receipt.
 
-        反例（真机复现过两次）：
-
-        * 箱里有个早已受理的旧轮 ⇒ 旧判据把新信的待办结清（信没送出、待办没了）；
-        * 只有 `before_agent_start` 的受理、`round.run_state` 仍为 NULL ⇒ 轮没真起，也不该结账。
-          §3.3 把"受理"与"起轮"分开，所以这里要的是**起轮**，不是受理。
-
-        四件事同时成立，且都锚在这一帧上：
-
-        1. 本帧冻结的 `refs` 全部在这一轮的 `round_ref` 里（这一轮就是把它们发出去的那一轮）；
-        2. `begun_ts >= 帧的 at`（不是更早的那一轮）；
-        3. 这一轮的身份仍是**当前**可信绑定（`binding_id`/`binding_gen` 与本连接相同）；
-        4. **真实原生起轮**：这一轮 `run_state` 已进入 `running|settled`，且 `channel_run` 里有
-           这一轮对应的原生实例（本连接的原生实例）。
-
-        两样都**不作为**证据：
-        * `state='begun'` —— 只说明 Core 建了这一轮，不说明宿主起过；
-        * `state='accepted'` —— `round.settle` 是**宿主自己的声称**；把它当放行条件，等于给"没起轮"
-          留了第二条路（真机复现：settle 报 accepted 时 `run_state` 仍是 NULL，ack 照样清账）。
-          accepted 作为事实照旧保留在 `round` 里（页面/履历要它），只是**不能**用来结账。
+        A new turn proves receipt via its recorded run. Claude can also receive
+        mail at a tool boundary in an existing turn, with a matching native item.
         """
         unit, refs = frame.get("unit"), list(frame.get("refs") or ())
         if not isinstance(unit, str) or not unit or not refs:
@@ -971,7 +1012,7 @@ class Officed:
         with self.core._txn(read_only=True) as conn:
             marks = ",".join("?" * len(wanted))
             rows = conn.execute(
-                "SELECT r.token, r.binding_id, r.binding_gen, r.state, r.run_state, r.result,"
+                "SELECT r.token, r.binding_id, r.binding_gen, r.state, r.run_state, r.channel,"
                 "       (SELECT COUNT(DISTINCT f.ref) FROM round_ref f"
                 "         WHERE f.token = r.token AND f.ref IN (%s)) AS frozen"
                 "  FROM round r"
@@ -983,6 +1024,10 @@ class Officed:
                 if (row["binding_id"], int(row["binding_gen"] or 0)) != (
                         binding.binding_id, int(binding.generation or 0)):
                     continue
+                if row["state"] != "accepted":
+                    continue
+                if row["channel"] == "native_delivery":
+                    return True
                 if row["run_state"] not in ("running", "settled") or not instance:
                     continue
                 run = conn.execute(
@@ -1003,13 +1048,7 @@ class Officed:
                                                          binding.generation, key))
 
     def _wake_op(self, req, binding):
-        """唤醒帧的取用与回执（`wake.take` / `round.await` / `wake.ack`）。
-
-        帧**原样返回**、形状由 `delivery/dispatch.py` 定：`batch_round.text` 是投递层写的正文
-        （`delivery.round.batch_text`），`idle_started.text` 是 D1 的固定措辞 —— 两者都非空，
-        宿主只负责把它送下去。凡说"帧里 `text` 为 null、宿主按 refs 渲染"的描述都是旧的，
-        照抄会得到第二份正文（真机上就是硬门停在 `projection incomplete: text`）。
-        """
+        """Read the binding's wake frames or acknowledge an observed delivery."""
         asked = req.get("unit")
         # 显式给了单元：只读它；没给：**个人箱 + 现任岗位**，由服务端现算（宿主不扫目录）。
         carried = self._carried_units(binding)
@@ -1030,8 +1069,20 @@ class Officed:
                 if not frames:
                     return {"ok": False, "code": "forbidden",
                             "message": "等待期间该投递单元的责任已变更"}
-            return {"ok": True, "result": {"unit": asked, "units": units, "frames": frames,
-                                           "more": len(frames) >= 64}}
+            result = {"unit": asked, "units": units, "frames": frames, "more": len(frames) >= 64}
+            if req.get("tool_mail") is True and binding.ctx.get("surface") == "claude":
+                with self.core._txn(read_only=True) as conn:
+                    actor = self.core._verify_trusted_ctx(conn, binding.ctx)
+                    rows = conn.execute(
+                        "SELECT r.box, r.token, p.payload_text AS text FROM round r JOIN round_payload p ON p.token=r.token"
+                        " WHERE r.channel='native_delivery' AND r.state IN ('begun','unknown')"
+                        " AND p.binding_id=? AND p.binding_gen=? AND p.owner_instance=? AND p.payload_text IS NOT NULL"
+                        " AND EXISTS (SELECT 1 FROM round_ref f JOIN letter_states s ON s.letter_id=f.ref AND s.box=f.box"
+                        " WHERE f.token=r.token AND f.role='deliver' AND s.state<>'archived' AND s.accepted_at IS NULL)",
+                        (binding.binding_id, binding.generation, binding.ctx["instance"]))
+                    result["tool_mail"] = [dict(row) for row in rows
+                                           if row["box"] in units and self.core._may_accept_for(conn, row["box"], actor)]
+            return {"ok": True, "result": result}
         if req.get("op") == "wake.ack":
             key, due_key = req.get("attempt_key"), req.get("due_key")
             if key is not None and (not isinstance(key, str) or not key):
@@ -1082,10 +1133,6 @@ class Officed:
                                                        "applied": applied}}
                 return {"ok": False, "code": "not_found",
                         "message": "没有这一帧（可能已被取走）"}
-        limit = max(1, int(req.get("limit") or 8))
-        frames = self._frames_of(units, binding)
-        return {"ok": True, "result": {"units": units, "frames": frames[:limit],
-                                       "more": len(frames) > limit}}
 
     def stop(self):
         self._stop.set()
@@ -1149,14 +1196,13 @@ def main(argv=None):
     except ValueError as e:
         print("officed: %s" % e, file=sys.stderr)
         return 2
-    # 真 handlers：合批用 Core 的读者判据 + 投递策略的只读选信（`delivery.selection`），
-    # 轮由宿主在 action 之后建；工具/空闲这两类需要原生观测与原生尝试标识，daemon 给不出，
-    # 所以不登记（它们的到期项留在表里，等宿主装上自己的 handler）。
+    # Core recovers unsubmitted rounds and selects mail before rendering the next frame.
     def begin_round(conn, row, who):
         unit = row["subject_ref"]
         if unit == daemon.core._request_user() and not any(
                 binding.actor == unit and binding.host_session_ref for binding in daemon._bindings):
             return {"reason": "manual"}
+        daemon.core._recover_rounds(conn, unit, time.time(), unsent_only=True)
         window, batch = daemon.core._selection_timing()
         plan = selection_mod.select(conn, unit, window=window, batch=batch)
         # ★ 冻结的是**这一轮选中的全部 ref**：`deliver` 与 `carry` 都进了 `round_ref`（Core 按这个

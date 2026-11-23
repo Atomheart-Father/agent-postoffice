@@ -1,5 +1,6 @@
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { join } from 'node:path';
 import { openControlledEndpoint, createOfficeSocket } from '../ext/office_socket.mjs';
 import { createOfficeTools, validateArgs } from '../ext/office_tools.mjs';
@@ -11,40 +12,61 @@ import TOOL_TEXT from '../ext/office_tool_text.json' with { type: 'json' };
 
 const hintPath = (home: string, name: any) => typeof name === 'string' && /^[A-Za-z0-9_.-]+\.endpoint\.json$/.test(name)
   ? join(home, 'sock', name) : '';
-async function bind(ctx: any, descriptor: string, expectedSession?: string) {
-    const endpoint = openControlledEndpoint({ descriptor });
+export async function receiptPages(storage: any, prefix: string) {
+  const entries: any[] = []; let after: string | undefined;
+  do { const page = await storage.scan({prefix, ...(after ? {after} : {})}); entries.push(...page.entries); after = page.next; } while (after);
+  return entries;
+}
+async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: AbortSignal) {
     if (!endpoint.ok || !endpoint.endpoint.hostSessionRef) return;
     const sessionID = endpoint.endpoint.hostSessionRef;
     if (expectedSession && sessionID !== expectedSession) return;
     const directory = ctx.location?.directory;
     const ownsSession = async () => typeof directory === "string" && Boolean(directory)
       && (await ctx.session.get({sessionID}))?.location?.directory === directory;
-    if (!await ownsSession()) return;
+    if (!await ownsSession() || signal?.aborted) return;
     const client = createPiRoundClient({socketPath: endpoint.socketPath, tokenFile: endpoint.tokenFile});
     let who: any;
     try { who = await client.context(); } finally { client.close(); }
-    if (!who || who.ok === false || who.actor !== endpoint.endpoint.actor) return;
+    if (who?.unknown) throw new Error('endpoint temporarily unavailable');
+    if (!who || who.ok === false || who.actor !== endpoint.endpoint.actor || signal?.aborted) return;
     const socket = createOfficeSocket({socketPath: endpoint.socketPath, tokenFile: endpoint.tokenFile});
     const office = createOfficeTools({endpoint: endpoint.endpoint, core: socket});
     let pending: any = null;
     let closed = false;
-    let paused = false;
+    let officeRunning = false, officeStep = '', officeStarted = 0, stepStarted = 0;
     let quotaAt = 0;
     let resume: (() => void) | undefined;
     const controller = new AbortController();
-    const loop = createWakeLoop({client, box: endpoint.endpoint.actor, host: {
+    const loop = createWakeLoop({client, box: endpoint.endpoint.actor,
+      diagFailure: (message: string) => console.error('OpenCode Office:', message), host: {
       sessionRef: () => sessionID,
+      receiptEntries: async () => (await receiptPages(ctx.storage, `office.receipt.${sessionID}.`))
+        .map((e: any) => ({type:'custom', customType:'office.receipt', data:e.value})),
+      saveReceipt: async (receipt: any) => {
+        const key = `office.receipt.${sessionID}.${receipt.token}`;
+        if (receipt.done) await ctx.storage.remove(key); else await ctx.storage.set(key, receipt);
+      },
+      receiptText: async (receipt: any) => {
+        if (!await ownsSession()) return;
+        const state = await client.roundState(receipt.unit, receipt.token);
+        if (state?.ok === false) { if (state.reason_code === 'unit_not_carried') return; throw new Error('round payload unavailable'); }
+        return state?.payloads?.find((p: any) => p.ref === receipt.anchorRef && p.attempt_key === receipt.attemptKey)?.text;
+      },
       instanceId: () => `oc2:${endpoint.endpoint.instance}@${sessionID}`,
-      beforeBegin: async () => {
-        await ctx.session.wait({sessionID});
-        if (paused || quotaAt) await new Promise<void>(resolve => { resume = resolve; });
+      acceptWhileBusy: true,
+      conditionalOwner: true,
+      beforeBegin: async (_: unknown, frame: any) => {
+        if (frame.kind === 'idle_started') await ctx.session.wait({sessionID});
+        if (quotaAt) await new Promise<void>(resolve => { resume = resolve; });
         if (closed || !await ownsSession()) throw new Error('Office session is unavailable or belongs to another OpenCode location');
       },
       triggerTurn: async (text: string, details: any) => {
-        if (closed || !await ownsSession()) throw new Error('Office session is unavailable or belongs to another OpenCode location');
+        const owned = await ownsSession().catch(() => false);
+        if (closed || signal?.aborted || !owned) throw Object.assign(new Error('Office session is unavailable or belongs to another OpenCode location'), {notSent:true});
         const current = pending = {text, details, messageID: '', events: [], ready: false};
         let admitted: any;
-        try { admitted = await ctx.session.prompt({sessionID, text, delivery: 'queue'}); }
+        try { admitted = await ctx.session.prompt({sessionID, text, delivery: details?.officeWorkContinuation ? 'queue' : 'steer'}); }
         catch (error) { if (pending === current) pending = null; throw error; }
         if (!admitted?.id || admitted.id !== current.messageID || admitted.sessionID !== sessionID || admitted.payload?.text !== text)
           { pending = null; throw new Error('OpenCode prompt admission did not match the submitted batch'); }
@@ -53,13 +75,13 @@ async function bind(ctx: any, descriptor: string, expectedSession?: string) {
       },
     }});
     const hook = await ctx.session.hook('prompt', async (event: any) => {
-      if (paused && !pending && event.sessionID === sessionID) paused = false;
       if (pending && event.sessionID === sessionID && event.prompt?.text === pending.text) {
         if (!pending.details?.officeWorkContinuation && (!event.messageID
             || !await loop.submittedExact(pending.text, {}, event.messageID))) throw new Error('Office admission refused before enqueue');
         pending.messageID = event.messageID;
       }
     });
+    if (signal?.aborted) { await hook.dispose(); await socket.close(); await client.close(); return; }
     const responseHook = await ctx.session.hook('http.response', async (event: any) => {
       if (event.sessionID !== sessionID || event.response?.status !== 402 || !await ownsSession()) return;
       quotaAt = Date.now();
@@ -70,12 +92,15 @@ async function bind(ctx: any, descriptor: string, expectedSession?: string) {
         if (result?.ok === false) console.error(`OpenCode quota: ${result.code || 'unknown'}`);
       } catch (error) { console.error('OpenCode quota:', error); }
     });
+    if (signal?.aborted) { await hook.dispose(); await responseHook.dispose(); await socket.close(); await client.close(); return; }
     const terminal = (event: any) => ['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(event.type);
     const resumeQuota = (result: any, blockedAt: number) => {
       if (blockedAt && quotaAt === blockedAt && result?.quota_recovered) quotaAt = 0;
     };
     async function reportEnd(event: any) {
+      officeRunning = false; officeStep = '';
       const closed = loop.turnClosed('');
+      await loop.agentSettled({aborted: event.type !== 'session.execution.succeeded'}, {});
       const result = await client.hostEvent('turn_end', event.created / 1000, {
         act_key: `oc2:turn_end:${event.id}`, ...(closed?.attempt_id ? {attempt_id: closed.attempt_id} : {}),
       });
@@ -158,13 +183,31 @@ async function bind(ctx: any, descriptor: string, expectedSession?: string) {
           || !event.id || !Number.isFinite(event.created) || !await ownsSession()) return;
       const usage = stepUsage.get(id); stepUsage.delete(id);
       const count = (n: any) => Number.isInteger(n) && n >= 0 ? n : undefined;
-      const tokens = {in: count(data.tokens?.input), out: count(data.tokens?.output), cache: count(data.tokens?.cache?.read)};
-      if (!(tokens.in || tokens.out || tokens.cache)) return;
+      const usageTokens = data.tokens, input = count(usageTokens?.input), output = count(usageTokens?.output);
+      const tokens = {in: input === undefined ? undefined : input + (count(usageTokens?.cache?.write) ?? 0),
+        out: output === undefined ? undefined : output + (count(usageTokens?.reasoning) ?? 0),
+        cache: count(usageTokens?.cache?.read)};
+      if (!Object.values(tokens).some(Boolean)) return;
       const entry = {entry_id: id, at: event.created / 1000, tokens,
         ...(usage?.model ? {model: usage.model} : {}),
         ...(usage?.refs.size === 1 ? {ref: [...usage.refs][0]} : {})};
       const result = await client.usageRecord([entry], `oc2:usage:${event.id}`);
       if (result?.ok === false) throw new Error(`OpenCode usage: ${result.code || 'unknown'}`);
+    }
+    async function reportProgress(event: any) {
+      const data = event.data;
+      if (data?.sessionID !== sessionID) return;
+      if (event.type === 'session.inbox.delivered') { officeRunning = false; officeStep = ''; }
+      if (event.type === 'session.step.started' && officeRunning && Number.isFinite(event.created) && event.created >= officeStarted
+          && typeof data.assistantMessageID === 'string' && data.assistantMessageID) {
+        officeStep = data.assistantMessageID; stepStarted = event.created;
+      }
+      if (event.type === 'session.step.ended' && data.assistantMessageID === officeStep) officeStep = '';
+      if (event.type === 'session.text.delta' && officeRunning && officeStep && data.assistantMessageID === officeStep
+          && typeof event.id === 'string' && event.id && Number.isFinite(event.created) && event.created >= stepStarted
+          && (!quotaAt || event.created > quotaAt)
+          && typeof data.delta === 'string' && data.delta && await ownsSession())
+        await loop.modelProgress({turnId:officeStep});
     }
     async function drain(current: any) {
       if (pending !== current || !current.ready || current.processing) return;
@@ -173,21 +216,24 @@ async function bind(ctx: any, descriptor: string, expectedSession?: string) {
         while (current.events.length) {
           const event = current.events.shift();
           if (event.type === 'session.inbox.delivered' && event.data?.inboxID === current.messageID) {
-            current.started = await loop.agentStart({}, {pendingAttemptKey: current.details?.attempt_key});
-          } else if (current.started && terminal(event)) {
+            if (await loop.agentStart({}, {pendingAttemptKey: current.details?.attempt_key})) {
+              officeRunning = Number.isFinite(event.created); officeStarted = event.created; officeStep = '';
+              if (pending === current) pending = null;
+            }
+          } else if (terminal(event)) {
             await reportEnd(event);
-            await loop.agentSettled({aborted: event.type !== 'session.execution.succeeded'}, {});
-            pending = null;
-            break;
-          }
+            if (pending === current && event.type === 'session.execution.interrupted' && event.data.reason === 'user'
+                && !current.details?.officeWorkContinuation && !quotaAt && !closed && await ownsSession()) {
+              await ctx.session.prompt({sessionID, id: current.messageID, text: current.text, delivery: 'steer'});
+            }
+          } else await reportProgress(event);
         }
       } finally { current.processing = false; }
     }
     void (async () => {
       for await (const event of ctx.event.subscribe({signal: controller.signal})) {
         try {
-          if (event.type === 'session.execution.interrupted' && event.data?.sessionID === sessionID && event.data?.reason === 'user') paused = true;
-          if (!paused && !quotaAt && event.data?.sessionID === sessionID && terminal(event)) { resume?.(); resume = undefined; }
+          if (!quotaAt && event.data?.sessionID === sessionID && terminal(event)) { resume?.(); resume = undefined; }
           const error = event.data?.error;
           if (event.type === 'session.execution.failed' && event.data?.sessionID === sessionID
               && ((error?.type === 'provider.quota' && error.status === 402)
@@ -213,14 +259,16 @@ async function bind(ctx: any, descriptor: string, expectedSession?: string) {
           if (pending && event.data?.sessionID === sessionID) {
             pending.events.push(event);
             await drain(pending);
-          } else if (event.data?.sessionID === sessionID && terminal(event)) await reportEnd(event);
+          } else if (event.data?.sessionID === sessionID && terminal(event)) {
+            await reportEnd(event);
+          } else await reportProgress(event);
         } catch (error) { console.error('OpenCode Office event:', error); }
       }
     })().catch(() => {});
     loop.start({});
     const version = releaseVersion(import.meta.url)?.version ?? null;
     void client.hostEvent('loaded', Math.floor(Date.now() / 1000), {version});
-    return {office, close: async () => { closed = true; resume?.(); controller.abort(); loop.stop(); await hook.dispose(); await responseHook.dispose(); socket.close(); }};
+    return {office, close: async () => { closed = true; resume?.(); controller.abort(); loop.stop(); await hook.dispose(); await responseHook.dispose(); socket.close({final:true}); }};
 }
 export function createOfficePlugin(configuredHome?: string) { return {
   id: 'postoffice-delivery',
@@ -228,7 +276,8 @@ export function createOfficePlugin(configuredHome?: string) { return {
     const home = configuredHome || process.env.POSTOFFICE_HOME || join(homedir(), 'office11');
     const sessions = new Map<string, Promise<Awaited<ReturnType<typeof bind>>>>();
     const configured = !configuredHome && process.env.OFFICE_ENDPOINT_FILE;
-    const remembered = hintPath(home, await ctx.storage.get('office.endpoint'));
+    let remembered = '';
+    const recovery = new AbortController();
     const directory = ctx.location?.directory;
     const owns = async (id: string) => typeof directory === 'string' && Boolean(directory)
       && /^ses_[A-Za-z0-9]+$/.test(id)
@@ -237,11 +286,17 @@ export function createOfficePlugin(configuredHome?: string) { return {
       if (!sessions.has(id)) {
         const opening = (async () => {
           const native = hintPath(home, 'opencode-' + id + '.endpoint.json');
+          let pending = false, refused = false;
           for (const file of new Set([supplied, native, configured, remembered])) {
             if (!file) continue;
-            const session = await bind(ctx, file, id);
-            if (session) return session;
+            const observed = openControlledEndpoint({descriptor: file});
+            try {
+              const session = await bind(ctx, observed, id, recovery.signal);
+              if (session) { if (recovery.signal.aborted) { await session.close(); return; } return session; }
+              if (observed.ok && observed.endpoint.hostSessionRef === id || file === native && observed.error === 'endpoint_untrusted') refused = true;
+            } catch { pending = true; }
           }
+          if (pending && !refused) throw new Error('Office endpoint temporarily unavailable');
         })();
         sessions.set(id, opening);
         void opening.then(session => { if (!session) sessions.delete(id); }, () => sessions.delete(id));
@@ -255,23 +310,23 @@ export function createOfficePlugin(configuredHome?: string) { return {
         const name = file.split('/').pop();
         const selected = file && hintPath(home, name) === file && openControlledEndpoint({descriptor: file});
         if (!selected || !selected.ok || selected.endpoint.hostSessionRef !== sessionID
-            || !await owns(sessionID) || !await attached(sessionID, file))
+            || !await owns(sessionID) || !await attached(sessionID, file).catch(() => undefined))
           throw new Error(TOOL_TEXT._opencode_connect.wrong_session);
         await ctx.storage.set('office.endpoint', name);
         await ctx.session.synthetic({sessionID, text: TOOL_TEXT._office_connect.connected, resume: false});
       },
     }));
     const prompt = await ctx.session.hook('prompt', async ({sessionID}: any) => {
-      if (await owns(sessionID)) await attached(sessionID);
+      if (await owns(sessionID)) await attached(sessionID).catch(() => undefined);
     });
     const locale = process.env.OFFICE_LOCALE === 'zh' ? 'zh' : 'en';
     const registration = await ctx.tool.transform((tools: any) => {
-      for (const spec of toolSpecs(locale).filter((s: any) => !s.local)) tools.add({
+      for (const spec of toolSpecs(locale)) tools.add({
         name: spec.name, description: spec.description,
         input: spec.parameters, options: {codemode: false},
         execute: async (args: any, {sessionID}: any) => {
           if (!await owns(sessionID)) throw new Error(TOOL_TEXT._opencode_connect.wrong_session);
-          const linked = await attached(sessionID);
+          const linked = await attached(sessionID).catch(() => undefined);
           let result;
           if (linked) result = await linked.office.callTool(spec.name, args);
           else if (spec.name !== 'office_request_create' || args?.kind !== 'join') {
@@ -289,11 +344,30 @@ export function createOfficePlugin(configuredHome?: string) { return {
         },
       });
     });
-    const initial = openControlledEndpoint({descriptor: configured || remembered});
-    if (initial.ok && initial.endpoint.hostSessionRef) await attached(initial.endpoint.hostSessionRef);
+    const retry = async (action: () => Promise<any>) => {
+      let delay = 250;
+      while (!recovery.signal.aborted) {
+        try { return await action(); }
+        catch (error) { console.error('OpenCode Office receipt restore:', error); }
+        try { await sleep(delay, undefined, {signal: recovery.signal, ref: false}); }
+        catch { return; }
+        delay = Math.min(delay * 2, 4000);
+      }
+    };
+    void (async () => {
+      remembered = hintPath(home, await retry(() => ctx.storage.get('office.endpoint')));
+      if (recovery.signal.aborted) return;
+      const initial = openControlledEndpoint({descriptor: configured || remembered});
+      if (initial.ok && initial.endpoint.hostSessionRef) void retry(() => attached(initial.endpoint.hostSessionRef));
+      const entries = await retry(() => receiptPages(ctx.storage, 'office.receipt.'));
+      if (!entries || recovery.signal.aborted) return;
+      for (const id of new Set(entries.map((entry: any) => entry.value?.sessionFile).filter(Boolean)))
+        void retry(async () => { if (!await owns(id as string) || recovery.signal.aborted) return; await attached(id as string); });
+    })();
     return async () => {
+      recovery.abort();
       await prompt.dispose(); await registration.dispose(); await command.dispose();
-      for (const session of sessions.values()) await (await session)?.close();
+      for (const session of sessions.values()) void session.then(value => value?.close()).catch(() => {});
     };
   },
 }; }

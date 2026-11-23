@@ -50,7 +50,7 @@ struct OfflineConfirm: View {
                         Text(b.bindingID).font(Theme.Font.mono).foregroundStyle(Theme.ink3).lineLimit(1)
                     }
                     if let a = desk.actions[key] { status(a, key) }
-                    if desk.offlineFinished { Text(stillOnline(b) ? tr("仍在线", "Still online") : tr("已下线", "Offline")).font(Theme.Font.small).foregroundStyle(Theme.ink3) }
+                    if desk.offlineFinished { Text(onlineStatus(b)).font(Theme.Font.small).foregroundStyle(Theme.ink3) }
                 }
                 .padding(.vertical, 10).frame(maxWidth: .infinity, alignment: .leading)
                 .overlay(alignment: .bottom) { Rule() }
@@ -68,8 +68,8 @@ struct OfflineConfirm: View {
     }
 
     /// 重读后这个绑定还在活动列表里吗（以后端重读为准）。
-    private func stillOnline(_ b: HostBinding) -> Bool {
-        (desk.hosts.value?.bindings ?? []).contains { $0.bindingID == b.bindingID }
+    private func onlineStatus(_ b: HostBinding) -> String {
+        desk.hosts.text { $0.bindings.contains { $0.bindingID == b.bindingID } ? tr("仍在线", "Still online") : tr("已下线", "Offline") }
     }
 
     /// 已下线 a / 被拒 b / 未知 c / 未发 d：每一项各占一类，不合成一个整体的成功或失败。

@@ -6,9 +6,11 @@ commit time in the same transaction, so a revoked or rebound context cannot carr
 a write. This module owns those facts and their transitions.
 
 Core owns the connection, the caller's transaction, the pending-context recheck inside ``_txn``, the
-shared authority lock, the resolver and every position/grant fact; ``_verify_pending_actor`` (the
+shared authority lock and every position/grant fact; ``_verify_pending_actor`` (the
 pending context a transaction re-reads) stays with ``_txn``.
 """
+
+from contextlib import nullcontext
 
 
 class BindingOperations:
@@ -378,9 +380,9 @@ class BindingOperations:
                                 "prev_channel_lifetime_ref": r["prev_channel_lifetime_ref"]}
                                for r in rows]}
 
-    def capabilities(self, actor, *, now_ts=None):
+    def capabilities(self, actor, *, now_ts=None, conn=None):
         """报告当前审批身份和项目管理能力。业务动作仍在提交事务里按项目验证。"""
-        with self._txn(read_only=True) as conn:
+        with nullcontext(conn) if conn is not None else self._txn(read_only=True) as conn:
             administrator = self._is_governance(conn, actor)
             management = bool(self._managed_project_refs(conn, actor, now_ts=now_ts))
         return {"ok": True, "actor": actor, "governance": administrator,

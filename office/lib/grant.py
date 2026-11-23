@@ -137,7 +137,7 @@ class GrantOperations:
     def grant_show(self, actor, *, grant_ref, now_ts=None):
         """读一份授权的正文与事件。可见规则与 `grant_list` **同一条**（`_grant_visible_to`）。"""
         self._check_actor(actor)
-        with self._txn() as conn:
+        with self._txn(read_only=True) as conn:
             row = conn.execute("SELECT * FROM grants WHERE grant_ref=?", (grant_ref,)).fetchone()
             if row is None:
                 raise self.CoreError("not_found", f"grant {grant_ref!r} 不存在", en=f"grant {grant_ref!r} does not exist")

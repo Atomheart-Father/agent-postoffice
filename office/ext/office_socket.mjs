@@ -35,8 +35,12 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 	let pending = 0;
 	let leased = false;
 	let leaseSocket = null;
+	let runSocket = null, runQueue = Promise.resolve(), generation = 0, finalClosed = false;
+	let authenticatedToken = null;
+	const transient = new Set();
 
 	async function exchange(request) {
+		if (finalClosed) return {ok:false, error:"socket_closed", message:"controlled client closed", sent:false};
 		if (!socketPath) {
 			return { ok: false, error: "no_socket_path", message: "无受控 socket，未发出任何请求", sent: false };
 		}
@@ -57,7 +61,20 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 		// Exclusive use: never let two replies interleave on one connection.
 		if (leased && (pending || !leaseSocket || leaseSocket.destroyed || pooled !== leaseSocket))
 			return {ok:false, error:"socket_closed", message:"controlled connection lost", sent:false};
-		if (pending > 0) return await rawOn(new net.Socket(), request);
+		if (!leased && request.op === "round.run.begin") {
+			const current = generation;
+			const next = runQueue.then(() => {
+				if (current !== generation) return {ok:false, error:"socket_closed", sent:false};
+				if (!runSocket || runSocket.destroyed) { runSocket = new net.Socket(); runSocket.unref(); }
+				return rawOn(runSocket, request);
+			});
+			runQueue = next.then(() => {}, () => {});
+			return await next;
+		}
+		if (pending > 0) {
+			const sock = new net.Socket(); transient.add(sock);
+			try { return await rawOn(sock, request); } finally { transient.delete(sock); sock.destroy(); }
+		}
 		pending += 1;
 		try {
 			if (!pooled || pooled.destroyed) {
@@ -104,6 +121,8 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 					// endpoint put on the wire (endpoint.py forwards CoreError.detail["reason_code"]);
 					// nothing here reads the human message, and nothing is invented when it is absent.
 					const out = { ok: false, error: parsed.code, message: parsed.message };
+					if (parsed.code === 'unauthorized_attempt' && authenticatedToken && frame.session_token !== authenticatedToken)
+						out.credential_changed = true;
 					if (typeof parsed.reason_code === "string" && parsed.reason_code) {
 						out.reason_code = parsed.reason_code;
 					}
@@ -121,6 +140,7 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 					}
 					done(out);
 				} else {
+					if (typeof frame.session_token === 'string' && frame.session_token) authenticatedToken = frame.session_token;
 					done(parsed?.result);
 				}
 			};
@@ -202,7 +222,10 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 		async handle(request, _trustedCtx) {
 			return await exchange(request);
 		},
-		async close() {
+		async close(options = {}) {
+			if (options.final) finalClosed = true;
+			generation += 1; for (const sock of transient) sock.destroy();
+			if (runSocket) runSocket.destroy(); runSocket = null;
 			if (pooled && !pooled.destroyed) pooled.destroy();
 			pooled = null; leaseSocket = null; leased = false;
 		},

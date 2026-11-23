@@ -31,19 +31,6 @@ FORMAL_KINDS = ("formal", "alarm")
 RIDE_KINDS = ("receipt", "notice", "cc")
 
 
-def _informational(need):
-    """Whether a `need` asks for nothing. Delegates to the one judge in `lib.mail`.
-
-    Imported lazily and with a fallback: this module is also exercised without a Core, and a second
-    copy of the Chinese phrasing test would be exactly the kind of drift the file-era code suffered.
-    """
-    try:
-        from lib.mail import informational_need
-        return informational_need(need or "")
-    except Exception:                                  # noqa: BLE001 - unavailable judge, not "no need"
-        return False
-
-
 def _meta(raw):
     try:
         value = json.loads(raw) if raw else {}
@@ -66,7 +53,8 @@ def _kind_of(row, meta, need):
     system = str(meta.get("system") or "")
     if system == "alarm" or system.startswith("alarm."):
         return "alarm"
-    return "receipt" if _informational(need) else "formal"
+    from lib.mail import SYSTEM_MAIL_SENDER, informational_need
+    return "receipt" if informational_need(need, system=row["from_actor"] == SYSTEM_MAIL_SENDER) else "formal"
 
 
 def _epoch(value):
@@ -112,14 +100,10 @@ def candidates(conn, box, *, only=None, exclude=None, own_round=None):
     from lib.mail import letter_fields
 
     rows = conn.execute(
-        "SELECT s.letter_id, s.category, s.accepted_at, s.logical_address, l.created_at,"
-        "       l.need, l.subject, l.meta_json, s.content_override_json"
-        "  FROM letter_states s JOIN letters l ON l.letter_id = s.letter_id"
-        " WHERE s.box = ? AND s.state = 'delivered' AND s.accepted_at IS NULL"
-        " AND NOT EXISTS (SELECT 1 FROM work w WHERE l.from_actor='postoffice'"
-        " AND json_valid(l.meta_json) AND json_extract(l.meta_json,'$.system')"
-        " IN ('work.assigned','work.returned','work.unblocked')"
-        " AND w.work_ref=json_extract(l.meta_json,'$.work_ref') AND w.state IN ('Done','Cancelled'))"
+        "SELECT l.letter_id, l.from_actor, l.created_at, l.subject, l.need, l.meta_json, s.state, s.state_reason,"
+        " s.accepted_at, s.category, s.logical_address, s.content_override_json"
+        " FROM letter_states s JOIN letters l ON l.letter_id=s.letter_id"
+        " WHERE s.box=? AND s.state='delivered' AND s.accepted_at IS NULL"
         # No `ORDER BY l.created_at`: the column can hold both text and epoch rows during the
         # transition, and SQLite sorts numbers before text, so a mixed table would silently reorder
         # the queue (measured: the epoch row jumped ahead of an older text row). Ordering happens in
@@ -127,22 +111,20 @@ def candidates(conn, box, *, only=None, exclude=None, own_round=None):
         " ORDER BY s.letter_id", (box,)).fetchall()
     keep = set(only) if only is not None else None
     drop = set(exclude or ())
-    active = {row[0] for row in conn.execute(
-        "SELECT ref FROM round_ref WHERE box = ? AND ref_state = 'active'"
-        " AND token IS NOT ?", (box, own_round)).fetchall()}
-    unknown = {row[0] for row in conn.execute(
-        "SELECT rr.ref FROM round_ref rr JOIN round r ON r.token=rr.token"
-        " WHERE rr.box=? AND r.state='unknown' AND r.channel='codex' AND NOT EXISTS"
-        " (SELECT 1 FROM round_ref newer WHERE newer.box=rr.box AND newer.ref=rr.ref"
-        "  AND newer.attempt>rr.attempt)", (box,)).fetchall()}
+    reserved = set(_reserved_refs(conn, box, own_round))
+    from office_core import Core
+    facts = Core._work_notice_facts(conn, [Core._notice_work_ref(r["meta_json"]) for r in rows])
     out = []
     for row in rows:
         ref = row["letter_id"]
         if keep is not None and ref not in keep:
             continue
-        if ref in drop or ref in active or ref in unknown:
+        if ref in drop or ref in reserved:
             continue
         meta = _meta(row["meta_json"])
+        life = Core._letter_lifecycle(row, row, facts=facts, box=box)
+        if life["letter_class"] == "work_notice" and life["terminal"]:
+            continue
         fields = letter_fields(row, row, ("subject", "need"))
         out.append({"ref": ref, "kind": _kind_of(row, meta, fields["need"]), "created_at": _epoch(row["created_at"]),
                     "subject": fields["subject"], "logical_address": row["logical_address"],
@@ -162,13 +144,8 @@ def pending_delivery_count(conn, box):
     batch = due.get(conn, due.due_key("batch", box))
     waiting = sum(item["kind"] in FORMAL_KINDS and item["created_at"] is not None
                   for item in candidates(conn, box)) if batch and batch["state"] == "armed" else 0
-    frozen = conn.execute(
-        "SELECT COUNT(*) FROM round_ref rr JOIN round r ON r.token=rr.token"
-        " JOIN letter_states s ON (s.box,s.letter_id)=(rr.box,rr.ref)"
-        " WHERE rr.box=? AND rr.ref_state='active' AND s.state='delivered'"
-        " AND r.state IN ('begun','accepted') AND r.run_state IS NULL AND r.deadline_ts>?",
-        (box, time.time())).fetchone()[0]
-    return waiting + frozen
+    return waiting + len(_reserved_refs(conn, box))
+
 
 def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
     """`{deliver, carry, hold_until, reason, unread, would_deliver}` — the one selection answer.
@@ -217,7 +194,7 @@ def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
     # operator would be told "cc_wait" or "receipts_wait" for a mailbox whose real state is "already
     # reminded, waiting for the round" — a wrong explanation is worse than no explanation, because it
     # sends the next person looking for copies that are not there.
-    in_round = _formal_in_round(conn, box)
+    in_round = _reserved_refs(conn, box)
     if in_round:
         return {"deliver": [], "carry": [], "hold_until": None, "reason": "unread_reminder",
                 "unread": True, "in_round": in_round}
@@ -228,24 +205,16 @@ def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
                       "unread": False}, bad)
 
 
-def _formal_in_round(conn, box):
-    """Refs of action-asking letters already in an **active** round for this box, oldest first.
-
-    This is what the file era spelled `mailbox_unread_on` / `_mailbox_mark_reminded`: a reminder that
-    was handed to a round and not yet accepted must not be handed again. In the record it is one
-    indexed question — active refs are exactly the letters somebody is already being told about — so
-    there is no `.seen` file and no per-box marker to keep in step.
-
-    A round on a letter that has since been accepted or archived is not a pending reminder, so both
-    are excluded: the question is "is somebody still being told", not "was there ever a round".
-    """
+def _reserved_refs(conn, box, own_round=None):
+    """Unaccepted handoffs, including Codex unknowns released by older versions."""
     rows = conn.execute(
-        "SELECT r.ref FROM round_ref r JOIN letter_states s"
-        "  ON s.letter_id = r.ref AND s.box = r.box"
-        " WHERE r.box = ? AND r.ref_state = 'active' AND s.state = 'delivered'"
-        "   AND s.accepted_at IS NULL"
-        " ORDER BY r.rowid", (box,)).fetchall()
-    return [row[0] for row in rows]
+        "SELECT rr.ref FROM round_ref rr JOIN round r ON r.token=rr.token"
+        " JOIN letter_states s ON (s.box,s.letter_id)=(rr.box,rr.ref)"
+        " WHERE rr.box=? AND rr.token IS NOT ? AND s.state='delivered' AND s.accepted_at IS NULL"
+        " AND (rr.ref_state='active' OR (r.channel='codex' AND r.state='unknown' AND NOT EXISTS"
+        " (SELECT 1 FROM round_ref newer WHERE newer.box=rr.box AND newer.ref=rr.ref AND newer.attempt>rr.attempt)))"
+        " ORDER BY rr.rowid", (box, own_round))
+    return list(dict.fromkeys(row[0] for row in rows))
 
 
 def _with_bad(answer, bad):

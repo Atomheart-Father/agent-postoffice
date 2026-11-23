@@ -18,7 +18,7 @@ export function installClaudeHooks(config, executable = process.execPath, entry 
   const hooks = {...(config.hooks || {})};
   for (const [event, mode, asyncRewake] of [
     ['SessionStart', 'wait', true], ['Stop', 'stop', true],
-    ['UserPromptSubmit', 'observe', false], ['PostToolUse', 'observe', false],
+    ['UserPromptSubmit', 'observe', false], ['PostToolUse', 'observe', false], ['PostToolBatch', 'observe', false],
     ['MessageDisplay', 'observe', false], ['StopFailure', 'observe', false],
   ]) {
     const entries = Array.isArray(hooks[event]) ? hooks[event] : [];

@@ -1,21 +1,22 @@
-"""R package: controlled artifact read. Core decides WHETHER (artifact.read.authorize); this module decides HOW.
+"""R package: controlled artifact read. Core decides access; this module renders the verified stream.
 
 One source: a submitted artifact -- the exact bytes snapshotted at publish time under their digest (never the
 mutable working copy). Loading those bytes and verifying their digest live in ONE place,
 `lib/work_result.read_version` (what `work.read` runs); this module only renders them.
 
 Views (all bounded; a partial answer says so and how to continue):
-  lines=[start,end] (1-based, inclusive) · search="text" · compare_data=<other version bytes> (unified diff,
-  itself paged with cursor/limit/has_more over diff lines: a long diff is read the same way as text)
+  lines=[start,end] (1-based, inclusive) · search="text"
   cursor=<line number or returned long-line continuation>. Text is UTF-8; anything else is reported as binary with its size -- never decoded
   as if it were text, never claimed to be previewable."""
-import difflib, re
+import re
+from codecs import getincrementaldecoder
+from itertools import chain, groupby
+from operator import itemgetter
 
 DEFAULT_LINES = 200
 MAX_LINES = 2000
 MAX_BYTES = 128 * 1024                 # per answer, not per object
 MAX_MATCHES = 100
-_DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
 
 
 class ArtifactReadRefused(Exception):
@@ -27,20 +28,8 @@ class ArtifactReadRefused(Exception):
         return self.message_en if locale == "en" and self.message_en else self.message
 
 
-def digest_name(exact_version):
-    m = _DIGEST.fullmatch(exact_version) if isinstance(exact_version, str) else None
-    if not m:
-        raise ArtifactReadRefused("invalid_request", "exact_version 必须是 sha256:<64位小写十六进制>", en="exact_version must be sha256:<64 lowercase hex>")
-    return m.group(1)
-
-
 def version_name(digest_hex):
-    """`<64 hex>` → `sha256:<64 hex>`：`digest_name` 的**反方向**，两个方向挨着放、各写一次。
-
-    这个令牌是线路契约：`publish` 产出它、`digest_name` 解析它、每一处把版本给读的人看的地方
-    都重复它。散着写就总有一处能漂成 `digest_name` 拒收的样子 —— 那一版交上去、谁也读不回来。
-    存储库的对象名、`exact_version`、`sha256` 字段是**同一个字符串**，所以只有一个渲染点。
-    """
+    """发布时把内容摘要编码为成果版本令牌。"""
     return "sha256:" + digest_hex
 
 
@@ -61,118 +50,132 @@ def check_view(lines, search, cursor, limit):
 
 
 
-def _text_or_none(data):
-    if b"\x00" in data[:65536]:
-        return None
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
-
-
-def _page(lines, first, last, offset=0):
-    """Page whole lines when possible; continue an oversized line at a UTF-8 byte boundary."""
-    out, used, end, continuation = [], 0, first - 1, None
-    for i in range(first - 1, last):
-        raw = lines[i].encode("utf-8")
-        start = offset if i == first - 1 else 0
-        if start:
-            try:
-                if start >= len(raw):
-                    raise ValueError()
-                raw[:start].decode("utf-8")
-            except (ValueError, UnicodeDecodeError):
-                raise ArtifactReadRefused("invalid_request", "无效的续读游标", en="Invalid continuation cursor")
-        remaining = raw[start:]
-        if out and used + len(remaining) + 1 > MAX_BYTES:
-            break
-        if len(remaining) + 1 > MAX_BYTES:
-            fragment = remaining[:MAX_BYTES - 1].decode("utf-8", "ignore")
-            consumed = len(fragment.encode("utf-8"))
-            out.append(fragment); end = i + 1
-            continuation = {"line": end, "offset": start + consumed, "kept_bytes": consumed, "line_bytes": len(raw) + 1}
-            break
-        out.append(remaining.decode("utf-8")); used += len(remaining) + 1; end = i + 1
-    return out, end, continuation
-
-
 def _cursor(cursor):
     return tuple(map(int, cursor.split(":"))) if isinstance(cursor, str) else (cursor or 1, 0)
 
 
-def view(data, *, lines=None, search=None, cursor=None, limit=None, compare_data=None):
-    """Render a bounded view of `data` (see module doc). Never claims a partial answer is the whole."""
-    check_view(lines, search, cursor, limit)
-    size = len(data)
-    text = _text_or_none(data)
-    if text is None:
-        # ★ W20：这段文字原来说"在你的工作区用原生工具打开"——但提交的字节**不在**
-        #   审核者的工作区（它只在成果库）。现在只说这里确实没有文本预览，
-        #   并把"可原生打开"的那一份路径交给调用方（`image_view` / `stored_object_path`）补。
-        return {"kind": "binary", "size": size,
-                "note": "二进制成果：这里不提供文本预览（本页只读文本视图）；字节与 exact_version 一致",
-                "note_en": "Binary result: no text preview here (this view only renders text); the bytes match exact_version"}
-    all_lines = text.splitlines()
-    total = len(all_lines)
-    if compare_data is not None:
-        other = _text_or_none(compare_data)
-        if other is None:
-            return {"kind": "diff", "comparable": False, "note": "其中一版不是文本，无法逐行比较",
-                    "size": size}
-        # ★ W209：diff 也按**行**分页，用的就是正文那一套字段与读法
-        #   （`cursor` / `limit` / `has_more` / `start_line` / `end_line`）：以前这里一次答完，
-        #   超过 MAX_BYTES 就只剩前一段，**没有继续查看的路**（W204 明确报出的合同差额）。
-        # 普通页面按行号续读；超长行返回含 UTF-8 字节偏移的续读游标。
-        # truncated 仍与 has_more 同义，老消费方不会把片段当完整。
-        diff = list(difflib.unified_diff(other.splitlines(), all_lines, "before", "after", lineterm="", n=2))
-        dtotal = len(diff)
-        want = min(limit or DEFAULT_LINES, MAX_LINES)
-        first, offset = _cursor(cursor)
-        if (dtotal and first > dtotal) or (offset and not dtotal):
-            raise ArtifactReadRefused("invalid_request",
-                                      f"起始行 {first} 超出末尾（差异共 {dtotal} 行）",
-                                      en=f"Start line {first} is past the end ({dtotal} diff lines)")
-        last = min(dtotal, first + want - 1) if dtotal else 0
-        out, end, cut = _page(diff, first, last, offset)
-        more = bool(cut) or end < dtotal
-        next_cursor = f"{cut['line']}:{cut['offset']}" if cut else end + 1 if more else None
-        return {"kind": "diff", "comparable": True, "changed": bool(diff), "content": "\n".join(out),
-                "start_line": first if dtotal else 0, "end_line": end,
-                "diff_lines_total": dtotal,
-                "total_lines": total,                 # 这一版文件的行数（**不是**差异行数，原意保留）
-                "has_more": more, "cursor": next_cursor,
-                # 这一段是不是完整：后面还有行，或者这一页里有一行只给了开头
-                "truncated": bool(more or cut),
-                "line_truncated": cut,                # 被切片的那一行（没有就是 null）
-                "size": size}
-    if search is not None:
-        start = cursor or 1
-        matches, used, next_cursor = [], 0, None
-        for i in range(start - 1, total):
-            if search in all_lines[i]:
-                excerpt = all_lines[i][:500]
-                cost = len(excerpt.encode("utf-8")) + 1
-                if len(matches) >= MAX_MATCHES or used + cost > MAX_BYTES:
-                    next_cursor = i + 1
-                    break
-                matches.append({"line": i + 1, "text": excerpt})
+_LINE_ENDS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+
+
+def _fragments(chunks, needs_lines, search=None):
+    """Split as str.splitlines(), carrying only decoder state and a possible CR."""
+    decoder = getincrementaldecoder("utf-8")()
+    line, prefix, cr = 1, 65536, ""
+    for block in chain(chunks, (b"",)):
+        if prefix and b"\0" in block[:prefix]:
+            raise UnicodeError("binary prefix")
+        prefix = max(0, prefix - len(block))
+        text = cr + decoder.decode(block, final=not block)
+        cr = "\r" if block and text.endswith("\r") else ""
+        if cr:
+            text = text[:-1]
+        pieces = text.splitlines(keepends=True)
+        if pieces and not needs_lines(line, line + len(pieces) - 1):
+            # When the whole block is outside the page, count it without visiting every line.
+            unfinished = pieces[-1][-1] not in _LINE_ENDS
+            yield line + len(pieces) - 1, ""
+            line += len(pieces) - unfinished
+            continue
+        if search is not None and len(pieces) > 2 and search not in text:
+            first = pieces[0]
+            yield line, first[:-2] if first.endswith("\r\n") else first[:-1]
+            line += len(pieces) - 1
+            yield line - 1, ""
+            pieces = pieces[-1:]
+        for piece in pieces:
+            if piece[-1] in _LINE_ENDS:
+                yield line, piece[:-2] if piece.endswith("\r\n") else piece[:-1]
+                line += 1
+            else:
+                yield line, piece
+
+
+def _search_stream(chunks, search, start):
+    matches, used, next_cursor, total = [], 0, None, 0
+    overlap = len(search) - 1
+    rows = groupby(_fragments(chunks, lambda _, end: next_cursor is None and end >= start, search), key=itemgetter(0))
+    for total, pieces in rows:
+        if total < start or next_cursor is not None:
+            continue
+        excerpt, tail, matched = "", "", False
+        for _, piece in pieces:
+            excerpt += piece[:500 - len(excerpt)]
+            if not matched:
+                window = tail + piece
+                matched = search in window
+                tail = window[-overlap:] if overlap else ""
+        if matched:
+            cost = len(excerpt.encode("utf-8")) + 1
+            if len(matches) >= MAX_MATCHES or used + cost > MAX_BYTES:
+                next_cursor = total
+            else:
+                matches.append({"line": total, "text": excerpt})
                 used += cost
-        return {"kind": "search", "query": search, "matches": matches, "total_lines": total,
-                "has_more": next_cursor is not None, "cursor": next_cursor}
-    want = min(limit or DEFAULT_LINES, MAX_LINES)
+    return {"kind": "search", "query": search, "matches": matches, "total_lines": total,
+            "has_more": next_cursor is not None, "cursor": next_cursor}
+
+
+def _stream_line(pieces, offset):
+    kept = bytearray()
+    seen = 0
+    for _, piece in pieces:
+        raw = piece.encode("utf-8")
+        start = max(0, offset - seen)
+        room = MAX_BYTES - len(kept)
+        if start < len(raw) and room:
+            kept.extend(raw[start:start + room])
+        seen += len(raw)
+    if offset and (offset >= seen or kept[0] & 0xC0 == 0x80):
+        raise ArtifactReadRefused("invalid_request", "无效的续读游标", en="Invalid continuation cursor")
+    return kept, seen - offset
+
+
+def _page_stream(chunks, lines, cursor, limit):
     first, offset = _cursor(cursor)
     if lines is not None:
-        if cursor is None:
-            first = lines[0]
-        if first < lines[0] or first > lines[1]:
+        first = lines[0] if cursor is None else first
+        if not lines[0] <= first <= lines[1]:
             raise ArtifactReadRefused("invalid_request", "cursor 超出行范围", en="cursor is outside the requested lines")
-        last = min(lines[1], total)
+        last = lines[1]
     else:
-        last = min(total, first + want - 1)
+        last = first + min(limit or DEFAULT_LINES, MAX_LINES) - 1
+    out, used, total, end, cut, full = [], 0, 0, first - 1, None, False
+    rows = groupby(_fragments(chunks, lambda a, b: not full and a <= last and b >= first), key=itemgetter(0))
+    for total, pieces in rows:
+        if total < first or total > last or full:
+            continue
+        start = offset if total == first else 0
+        kept, size = _stream_line(pieces, start)
+        if out and used + size + 1 > MAX_BYTES:
+            full = True
+            continue
+        end = total
+        if size + 1 > MAX_BYTES:
+            text = kept[:MAX_BYTES - 1].decode("utf-8", "ignore")
+            cut = f"{end}:{start + len(text.encode('utf-8'))}"
+            out.append(text)
+            full = True
+        else:
+            out.append(kept.decode("utf-8"))
+            used += size + 1
     if (total and first > total) or (offset and not total):
-        raise ArtifactReadRefused("invalid_request", f"起始行 {first} 超出末尾（共 {total} 行）", en=f"Start line {first} is past the end ({total} lines)")
-    out, end, cut = _page(all_lines, first, last, offset)
-    more = bool(cut) or end < (last if lines is not None else total)
-    next_cursor = f"{cut['line']}:{cut['offset']}" if cut else end + 1 if more else None
+        raise ArtifactReadRefused("invalid_request", f"起始行 {first} 超出末尾（共 {total} 行）",
+                                  en=f"Start line {first} is past the end ({total} lines)")
+    more = cut is not None or end < (min(last, total) if lines is not None else total)
     return {"kind": "text", "total_lines": total, "start_line": first if total else 0, "end_line": end,
-            "content": "\n".join(out), "has_more": more, "cursor": next_cursor, "size": size}
+            "content": "\n".join(out), "has_more": more, "cursor": cut or (end + 1 if more else None)}
+
+
+def _binary():
+    return {"kind": "binary",
+            "note": "二进制成果：这里不提供文本预览（本页只读文本视图）；字节与 exact_version 一致",
+            "note_en": "Binary result: no text preview here (this view only renders text); the bytes match exact_version"}
+
+
+def stream_view(chunks, *, lines=None, search=None, cursor=None, limit=None):
+    check_view(lines, search, cursor, limit)
+    try:
+        return (_search_stream(chunks, search, cursor or 1) if search is not None
+                else _page_stream(chunks, lines, cursor, limit))
+    except UnicodeError:
+        return _binary()

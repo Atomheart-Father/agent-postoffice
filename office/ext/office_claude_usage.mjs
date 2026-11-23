@@ -38,8 +38,12 @@ export function claudeUsageEntries(path, session) {
   }
   const out = [];
   for (const [id, {m, at, uses}] of msgs) {
-    const u = m.usage || {}, tokens = {in: u.input_tokens, out: u.output_tokens, cache: u.cache_read_input_tokens};
-    if (!m.stop_reason || !(tokens.in || tokens.out || tokens.cache)) continue;
+    const u = m.usage || {};
+    const written = u.cache_creation_input_tokens;
+    const input = Number.isSafeInteger(u.input_tokens)
+      ? u.input_tokens + (Number.isSafeInteger(written) && written >= 0 ? written : 0) : undefined;
+    const tokens = {in: input, out: u.output_tokens, cache: u.cache_read_input_tokens};
+    if (!m.stop_reason || !Object.values(tokens).some(Boolean)) continue;
     if (!uses.every(([uid]) => results.has(uid))) continue;
     const refs = new Set();
     for (const [uid, name] of uses) {

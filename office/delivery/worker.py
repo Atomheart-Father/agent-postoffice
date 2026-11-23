@@ -444,13 +444,17 @@ class ModelSilentHandler(Handler):
         if quota_blocked(conn, binding, gen):
             return defer("quota_blocked")
 
-        # 6. 明确等待？（承办人名下有等待说明的 Work）
-        if conn.execute("SELECT 1 FROM work WHERE assignee_ref=? AND waiting_json IS NOT NULL"
-                        " AND waiting_json != '' LIMIT 1", (who,)).fetchone() is not None:
+        works, other = self.core._notified_work_of_attempt(conn, attempt, binding, gen)
+        if works and not other and all(conn.execute(
+                "SELECT 1 FROM work WHERE work_ref=? AND state='Active'"
+                " AND waiting_json != '' AND (assignee_ref=? OR assignee_ref IN"
+                " (SELECT position FROM position_holders WHERE holder=?))",
+                (work, who, who)).fetchone() for work in works):
             return defer("work_waiting")
+        work = works[0] if len(works) == 1 else None
 
         # 7. 都没有：升级一封。收件人按 §9 尽量给"该 Work 的负责经理"，归属不确定就如实说不确定。
-        target, basis = self._escalation_target(conn, attempt=attempt, actor=who, now_ts=at)
+        target, basis = self._escalation_target(conn, actor=who, work=work, now_ts=at)
         escalate = "model-silent:%s:%s:silent" % (binding, attempt)
         because = "" if basis == "work_manager" else "\n（Work 归属无法唯一确定，先报直接责任人。）"
         sent = self.core.system_letter(
@@ -469,9 +473,8 @@ class ModelSilentHandler(Handler):
                 "recipient": target, "basis": basis, "fired": fired is not None}
 
 
-    def _escalation_target(self, conn, *, attempt, actor, now_ts=None):
+    def _escalation_target(self, conn, *, actor, work=None, now_ts=None):
         """能确定唯一 Work 和一位当前项目经理时，向该经理升级。"""
-        work = self.core._notified_work_of_attempt(conn, attempt, actor)
         row = conn.execute("SELECT project_ref FROM work WHERE work_ref=?", (work,)).fetchone() if work else None
         if row is None:
             return actor, "unknown"

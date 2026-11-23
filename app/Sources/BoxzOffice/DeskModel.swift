@@ -43,19 +43,22 @@ final class DeskModel: ObservableObject {
         didSet {
             guard page != oldValue else { return }
             if page != .host { focusBinding = nil }
-            load(needs(page))
+            if page == .work { queueCompleted() } else { load(needs(page)) }
         }
     }
     /// Work 页当前项目页签（nil = 第一个项目）。
     @Published var workTab: String? {
-        didSet { if page == .work { load(needs(Page.work)) } }
+        didSet { if page == .work && effectiveWorkTab(oldValue) != currentWorkTab { queueCompleted() } }
     }
     /// 界面语言（设置页切换；存本机）。
     @Published var lang: Lang {
         didSet { Lang.current = lang; UserDefaults.standard.set(lang.rawValue, forKey: Prefs.languageKey) }
     }
     @Published var drawer: Drawer? {
-        didSet { if drawer != oldValue { load(needs(drawer)) } }
+        didSet {
+            guard drawer != oldValue else { return }
+            if case .project = drawer { queueProjectWork() } else { load(needs(drawer)) }
+        }
     }
     /// 宿主页"全部下线 / 下线"的确认框。
     @Published var offlineDraft: OfflineDraft?
@@ -73,6 +76,12 @@ final class DeskModel: ObservableObject {
     @Published var whoami: Panel<String> = .loading
     @Published var projects: Panel<[ProjectDetail]> = .loading
     @Published var work: Panel<WorkList> = .loading
+    @Published var completed: Panel<WorkList> = .loading
+    @Published private(set) var completedCursor: String?
+    @Published var projectWork: Panel<WorkList> = .loading
+    @Published private(set) var projectCursor: String?
+    @Published var reviews: Panel<WorkList> = .loading
+    @Published private(set) var reviewCursor: String?
     @Published var inbox: Panel<Inbox> = .loading
     @Published var workDetails: [String: Panel<WorkDetail>] = [:]
     @Published var refreshedAt: Date?
@@ -172,6 +181,8 @@ final class DeskModel: ObservableObject {
         async let w = Task.detached { reads.context() }.value
         async let p = Task.detached { reads.projectDetails() }.value
         async let k = Task.detached { reads.workList() }.value
+        let cursor = reviewCursor
+        async let q = Task.detached { reads.reviewPage(cursor: cursor) }.value
         async let i = Task.detached { reads.inbox() }.value
         async let r = Task.detached { contract.requests() }.value
         let context = await w
@@ -180,9 +191,13 @@ final class DeskModel: ObservableObject {
         whoami = .done(who)
         projects = .done(await p)
         work = .done(await k)
+        let reviewResult = await q
+        if reviewCursor == cursor { reviews = .done(reviewResult) }
         inbox = .done(await i)
         requests = .done(await r)
         hosts = .done(await h)
+        if page == .work { await fetchCompleted(cursor: completedCursor) }
+        if case .project = drawer { await fetchProjectWork(cursor: projectCursor) }
         adminApproval = .done(contract.adminApproval(context: context))
         if !inboxTabChosen, let rs = requests.value {         // 待办抽屉默认落在有事要做的那一页
             inboxTabChosen = true
@@ -210,8 +225,8 @@ final class DeskModel: ObservableObject {
         } else {
             seatMail.removeAll()
         }
-        if let w = work.value {
-            var refs = Set(w.items.map(\.ref))
+        if work.value != nil {
+            var refs = Set(doneInTab.map(\.ref))
             if case .work(let r) = drawer { refs.insert(r) }
             workDetails = workDetails.filter { refs.contains($0.key) }
         }
@@ -225,22 +240,73 @@ final class DeskModel: ObservableObject {
     var workTabs: [String] {
         Set((projects.value ?? []).map(\.ref)).union((work.value?.items ?? []).map(\.projectRef)).sorted()
     }
-    var currentWorkTab: String? {
-        if let t = workTab, workTabs.contains(t) { return t }
+    private func effectiveWorkTab(_ tab: String?) -> String? {
+        if let t = tab, workTabs.contains(t) { return t }
         return workTabs.first
     }
+    var currentWorkTab: String? { effectiveWorkTab(workTab) }
 
     /// 当前页签里画在图上的 Work：已完成的。进行中 / 待审核 / 已取消的不画，也不读详情。
-    var doneInTab: [WorkRow] { (work.value?.items ?? []).filter { $0.projectRef == currentWorkTab && $0.state == .done } }
-    /// 等老板审核的 Work：待审核、审核人是老板（所有项目）。读不全时只是下限。
-    var reviewQueue: [WorkRow] { work.value?.items.filter { $0.state == .submitted && $0.reviewer == whoami.value } ?? [] }
+    var doneInTab: [WorkRow] { completed.value?.items ?? [] }
+    func loadReviews(cursor: String?) async {
+        reviewCursor = cursor
+        reviews = .loading
+        let reads = self.reads
+        let result = await Task.detached { reads.reviewPage(cursor: cursor) }.value
+        if reviewCursor == cursor { reviews = .done(result) }
+    }
     /// 这件的用量卡：夹具有就用夹具的（模拟数据），否则用 work.get 自己带的。
     func usageCard(_ d: WorkDetail) -> (card: WorkUsageCard?, simulated: Bool) { contract.workUsage(ref: d.row.ref, real: d.usage) }
 
-    /// 已完成的 Work 不会再变：详情按 (ref, version) 缓存，work.list 里版本没动就不再读。
-    private func isCached(_ ref: String) -> Bool {
-        guard case .done(.ok(let d))? = workDetails[ref], d.row.state == .done else { return false }
-        return d.row.version == work.value?.items.first { $0.ref == ref }?.version
+    private func fetchCompleted(cursor: String?) async {
+        guard let project = currentWorkTab else { completed = .loading; return }
+        completedCursor = cursor
+        let reads = self.reads
+        let result = await Task.detached { reads.workList(projectRef: project, state: "Done", cursor: cursor, limit: 30) }.value
+        if currentWorkTab == project && completedCursor == cursor {
+            completed = .done(result)
+            if case .ok(let page) = result { workPicked = workPicked.filter { ref in page.items.contains { $0.ref == ref } } }
+        }
+    }
+
+    func loadCompleted(cursor: String?) async {
+        workPicked = []
+        completed = .loading
+        await fetchCompleted(cursor: cursor)
+        var n = needs(page); n.formUnion(needs(drawer)); await read(n)
+    }
+
+    private func fetchProjectWork(cursor: String?) async {
+        guard case .project(let project) = drawer else { return }
+        projectCursor = cursor
+        let reads = self.reads
+        let result = await Task.detached { reads.workList(projectRef: project, cursor: cursor) }.value
+        if drawer == .project(project) && projectCursor == cursor { projectWork = .done(result) }
+    }
+
+    func loadProjectWork(cursor: String?) async {
+        projectWork = .loading
+        await fetchProjectWork(cursor: cursor)
+    }
+
+    private func queueCompleted() {
+        workPicked = []
+        completedCursor = nil
+        completed = .loading
+        let project = currentWorkTab
+        let prev = loading
+        loading = Task {
+            await prev?.value
+            guard self.page == .work, self.currentWorkTab == project else { return }
+            await self.loadCompleted(cursor: nil)
+        }
+    }
+
+    private func queueProjectWork() {
+        projectCursor = nil
+        projectWork = .loading
+        let prev = loading
+        loading = Task { await prev?.value; await self.loadProjectWork(cursor: nil) }
     }
 
     private func needs(_ page: Page) -> Needs {
@@ -258,8 +324,7 @@ final class DeskModel: ObservableObject {
         var n = Needs()
         switch drawer {
         case .seat(let a): n.mail = [a]
-        case .work(let ref):
-            if !(page == .work && workDetails[ref]?.value != nil) { n.works = [ref] }       // Work 页上已经读过的不再读
+        case .work(let ref): n.works = [ref]
         case .inbox, .project, nil: break
         }
         return n
@@ -282,7 +347,7 @@ final class DeskModel: ObservableObject {
         await withTaskGroup(of: Void.self) { group in
             // 读到一个落一个；没读到之前显示"读取中"。
             for k in n.mail { group.addTask { let o = reads.inbox(target: k); await MainActor.run { self.seatMail[k] = .done(o) } } }
-            for k in n.works where !isCached(k) { group.addTask { let o = reads.workDetail(k); await MainActor.run { self.workDetails[k] = .done(o) } } }
+            for k in n.works { group.addTask { let o = reads.workDetail(k); await MainActor.run { self.workDetails[k] = .done(o) } } }
             if n.admin { group.addTask { let o = reads.adminHolder(); await MainActor.run { self.adminHolder = .done(o) } } }
             if n.usage { group.addTask { let o = contract.threadUsage(); await MainActor.run { self.threads = .done(o) } } }
         }

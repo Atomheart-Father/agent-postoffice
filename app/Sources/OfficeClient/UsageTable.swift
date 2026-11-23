@@ -6,7 +6,7 @@ public struct UsageCell: Sendable, Equatable {
     public init(tokensIn: Int?, tokensOut: Int?, tokensCache: Int?) {
         self.tokensIn = tokensIn; self.tokensOut = tokensOut; self.tokensCache = tokensCache
     }
-    /// 用量排序 / 主数字用"入 + 出"（缓存读便宜，单列，不进排序；Q1 先按保守做法）。任一个未知 = 未知。
+    /// 输入已包含缓存读；缓存列供查看其中的缓存读。任一项未知时合计未知。
     public var inOut: Int? {
         guard let a = tokensIn, let b = tokensOut else { return nil }
         return a + b

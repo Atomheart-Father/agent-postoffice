@@ -10,39 +10,6 @@ with open(__file__[:-3] + "_text.json", encoding="utf-8") as _f:      # 系统�
     TEXT = json.load(_f)
 
 
-def handover_return_terminal(planned, *, position, **retired):
-    """交还计划 → 终态回包：Core 已在同一事务里把岗位绑回原会话（W432），这里只转述、不写。
-
-    `**retired` 明确拒绝旧调用形状（actor=/write_holder=/core_call=）：交还的记录支路（W436）已删，不静默忽略。
-    """
-    if retired:
-        raise RuntimeError(
-            "交还的记录支路已删除（W436）：`handover.return` 现在由 Core 在同一事务里 "
-            "`position.bind` 绑回原会话；不再写 config 的任职人。调用方去掉 %s 即可"
-            % sorted(retired))
-    if "execution" not in planned and planned.get("state") and "result" in planned:
-        return planned
-    plan = planned.get("execution") or {}
-    pos = plan.get("position") or planned.get("position") or position
-    if plan.get("op") != "position.bind":
-        return {"ok": False, "code": "invalid_result", "state": "failed", "position": pos,
-                "holder": None, "prev_holder": None,
-                "result": {"items": [], "error":
-                           "交还只有一个结果：Core 在同一事务里的 position.bind（now %r）"
-                           % (plan.get("op"),)}}
-    target_session = plan.get("session_ref") or planned.get("to_session_ref")
-    if not isinstance(target_session, str) or not target_session:
-        return {"ok": False, "code": "invalid_result", "state": "failed", "position": pos,
-                "holder": None, "prev_holder": None,
-                "result": {"items": [], "error": "Core position.bind receipt has no session_ref"}}
-    previous_session = plan.get("prev_session")
-    what = "@%s 已绑定到受控会话 %s（交还）" % (pos, target_session)
-    return {"ok": True, "code": None, "state": "done", "position": pos,
-            "holder": None, "prev_holder": None,
-            "to_session_ref": target_session, "from_session_ref": previous_session,
-            "result": {"items": [{"what": what, "ok": True, "error": None}], "error": None}}
-
-
 class HandoverOperations:
     """交还与岗位绑定事实（在 Core 的显式契约上）；申请/审批本体已退役。"""
 

@@ -52,8 +52,8 @@
 			"en": "Reference returned on resource registration."
 		},
 		"REFERENCE": {
-			"en": "Reference: a resource string, or {resource, version?, sub?, location?, note?, adopted?}. Leave version out when unknown; adopted=true means this exact version must be used",
-			"zh": "参考资料：资源定位字符串，或 {resource, version?, sub?, location?, note?, adopted?}。版本不知道就不填；adopted=true 表示要求采用该准确版本"
+			"en": "Reference: a resource string, or {resource, version?, sub?, note?}. Leave version out when unknown.",
+			"zh": "参考资料：资源定位字符串，或 {resource, version?, sub?, note?}。版本不知道就不填。"
 		},
 		"RELATION": {
 			"en": "Relation to an existing Work: belongs_to (parent), modifies (revised Work), waits_for (prerequisite), based_on or references.",
@@ -306,7 +306,10 @@
 		"office_letter_revise": {
 			"description": {"en": "Revise your sent letter for one direct recipient before delivery begins.", "zh": "投递开始前，修订自己发给一个主送收件人的信。"},
 			"label": {"en": "Revise sent letter", "zh": "改信"},
-			"parameters": {"content_version": {"en": "Expected version for this recipient. A newly sent letter starts at 1.", "zh": "该收件箱的当前正文版本。新信从 1 开始。"}}
+			"parameters": {
+				"content_version": {"en": "Expected version for this recipient. A newly sent letter starts at 1.", "zh": "该收件箱的当前正文版本。新信从 1 开始。"},
+				"need": {"en": "New action required. For information only, use exactly FYI and put details in the body.", "zh": "新行动要求。仅告知时只写 FYI，说明放正文。"}
+			}
 		},
 		"office_letter_retract": {
 			"description": {"en": "Retract your sent letter for one direct recipient before delivery begins.", "zh": "投递开始前，撤回自己发给一个主送收件人的信。"},
@@ -334,8 +337,8 @@
 		},
 		"office_letter_list": {
 			"description": {
-				"en": "List inbox metadata, excluding archived letters by default. Use office_letter_read for the body. Filing is optional.",
-				"zh": "列收件箱，默认排除已归档信。用 office_letter_read 读正文。归档可选。"
+				"en": "List inbox metadata newest first, 50 per page by default. Archived letters are excluded unless requested. Pass next_cursor to continue; read the body with office_letter_read.",
+				"zh": "从最新开始列收件箱，默认每页 50 封且排除已归档信。传 next_cursor 续读，用 office_letter_read 读正文。"
 			},
 			"label": {
 				"en": "Inbox",
@@ -345,6 +348,14 @@
 				"include_archived": {
 					"en": "Optional: include archived letters too (default: no)",
 					"zh": "可选：连已归档的也列出来（默认不列）"
+				},
+				"cursor": {
+					"en": "next_cursor from the previous inbox page",
+					"zh": "上一页收件箱返回的 next_cursor"
+				},
+				"limit": {
+					"en": "Letters per page (1–200, defaults to 50)",
+					"zh": "每页信件数（1–200，默认 50）"
 				}
 			}
 		},
@@ -391,6 +402,10 @@
 					"en": "Body. For Work, give the conclusion, next action and references to the relevant Work or artifact version.",
 					"zh": "正文。涉及 Work 时写结论、下一步和 Work 或成果版本的引用。"
 				},
+				"intent": {
+					"en": "Choose fyi for information only (omit need), or request when the recipient must act (fill need). Put FYI details in the body.",
+					"zh": "选 fyi 表示仅告知（省略 need），选 request 表示需要行动（填写 need）。告知的说明写在正文。"
+				},
 				"cc": {
 					"en": "Mailbox names or @positions to copy. Copies can be read or filed and need no reply.",
 					"zh": "抄送的信箱名或 @岗位。抄送人可读、可归档，无需回复。"
@@ -400,8 +415,8 @@
 					"zh": "可选：与 reply_to 配合；true 时发送后不收纳原信"
 				},
 				"need": {
-					"en": "State the actual next action (e.g. confirm a date or review a draft). If no action is needed, use FYI. Do not add a request just to trigger a wake.",
-					"zh": "写对方实际要做的事，如确认日期或审核草稿。无需行动时写「仅告知」（FYI）。不要为了唤醒而虚构待办。"
+					"en": "For intent=request, state the actual next action. For intent=fyi, omit this field. Existing callers without intent must write exactly FYI for information only and place details in the body.",
+					"zh": "intent=request 时写真实的下一步行动；intent=fyi 时省略。不传 intent 的原调用仅告知时请只写 FYI，说明放正文。"
 				},
 				"reply_to": {
 					"en": "Original letter ID. Leave to empty to reply to the sender of ordinary mail in your inbox. The original is filed after sending.",
@@ -566,8 +581,8 @@
 					"zh": "项目编号，如 prj-1。"
 				},
 				"references": {
-					"en": "Reference: a resource string, or {resource, version?, sub?, location?, note?, adopted?}. Leave version out when unknown; adopted=true means this exact version must be used",
-					"zh": "参考资料：资源定位字符串，或 {resource, version?, sub?, location?, note?, adopted?}。版本不知道就不填；adopted=true 表示要求采用该准确版本"
+					"en": "Reference: a resource string, or {resource, version?, sub?, note?}. Leave version out when unknown.",
+					"zh": "参考资料：资源定位字符串，或 {resource, version?, sub?, note?}。版本不知道就不填。"
 				},
 				"relations": {
 					"en": "Optional: relations to existing Work",
@@ -585,8 +600,8 @@
 		},
 		"office_work_get": {
 			"description": {
-				"en": "Read a Work's goal, responsibility, current or final submission, latest return feedback, references, relations and available actions. history=true adds events, reviews and changes; todo=true adds actionable items. Both default off. Work is authoritative; notices are pointers.",
-				"zh": "打开一项 Work：目标、责任、当前/最终提交（文件与版本）、最近一次退回意见、参考、关系、你能做的动作。history=true 附带完整履历（事件、已决定的审核轮次、材料与关系的全部变化）；todo=true 附带「我现在还能动手的」那一段。两个可选段都默认不给——日常处理靠现状、准确提交和最近一次退回。Work 是权威；通知只指路。"
+				"en": "Read a Work's goal, responsibility, submission, feedback, references, relations and available actions. history=true adds history; todo=true adds up to 20 items you or your positions can act on, with total count, skipped and omitted. Long objectives are previews; open a Work to see its full objective. Both sections default off.",
+				"zh": "打开 Work 的目标、责任、提交、反馈、参考、关系和可用动作。history=true 附加履历；todo=true 附加本人及现任岗位可动手的最多 20 项，并给出总数、跳过和省略数。长目标为预览，打开该 Work 可看全文。两段默认不返回。"
 			},
 			"label": {
 				"en": "Open work",
@@ -598,8 +613,8 @@
 					"zh": "可选：附带全部历史"
 				},
 				"todo": {
-					"en": "Optional: true = also return the part of this Work you can act on right now (your own to-do; the predicate is the same one the system uses for assignment, returned under your existing rights)",
-					"zh": "可选：true = 同时给我「现在还能动手的」那一段（本人待办；判据就是系统派工用的那一份，按既有权限返回）"
+					"en": "Optional: true adds the current actionable Work for you and your positions, with up to 20 previews and counts for all.",
+					"zh": "可选：true 附加本人及现任岗位当前可动手的 Work，最多显示 20 项预览并给出完整计数。"
 				},
 				"work_ref": {
 					"en": "Work reference such as prj-1/W17 (from office_work_list, a notice or office_work_get)",
@@ -645,8 +660,8 @@
 		},
 		"office_work_publish": {
 			"description": {
-				"en": "Submit changed files. Paths are relative to this Work's working directory, delivery.root in office_work_get, which does not follow the shell's current directory. In scope repo/app, `export.py` becomes repo/app/export.py; the scope-prefixed path is equivalent. Repeated subdirectories are refused. The system notifies reviewers and sends feedback; no completion letter is needed.",
-				"zh": "交付本次修改的文件。路径相对本 Work 的工作目录 delivery.root（见 office_work_get），不随 shell 的当前目录变。`export.py` 在 scope 为 repo/app 时生成 repo/app/export.py，带 scope 前缀等价，重复子目录会被拒绝。系统通知审核者并投递退回理由，无需另发完成信。"
+				"en": "Submit changed files from the workspace registered for this Work's scope. In scope repo/app, `export.py` becomes repo/app/export.py; the scope-prefixed path is equivalent. The system notifies reviewers and sends feedback.",
+				"zh": "交付本 Work 的 scope 所登记工作区中的文件。scope 为 repo/app 时，`export.py` 生成 repo/app/export.py，带 scope 前缀等价。系统通知审核者并投递退回理由。"
 			},
 			"label": {
 				"en": "Publish",
@@ -654,8 +669,8 @@
 			},
 			"parameters": {
 				"files": {
-					"en": "Paths relative to delivery.root, e.g. `export.py` (ref repo/app/export.py). Delete with {path, op:\"delete\"}.",
-					"zh": "路径相对 delivery.root，如 `export.py`（结果 repo/app/export.py）。删除用 {path, op:\"delete\"}。"
+					"en": "Paths relative to the Work's scope, e.g. `export.py` (ref repo/app/export.py). Delete with {path, op:\"delete\"}.",
+					"zh": "路径相对 Work 的 scope，如 `export.py`（结果 repo/app/export.py）。删除用 {path, op:\"delete\"}。"
 				},
 				"final": {
 					"en": "Optional: true = final delivery (completes a no-review Work; a reviewed Work completes when the final submission passes). Omitted or false = an interim submission; the Work stays open.",
@@ -685,6 +700,10 @@
 				"zh": "读提交里那一份文件"
 			},
 			"parameters": {
+				"search": {
+					"en": "Search text in the submitted file; use the returned cursor to continue matches.",
+					"zh": "搜索提交文件中的文字；用返回的 cursor 继续查看匹配。"
+				},
 				"cursor": {
 					"en": "Previous page’s cursor (line number or long-line continuation); pass it unchanged.",
 					"zh": "上一页的 cursor（行号或长行续读标记），原样传回。"
@@ -722,8 +741,8 @@
 					"zh": "accept / return"
 				},
 				"evidence": {
-					"en": "Optional: locatable evidence {resource, location?, note?}",
-					"zh": "可选：有可定位依据时给 {resource, location?, note?}"
+					"en": "Optional evidence describing the reason for the review.",
+					"zh": "可选：说明审核依据。"
 				},
 				"reason": {
 					"en": "Reasoning; required for return",
@@ -741,8 +760,8 @@
 		},
 		"office_work_runnable": {
 			"description": {
-				"en": "List the Work you can still act on right now (the same predicate the system uses for assignment and the todo section of work get, under your existing rights). The optional unit only narrows by delivery unit — it is not an identity: a position you do not hold yields an empty result with a skipped note, and nothing is written.",
-				"zh": "列出此刻还能由你动手的 Work（判定与系统派工、work get 的 todo 段是同一条谓词，按既有权限返回）。可选的 unit 只影响按投递单元收窄，不是身份：传一个你不在任的岗位地址得到空结果加 skipped 说明，不写任何行。"
+				"en": "List up to 20 Work items you can act on now; count and skipped cover all, and omitted reports the rest. Long objectives are previews; use office_work_get for the full text. After handling items, call again; use office_work_list with assigned or review and its cursor to inspect further responsibilities. An optional unit narrows to your mailbox or a position you hold.",
+				"zh": "列出此刻可动手的最多 20 项 Work；count 和 skipped 覆盖全部，omitted 表示省略数。长目标只显示预览，全文用 office_work_get 查看。处理后再查；也可用 office_work_list 的 assigned 或 review 及 cursor 查看更多责任。unit 可收窄到本人邮箱或现任岗位。"
 			},
 			"label": {
 				"en": "The Work I can act on now",
@@ -802,8 +821,8 @@
 					"zh": "references：要移除的项 {\"seq\":…} 或 {\"relation_id\":…}（见 office_work_get）"
 				},
 				"reviewer": {
-					"en": "reviewer: the new reviewer; none for no review",
-					"zh": "reviewer：新审核者；不需要审核写 none"
+					"en": "reviewer: the new reviewer. Use none if there is no submission awaiting review.",
+					"zh": "reviewer：新审核者。没有待审提交时可用 none 设为免审。"
 				},
 				"scope": {
 					"en": "assign: optional delivery scope (a workspace reference name such as repo/app; a name, not a directory)",

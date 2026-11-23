@@ -9,7 +9,8 @@ enum ReadOp: String {
     case lookup = "office.lookup"
     case letter = "letter.read"
     case workList = "work.list"       // office_work_list
-    case workGet = "work.get"         // office_work_get
+    case workGet = "work.get"
+    case workRead = "work.read"         // office_work_get
     case requests = "request.list"
     case hosts = "release.status"
     case usage = "usage.read"
@@ -109,6 +110,20 @@ public struct WorkList: Sendable, Equatable {
     public let total: Int
     public let hasMore: Bool
     public let items: [WorkRow]
+    public let nextCursor: String?
+}
+
+public struct SubmissionFile: Sendable, Equatable, Identifiable {
+    public let ref: String
+    public let op: String
+    public let version: String?
+    public var id: String { ref }
+}
+
+public struct ArtifactPage: Sendable {
+    public let kind: String
+    public let content: String
+    public let cursor: String?
 }
 
 public struct SubmissionSummary: Sendable, Equatable {
@@ -116,6 +131,8 @@ public struct SubmissionSummary: Sendable, Equatable {
     public let state: String
     public let note: String
     public let createdAt: String
+    public let final: Bool?
+    public let files: [SubmissionFile]
 }
 
 public struct WorkDetail: Sendable, Equatable {
@@ -227,13 +244,26 @@ public struct OfficeReads: Sendable {
     }
 
     /// 老板可读的全部 Work（role=all），一页 200；还有更多时 `hasMore` 为真，不装作读全了。
-    public func workList() -> Outcome<WorkList> {
-        call(.workList, ["role": "all", "limit": 200]) { r in
+    public func workList(role: String = "all", projectRef: String? = nil, state: String? = nil, cursor: String? = nil, limit: Int = 200, reviewable: Bool? = nil) -> Outcome<WorkList> {
+        var params: [String: Any] = ["role": role, "limit": limit]
+        params["state"] = state
+        params["project_ref"] = projectRef
+        params["cursor"] = cursor
+        params["reviewable"] = reviewable
+        return call(.workList, params) { r in
             guard let rows = r["items"] as? [[String: Any]] else { return nil }
             let items = rows.compactMap(Self.workRow)
             guard items.count == rows.count else { return nil }
-            return WorkList(total: r["total"] as? Int ?? items.count, hasMore: r["has_more"] as? Bool ?? false, items: items)
+            let more = r["has_more"] as? Bool ?? false
+            let next = r["next_cursor"] as? String
+            guard !more || (next != nil && next != cursor) else { return nil }
+            return WorkList(total: r["total"] as? Int ?? items.count, hasMore: more, items: items, nextCursor: next)
         }
+    }
+
+    /// 服务端筛选本人及现任岗位实际可审核的提交，再按候选页续读。
+    public func reviewPage(cursor: String? = nil) -> Outcome<WorkList> {
+        workList(role: "review", state: "Submitted", cursor: cursor, limit: 20, reviewable: true)
     }
 
     public static func tokens(_ g: [String: Any]) -> (i: Int?, o: Int?, c: Int?) {
@@ -276,7 +306,21 @@ public struct OfficeReads: Sendable {
     static func submission(_ raw: Any?) -> SubmissionSummary? {
         guard let s = raw as? [String: Any], let ref = s["sub_ref"] as? String else { return nil }
         return SubmissionSummary(ref: ref, state: s["state"] as? String ?? "", note: s["note"] as? String ?? "",
-                                 createdAt: s["created_at"] as? String ?? "")
+                                 createdAt: s["created_at"] as? String ?? "", final: s["final"] as? Bool,
+                                 files: (s["files"] as? [[String: Any]] ?? []).compactMap { f in
+                                     guard let ref = f["ref"] as? String else { return nil }
+                                     return SubmissionFile(ref: ref, op: f["op"] as? String ?? "write", version: f["exact_version"] as? String)
+                                 })
+    }
+
+    public func artifactPage(subRef: String, path: String, cursor: String? = nil) -> Outcome<ArtifactPage> {
+        var args: [String: Any] = ["sub_ref": subRef, "path": path]
+        if let cursor { args["cursor"] = Int(cursor).map { $0 as Any } ?? cursor }
+        return call(.workRead, args) { r in
+            guard let kind = r["kind"] as? String else { return nil }
+            return ArtifactPage(kind: kind, content: (r["content"] as? String) ?? (r["note"] as? String ?? ""),
+                                cursor: (r["cursor"] as? Int).map(String.init) ?? (r["cursor"] as? String))
+        }
     }
 
     /// 读信箱。`target` 省略 = 自己的箱；给了就是直读那个地址的箱（老板可读，后端判权）。

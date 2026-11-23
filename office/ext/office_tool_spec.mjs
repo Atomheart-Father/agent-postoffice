@@ -111,7 +111,7 @@ export const OFFICE_TOOLS = [
 				properties: { letter_id: S("office_letter_read/letter_id"), to: S("office_letter_send/to"),
 					content_version: I("office_letter_revise/content_version", { minimum: 1 }),
 					...(action === "revise" ? { subject: S("office_letter_send/subject"),
-						need: S("office_letter_send/need"), body: S("office_letter_send/body") } : {}) } } };
+						need: S("office_letter_revise/need"), body: S("office_letter_send/body") } : {}) } } };
 	}),
 	{
 		name: "office_request_list", op: "request.list", write: false,
@@ -397,6 +397,7 @@ export const OFFICE_TOOLS = [
 				work_ref: S("office_work_read/work_ref"),
 				sub_ref: S("office_work_read/sub_ref"),
 				path: S("office_work_read/path"),
+				search: S("office_work_read/search"),
 				cursor: { anyOf: [{ type: "integer", minimum: 1 }, { type: "string" }], ...textFields("office_work_read/cursor") },
 				limit: I("office_work_read/limit"),
 			},
@@ -424,6 +425,7 @@ export const OFFICE_TOOLS = [
 			properties: {
 				to: S("office_letter_send/to"),
 				subject: S("office_letter_send/subject"),
+				intent: S("office_letter_send/intent", { enum: ["fyi", "request"] }),
 				need: S("office_letter_send/need"),
 				body: S("office_letter_send/body"),
 				reply_to: S("office_letter_send/reply_to"),
@@ -439,7 +441,7 @@ export const OFFICE_TOOLS = [
 				//   act_key（Core 与端点据它回放/同一封信）。新发一封就不填。
 				retry_ref: S("office_letter_send/retry_ref"),
 			},
-			required: ["subject", "need", "body"],
+			required: ["subject", "intent", "body"],
 			additionalProperties: false,
 		},
 	},
@@ -451,6 +453,8 @@ export const OFFICE_TOOLS = [
 			type: "object",
 			properties: {
 				include_archived: B("office_letter_list/include_archived"),
+				cursor: S("office_letter_list/cursor"),
+				limit: I("office_letter_list/limit"),
 			},
 			additionalProperties: false,
 		},
@@ -522,20 +526,6 @@ export const OFFICE_TOOLS = [
 
 export const TOOL_NAMES = OFFICE_TOOLS.map((t) => t.name);
 
-/** 这个工具在给定能力下要不要摆到桌面上（修复批 2 C）。
- *
- * `requires` 是 Core 的动作名（或 `governance`）。判据只有这一处：Pi 与 OC2 都调 `toolSpecs`。
- * **默认（没给能力）一律不给管理类工具** —— 会话启动时读不到"能不能"就不猜，宁可少给一个入口，
- * 也不给普通员工多一扇门。真正的授权永远在 Core 的动作事务里复核，这里只管工具表长短。
- */
-export function toolAllowed(tool, capabilities) {
-	const need = tool.requires;
-	if (!need) return true;
-	const c = capabilities || {};
-	if (c[need] === true) return true;
-	return (c.actions || {})[need] === true;
-}
-
 /** Localized, host-neutral JSON Schema (description_* collapsed to one `description`). */
 function localizeSchema(node, idx) {
 	if (Array.isArray(node)) return node.map((n) => localizeSchema(n, idx));
@@ -575,49 +565,11 @@ export function normLocale(loc) {
 	return isLocale(loc) ? loc : DEFAULT_LOCALE;
 }
 
-//: ★ W113：系统提示里那一段 Office 导航的**单处定义**（两个宿主适配器共用）。
-//
-//  以前只有 Pi 适配器（ext/office-tools.ts）自己写了 `const SECTION = "office_navigation"`，
-//  OC2 那边完全没有这段 —— 同一个员工在 Pi 里读得到"你是谁、什么岗位、待办、怎么沟通"，
-//  在 OC 里读不到。本票把章节名与"过期"补充语搬到共享 spec：**一处定义**，两个适配器引用；
-//  正文本身仍然只有一份 —— `office.context.navigation`（Python `navigation_text()`）。
-//  适配器只负责把它送进宿主的系统提示，**不重写、不裁剪、不另写模板**。
-export const NAV_SECTION = "office_navigation";
-
-//: 上下文过期的补充语（Pi 与 OC2 同一句）。这是把**已存在**的那句话挪到共享位置，
-//  不是新增模板：两个宿主对"这次没取到上下文"必须说同一句话，否则模型会读到两种口径。
-const NAV_STALE_SUFFIX = {
-	zh: "（Office 上下文可能不是最新：受控连接这次没有应答。）",
-	en: "(Office context may be outdated: the controlled connection did not answer.)",
-};
-
-/**
- * 把 `office.context.navigation` 的正文变成要写进系统提示的那段文字。
- * 两个适配器都走这里，避免各写一遍拼接（也避免一边加了"过期"提示、另一边忘了）。
- * @param {unknown} navigation 正文；不是非空字符串就返回 null（没有正文就不注入，不编空壳）
- * @param {string} locale 会话语言
- * @returns {{section: string, text: string, staleText: string} | null}
- */
-export function navSectionText(navigation, locale) {
-	if (typeof navigation !== "string" || navigation.length === 0) return null;
-	const suffix = NAV_STALE_SUFFIX[normLocale(locale)];
-	return { section: NAV_SECTION, text: navigation, staleText: navigation + "\n" + suffix };
-}
-
-/**
- * ★ W228（审计 #8）：`neutral: true` = **诚实的中性全集**：这套工具面本来就有哪些，全部如实声明。
- *
- * 为什么需要：能力**未知**时按 `toolAllowed` 过滤，会让管理类工具永远不出现（连"有这个入口"都
- * 看不到），而宿主又没实现真正按会话变化的列表（`listChanged:false`）⇒ 一旦早期请求算错，
- * 后面永远少三项。声明与授权是两件事：这里只决定"桌面上摆不摆这张牌"，
- * **能不能打由 Core 的动作事务复核**（`call()` 走的是同一条 Core op，拒就拒）。
- * 能力**已知**时仍按能力过滤（那是真实范围，不是猜）。
- */
-export function toolSpecs(locale = DEFAULT_LOCALE, capabilities = null, opts = {}) {
+/** The shared tool catalog. Core authorizes each operation when called. */
+export function toolSpecs(locale = DEFAULT_LOCALE) {
 	const idx = normLocale(locale) === "en" ? 1 : 0;
-	const neutral = opts && opts.neutral === true;
-	return (neutral ? OFFICE_TOOLS : OFFICE_TOOLS.filter((t) => toolAllowed(t, capabilities))).map((t) => ({
-		name: t.name, op: t.op, write: t.write, requires: t.requires,
+	return OFFICE_TOOLS.map((t) => ({
+		name: t.name, op: t.op, write: t.write,
 		label: t.label[idx], description: t.description[idx],
 		parameters: localizeSchema(t.parameters, idx),
 	}));

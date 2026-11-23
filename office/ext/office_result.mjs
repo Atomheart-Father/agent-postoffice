@@ -8,8 +8,6 @@ import { DEFAULT_LOCALE, normLocale } from "./office_tool_spec.mjs";
 // `office_tool_text.json`: no loader, no fs read.
 import RESULT_TEXT from "./office_result_text.json" with { type: "json" };
 
-// ★ W229 R3 / W436：`outcome_unknown` 不在表里（唯一产出方 `office_tools.callTool` 自带按 op 分开的
-//   message）；`view_required` / `view_ambiguous` 的话由 `office_tools.mjs::say()` 给。空白码不是覆盖。
 const GUIDE = Object.fromEntries(
 	Object.entries(RESULT_TEXT.guide).map(([k, e]) => [k, [e.zh, e.en]]));
 ;
@@ -40,13 +38,13 @@ export function sayReason(table, reason, locale, detail) {
 	return `${text}${en ? ` (${detail})` : `（${detail}）`}`;
 }
 
-// Fields the model never acts on: the adapter's concurrency baseline (view, the integer Work version), digests,
-// binding/source bookkeeping and the navigation text already injected as the Office section.
+// Fields the model never acts on: the adapter's concurrency baseline (the integer Work version), digests,
+// Binding/source bookkeeping and legacy fields from older Office servers.
 // ★ R3-W181.1: letter ids and timestamps are NOT bookkeeping. The old list also hid
 // `letter_id`, `created_at` and `recorded_at`; with the one-JSON rule that made letter.send's
 // exact id and work_get's timestamps disappear from the only copy. They stay: business ids and
 // times the employee has to act on, on every host (Pi/OC/MCP share this renderer).
-const INTERNAL = new Set(["ok", "view", "sub_digest", "binding",
+const INTERNAL = new Set(["ok", "sub_digest", "binding",
 	"sources", "navigation", "epoch_at_submit", "body_sha256"]);
 const QUIET_FALSE = new Set(["has_more", "truncated", "waiting"]);
 // an empty list that answers a question ("nothing", "no role here", "nothing you can do") stays visible
@@ -60,17 +58,16 @@ const KEEP_EMPTY = new Set(["items", "your_roles", "available_actions", "work_pa
  *  time a signature in this wave claimed something the body did not do (after the daemon client's
  *  and `runEntry`'s `timeoutMs`, and `writeActivity`'s `sessionID`).
  */
-export function compact(v, knowledge = false) {
-	if (Array.isArray(v)) return v.map((x) => compact(x, knowledge)).filter((x) => x !== undefined);
+export function compact(v) {
+	if (Array.isArray(v)) return v.map(compact).filter((x) => x !== undefined);
 	if (v && typeof v === "object") {
-		knowledge ||= typeof v.position === "string" && (Array.isArray(v.entries) && Array.isArray(v.snapshots)
-			|| ["add", "replace", "remove", "restore"].includes(v.op) && "entry_version" in v);
 		const out = {};
 		for (const [k, x] of Object.entries(v)) {
 			if (INTERNAL.has(k) || (k === "acted_at_ts" && v.acted_at)) continue;
-			if (k === "version" && Number.isInteger(x) && !knowledge) continue;   // Work CAS version
+			if (k === "version" && Number.isInteger(x) && typeof v.work_ref === "string"
+				&& !Object.hasOwn(v, "request_ref")) continue;   // Work CAS version, managed by the tool adapter
 			if (x === false && QUIET_FALSE.has(k)) continue;
-			const c = compact(x, knowledge);
+			const c = compact(x);
 			if (c === undefined) continue;
 			const rosterPositions = k === "positions" && Array.isArray(v.work_participants);
 			if (!KEEP_EMPTY.has(k) && !rosterPositions
@@ -161,7 +158,7 @@ export function exitCodeOf(result) {
 	if (state === OUTCOMES.unknown) return 4;
 	const code = (result && (result.error ?? result.code)) ?? "";
 	// 3 is "the line is not there", not "we refused something before sending it": a validation or
-	// view refusal is also `sent: false`, and calling that "unavailable" would hide a real answer.
+	// A validation refusal can also have `sent: false` and still be a real answer.
 	if (result && result.sent === false && (UNREACHABLE.has(code) || TRANSPORT_UNKNOWN.has(code))) return 3;
 	return 2;
 }

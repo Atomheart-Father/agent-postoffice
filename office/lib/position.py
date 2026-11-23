@@ -14,23 +14,25 @@ def _mod(filename):
     return mod
 
 
+def archived_recipients(conn, boxes):
+    if not boxes:
+        return []
+    return [row[0] for row in conn.execute(
+        "SELECT box FROM box_archive WHERE box IN (%s) ORDER BY box" % ",".join("?" * len(boxes)), tuple(boxes))]
+
+
 class PositionOperations:
+    _archived_recipients = staticmethod(archived_recipients)
+
     def _position_exists(self, conn, position):
-        """岗位存在 = 注册事实（`_is_position_address`），不按目录/前缀/在线推断，也不问 `resolver.role_exists`（它把人名箱也算真）。
-        撤了的岗位（信箱已归档）不再算：不能再绑、再撤；地址仍登记着，发来的信由归档那道门退回。"""
-        return self._is_position_address(conn, position) and not conn.execute(
-            "SELECT 1 FROM box_archive WHERE box=?", (position,)).fetchone()
+        """A position is usable until its mailbox is archived."""
+        return self._is_position_address(conn, position) and not archived_recipients(conn, (position,))
 
     def _position_spec(self, conn, position):
-        """岗位定义（职责 / 汇报岗），形状同 config 的 `aliases.<岗位>`：以 `position_holders` 的列为准，未填的回落到 config。"""
-        aliases = self._config().get("aliases")
-        spec = dict((aliases or {}).get(position) or {}) if isinstance(aliases, dict) else {}
+        """岗位职责和汇报线以登记的岗位事实为准。"""
         row = conn.execute("SELECT duties, reports_to FROM position_holders WHERE position=?", (position,)).fetchone()
-        if row is not None:
-            spec["role"] = {**(spec.get("role") or {}),
-                            **({"duties": json.loads(row["duties"])} if row["duties"] else {})}
-            spec["reports_to"] = row["reports_to"] or spec.get("reports_to")
-        return spec
+        return {"duties": json.loads(row["duties"]) if row and row["duties"] else [],
+                "reports_to": row["reports_to"] if row else None}
 
     def _positions_of(self, conn, actor):
         """"这人在哪些岗位"的唯一一份：本人是现任（`position_holders.holder`），或本人就是这个岗位的会话（actor = 岗位名）。"""
@@ -90,13 +92,20 @@ class PositionOperations:
         return {"ok": True, "person": person, "position_ref": held}
 
     def _position_retire_apply(self, conn, actor, position, cancel_work, act_key, now_ts):
-        """撤岗（调用方核过授权，同一事务）：名下有未完成的 Work 就拒绝（`cancel_work` = 同一动作里一并取消）；
-        授权与绑定随即失效，岗位信箱归档，再发来的信被退回并指向汇报岗。岗位行保留（现任清空），投递才认得出这个地址。"""
+        """先处理未完成的承办和审核，再在原事务内撤权、撤绑定、归档岗位邮箱。"""
         if not self._position_exists(conn, position):
             raise self.CoreError("not_found", "没有岗位 %r" % position, en="There is no position %r" % position, field="position")
         now, up = self._now(now_ts), self._position_spec(conn, position).get("reports_to")
-        open_work = [r[0] for r in conn.execute(
-            "SELECT work_ref FROM work WHERE assignee_ref=? AND state IN ('Active','Submitted') ORDER BY work_ref", (position,))]
+        duties = conn.execute("SELECT work_ref, assignee_ref FROM work WHERE state IN ('Active','Submitted')"
+                              " AND (assignee_ref=? OR reviewer_ref=?) ORDER BY work_ref", (position, position)).fetchall()
+        open_reviews = [ref for ref, assignee in duties if assignee != position]
+        if open_reviews:
+            raise self.CoreError("conflict", "请先为岗位 %r 的审核任务换审或单独取消：%s"
+                                 % (position, "、".join(open_reviews)),
+                                 en="Reassign review or explicitly cancel these Work items before retiring %r: %s"
+                                    % (position, ", ".join(open_reviews)),
+                                 reason_code="position_has_open_reviews", work=open_reviews)
+        open_work = [ref for ref, _ in duties]
         if open_work and not cancel_work:
             raise self.CoreError("conflict", "岗位 %r 名下还有未完成的 Work：%s；先改派，或带 cancel_work 一并取消"
                                  % (position, "、".join(open_work)),
@@ -104,8 +113,8 @@ class PositionOperations:
                                     % (position, ", ".join(open_work)),
                                  reason_code="position_has_open_work", work=open_work)
         for ref in open_work:
-            _mod("work_business.py").update(self.storage, conn, actor, work_ref=ref, action="cancel", reason="撤岗 " + position,
-                                            act_key="retire:%s:%s" % (position, ref), now_ts=now_ts, can_manage=lambda _p: True)
+            self._work_update_in_txn(conn, actor, work_ref=ref, action="cancel", reason="撤岗 " + position,
+                                     act_key="retire:%s:%s" % (position, ref), now_ts=now_ts, retiring_position=position)
         for (grant_ref,) in conn.execute("SELECT grant_ref FROM grants WHERE subject_ref=? AND revoked_at IS NULL",
                                          (position,)).fetchall():
             self._grant_revoke_in_txn(conn, actor, grant_ref, now)
@@ -301,7 +310,7 @@ class PositionOperations:
         return positions
 
     def _directory_contact(self, conn, address, *, include_holder=False):
-        if conn.execute("SELECT 1 FROM box_archive WHERE box=?", (address,)).fetchone():
+        if archived_recipients(conn, (address,)):
             return None
         row = conn.execute("SELECT project_ref, holder FROM position_holders WHERE position=?",
                            (address,)).fetchone()
@@ -317,7 +326,7 @@ class PositionOperations:
         return self.CoreError(e.code, e.zh, en=e.en, reason_code=e.reason_code, **e.fields)
 
     def _knowledge_gate(self, conn, actor, position):
-        """岗位的现任持有人，或汇报线（`aliases.<岗位>.reports_to` 逐级向上）上某一岗的现任，才能读写这个岗位的知识。"""
+        """岗位的现任持有人，或登记汇报线上某一岗的现任，才能读写这个岗位的知识。"""
         if not isinstance(position, str) or not position.strip():
             raise self._knowledge_refusal(_mod("position_knowledge.py").Refused("invalid_request", "position_required"))
         if not self._position_exists(conn, position):
@@ -372,9 +381,6 @@ class PositionOperations:
         pk, rs = _mod("position_knowledge.py"), _mod("resource.py")
         return [{**p, **pk.summary(conn, p["role"], self._position_spec(conn, p["role"])),
                  "resources": rs.items(conn, "position", p["role"], [p["role"]])} for p in positions]
-
-    def position_navigation_lines(self, positions, zh=True):
-        return _mod("position_knowledge.py").navigation_lines(positions, zh)
 
     def _position_welcome(self, conn, position, recipient, change, now_ts):
         pk = _mod("position_knowledge.py")

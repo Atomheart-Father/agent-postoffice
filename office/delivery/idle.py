@@ -89,6 +89,14 @@ def clear(conn, *, binding_id: str, generation: int, now_ts: float | None = None
     return due_mod.clear(conn, "idle_check", _subject(binding_id, generation), now_ts=now_ts)
 
 
+def reset_attempts(conn, *, binding_id, generation, now_ts=None):
+    """A committed Work action resets the budget, leaving any handed request intact."""
+    row = get(conn, binding_id, generation)
+    if row and row["state"] == "armed" and row["payload"].get("attempts"):
+        due_mod.set_payload(conn, "idle_check", row["subject_ref"],
+                            {**row["payload"], "attempts": []}, now_ts=now_ts)
+
+
 def _attempts(conn, binding_id: str, generation: int) -> list:
     row = get(conn, binding_id, generation)
     if row is None:

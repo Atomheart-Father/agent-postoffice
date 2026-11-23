@@ -4,7 +4,7 @@ import {tail} from './office_claude_usage.mjs';
 
 export async function reportCodexUsage(core, event) {
   const {session_id: session, turn_id: turn, transcript_path: path} = event;
-  if (event.hook_event_name !== 'PostModelRequest' || typeof session !== 'string' ||
+  if (typeof session !== 'string' ||
       typeof turn !== 'string' || !turn || typeof path !== 'string') return;
   const rollout = basename(path).replace(/_[\da-f-]{36}\.jsonl$/i, '.jsonl');
   if (!rollout.endsWith(`-${session}.jsonl`)) return;
