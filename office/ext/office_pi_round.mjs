@@ -142,7 +142,7 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
       const out = await sock.serialRequest({op: `host.serial.${op}`, ...(state ? {state} : {})});
       if (!out || out.ok === false) {
         const error = Error('serial state unknown');
-        error.serialReadDisconnected = op === 'read' && (['socket_error', 'socket_closed'].includes(out?.error)
+        error.serialReadRetryable = op === 'read' && (['socket_error', 'socket_closed', 'internal', 'busy'].includes(out?.error)
           || (out?.error === 'unauthorized_attempt' && out.credential_changed));
         error.serialWriteDisconnected = op === 'write' && ['socket_error', 'socket_closed'].includes(out?.error);
         throw error;

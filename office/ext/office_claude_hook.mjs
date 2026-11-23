@@ -11,6 +11,8 @@ import messages from '../delivery/messages.json' with {type: 'json'};
 
 const good = x => x && typeof x === 'object' && x.ok !== false && !x.refused;
 const nonempty = x => typeof x === 'string' && x.length > 0;
+const retryableHookFailure = x => x?.unknown === true || ['internal', 'busy'].includes(x?.code) ||
+  (x?.code === 'unauthorized_attempt' && x.credential_changed === true);
 
 async function reconnect(windowOpen, call, disconnected) {
   for (let delay = 250; !windowOpen || windowOpen(); delay = Math.min(delay * 2, 5000)) {
@@ -21,18 +23,18 @@ async function reconnect(windowOpen, call, disconnected) {
   return null;
 }
 async function locked(client, fn, windowOpen, retryAuth = false) {
-  while (true) {
+  for (let delay = 250; ; delay = Math.min(delay * 2, 5000)) {
     const acquired = await reconnect(windowOpen, () => client.acquireSerial(), result =>
-      ['busy', 'socket_error', 'socket_closed'].includes(result?.error) ||
+      ['busy', 'internal', 'socket_error', 'socket_closed'].includes(result?.error) ||
       (result?.error === 'unauthorized_attempt' && (retryAuth || result.credential_changed)));
     if (windowOpen && acquired?.error) throw Error('serial acquire: ' + acquired.error);
     if (acquired !== true) return null;
     try { return await fn(); }
     catch (error) {
-      if (!windowOpen || !error.serialReadDisconnected) throw error;
+      if (!windowOpen || !error.serialReadRetryable) throw error;
     } finally { await client.releaseSerial(); }
     if (!windowOpen()) return null;
-    await sleep(250);
+    await sleep(delay);
   }
 }
 async function writeCodexHandoff(client, state) {
@@ -270,7 +272,7 @@ async function receiveCodexHistory(client, descriptor, event) {
   return {tokens:received};
 }
 
-export async function handleClaudeHook({event, mode, descriptorPath, clientFactory = createPiRoundClient, waitMs = 60000, promptMatches = exactPrompt, nativeStart = false, stopCanStart = true, dueKey = null, collectUsage = true, absentMarker = null, codexNative = false, codexQueue, expectedOffer, windowOpen = () => true}) {
+export async function handleClaudeHook({event, mode, descriptorPath, clientFactory = createPiRoundClient, waitMs = 60000, promptMatches = exactPrompt, nativeStart = false, stopCanStart = true, dueKey = null, collectUsage = true, absentMarker = null, codexNative = false, codexQueue, expectedOffer, windowOpen = () => true, reportWaitError = () => {}}) {
   const d = readDescriptor(descriptorPath);
   const session = event?.session_id;
   if (!d || !nonempty(session) || d.hostSessionRef !== session) return {status: 'unknown', reason: 'session_or_descriptor'};
@@ -305,8 +307,18 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
     if (mode === 'wait' || mode === 'prepare') {
       if (!['SessionStart', 'Stop'].includes(event.hook_event_name)) return {status: 'unknown', reason: 'event'};
       const waitWindow = mode === 'wait' ? windowOpen : undefined;
-      const awaitFrames = options => reconnect(waitWindow, () => client.awaitFrames(options), got =>
-        got?.unknown === true || (got?.code === 'unauthorized_attempt' && got.credential_changed === true));
+      let lastWaitError;
+      const awaitFrames = options => reconnect(waitWindow, () => client.awaitFrames(options), got => {
+        // Waiting only reads delivery frames. A failed daemon read must not end the native waiter.
+        if (got?.code === 'internal' || got?.code === 'busy') {
+          const error = [got.code, got.message].filter(Boolean).join(': ').slice(0, 300);
+          if (error !== lastWaitError) reportWaitError(`await_retry: ${error}`);
+          lastWaitError = error;
+          return true;
+        }
+        if (good(got) && lastWaitError) { reportWaitError('await_resumed'); lastWaitError = undefined; }
+        return retryableHookFailure(got);
+      });
       const skip = new Set();
       while (true) {
         if (!windowOpen()) return {status: 'window_closed'};
@@ -463,7 +475,8 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
         if (codexNative && event.historical) return {status:'finished'};
         const ended = await client.hostEvent('turn_end', event.terminal_ts ?? Math.floor(Date.now()/1000),
           {turn_id: event.prompt_id, act_key: `${codexNative ? 'codex' : 'claude'}:turn_end:${event.prompt_id}`});
-        return good(ended) ? {status: codexNative ? 'idle_reported' : 'finished'} : {status: 'unknown', reason: 'turn_end'};
+        return good(ended) ? {status: codexNative ? 'idle_reported' : 'finished'} :
+          {status: 'unknown', reason: 'turn_end', retryStop: !codexNative && retryableHookFailure(ended)};
       }
       if (!s || s.session !== session) return {status: 'unknown', reason: 'no_pending'};
       if (mode === 'reject' && s.phase === 'handed') {
@@ -532,7 +545,8 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
           return {status: 'unknown', reason: 'turn_end'};
         if (!codexNative || !event.historical) {
           const fields = codexNative ? {turn_id:s.prompt, act_key:`codex:turn_end:${s.prompt}`} : {attempt_id:s.attempt};
-          if (!good(await client.hostEvent('turn_end', s.stopTs, fields))) return {status: 'unknown', reason: 'turn_end'};
+          const ended = await client.hostEvent('turn_end', s.stopTs, fields);
+          if (!good(ended)) return {status: 'unknown', reason: 'turn_end', retryStop: !codexNative && retryableHookFailure(ended)};
         }
         if (s.frame.kind === 'idle_started' && s.ackUnknown) {
           const ack = await client.wakeAck(s.unit, s.frame.due_key, s.attempt);
@@ -549,7 +563,7 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
 if (import.meta.main ?? (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href)) {
   const mode = process.argv[2];
   let descriptorPath;
-  const logExit = reason => {
+  const logWait = reason => {
     if (!descriptorPath || !['wait', 'stop'].includes(mode)) return;
     const dir = join(dirname(descriptorPath), '..', 'logs');
     try {
@@ -562,18 +576,29 @@ if (import.meta.main ?? (process.argv[1] && import.meta.url === pathToFileURL(re
     const input = JSON.parse(readFileSync(0, 'utf8'));
     descriptorPath = nativeDescriptor(null, 'claude', input.session_id);
     const parent = process.ppid;
-    const args = {event: input, descriptorPath, windowOpen: () => parent > 1 && process.ppid === parent};
+    const args = {event: input, descriptorPath, reportWaitError: logWait,
+      windowOpen: () => parent > 1 && process.ppid === parent};
     if (['wait', 'stop'].includes(mode))
-      process.once('SIGTERM', () => { logExit('SIGTERM'); process.exit(143); });
+      process.once('SIGTERM', () => { logWait('SIGTERM'); process.exit(143); });
+    let result;
     if (mode === 'stop') {
-      const done = await handleClaudeHook({...args, mode: 'observe'});
-      if (args.windowOpen() && done.status !== 'finished' && done.reason !== 'no_pending')
+      // The same native Stop must keep the same action parameters across daemon recovery.
+      input.terminal_ts ??= Math.floor(Date.now()/1000);
+      let retrying = false;
+      const done = await reconnect(args.windowOpen, () => handleClaudeHook({...args, mode: 'observe'}), outcome => {
+        if (!outcome?.retryStop) return false;
+        if (!retrying) logWait('stop_retry: turn_end');
+        retrying = true;
+        return true;
+      });
+      if (!args.windowOpen()) result = {status:'window_closed'};
+      else if (done.status !== 'finished' && done.reason !== 'no_pending')
         throw Error('stop remains unknown: ' + done.reason);
     }
-    const result = await handleClaudeHook({...args, mode: mode === 'stop' ? 'wait' : mode});
-    logExit(args.windowOpen() ? [result.reason || result.status, result.error].filter(Boolean).join(':') : 'window_closed');
+    result ??= await handleClaudeHook({...args, mode: mode === 'stop' ? 'wait' : mode});
+    logWait(args.windowOpen() ? [result.reason || result.status, result.error].filter(Boolean).join(':') : 'window_closed');
     if (result.status === 'handoff') { process.stderr.write(result.text + '\n'); process.exitCode = 2; }
     if (result.status === 'context') console.log(JSON.stringify({hookSpecificOutput:
       {hookEventName: input.hook_event_name, additionalContext: result.text}}));
-  } catch (e) { logExit(e.message); process.stderr.write('Office hook unknown: ' + e.message + '\n'); process.exitCode = 1; }
+  } catch (e) { logWait(e.message); process.stderr.write('Office hook unknown: ' + e.message + '\n'); process.exitCode = 1; }
 }

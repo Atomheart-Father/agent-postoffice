@@ -30,6 +30,7 @@ import re
 import secrets
 import signal
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -429,6 +430,13 @@ class Officed:
         write_lock = threading.Lock()
         tracked = []
 
+        def serial_error(exc):
+            if isinstance(exc, sqlite3.OperationalError):
+                return {"ok": False, "code": "internal", "message": str(exc)}
+            if isinstance(exc, core_mod.CoreError) and exc.code == "busy":
+                return {"ok": False, "code": "busy", "message": exc.message}
+            return {"ok": False, "code": "unauthorized_attempt"}
+
         def answer(line, req):
             try:
                 frame = self._one(line)
@@ -486,12 +494,12 @@ class Officed:
                                 result = {"ok": True, "result": {"acquired": True}}
                             else:
                                 result = {"ok": False, "code": "busy"}
-                        except Exception:
+                        except Exception as exc:
                             if held is not None:
                                 held.release()
                                 held = None
                                 holder = None
-                            result = {"ok": False, "code": "unauthorized_attempt"}
+                            result = serial_error(exc)
                     if isinstance(request.get("req_id"), (str, int)):
                         result["req_id"] = request["req_id"]
                     with write_lock:
@@ -534,8 +542,8 @@ class Officed:
                             finally:
                                 temp.unlink(missing_ok=True)
                             result = {"ok": True, "result": {"written": True}}
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        result = serial_error(exc)
                     with write_lock:
                         f.write(json.dumps(result, ensure_ascii=False) + "\n")
                         f.flush()
