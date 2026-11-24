@@ -59,7 +59,6 @@ core_mod = _load("office_core.py", "office_core_daemon")
 endpoint_mod = _load("r/endpoint.py", "office_endpoint_daemon")
 due_mod = _load("delivery/due.py", "office_delivery_due_daemon")
 worker_mod = _load("delivery/worker.py", "office_delivery_worker_daemon")
-idle_mod = _load("delivery/idle.py", "office_delivery_idle_daemon")
 dispatch_mod = _load("delivery/dispatch.py", "office_delivery_dispatch_daemon")
 selection_mod = _load("delivery/selection.py", "office_delivery_selection_daemon")
 
@@ -129,20 +128,29 @@ class Binding:
         return self.token
 
 
+_NATIVE_SEND_OPS = frozenset(("round.await", "round.begin", "round.record_payload", "host.serial.acquire"))
+
+
+def _native_send_version_error(req, binding):
+    version = req.pop("send_protocol", None)
+    guarded = (binding.host_session_ref and binding.ctx.get("surface") in ("codex", "claude", "pi", "opencode")
+               and req.get("op") in _NATIVE_SEND_OPS)
+    if guarded and (type(version) is not int or version != 1):
+        return {"ok": False, "code": "host_upgrade_required",
+                "message": "Reload the Office host adapter before automatic delivery."}
+
+
 #: `build_handlers` 的 kind → `worker.drain` 的形参后缀。只登记一次，别在调用处再拼。
-_DRAIN_ARG = {"batch": "batch", "tool_hang": "tool", "idle_check": "idle",
-              "wait_deadline": "wait", "model_silent": "model"}
+_DRAIN_ARG = {"batch": "batch", "tool_hang": "tool", "wait_deadline": "wait"}
 
 
-def build_handlers(core, *, observe=None, notify=None, begin_round=None,
-                   actionable=None, attempt_key=None, carried=None):
+def build_handlers(core, *, observe=None, notify=None, begin_round=None):
     """按宿主能给的东西装配到期处理器；给不出的那种就**不注册**（那一类到期项留在表里）。
 
     三个 handler 的业务判断全在 `delivery.worker` 里，这里只做接线：
     * `batch`：消费者是 Core 的 `due_consumers`（真已登记的读者 / 岗位现任），
       `begin_round` 只在**提交后**由宿主执行；
     * `tool_hang`：`observe` 是原生调用（事务外），`notify(conn,row)` 在同一事务里写系统信；
-    * `idle_check`：`actionable` 必须与 UI/`work.todo` 同一谓词，`attempt_key` 是原生尝试标识。
     """
     out = {}
     # 没有 `begin_round` 就不登记 batch：选信是投递策略（`delivery.selection.select`），
@@ -150,33 +158,12 @@ def build_handlers(core, *, observe=None, notify=None, begin_round=None,
     if begin_round is not None:
         out["batch"] = worker_mod.BatchHandler(consumers=core.due_consumers,
                                                begin_round=begin_round)
-    # `observe` 可以缺：daemon 没有原生句柄，可信进度就是 `host.event` 记在这一行上的事实
-    # （`ToolHandler` 用记录当观测）。真正缺不得的是 `notify` —— 没有它，"卡住"只能看见不能报。
-    if notify is not None:
+    if observe is not None and notify is not None:
         out["tool_hang"] = worker_mod.ToolHandler(observe=observe, notify=notify)
-    if actionable is None:
-        # 默认就用 Core 那一份谓词（`runnable_work`），避免"看门狗说有活、页面说没有"。
-        actionable = core.work_actionable
-    # ★ 32220768（真机 75 轮空转）：不在这里给默认 attempt_key。旧的默认把**行 version**
-    #   拼进标识，而 `settle` 自己每拍 `push_back`（version +1）⇒ 每拍一个新 key ⇒
-    #   `already_attempted` 永远拦不住、`MAX_ATTEMPTS` 永远凑不满。尝试标识是**段的属性**：
-    #   传 `attempt_key=None`，由 `delivery.idle.settle` 用段内持久计数发 `#1`、`#2`…，
-    #   只有真的起过（`record_attempt`）或关段才推进。宿主能给**跨拍稳定**的原生标识时
-    #   仍可显式传入。
-    if actionable is not None:
-        out["idle_check"] = worker_mod.IdleHandler(actionable=actionable,
-                                                   attempt_key=attempt_key)
     # ★ D3 第二段：「继续等到 X」到期重读。要的只有 Core 自己
     #   （升级信是 `system_letter`、判据全在 `delivery.worker`），所以无条件注册 ——
     #   没有它，`coord.respond(wait)` 的 deadline 到了没人读，经理永收不到升级。
     out["wait_deadline"] = worker_mod.WaitDeadlineHandler(core=core)
-    # ★ D2 心跳：「模型无动静」到期重读。窗口只在 Core 一处
-    #   （`MODEL_SILENT_SECONDS`，handler 自己从 core 取），这里只接线 —— 没有它，`round.started`
-    #   挂的窗口到点没人读，静默永远不成为一封信。
-    # `carried`：**本次服务是否在观测这个绑定**（`callable(binding_id) -> True/False/None`）。
-    # "数据库说它 active"与"这台 daemon 真的开着它的端点"是两件事：后者缺席时静默与否**未知**，
-    # 不发信、也不清行（handler 里 `False`/`None` 都只推后）。给不出知识就不传（当前口径）。
-    out["model_silent"] = worker_mod.ModelSilentHandler(core=core, carried=carried)
     return out
 
 
@@ -199,7 +186,7 @@ class Officed:
         self._wake = threading.Condition()
         self._next_due_at = None
         self._due_seq = 0
-        #: 投递层的到期处理器（`batch`/`tool_hang`/`idle_check`）；不注册就什么都不结算，
+        #: 投递层的到期处理器（`batch`/`tool_hang`）；不注册就什么都不结算，
         #: 到期行留在表里等宿主装上处理器 —— daemon 不替业务决定"这条该谁办"。
         self.handlers = dict(handlers or {})
         #: 提交后派发器（`delivery.dispatch.wake_host(...)`）；没装就只攒在内存里。
@@ -475,7 +462,10 @@ class Officed:
                 if isinstance(request, dict) and request.get("op") == "host.serial.acquire":
                     binding = self.resolve(request.get("session_token"))
                     result = {"ok": False, "code": "unauthorized_attempt"}
-                    if held is None and binding and binding.host_session_ref:
+                    upgrade = _native_send_version_error(request, binding) if binding else None
+                    if upgrade is not None:
+                        result = upgrade
+                    elif held is None and binding and binding.host_session_ref:
                         try:
                             with self.core._txn(read_only=True) as db:
                                 self.core._verify_trusted_ctx(db, binding.ctx)
@@ -598,6 +588,9 @@ class Officed:
         if b is None:
             return {"ok": False, "code": "unauthorized_attempt",
                     "message": "线路持有凭据缺失或不符（未进入 Core）"}
+        upgrade = _native_send_version_error(req, b)
+        if upgrade is not None:
+            return upgrade
         if req.get("op") == "identity.join":
             return self._issue_personal_binding(req, b)
         if req.get("op") in self._WAKE_OPS:
@@ -608,7 +601,16 @@ class Officed:
             return frame
         frame = self.ep.dispatch(req, dict(b.ctx))
         op, result = req.get("op"), frame.get("result") or {}
+        if frame.get("ok") and op == "host.event" and result.get("quota_recovered"):
+            peers = [p for p in self._bindings if p is b or (b.host_session_ref and p.host_session_ref == b.host_session_ref)]
+            units = {unit for peer in peers for unit in self._carried_units(peer)}
+            with self.core._txn() as conn:
+                for unit in units:
+                    row = due_mod.get(conn, due_mod.due_key("batch", unit))
+                    if row and row["state"] == "armed":
+                        due_mod.push_back(conn, "batch", unit, time.time())
         unchanged_due = (op == "usage.record" or (op == "host.event" and result.get("idempotent"))
+                         or (op == "round.authorize_send" and not result.get("rejected"))
                          or (op == "round.run.end" and req.get("native_ref") is not None and result.get("recorded") == []))
         if frame.get("ok") and not unchanged_due and not core_mod.read_only_request(req, b.ctx):
             self._rearm()
@@ -693,7 +695,7 @@ class Officed:
                         continue
                     with self.core._txn(read_only=True) as conn:
                         outstanding = conn.execute(
-                            "SELECT token,begun_ts, EXISTS(SELECT 1 FROM round_payload p WHERE p.token=round.token) AS captured, "
+                            "SELECT token,box,begun_ts,deadline_ts,state,run_state, EXISTS(SELECT 1 FROM round_payload p WHERE p.token=round.token) AS captured, "
                             "(SELECT CASE WHEN COUNT(*)=COUNT(rr.harness_ref) AND COUNT(DISTINCT rr.harness_ref)=1 "
                             " THEN MIN(rr.harness_ref) END FROM round_ref rr WHERE rr.token=round.token) AS native_ref "
                             "FROM round WHERE binding_id=? AND binding_gen=? AND channel='codex' AND "
@@ -702,15 +704,33 @@ class Officed:
                             " AND EXISTS(SELECT 1 FROM round_ref r JOIN letter_states l ON l.letter_id=r.ref AND l.box=r.box"
                             " WHERE r.token=round.token AND l.accepted_at IS NULL AND l.state='delivered')))",
                             (binding.binding_id, binding.generation)).fetchall()
-                    if not (outstanding or self._serial_path(binding).exists()
-                            or any(self.core.work_actionable(unit) for unit in units)
-                            or any(f.get('kind') == 'batch_round' for f in self._frames_of(units, binding))):
+                        outstanding = [row for row in outstanding if row['box'] in units]
+                        quota = worker_mod.quota_blocked(conn, binding.binding_id, binding.generation)
+                    now = time.time()
+                    observing = any(
+                        row["state"] == "begun" or row["run_state"] == "running"
+                        or (row["deadline_ts"] or row["begun_ts"]) > now for row in outstanding)
+                    if not (observing or self._codex_business_serial(binding, units)
+                            or (not quota and any(f.get('kind') == 'batch_round'
+                                                 for f in self._frames_of(units, binding)))):
                         continue
                     sessions.add(binding.host_session_ref)
                     subprocess.run(self._codex_command(binding, "poll", json.dumps([dict(row) for row in outstanding if row["captured"]])), env=self._codex_env(),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=20)
                 except Exception as exc:  # one unavailable binding must not stop other observations
                     self._log("Codex 原生回执读取失败 %s：%s" % (binding.host_session_ref, exc))
+
+    def _codex_business_serial(self, binding, units):
+        try:
+            state = json.loads(self._serial_path(binding).read_text(encoding="utf-8"))
+            if state.get("frame", {}).get("kind") == "idle_started":
+                return False
+            parts = [state, *state.get("appends", [])]
+            return any(not part.get("unit") or part["unit"] in units for part in parts)
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError, AttributeError, TypeError):
+            return True  # Unknown handoff remains available for receipt investigation.
 
     def _codex_command(self, binding, mode, *args):
         return ["node", str(_HERE / "ext/office_codex_delivery.mjs"), mode, binding.host_session_ref, *args]
@@ -746,37 +766,6 @@ class Officed:
                 now = time.time()
                 rows = [r for r in due_mod.due_rows(conn, now, kinds=kinds)
                         if self._handed.get(r["due_key"]) != r["version"] and self._retry_at(r) <= now]
-                for row in rows:
-                    key = row['payload'].get('asked_key') if row['kind'] == 'idle_check' else None
-                    locate = getattr(self.dispatch, 'frame_path', None)
-                    if not key or not callable(locate):
-                        continue
-                    try:
-                        if self.core._attempt_entry(conn, (row['binding_id'], row['binding_gen']), key):
-                            continue
-                        binding = next((b for b in self._bindings if b.binding_id == row['binding_id']
-                                        and b.generation == row['binding_gen']), None)
-                        if binding is None or not binding.host_session_ref:
-                            continue
-                        if binding.ctx.get('surface') in ('codex', 'claude'):
-                            try:
-                                self._serial_path(binding).lstat()
-                                continue
-                            except FileNotFoundError:
-                                pass
-                        unit = row['payload'].get('unit') or row['owner_ref']
-                        if row['payload'].get('launch_failed') == key and unit not in self._carried_units(binding):
-                            continue
-                        path = Path(locate(unit, 'idle_started', row['due_key']))
-                        path.lstat()
-                        if row['payload'].get('launch_failed') == key:
-                            frame = json.loads(path.read_text(encoding='utf-8'))
-                            if (frame.get('kind'), frame.get('unit'), frame.get('due_key'), frame.get('attempt_key')) == ('idle_started', unit, row['due_key'], key):
-                                row['_retry_pending'] = True
-                    except FileNotFoundError:
-                        row['_retry_pending'] = True
-                    except (OSError, TypeError, ValueError, AttributeError):
-                        pass
         except Exception as exc:                                   # noqa: BLE001
             self._log(f"读取到期任务失败，将重试：{exc}")
             return None
@@ -814,12 +803,10 @@ class Officed:
             kw = {"limit": 64, "rows": rows}
             if now_ts is not None:
                 kw["now_ts"] = now_ts
-            # `build_handlers` 的键是 kind（`batch`/`tool_hang`/`idle_check`），
+            # `build_handlers` 的键是 kind（`batch`/`tool_hang`），
             # `drain` 的形参是 `on_<kind>` —— 在这里换一次名，不让两边各记一套。
             for kind, handler in handlers.items():
                 if handler is not None:
-                    # `drain` 的形参不是 kind 的直译：`idle_check` → `on_idle`、
-                    # `tool_hang` → `on_tool`、`batch` → `on_batch`。
                     kw["on_" + _DRAIN_ARG.get(kind, kind)] = handler
             out = worker_mod.drain(self.store, **kw)
         except Exception as exc:                                   # noqa: BLE001
@@ -850,17 +837,7 @@ class Officed:
                 if plan.get("in_round"):
                     return row
                 return due_mod.clear_batch(conn, unit, expected_version=row["version"])
-            if kind == "idle_started":
-                key, due_key = action["attempt_key"], action["due_key"]
-                identity = (binding.binding_id, binding.generation)
-                if not self.core.native_attempt_started(conn, *identity, key):
-                    return None
-                applied = idle_mod.record_attempt(conn, attempt_key=key, due_key=due_key)
-                if applied is not None:
-                    self.core._attempt_patch(conn, identity, key, wake_receipt={"unit": unit, "due_key": due_key})
-                return applied
         return None
-
     def _log(self, message):
         """daemon 的诊断行：一律 stderr，不进业务库、不进信件。"""
         print("officed: %s" % message, file=sys.stderr, flush=True)
@@ -876,20 +853,6 @@ class Officed:
         with self.core._txn(read_only=True) as conn:
             is_position = self.core._is_position_address(conn, name)
         return (self.home / "positions" / name) if is_position else (self.home / name)
-
-    def _codex_launch_failure(self, action, binding):
-        if action.get('kind') != 'idle_started':
-            return
-        with self.core._txn() as conn:
-            row = due_mod.get(conn, action['due_key'])
-            attempt = action.get('attempt_key')
-            if (not row or row['state'] != 'armed' or row['binding_id'] != binding.binding_id
-                    or row['binding_gen'] != binding.generation or row['payload'].get('asked_key') != attempt
-                    or self.core._attempt_entry(conn, (binding.binding_id, binding.generation), attempt)):
-                return
-            payload = dict(row['payload']); payload['launch_failed'] = attempt
-            due_mod.push_back(conn, 'idle_check', row['subject_ref'], max(row['due_at'], time.time() + 30))
-            due_mod.set_payload(conn, 'idle_check', row['subject_ref'], payload)
 
     def _dispatch(self, actions):
         """提交后写持久帧，再启动对应的 Codex 消费者。"""
@@ -910,16 +873,15 @@ class Officed:
                 ref = binding.host_session_ref
                 if (binding.ctx.get("surface") == "codex" and ref and ref not in sent_to
                         and action.get("unit") in self._carried_units(binding)):
+                    with self.core._txn(read_only=True) as conn:
+                        if worker_mod.quota_blocked(conn, binding.binding_id, binding.generation):
+                            continue
                     sent_to.add(ref)
                     try:
                         subprocess.Popen(self._codex_command(binding, "send", action["due_key"]),
                                          env=self._codex_env(),
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
                     except OSError as exc:
-                        try:
-                            self._codex_launch_failure(action, binding)
-                        except Exception as record_exc:
-                            self._log("Codex 失败记账异常 %s：%s" % (action.get("due_key"), record_exc))
                         self._log("Codex 消费者未启动 %s：%s" % (action.get("due_key"), exc))
         if written:
             with self._wake:
@@ -937,7 +899,7 @@ class Officed:
         """读这个单元的唤醒帧，**不删**：删不删由回执决定（帧在 = 还没被确认取走）。"""
         out = []
         d = self.box_dir_for(unit) / "wake"
-        for path in sorted(d.glob("*.json"))[:max(1, int(limit))]:
+        for path in sorted(d.glob("batch_round-*.json"))[:max(1, int(limit))]:
             try:
                 out.append((path, json.loads(path.read_text(encoding="utf-8"))))
             except (OSError, ValueError):
@@ -955,7 +917,8 @@ class Officed:
 
     def _frames_of(self, units, binding, skip=()):
         frames = [frame for unit in units for _path, frame in self._wake_frames(unit, 64)
-                  if frame.get("due_key") not in skip and frame.get("attempt_key") not in skip]
+                  if frame.get("kind") == "batch_round" and frame.get("due_key") not in skip
+                  and f"{frame.get('due_key')}#{frame.get('due_version')}" not in skip]
         if any(frame.get("kind") == "batch_round" for frame in frames):
             with self.core._txn(read_only=True) as conn:
                 versions = {f.get("due_key"): due_mod.get(conn, f.get("due_key"))
@@ -963,13 +926,6 @@ class Officed:
             frames = [f for f in frames if f.get("kind") != "batch_round" or
                       (versions.get(f.get("due_key")) and versions[f["due_key"]]["state"] == "armed"
                        and versions[f["due_key"]]["version"] == f.get("due_version"))]
-        if any(frame.get("kind") == "idle_started" for frame in frames):
-            with self.core._txn(read_only=True) as conn:
-                current = idle_mod.get(conn, binding.binding_id, binding.generation)
-            frames = [f for f in frames if f.get("kind") != "idle_started" or
-                      (current and current["state"] == "armed" and
-                       f.get("due_key") == current["due_key"] and
-                       f.get("attempt_key") == current["payload"].get("asked_key"))]
         return frames
 
     #: `round.await` 的默认与上限（毫秒）。上限是**协议**而不是调度：宿主不许自己去轮询。
@@ -1045,16 +1001,6 @@ class Officed:
                     return True
         return False
 
-    def _idle_started(self, frame, binding):
-        key = frame.get("attempt_key")
-        if not isinstance(key, str) or not key:
-            return False
-        with self.core._txn(read_only=True) as conn:
-            current = idle_mod.get(conn, binding.binding_id, binding.generation)
-            return bool(current and current["due_key"] == frame.get("due_key") and
-                        self.core.native_attempt_started(conn, binding.binding_id,
-                                                         binding.generation, key))
-
     def _wake_op(self, req, binding):
         """Read the binding's wake frames or acknowledge an observed delivery."""
         asked = req.get("unit")
@@ -1096,31 +1042,10 @@ class Officed:
             if key is not None and (not isinstance(key, str) or not key):
                 return {"ok": False, "code": "invalid_request", "message": "attempt_key must be non-empty"}
             with self._frame_lock:
-                if key:
-                    with self.core._txn(read_only=True) as conn:
-                        try:
-                            self.core._verify_trusted_ctx(conn, binding.ctx)
-                        except core_mod.CoreError as e:
-                            return {"ok": False, "code": e.code, "message": str(e)}
-                        identity = (binding.binding_id, binding.generation)
-                        entry = self.core._attempt_entry(conn, identity, key) or {}
-                        receipt = entry.get("wake_receipt") or {}
-                    if receipt.get("unit") in units and receipt.get("due_key") == due_key:
-                        return {"ok": True, "result": {**receipt, "taken": True, "idempotent": True,
-                                                       "kind": "idle_started"}}
                 for unit in units:
                     for path, frame in self._wake_frames(unit, 64):
                         if frame.get("due_key") != due_key or (key and frame.get("attempt_key") != key):
                             continue
-                        if frame.get("kind") == "idle_started" and not self._idle_started(
-                                frame, binding):
-                            # 纯续工没有业务 round，但**这一次尝试必须真的起过**（同一 attempt_key、
-                            # 当前绑定代次）。只排队、只提交注入请求都不算。
-                            return {"ok": True, "result": {
-                                "taken": False, "kind": frame.get("kind"), "unit": frame.get("unit"),
-                                "due_key": frame.get("due_key"),
-                                "applied": {"cleared": False, "reason": "no_native_attempt",
-                                            "note": "这次续工尝试还没有原生起轮的记录"}}}
                         if frame.get("kind") == "batch_round" and not self._ack_ready(frame, binding):
                             # 不是"这一轮"发出的、或还没有原生受理/尝试：待办不清，帧留着。
                             return {"ok": True, "result": {
@@ -1210,6 +1135,13 @@ def main(argv=None):
         if unit == daemon.core._request_user() and not any(
                 binding.actor == unit and binding.host_session_ref for binding in daemon._bindings):
             return {"reason": "manual"}
+        role = conn.execute("SELECT host_session_ref FROM bindings WHERE binding_id=? AND state='active'"
+                            " AND revoked_at IS NULL", (unit,)).fetchone()
+        sessions = [b for b in daemon._bindings if b.actor in who and b.host_session_ref
+                    and (b.actor == unit or (role and role["host_session_ref"] == b.host_session_ref))
+                    and worker_mod.quota_bindings(conn, b.binding_id, b.generation)]
+        if sessions and all(worker_mod.quota_blocked(conn, b.binding_id, b.generation) for b in sessions):
+            return {"reason": "quota_blocked"}
         daemon.core._recover_rounds(conn, unit, time.time(), unsent_only=True)
         window, batch = daemon.core._selection_timing()
         plan = selection_mod.select(conn, unit, window=window, batch=batch)
@@ -1220,33 +1152,7 @@ def main(argv=None):
                 "reason": plan.get("reason"), "hold_until": plan.get("hold_until"),
                 "bad_created_at": plan.get("bad_created_at")}
 
-    def notify_tool_stall(conn, fired):
-        """工具卡住：系统信与 `fired` **同一个事务**（回滚一起回滚，不会"报了却没落地"）。"""
-        core_ = daemon.core
-        owner = conn.execute("SELECT actor FROM bindings WHERE binding_id=? AND generation=?"
-                             " AND state='active' AND revoked_at IS NULL",
-                             (fired["binding_id"], fired["binding_gen"])).fetchone()
-        if owner is None:
-            return None
-        from delivery.round import MESSAGES
-        actor = owner["actor"]
-        boxes = [m["role"] for m in core_._managers_of(conn, actor, core_._positions_of(conn, actor))]
-        return core_.system_letter(
-            letter_id="due-tool_hang-%s" % fired["due_key"].replace(":", "-")[-40:],
-            boxes=boxes or [core_._request_user() or actor], subject=MESSAGES["tool_stall_subject"] % actor,
-            body=MESSAGES["tool_stall_body"],
-            need="", kind="tool.due", fact_key="tool:" + fired["due_key"], conn=conn)
-
-    # `attempt_key` 不在这里传：`build_handlers` 已经有一个同形状的默认拼法（`idle:<due_key>:<版本>`）。
-    # 两处各写一种拼法，就是给"这次尝试是哪一次"留下两个答案。
-    # 供给集合 = `prepare()` 真的开过端点的那一份（一个 home 一个 daemon，见模块头）。
-    # 不在其中的绑定这一刻没有原生观测 ⇒ 答 `False`（"确定不承载"），handler 只推后不发信。
-    # ★ 这个 `False` 只在"供给就是全集"这个前提成立时诚实：若将来出现一个 home 多 daemon、
-    #   或供给可能是子集，这里必须改答 `None`（未知）—— `False` 与 `None` 在 handler 里
-    #   含义不同（前者是事实，后者是没有知识），别为了少写一个分支把未知说成不承载。
-    carried = lambda bid: any(b.binding_id == bid for b in daemon._bindings)
-    daemon.handlers = build_handlers(daemon.core, begin_round=begin_round,
-                                     notify=notify_tool_stall, carried=carried)
+    daemon.handlers = build_handlers(daemon.core, begin_round=begin_round)
     daemon.dispatch = dispatch_mod.wake_host(box_dir_for=daemon.box_dir_for)
 
     print("officed: home=%s socket=%s bindings=%d descriptors=%s"

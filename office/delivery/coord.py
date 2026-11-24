@@ -176,7 +176,7 @@ def respond(core, conn, actor, *, letter_id, choice, reason=None, deadline=None,
                   % (actor, work_ref, (waiting.get("reason") or "（未写）").strip(),
                      (waiting.get("on") or "（未写）").strip())),
             need="接手处理这件 Work 的阻塞", kind="work.delegated",
-            fact_key=fact + ":delegated", conn=conn, now_ts=at)
+            fact_key=fact + ":delegated", work_ref=work_ref, conn=conn, now_ts=at)
         return {**out, "sent": sent}
     if not isinstance(deadline, (int, float)) or float(deadline) <= at:
         return {"refused": "deadline_past"}

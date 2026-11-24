@@ -168,8 +168,8 @@
 				"en": "Read release status"
 			},
 			"description": {
-				"zh": "查看项目发版与窗口实载版本。老板省略项目可看全部有效绑定。未上报显示未知。",
-				"en": "Read releases and loaded versions. The operator may omit the project to see all active bindings. Unreported versions are unknown."
+				"zh": "查看项目发版与窗口实载版本。老板省略项目可看有效绑定、会话额度和每个信箱的待投及未决投递。未上报显示未知。",
+				"en": "Read releases and loaded versions. The operator may omit the project to see active bindings, session quota, pending and unresolved deliveries. Unreported versions are unknown."
 			},
 			"parameters": {
 				"project_ref": {"zh": "要查的项目。仅管理一个项目时可省略。", "en": "Project to inspect. May be omitted if you manage exactly one project."}
@@ -337,8 +337,8 @@
 		},
 		"office_letter_list": {
 			"description": {
-				"en": "List inbox metadata newest first, 50 per page by default. Archived letters are excluded unless requested. Pass next_cursor to continue; read the body with office_letter_read.",
-				"zh": "从最新开始列收件箱，默认每页 50 封且排除已归档信。传 next_cursor 续读，用 office_letter_read 读正文。"
+				"en": "List inbox metadata newest first, 50 per page by default. Archived letters are excluded unless requested. delivery_unresolved identifies retained unconfirmed sends; do not resend them automatically. Pass next_cursor to continue; read the body with office_letter_read.",
+				"zh": "从最新开始列收件箱，默认每页 50 封且排除已归档信。delivery_unresolved 标明保留的未决投递，不自动重发。传 next_cursor 续读，用 office_letter_read 读正文。"
 			},
 			"label": {
 				"en": "Inbox",
@@ -546,8 +546,8 @@
 		},
 		"office_whoami": {
 			"description": {
-				"en": "Check your identity, positions, reporting line, permissions, and to-dos.",
-				"zh": "查自己的身份、岗位、直属上级、权限和待办。"
+				"en": "Check your identity, positions, reporting line, permissions, to-dos, session quota, and delivery and unresolved counts for carried mailboxes. Unresolved sends are not retried automatically.",
+				"zh": "查自己的身份、岗位、直属上级、权限、待办、会话额度与各承载信箱的待投和未决投递；未决不自动重发。"
 			},
 			"label": {
 				"en": "Who am I",

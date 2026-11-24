@@ -35,8 +35,6 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     let pending: any = null;
     let closed = false;
     let officeRunning = false, officeStep = '', officeStarted = 0, stepStarted = 0;
-    let quotaAt = 0;
-    let resume: (() => void) | undefined;
     const controller = new AbortController();
     const loop = createWakeLoop({client, box: endpoint.endpoint.actor,
       diagFailure: (message: string) => console.error('OpenCode Office:', message), host: {
@@ -56,9 +54,7 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
       instanceId: () => `oc2:${endpoint.endpoint.instance}@${sessionID}`,
       acceptWhileBusy: true,
       conditionalOwner: true,
-      beforeBegin: async (_: unknown, frame: any) => {
-        if (frame.kind === 'idle_started') await ctx.session.wait({sessionID});
-        if (quotaAt) await new Promise<void>(resolve => { resume = resolve; });
+      beforeBegin: async () => {
         if (closed || !await ownsSession()) throw new Error('Office session is unavailable or belongs to another OpenCode location');
       },
       triggerTurn: async (text: string, details: any) => {
@@ -66,7 +62,7 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
         if (closed || signal?.aborted || !owned) throw Object.assign(new Error('Office session is unavailable or belongs to another OpenCode location'), {notSent:true});
         const current = pending = {text, details, messageID: '', events: [], ready: false};
         let admitted: any;
-        try { admitted = await ctx.session.prompt({sessionID, text, delivery: details?.officeWorkContinuation ? 'queue' : 'steer'}); }
+        try { admitted = await ctx.session.prompt({sessionID, text, delivery: 'steer'}); }
         catch (error) { if (pending === current) pending = null; throw error; }
         if (!admitted?.id || admitted.id !== current.messageID || admitted.sessionID !== sessionID || admitted.payload?.text !== text)
           { pending = null; throw new Error('OpenCode prompt admission did not match the submitted batch'); }
@@ -76,17 +72,15 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     }});
     const hook = await ctx.session.hook('prompt', async (event: any) => {
       if (pending && event.sessionID === sessionID && event.prompt?.text === pending.text) {
-        if (!pending.details?.officeWorkContinuation && (!event.messageID
-            || !await loop.submittedExact(pending.text, {}, event.messageID))) throw new Error('Office admission refused before enqueue');
+        if (!event.messageID || !await loop.submittedExact(pending.text, {}, event.messageID)) throw new Error('Office admission refused before enqueue');
         pending.messageID = event.messageID;
       }
     });
     if (signal?.aborted) { await hook.dispose(); await socket.close(); await client.close(); return; }
     const responseHook = await ctx.session.hook('http.response', async (event: any) => {
       if (event.sessionID !== sessionID || event.response?.status !== 402 || !await ownsSession()) return;
-      quotaAt = Date.now();
       try {
-        const result = await client.hostEvent('quota', quotaAt / 1000, {
+        const result = await client.hostEvent('quota', Date.now() / 1000, {
           act_key: `oc2:quota:http:${randomUUID()}`, status: 402,
         });
         if (result?.ok === false) console.error(`OpenCode quota: ${result.code || 'unknown'}`);
@@ -94,9 +88,6 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     });
     if (signal?.aborted) { await hook.dispose(); await responseHook.dispose(); await socket.close(); await client.close(); return; }
     const terminal = (event: any) => ['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(event.type);
-    const resumeQuota = (result: any, blockedAt: number) => {
-      if (blockedAt && quotaAt === blockedAt && result?.quota_recovered) quotaAt = 0;
-    };
     async function reportEnd(event: any) {
       officeRunning = false; officeStep = '';
       const closed = loop.turnClosed('');
@@ -108,7 +99,7 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     }
     const toolsInFlight = new Map<string, {revision: number; seen: Set<string>; skill?: string; name?: string}>();
     const toolNames = new Map<string, string>();
-    const stepUsage = new Map<string, {refs: Set<string>, model?: string}>();
+    const stepUsage = new Map<string, {refs: Set<string>, model?: string, started?: number, startId?: string, progress?: boolean}>();
     const fingerprint = (value: any): string => JSON.stringify(value, (_key, item) =>
       item && typeof item === 'object' && !Array.isArray(item)
         ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
@@ -139,14 +130,12 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
         state.seen.add(signature);
         state.revision += 1;
       }
-      const blockedAt = quotaAt;
       const result = await client.hostEvent(kind, event.created / 1000, {
         act_key: `oc2:tool:${event.id}`, turn_id: data.assistantMessageID, native_id: data.id,
         ...(kind === 'tool_progress' ? {version: String(state.revision)} : {}),
         ...(kind === 'tool_end' ? {outcome: event.type === 'session.tool.success' ? 'ok' : 'error'} : {}),
       });
       if (result?.ok === false) throw new Error(`OpenCode ${kind}: ${result.code || 'unknown'}`);
-      if (kind === 'tool_start') resumeQuota(result, blockedAt);
       if (kind === 'tool_end') {
         toolsInFlight.delete(key);
         if (event.type === 'session.tool.success' && ['office_work_publish', 'office_work_review'].includes(state.name || '')) {
@@ -176,8 +165,8 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     async function reportUsage(event: any) {
       const data = event.data, id = data?.assistantMessageID;
       if (data?.sessionID !== sessionID || !id) return;
-      if (event.type === 'session.step.started' && typeof data.model?.id === 'string') {
-        stepUsage.set(id, {refs: new Set(), model: data.model.id});
+      if (event.type === 'session.step.started') {
+        stepUsage.set(id, {refs: new Set(), model: typeof data.model?.id === 'string' ? data.model.id : undefined, started: event.created, startId: event.id});
       }
       if (event.type !== 'session.step.ended'
           || !event.id || !Number.isFinite(event.created) || !await ownsSession()) return;
@@ -205,7 +194,6 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
       if (event.type === 'session.step.ended' && data.assistantMessageID === officeStep) officeStep = '';
       if (event.type === 'session.text.delta' && officeRunning && officeStep && data.assistantMessageID === officeStep
           && typeof event.id === 'string' && event.id && Number.isFinite(event.created) && event.created >= stepStarted
-          && (!quotaAt || event.created > quotaAt)
           && typeof data.delta === 'string' && data.delta && await ownsSession())
         await loop.modelProgress({turnId:officeStep});
     }
@@ -216,16 +204,14 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
         while (current.events.length) {
           const event = current.events.shift();
           if (event.type === 'session.inbox.delivered' && event.data?.inboxID === current.messageID) {
-            if (await loop.agentStart({}, {pendingAttemptKey: current.details?.attempt_key})) {
+            if (await loop.agentStart({})) {
               officeRunning = Number.isFinite(event.created); officeStarted = event.created; officeStep = '';
               if (pending === current) pending = null;
             }
           } else if (terminal(event)) {
-            await reportEnd(event);
-            if (pending === current && event.type === 'session.execution.interrupted' && event.data.reason === 'user'
-                && !current.details?.officeWorkContinuation && !quotaAt && !closed && await ownsSession()) {
-              await ctx.session.prompt({sessionID, id: current.messageID, text: current.text, delivery: 'steer'});
-            }
+            const late = loop.lateNativeRunning();
+            try { await reportEnd(event); }
+            finally { if (!late && pending === current) pending = null; }
           } else await reportProgress(event);
         }
       } finally { current.processing = false; }
@@ -233,7 +219,6 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     void (async () => {
       for await (const event of ctx.event.subscribe({signal: controller.signal})) {
         try {
-          if (!quotaAt && event.data?.sessionID === sessionID && terminal(event)) { resume?.(); resume = undefined; }
           const error = event.data?.error;
           if (event.type === 'session.execution.failed' && event.data?.sessionID === sessionID
               && ((error?.type === 'provider.quota' && error.status === 402)
@@ -245,17 +230,25 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
             });
             if (result?.ok === false) throw new Error(`OpenCode quota: ${result.code || 'unknown'}`);
           }
-          const blockedAt = quotaAt;
-          if (blockedAt && event.type === 'session.text.delta' && event.data?.sessionID === sessionID
-              && event.created > blockedAt && event.id && event.data.assistantMessageID
+          const step = stepUsage.get(event.data?.assistantMessageID);
+          if (event.type === 'session.text.delta' && event.data?.sessionID === sessionID
+              && event.id && step?.startId && !step.progress && Number.isFinite(step.started)
+              && Number.isFinite(event.created) && event.created >= step.started!
               && typeof event.data.delta === 'string' && event.data.delta.trim() && await ownsSession()) {
-            resumeQuota(await client.hostEvent('model_progress', event.created / 1000, {
-              act_key: `oc2:progress:${event.id}`, native_id: event.id, turn_id: event.data.assistantMessageID,
-            }), blockedAt);
+            const result = await client.hostEvent('model_progress', step.started! / 1000, {
+              act_key: `oc2:progress:${step.startId}`, native_id: step.startId, turn_id: event.data.assistantMessageID,
+            });
+            if (result?.ok !== false && !result?.unknown) step.progress = true;
           }
           await reportTool(event);
           await reportUsage(event);
           if (event.data?.sessionID === sessionID && terminal(event)) stepUsage.clear();
+          if (event.type === 'session.inbox.delivered' && event.data?.sessionID === sessionID
+              && event.data.inboxID && event.data.inboxID !== pending?.messageID
+              && await loop.lateNativeStart(event.data.inboxID, {})) {
+            officeRunning = Number.isFinite(event.created); officeStarted = event.created; officeStep = '';
+            continue;
+          }
           if (pending && event.data?.sessionID === sessionID) {
             pending.events.push(event);
             await drain(pending);
@@ -268,7 +261,7 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     loop.start({});
     const version = releaseVersion(import.meta.url)?.version ?? null;
     void client.hostEvent('loaded', Math.floor(Date.now() / 1000), {version});
-    return {office, close: async () => { closed = true; resume?.(); controller.abort(); loop.stop(); await hook.dispose(); await responseHook.dispose(); socket.close({final:true}); }};
+    return {office, close: async () => { closed = true; controller.abort(); loop.stop(); await hook.dispose(); await responseHook.dispose(); socket.close({final:true}); }};
 }
 export function createOfficePlugin(configuredHome?: string) { return {
   id: 'postoffice-delivery',

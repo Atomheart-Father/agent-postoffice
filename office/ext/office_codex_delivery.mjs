@@ -32,6 +32,12 @@ try {
     const timer = setTimeout(() => { timedOut = true; child.kill(); rl.close(); }, 10000);
     const call = (id, method, params) => child.stdin.write(JSON.stringify({id, method, params}) + '\n');
     async function enqueue() {
+      const permission = await handleClaudeHook({...options, mode:'authorize', expectedOffer:result.state?.offer});
+      if (permission?.allowed !== true || timedOut || child.exitCode !== null) {
+        if (permission && !permission.allowed && !permission.unknown) unsent = false;
+        finished = true;
+        return;
+      }
       nativeWrite = true;
       call(2, 'thread/queue/add', {threadId:ref, clientUserMessageId:marker, input:[{type:'text', text:result.text}]});
       if (result.state?.frame?.kind === 'batch_round')
@@ -41,13 +47,6 @@ try {
     let marker = result.text?.split('\n', 1)[0];
     call(1, 'initialize', {clientInfo: {name: 'office', version: '1'}, capabilities: {experimentalApi: true}});
     const stream = rl[Symbol.asyncIterator]();
-    async function exchange(id, method, params) {
-      call(id, method, params);
-      for (let next; !(next = await stream.next()).done;) {
-        const msg = JSON.parse(next.value);
-        if (msg.id === id) return msg.result;
-      }
-    }
     for (let next; !(next = await stream.next()).done;) {
       const msg = JSON.parse(next.value);
       if (msg.id === 1 && msg.result) {
@@ -57,7 +56,8 @@ try {
       }
       if (msg.error) {
         console.error('office codex delivery: RPC', JSON.stringify(msg.error));
-        if (msg.id === 2) finished = (await handleClaudeHook({...options, mode: 'reject', expectedOffer:result.state?.offer}))?.status === 'rejected';
+        // A native error reply does not universally prove the queue write rolled back.
+        if (msg.id === 2) finished = true;
         break;
       }
       if (msg.id === 2 && msg.result?.queuedSubmission?.clientUserMessageId === marker)
@@ -84,20 +84,6 @@ try {
         if (!Array.isArray(msg.result?.data)) break;
         if (msg.result.data.some(x => x.clientUserMessageId === marker)) {
           await handleClaudeHook({...options, mode:'seen', expectedOffer:result.offer, event:{...options.event, client_id:marker}});
-          if (result.batch) await handleClaudeHook({...options, mode:'merge', expectedOffer:result.offer, codexQueue: {
-            read: async clientMarker => {
-              let cursor;
-              do {
-                const page = await exchange(8, 'thread/queue/list', {threadId:ref, limit:100, ...(cursor ? {cursor} : {})});
-                const item = page?.data?.find(entry => entry.clientUserMessageId === clientMarker);
-                if (item) return item;
-                cursor = page?.nextCursor;
-              } while (cursor);
-            },
-            write: (id, text) => exchange(9, 'thread/queue/update', {
-              threadId:ref, queuedSubmissionId:id, input:[{type:'text', text}],
-            }),
-          }});
           call(3, 'thread/turns/list', {threadId: ref, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded'});
           continue;
         }

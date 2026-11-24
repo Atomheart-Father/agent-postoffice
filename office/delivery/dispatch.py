@@ -1,7 +1,7 @@
 """Write one wake frame per unit and due key after the due transaction commits.
 
 A batch carries the text and refs selected by delivery. Its receipt checks
-the due version. Idle wake frames carry the attempt key. Atomic replacement
+the due version. Atomic replacement
 keeps one frame per key. The host reads without removing it and acknowledges
 only after native start.
 """
@@ -13,7 +13,6 @@ import os
 import re
 import time
 
-from delivery.round import MESSAGES
 
 #: Frame format. Bumped only if a field changes meaning; the consumer refuses what it cannot read
 #: rather than guessing, because a guessed wake is a wrong turn.
@@ -32,7 +31,7 @@ def frame_for(action: dict, *, at: float | None = None) -> dict:
     delivery that was made.
     """
     kind = action.get("kind")
-    if kind not in ("batch_round", "idle_started"):
+    if kind != "batch_round":
         raise ValueError("unknown wake action kind: %r" % (kind,))
     frame = {"v": FRAME_VERSION, "kind": kind, "unit": action.get("unit"),
              "due_key": action.get("due_key"), "at": float(at if at is not None else time.time())}
@@ -48,9 +47,6 @@ def frame_for(action: dict, *, at: float | None = None) -> dict:
                       # 这一帧对应的是哪一版到期行。回执按它做 CAS：帧写出之后又被重新 arm
                       # （又来一封信）时，旧帧的回执不能把新那一版一起清掉。
                       "due_version": action.get("due_version")})
-    else:
-        frame.update({"text": action.get("text") or MESSAGES["idle"],
-                      "attempt_key": action.get("attempt_key")})
     return frame
 
 

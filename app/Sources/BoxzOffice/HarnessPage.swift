@@ -120,9 +120,9 @@ private struct BindingCard: View {
             ForEach(addresses, id: \.self) { address in
                 Button { desk.openSeat(address) } label: {
                     let label = address.hasPrefix("@") ? address : tr("个人信箱", "Personal inbox")
-                    let pending = deliveryText(desk.deliveryPending(address))
+                    let pending = deliveryText(desk.deliveryAutomatic(address), inFlight: desk.deliveryInFlight(address), unresolved: desk.deliveryUnresolved(address))
                     Text(addresses.count == 1 ? pending : label + " · " + pending)
-                        .font(Theme.Font.small.weight(.semibold)).lineLimit(1)
+                        .font(Theme.Font.small.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
                 }
                 .buttonStyle(.plain).focusRing().padding(.top, 10)
             }

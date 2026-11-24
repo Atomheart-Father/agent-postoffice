@@ -161,6 +161,7 @@ _HANDLE_OPS = {
     "round.recover": "round_recover",
     "round.record_admission": "round_record_admission",
     "round.record_payload": "round_record_payload",
+    "round.authorize_send": "round_authorize_send",
     "round.payload": "round_payload",
 }
 
@@ -188,9 +189,6 @@ _ROUND_BASE = None
 
 #: `lib/mail.py` 是信件读面（list/read/accept/revise/retract/archive）的所属入口。
 _MAIL_BASE = None
-
-#: `delivery/idle.py`：空闲片段（D1）。解锁唤醒也走它，不另建一条续工路径。
-_IDLE_MOD = None
 
 #: `lib/handover.py`：任职交还的事实。
 _HANDOVER_BASE = None
@@ -379,26 +377,13 @@ def _work_module(filename, module_name):
     return mod
 
 
-def _idle_module():
-    """`delivery/idle.py`：空闲片段的登记与结算（解锁唤醒复用同一份）。"""
-    global _IDLE_MOD
-    if _IDLE_MOD is None:
-        spec = importlib.util.spec_from_file_location(
-            "office_delivery_idle_for_core", str(Path(__file__).resolve().parent / "delivery" / "idle.py"))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules.setdefault("office_delivery_idle_for_core", mod)
-        spec.loader.exec_module(mod)
-        _IDLE_MOD = mod
-    return _IDLE_MOD
-
-
 def _mail_module():
     """`lib/mail.py` 模块本身（要它的 `informational_need`，不是 mixin）。"""
     return _core_lib_module("mail.py")
 
 
 def _mail_base():
-    """按路径装载 `lib/mail.py`，拿到信件读面的 mixin（读只有这一份实现）。"""
+    """按路径装载 `lib/mail.py`，拿到信件读面的 mixin。"""
     global _MAIL_BASE
     if _MAIL_BASE is None:
         _MAIL_BASE = _core_lib_module("mail.py").MailOperations
@@ -1189,7 +1174,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 can_manage=partial(self._can_manage_project, conn, actor, now_ts=now_ts),
                 is_registered=self._is_registered_principal)
             if created:
-                self._reset_idle_attempts(conn, now_ts)
                 self._notify_work(conn, result, "assigned", objective, now_ts)
             return result
 
@@ -1215,7 +1199,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                                     is_registered=self._is_registered_principal, **fields)
         if before is None:
             return result
-        self._reset_idle_attempts(conn, now_ts)
         if action == "assign":
             if before["state"] == "Active" and before["assignee_ref"] != result["assignee"]:
                 self._notify_work(conn, result, "unassigned", reason, now_ts, recipient=before["assignee_ref"])
@@ -1256,35 +1239,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             result, changed = mod.withdraw(
                 self.storage, conn, actor, work_ref=work_ref, sub_ref=sub_ref,
                 expected_version=expected_version, act_key=act_key, now_ts=now_ts)
-            if changed:
-                self._reset_idle_attempts(conn, now_ts)
             return result
-
-    def _notified_work_of_attempt(self, conn, attempt_id, binding_id, generation):
-        """Read actionable items from the accepted attempt's actual round box."""
-        rows = conn.execute(
-            "SELECT DISTINCT l.letter_id, l.from_actor, l.meta_json, l.need, ls.box, ls.state, ls.state_reason,"
-            " ls.accepted_at, ls.category, ls.content_override_json"
-            " FROM round_payload p JOIN round r ON r.token=p.token"
-            " JOIN round_ref rr ON rr.token=r.token AND rr.box=r.box"
-            " JOIN letters l ON l.letter_id=rr.ref"
-            " JOIN letter_states ls ON ls.letter_id=rr.ref AND ls.box=rr.box"
-            " WHERE p.attempt_key=? AND p.binding_id=? AND p.binding_gen=?"
-            " AND r.binding_id=p.binding_id AND r.binding_gen=p.binding_gen AND r.state='accepted'"
-            " AND ls.accepted_at IS NOT NULL", (attempt_id, binding_id, generation)).fetchall()
-        facts = self._work_notice_facts(conn, [self._notice_work_ref(r["meta_json"]) for r in rows])
-        works, other = set(), False
-        for row in rows:
-            life = self._letter_lifecycle(row, row, facts=facts, box=row["box"])
-            ref = self._notice_work_ref(row["meta_json"])
-            if life["letter_class"] == "work_notice" and not life["terminal"]:
-                if ref:
-                    works.add(ref)
-                else:
-                    other = True
-            elif life["needs_reply"] and not life["terminal"]:
-                other = True
-        return sorted(works), other
 
     def release_record(self, actor, *, version, source_commit=None, work_refs, act_key,
                        now_ts=None):
@@ -1389,7 +1344,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             self.storage.record_action(conn, actor, "coord.respond", act_key, digest, out, now_ts)
             return out
 
-    def _notify_work(self, conn, result, event, detail, now_ts, *, recipient=None):
+    def _notify_work(self, conn, result, event, detail, now_ts, *, recipient=None, handover=None):
         from delivery.round import MESSAGES
 
         work_ref = result["work_ref"]
@@ -1403,6 +1358,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 "SELECT ref FROM inputs WHERE work_ref=? AND removed_at IS NULL ORDER BY seq", (work_ref,))]
             body += self.dispatch_knowledge(conn, who, row["project_ref"], materials)
         fact = "work-review:%s:%d" % (result["sub_ref"], result["version"]) if event == "review_requested" else "work-%s:%s:%d" % (event, work_ref, result["version"])
+        if handover is not None:
+            fact += ":handover:%s" % handover
         self.system_letter(
             letter_id="work-" + hashlib.sha256((fact + ":" + who).encode("utf-8")).hexdigest()[:16],
             boxes=[who], subject=copy["subject"] % work_ref, body=body,
@@ -1461,8 +1418,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         上游交付完成（`publish`/`review` 的 `unblocked`）、最后一项阻塞被撤（`work.update` 撤
         `waits_for` 时那项带 `because="dependency_withdrawn"`）——只差一句人话。
 
-        解锁 = "有事要你做"，走既有 `batch` 到期项（同一 `due` 行/合批/投递），不是 `idle_check`；
-        岗位承办时收件人是岗位单元，空缺也留得住。"空闲续工"是另一件事，走 `host.event{turn_end}`。
+        解锁走既有 `batch` 到期项；岗位承办时收件人是岗位单元，空缺也留得住。
         """
         items = [item for item in (unblocked or ())
                  if isinstance(item, dict) and item.get("work_ref")]
@@ -1501,30 +1457,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 kind="work.unblocked", fact_key=fact, work_ref=work_ref, conn=conn, now_ts=now))
         return sent
 
-    def work_actionable(self, unit):
-        """这个投递单元此刻有没有**能动手**的 Work —— 与 `work.todo`/看门狗同一谓词。
-
-        就是 `runnable_work`：不另写一份"能不能干活"的判断。岗位单元先取此刻的现任，没有现任
-        就是 `False`（信等合法现任，不是"有活没人"）。只读，自己开读事务（调用方在 gather 里
-        手边没有 conn）。
-        """
-        if not isinstance(unit, str) or not unit:
-            return False
-        mod = _work_module("work_runnable.py", "office_work_runnable")
-        with self._txn(read_only=True) as conn:
-            position = self._is_position_address(conn, unit)
-            holders = self._live_holders(conn, unit) if position else [unit]
-            for who in holders:
-                if mod.runnable_work(conn, who, unit if position else None, person=who).get("count"):
-                    return True
-        return False
-
-    def _reset_idle_attempts(self, conn, now_ts):
-        ctx = self._pending_ctx_ctx() or {}
-        if ctx:
-            _idle_module().reset_attempts(conn, binding_id=ctx["binding_id"],
-                                          generation=ctx["generation"], now_ts=now_ts)
-
     def work_publish(self, actor, *, work_ref, change_set=None, act_key, note="", replaces=None,
                      expected_version=None, final=False, now_ts=None, prepare=None):
         """交付一份：`prepare`（端点胶水）落字节前先跑 `work_flow.plan`，一个事务里写完。"""
@@ -1549,8 +1481,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             self._notify_unblocked(conn, result.get("unblocked"), upstream_ref=work_ref,
                                    now_ts=now_ts)
             advanced = before and result.get("version") == before["version"] + 1
-            if advanced:
-                self._reset_idle_attempts(conn, now_ts)
             if advanced and result.get("state") == "Submitted":
                 self._notify_work(conn, result, "review_requested", None, now_ts)
             return result
@@ -1566,7 +1496,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                                 decision=decision, reason=reason, evidence=evidence,
                                 act_key=act_key, now_ts=now_ts, operator=lambda: self._request_operator(conn, actor))
             if before and result.get("version") == before["version"] + 1:
-                self._reset_idle_attempts(conn, now_ts)
                 if result["decision"] == "return":
                     self._notify_work(conn, result, "returned", reason, now_ts)
                 elif result["state"] == self.WORK_ACTIVE:
@@ -1668,6 +1597,13 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 {"work_ref": item["work_ref"], "action": item["action"]}
                 for item in runnable["items"][:5]]}
             admin_approval = self._admin_approval(conn) if actor == self._request_user() else None
+            from delivery.worker import quota_state
+            trusted = self._pending_ctx_ctx() or {}
+            quota = (quota_state(conn, trusted["binding_id"], trusted["generation"])
+                     if trusted.get("binding_id") and trusted.get("generation") is not None else None)
+            from delivery.selection import delivery_projection
+            units = [actor, *self._carried_position_units(conn, trusted.get("binding_id"))] if trusted.get("binding_id") else [actor]
+            delivery = [{"unit": unit, **delivery_projection(conn, unit)} for unit in dict.fromkeys(units)]
         ctx = {
             "actor": actor,
             "locale": locale,
@@ -1683,6 +1619,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                              "note": "会话启动时能不能；动作发生时 Core 照常复核"},
             "todo": todo,
             "loaded": loaded,
+            "quota": quota,
+            "delivery": delivery,
         }
         if admin_approval is not None:
             ctx["admin_approval"] = admin_approval
@@ -2005,10 +1943,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         """适配层上报的一条原生观测。**只有受信适配器**能到这里：身份仍只来自 trusted_ctx。
 
         旧代次直接丢弃（不报错、不记账）——一条来自已换任窗口的观测不是“错”，是“不作数”。
-        D2 心跳：`round.started` 挂上「模型无动静」到期项（`model_silent`，产品 §17 初值 900 秒，
-        与 `tool_hang` 同一张 due 表/同一个 drain）；`model_progress`（真实文本增量，带 ext 手里
-        那个 `attempt_id`）只推后；`turn_end` 退休它。尝试没记过 ⇒ 缺事实路径不判（不挂不推不拒）。
-
         `quota` 的判定只问 `lib/watchdog.quota_decision`：可信耗尽阻止本窗口续投，
         经校验的后续真实执行才解除。状态按**这条
         binding 的当前代次**记在 `binding_state(binding_id, generation, 'quota')` —— **不是** due
@@ -2027,7 +1961,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                             en=f"host.event kind {kind!r} is not in the spec §3.2 closed set",
                             field="kind", allowed=list(self.HOST_EVENT_KINDS))
         # A host can identify output from a manual turn with its own message and event IDs.
-        # Only a recorded Office attempt can update the model-silence deadline.
         native_progress = kind == "model_progress" and attempt_id is None and all(
             isinstance(value, str) and value.strip() for value in (turn_id, native_id))
         if kind in ("round.accepted", "round.started", "model_progress") and not native_progress and not (
@@ -2080,11 +2013,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 result.update(self._resource_observe(conn, binding, resource_ref=resource_ref,
                                                      loaded=loaded, usable=usable, now_ts=now_ts))
             elif kind == "tool_start":
-                call = self._tool_call(binding, turn_id=turn_id, native_id=native_id)
-                previous = _delivery_due_module().get(conn, _delivery_due_module().tool_key(call))
                 result.update(self._tool_arm(conn, binding, ts=ts, turn_id=turn_id,
                                              native_id=native_id, version=version, now_ts=now_ts))
-                result["quota_recovered"] = previous is None and self._quota_activity(conn, binding, ts=ts)
             elif kind == "tool_progress":
                 result.update(self._tool_progress(conn, binding, ts=ts, turn_id=turn_id,
                                                   native_id=native_id, version=version,
@@ -2095,51 +2025,35 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 result["outcome"] = outcome or "unknown"
             elif kind in ("round.started", "round.accepted"):
                 result.update(self._native_attempt(conn, binding, kind=kind, attempt_id=attempt_id,
-                                                   ts=ts, turn_id=turn_id, terminal_ts=terminal_ts, now_ts=now_ts))
-                if kind == "round.started" and terminal_ts is None and result["native_attempt_recorded"]:
-                    result["silence"] = self._silence_arm(conn, binding, attempt_id=attempt_id,
-                                                          ts=ts, turn_id=turn_id, now_ts=now_ts)
+                                                   ts=ts, turn_id=turn_id, terminal_ts=terminal_ts))
             elif native_progress:
                 result["quota_recovered"] = self._quota_activity(conn, binding, ts=ts)
             elif kind == "model_progress":
-                # D2 心跳：只有**真实增量**续命（text/thinking delta；tool_* 不算产出）。没有 armed
-                # 的行就不推后也不新挂 —— `progress_model` 的 None 就是"没人看着"，不在此判静默。
                 entry = self._attempt_entry(conn, binding, attempt_id)
                 if not entry or entry.get("kind") != "round.started":
-                    # 缺事实路径不判：这次尝试没记过 ⇒ 不挂、不推、不拒（也绝不新挂一条）。
                     result.update({"attempt_known": False, "reason": "attempt_not_recorded"})
                 elif entry.get("turn_closed_at") is not None:
-                    # 乱序/重投的旧增量不能把已关的回合重新打开（否则一次传输重试就能让已结束的
-                    # run 在 900 秒后被判"静默"）：顺序按持久事实判，不按到达顺序。
+                    # A late delta from a closed attempt cannot prove fresh quota recovery.
                     result.update({"attempt_known": True, "stale": True,
                                    "reason": "before_turn_closed",
                                    "turn_closed_at": float(entry["turn_closed_at"])})
+                elif float(ts) <= float(entry.get("last_activity_ts") or entry.get("ts") or 0):
+                    result.update({"attempt_known": True, "stale": True, "reason": "before_last_activity"})
                 else:
-                    self._quota_activity(conn, binding, ts=ts)
-                    self._attempt_patch(conn, binding, attempt_id,
-                                        last_activity_ts=float(ts), turn_closed_at=None)
+                    result["quota_recovered"] = self._quota_activity(conn, binding, ts=ts, started_ts=entry.get("ts"))
+                    self._attempt_patch(conn, binding, attempt_id, last_activity_ts=float(ts))
                     result.update({"attempt_known": True, "last_activity_ts": float(ts)})
-                    result["silence"] = self._silence_extend(conn, binding, attempt_id=attempt_id,
-                                                             ts=ts, now_ts=now_ts)
             elif kind == "turn_end":
                 result["outcome"] = outcome or "unknown"
                 if not attempt_only:
                     self._quota_activity(conn, binding, ts=ts, closed=True)
-                which = self._model_attempt_for_clear(conn, binding, attempt_id, turn_id=turn_id, surface=surface)
-                if which:
-                    closed = self._attempt_patch(conn, binding, which, turn_closed_at=float(ts))
-                    result["silence"] = dict(self._silence_close(conn, binding, attempt_id=which,
-                                                                 ts=ts, now_ts=now_ts),
-                                             attempt_id=which)
-                    if closed is None:
-                        result["silence"]["attempt_recorded"] = False
-                else:
-                    result["silence"] = {"cleared": False, "reason": "no_single_armed_attempt"}
-                if not attempt_only:
-                    row = _idle_module().arm(conn, unit=actor, binding_id=binding[0],
-                                             generation=binding[1],
-                                             due_at=time.time() if now_ts is None else float(now_ts))
-                    result["idle_armed"] = [row["due_key"]]
+                if isinstance(attempt_id, str) and attempt_id:
+                    self._attempt_patch(conn, binding, attempt_id, turn_closed_at=float(ts))
+                elif surface == "codex" and turn_id:
+                    matches = [key for key, entry in self._attempt_book(conn, binding).items()
+                               if entry.get("turn_id") == turn_id and entry.get("turn_closed_at") is None]
+                    if len(matches) == 1:
+                        self._attempt_patch(conn, binding, matches[0], turn_closed_at=float(ts))
             self.storage.record_action(conn, actor, "host.event", act_key, digest, result, now_ts)
             return result
 
@@ -2184,7 +2098,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
              json.dumps(seen, ensure_ascii=False, sort_keys=True), time.time()))
 
     def _native_attempt(self, conn, binding, *, kind, attempt_id, ts, turn_id=None,
-                        terminal_ts=None, now_ts=None):
+                        terminal_ts=None):
         """Record a native start or merge its already-observed end in this transaction."""
         key = str(attempt_id)
         subject = re.match(r"^([^:#]+):([0-9]+)#", key)
@@ -2204,8 +2118,6 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                     # A live observation can fall back to receipt time when native startedAt is absent.
                     prior.update(ts=float(ts), turn_id=turn_id, turn_closed_at=float(terminal_ts))
                     self._attempt_save(conn, binding, seen)
-                    result["silence"] = self._silence_close(conn, binding, attempt_id=key,
-                                                            ts=terminal_ts, now_ts=now_ts)
             return result
         seen[key] = {"ts": float(ts), "turn_id": turn_id, "kind": kind,
                      "last_activity_ts": float(ts),
@@ -2235,88 +2147,12 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         entry = self._attempt_book(conn, binding).get(str(attempt_id))
         return dict(entry) if isinstance(entry, dict) else None
 
-    def _silence_subject(self, binding, attempt_id):
-        """`<binding>:<attempt>` —— 与 `tool_key` 同一拼法（原生身份，两段都不编）。"""
-        return "%s:%s" % (binding[0], attempt_id)
-
-    def _silence_payload(self, binding, attempt_id, *, ts, turn_id=None):
-        """到期项的 payload：`delivery.worker.ModelSilentHandler` 读的就是这两个键
-        （`attempt_id` / `binding_id`），外加代次与原生时刻供它重读同一段。"""
-        return {"attempt_id": str(attempt_id), "binding_id": binding[0],
-                "generation": int(binding[1]), "turn_id": turn_id, "armed_at": float(ts)}
-
-    def _silence_open(self, conn, binding, *, attempt_id, ts, turn_id=None, now_ts=None):
-        """挂上/重挂这一段到期项（截止 = **原生时刻** + 窗口，不是收到事件的时刻）。"""
-        return _delivery_due_module().arm(
-            conn, self.MODEL_SILENT_KIND, self._silence_subject(binding, attempt_id),
-            float(ts) + float(self.MODEL_SILENT_SECONDS), owner_ref=binding[0],
-            payload=self._silence_payload(binding, attempt_id, ts=ts, turn_id=turn_id),
-            binding_id=binding[0], binding_gen=int(binding[1]), now_ts=now_ts)
-
-    def _silence_arm(self, conn, binding, *, attempt_id, ts, turn_id=None, now_ts=None):
-        """起轮那一刻挂上「模型无动静」到期项。"""
-        row = self._silence_open(conn, binding, attempt_id=attempt_id, ts=ts,
-                                 turn_id=turn_id, now_ts=now_ts)
-        return {"due_key": row["due_key"], "due_at": row["due_at"], "state": row["state"]}
-
-    def _silence_extend(self, conn, binding, *, attempt_id, ts, now_ts=None):
-        """模型真的产出了：把截止推后到"这次产出 + 窗口"。
-
-        行不在 armed（已 clear / 已 fired / 从没挂过）⇒ **重新挂**而不是推后：`due.arm` 保留
-        `fire_count`（同一故障再触发只加次数），且 clear 过的段能回来。推后的是被观测到的那次
-        产出本身，不是猜一个小间隔。
-        """
-        due_mod = _delivery_due_module()
-        moved = due_mod.push_back(conn, self.MODEL_SILENT_KIND,
-                                  self._silence_subject(binding, attempt_id),
-                                  float(ts) + float(self.MODEL_SILENT_SECONDS), now_ts=now_ts)
-        if moved is not None:
-            return {"due_key": moved["due_key"], "due_at": moved["due_at"],
-                    "state": moved["state"], "extended": True}
-        row = self._silence_open(conn, binding, attempt_id=attempt_id, ts=ts, now_ts=now_ts)
-        return {"due_key": row["due_key"], "due_at": row["due_at"], "state": row["state"],
-                "extended": False, "rearmed": True}
-
-    def _silence_close(self, conn, binding, *, attempt_id, ts, now_ts=None):
-        """回合结束：这一段不再等模型产出 ⇒ 退休到期项（清不是 fire：没有静默这件事发生）。"""
-        due_mod = _delivery_due_module()
-        row = due_mod.clear(conn, self.MODEL_SILENT_KIND,
-                            self._silence_subject(binding, attempt_id), now_ts=now_ts)
-        return {"due_key": due_mod.due_key(self.MODEL_SILENT_KIND,
-                                           self._silence_subject(binding, attempt_id)),
-                "cleared": row is not None}
-
-    def _model_attempt_for_clear(self, conn, binding, attempt_id, *, turn_id=None, surface=None):
-        """`turn_end` 要关哪一段：事件带了 attempt_id 就用它（原生事实，最优先）。
-
-        Codex 未携带 attempt_id 时只认唯一匹配 turn_id 的原生尝试；其他宿主沿用恰好一条
-        armed model_silent 的原合同。没有确切候选就不动。
-        """
-        if isinstance(attempt_id, str) and attempt_id:
-            return attempt_id
-        if surface == "codex":
-            matches = [key for key, entry in self._attempt_book(conn, binding).items()
-                       if turn_id and entry.get("turn_id") == turn_id and entry.get("turn_closed_at") is None]
-            return matches[0] if len(matches) == 1 else None
-        due_mod = _delivery_due_module()
-        rows = conn.execute(
-            "SELECT subject_ref FROM due WHERE kind='model_silent' AND state='armed'"
-            " AND subject_ref LIKE ?", (binding[0] + ":%",)).fetchall()
-        if len(rows) != 1:
-            return None
-        return rows[0]["subject_ref"].split(":", 1)[1]  # subject = "<binding>:<attempt>"
-
     def native_attempt_started(self, conn, binding_id, generation, attempt_key):
         entry = self._attempt_entry(conn, (binding_id, generation), attempt_key)
         return bool(entry and entry.get("kind") == "round.started")
 
     #: 一次原生工具调用"多久没进展算卡住"：默认 10 分钟，可用环境变量覆盖（同一处定义）。
     TOOL_HANG_SECONDS = 600.0
-
-    #: 「模型无动静」窗口（§17 初值 900 秒）。**唯一一处**这个数字：`ModelSilentHandler` 从 Core
-    #: 取它；到期项与 `tool_hang` 同一张 `due` 表、同一个 drain、同一套版本 CAS。
-    MODEL_SILENT_SECONDS = 900.0
-    MODEL_SILENT_KIND = "model_silent"
 
     #: Valid native host events.
     HOST_EVENT_KINDS = ("tool_start", "tool_progress", "tool_end", "turn_end", "quota", "loaded",
@@ -2378,9 +2214,14 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         if current is None or not isinstance(seen, int) or revision <= seen:
             return {"due_key": due_mod.tool_key(call), "progress_revision": seen,
                     "advanced": False}
-        row = due_mod.advance(conn, "tool_hang", subject,
-                              float(ts) + float(self.TOOL_HANG_SECONDS),
-                              progress_revision=revision, now_ts=now_ts)
+        if current["state"] == "fired":
+            row = due_mod.arm_tool(conn, call, float(ts) + float(self.TOOL_HANG_SECONDS),
+                                   progress_revision=revision, owner_ref=binding[0], now_ts=now_ts)
+            conn.execute("UPDATE due SET fire_count=0 WHERE due_key=?", (row["due_key"],))
+        else:
+            row = due_mod.advance(conn, "tool_hang", subject,
+                                  float(ts) + float(self.TOOL_HANG_SECONDS),
+                                  progress_revision=revision, now_ts=now_ts)
         return {"due_key": (row or {}).get("due_key") or due_mod.tool_key(call),
                 "progress_revision": revision, "advanced": row is not None}
 
@@ -2448,6 +2289,23 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         `letter_id` 带段号，所以两段不会被“同名信件”判成重投。
         """
         watchdog = _core_lib_module("watchdog.py")
+        from delivery.worker import quota_bindings, quota_blocked
+        peers = quota_bindings(conn, *binding)
+        recovered = [v.get("recovered_at") for peer in peers for r in conn.execute(
+            "SELECT value_json FROM binding_state WHERE binding_id=? AND generation=? AND key='quota'"
+            " AND json_valid(value_json)", peer) for v in [json.loads(r[0])] if isinstance(v, dict)]
+        if float(ts) <= max((float(t) for t in recovered if type(t) in (int, float)), default=0):
+            return {"blocked": any(quota_blocked(conn, *peer) for peer in peers), "notified": False, "stale": True}
+        blocked = [peer for peer in peers if conn.execute(
+            "SELECT 1 FROM binding_state WHERE binding_id=? AND generation=? AND key='quota'"
+            " AND json_valid(value_json) AND json_extract(value_json,'$.blocked')=1", peer).fetchone()]
+        personal = [peer for peer in peers if conn.execute(
+            "SELECT 1 FROM bindings b WHERE b.binding_id=? AND b.generation=? AND NOT EXISTS"
+            " (SELECT 1 FROM position_holders p WHERE p.position=b.actor)", peer).fetchone()]
+        binding = blocked[0] if blocked else personal[0] if len(personal) == 1 else binding
+        owner = conn.execute("SELECT actor FROM bindings WHERE binding_id=? AND generation=?", binding).fetchone()
+        if owner:
+            actor = owner["actor"]
         at = time.time() if now_ts is None else float(now_ts)
         row = conn.execute(
             "SELECT value_json FROM binding_state WHERE binding_id=? AND generation=? AND key='quota'",
@@ -2461,6 +2319,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 state = {}
         was_blocked = bool(state.get("blocked"))
         episode = int(state.get("episode") or 0)
+        if type(state.get("recovered_at")) in (int, float) and float(ts) <= state["recovered_at"]:
+            return {"blocked": was_blocked, "notified": False, "episode": episode, "stale": True}
         decision = watchdog.quota_decision(
             was_blocked, status=status, limit_window=limit_window, reason=reason)
         out = {"blocked": decision.blocked, "notified": decision.notify,
@@ -2490,7 +2350,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                              (canonical_json(state), at, *binding))
             return out
         state = {"blocked": decision.blocked, "episode": episode,
-                 "status": status, "limit_window": limit_window, "observed_at": float(ts)}
+                 "status": status, "limit_window": limit_window, "observed_at": float(ts),
+                 "recovered_at": state.get("recovered_at")}
         conn.execute(
             "INSERT INTO binding_state(binding_id, generation, key, value_json, updated_at)"
             " VALUES(?,?,'quota',?,?) ON CONFLICT(binding_id, generation, key)"
@@ -2498,23 +2359,36 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             (binding[0], binding[1], canonical_json(state), at))
         return out
 
-    def _quota_activity(self, conn, binding, *, ts, closed=False):
-        row = conn.execute("SELECT value_json FROM binding_state WHERE binding_id=? AND generation=? AND key='quota'",
-                           binding).fetchone()
-        if not row:
-            return False
-        state = json.loads(row["value_json"] or "{}")
-        if not state.get("blocked") or state.get("observed_at") is None:
-            return False
-        if closed:
-            state["closed_at"] = max(float(ts), float(state.get("closed_at", 0)))
-        elif float(ts) > max(float(state["observed_at"]), float(state.get("closed_at", 0))):
+    def _quota_activity(self, conn, binding, *, ts, started_ts=None, closed=False):
+        from delivery.worker import quota_bindings
+        changed = False
+        for peer in quota_bindings(conn, *binding):
+            row = conn.execute("SELECT value_json FROM binding_state WHERE binding_id=? AND generation=? AND key='quota'",
+                               peer).fetchone()
+            if not row:
+                continue
+            try:
+                state = json.loads(row["value_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(state, dict):
+                continue
+            if not state.get("blocked") or state.get("observed_at") is None:
+                continue
+            if closed:
+                state["closed_at"] = max(float(ts), float(state.get("closed_at") or 0))
+                conn.execute("UPDATE binding_state SET value_json=?, updated_at=? WHERE binding_id=? AND generation=? AND key='quota'",
+                             (canonical_json(state), float(ts), *peer))
+                continue
+            last = max(float(state["observed_at"]), float(state.get("closed_at") or 0))
+            if float(ts) <= last or (started_ts is not None and float(started_ts) <= last):
+                continue
             state["blocked"] = False
-        else:
-            return False
-        conn.execute("UPDATE binding_state SET value_json=?, updated_at=? WHERE binding_id=? AND generation=? AND key='quota'",
-                     (canonical_json(state), float(ts), *binding))
-        return not closed
+            state["recovered_at"] = float(ts)
+            conn.execute("UPDATE binding_state SET value_json=?, updated_at=? WHERE binding_id=? AND generation=? AND key='quota'",
+                         (canonical_json(state), float(ts), *peer))
+            changed = True
+        return changed
 
 
 def _delivery_due_module():

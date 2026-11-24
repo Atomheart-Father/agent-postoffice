@@ -126,8 +126,10 @@ def install(package, home):
                 return backup
             time.sleep(.25)
         raise RuntimeError("Installed Office did not answer whoami")
-    except BaseException:
-        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
+    except BaseException as error:
+        stopped = subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
+        if stopped.returncode and not subprocess.run(["launchctl", "print", f"{domain}/{label}"], capture_output=True).returncode:
+            raise RuntimeError("Office install failed and could not stop the service; files were not restored") from error
         for i, path in enumerate(items):
             if path.is_dir() and not path.is_symlink():
                 shutil.rmtree(path)
@@ -135,8 +137,6 @@ def install(package, home):
                 path.unlink(missing_ok=True)
             if (backup / str(i)).exists() or (backup / str(i)).is_symlink():
                 copy(backup / str(i), path)
-        if loaded:
-            run("launchctl", "bootstrap", domain, str(launch))
         raise
 
 

@@ -8,6 +8,8 @@ See [the BoxZ Office project page](https://boxzstudio.xyz/projects/agent-postoff
 
 The `office/` directory contains the service and native host adapters. The `app/` directory contains the SwiftUI app. Both build from the same release tag.
 
+Codex Desktop automatic mail wake-up is experimental in this Preview. The native queue and CLI delivery path have been verified. Long model silence no longer sends mail or starts work.
+
 ## Download the macOS package
 
 Download the [prebuilt macOS ZIP](https://github.com/Atomheart-Father/BOXZ-Office/releases) for Apple silicon and Intel Macs and follow `INSTALL.txt` inside. The package runs on macOS 14 or later and needs Node.js and Python 3.12 or later. The app is ad-hoc signed and has not been notarized by Apple.

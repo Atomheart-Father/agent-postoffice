@@ -29,7 +29,7 @@ import time
 
 #: Spec §4.2's vocabulary. A row outside it is refused rather than written: a typo'd kind is a
 #: deadline nothing ever asks for, which looks exactly like "not due yet" for the rest of time.
-KINDS = ("batch", "tool_hang", "model_silent", "idle_check", "wait_deadline", "address_expiry",
+KINDS = ("batch", "tool_hang", "wait_deadline", "address_expiry",
          "cooldown")
 
 #: `armed` — waiting. `fired` — its time came and the judgement ran. `cleared` — the reason went

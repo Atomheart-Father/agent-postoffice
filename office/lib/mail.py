@@ -1,11 +1,13 @@
 import hashlib
 import json
 import re
+import time
+
 
 
 SYSTEM_MAIL_SENDER = "postoffice"
 _WORK_NOTICE_SYSTEMS = {
-    "work.blocked", "work.assigned", "work.returned", "work.unblocked", "work.stage_accepted",
+    "work.blocked", "work.delegated", "work.assigned", "work.returned", "work.unblocked", "work.stage_accepted",
     "work.review_requested", "work.unassigned", "work.review_unassigned", "work.cancelled",
 }
 
@@ -345,6 +347,9 @@ class MailOperations:
                     "terminal_reason": terminal_reason,
                     "needs_reply": needs_reply, "accepted": accepted}
 
+        alerts = (facts or {}).get("_derived_alerts", {})
+        if row["letter_id"] in alerts and not alerts[row["letter_id"]]:
+            return verdict(True, "alert_obsolete")
         if klass == "cc":
             # 抄送副本：写入即终结。它不是待投递项（`round_begin` 跳过 cc），不存在"投递前被抽走"；
             # 收件人在 Core/页面上照旧看得到这份副本。
@@ -435,7 +440,7 @@ class MailOperations:
         `(terminal_ids, reason_map, class_map, state_map, needs_reply_map)`，其中后两张
         覆盖**全部**行（不只是终结的）—— 提醒侧需要"还没终结、但本来就不用动手"的那一档。
         """
-        _facts = cls._work_notice_facts(conn, [cls._notice_work_ref(r["meta_json"]) for r in rows])
+        _facts = cls._mail_facts(conn, rows)
         done, why, kind = [], {}, {}
         state, needs_reply = {}, {}
         for r in rows:
@@ -579,7 +584,9 @@ class MailOperations:
                 heads = self._imported_header_lines(row["meta_json"], box)
                 _life = self._letter_lifecycle(
                     row, st,
-                    facts=self._work_notice_facts(conn, [self._notice_work_ref(row["meta_json"])]))
+                    facts=self._mail_facts(conn, [row]))
+                from delivery.selection import unresolved_refs
+                unresolved = letter_id in unresolved_refs(conn, box)
                 return {"ok": True, "box": box, "state": st["state"], "letter": {
                     "letter_id": row["letter_id"], "from": row["from_actor"],
                     "created_at": row["created_at"], "subject": c["subject"], "need": c["need"],
@@ -589,6 +596,7 @@ class MailOperations:
                     "headers": heads,
                     # ★ W362：这封信对收件人还要不要动作（派生值；事实仍是 state/state_reason）
                     **_life,
+                    "delivery_unresolved": unresolved,
                     "accepted_at": self._now_text(st),
                     "accepted_channel": (st["accepted_channel"]
                                          if "accepted_channel" in st.keys() else None),
@@ -626,7 +634,9 @@ class MailOperations:
             more = paged and len(rows) > limit
             if more:
                 rows.pop()
-            _facts = self._work_notice_facts(conn, [self._notice_work_ref(r["meta_json"]) for r in rows])
+            _facts = self._mail_facts(conn, rows)
+            from delivery.selection import unresolved_refs
+            unresolved = unresolved_refs(conn, box)
             out = []
             for r in rows:
                 if r["content_override_json"]:
@@ -642,6 +652,7 @@ class MailOperations:
                             "headers": heads,
                             # ★ W362：待办/计数只认这个派生值，不再让每个消费者自己拿 kind+need 推。
                             **self._letter_lifecycle(r, r, facts=_facts, box=box),
+                            "delivery_unresolved": r["letter_id"] in unresolved,
                             # 受理事实的原始字段（通道 + 时间）：`terminal` 的判据就在它上面，
                             # 读侧要核"凭什么说送到了"时不必再问一次。
                             "accepted_at": self._now_text(r),
@@ -696,8 +707,70 @@ class MailOperations:
             meta = json.loads(raw)
         except (TypeError, ValueError):
             return None
-        ref = meta.get("work_ref") if isinstance(meta, dict) else None
+        if not isinstance(meta, dict):
+            return None
+        ref = meta.get("work_ref")
+        if ref is None and meta.get("system") == "work.delegated":
+            parts = str(meta.get("fact_key") or "").split(":")
+            if len(parts) == 4 and parts[0] == "work-wait" and parts[-1] == "delegated":
+                ref = parts[1]
         return ref if isinstance(ref, str) and ref else None
+
+    @classmethod
+    def _mail_facts(cls, conn, rows):
+        """Batch current facts for Work notices and generated alerts in this read."""
+        facts = cls._work_notice_facts(conn, [cls._notice_work_ref(r["meta_json"]) for r in rows])
+        alerts, tools, quotas = {}, {}, {}
+        for row in rows:
+            if row["from_actor"] != cls.SYSTEM_MAIL_SENDER:
+                continue
+            try:
+                meta = json.loads(row["meta_json"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            kind, fact = meta.get("system"), meta.get("fact_key")
+            if kind not in ("tool.due", "model.silent", "quota.exhausted"):
+                continue
+            # Retired model-silence letters remain readable history only.
+            ref = row["letter_id"]
+            alerts[ref] = False
+            if not isinstance(fact, str):
+                continue
+            if kind == "tool.due" and fact.startswith("tool:tool_hang:"):
+                raw = fact[5:]
+                key, _, version = raw.rpartition("#")
+                # Versionless tool alerts predate verified stall observations.
+                if version.isascii() and version.isdecimal():
+                    tools[ref] = (key, version)
+            elif kind == "quota.exhausted":
+                quotas[ref] = fact
+        active_tools = set()
+        ids = list({key for key, _ in tools.values()})
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i+500]
+            q = ("SELECT d.due_key,d.version FROM due d JOIN bindings b"
+                 " ON b.binding_id=d.binding_id AND b.generation=d.binding_gen"
+                 " WHERE d.state='fired' AND b.state='active' AND b.revoked_at IS NULL"
+                 " AND d.due_key IN (%s)" % ",".join("?" * len(chunk)))
+            active_tools.update((key, str(version)) for key, version in conn.execute(q, chunk))
+        for ref, facts_key in tools.items():
+            alerts[ref] = facts_key in active_tools
+        if quotas:
+            for i in range(0, len(quotas), 500):
+                chunk = list(quotas.values())[i:i+500]
+                q = ("SELECT b.binding_id,b.generation,s.value_json FROM bindings b JOIN binding_state s"
+                     " ON s.binding_id=b.binding_id AND s.generation=b.generation AND s.key='quota'"
+                     " WHERE b.state='active' AND b.revoked_at IS NULL AND json_valid(s.value_json)"
+                     " AND ('quota-'||replace(b.binding_id,'/','_')||'-'||b.generation||'-'||json_extract(s.value_json,'$.episode')) IN (%s)"
+                     % ",".join("?" * len(chunk)))
+                valid = {"quota-%s-%s-%s" % (r["binding_id"].replace("/", "_"), r["generation"], json.loads(r["value_json"]).get("episode"))
+                         for r in conn.execute(q, chunk) if json.loads(r["value_json"]).get("blocked") is True}
+                for ref, fact in quotas.items():
+                    if fact in valid: alerts[ref] = True
+        facts["_derived_alerts"] = alerts
+        return facts
     @classmethod
     def _work_notice_facts(cls, conn, work_refs):
         """Batch the current Work, waiting segment and effective submission facts used in mail."""
@@ -750,7 +823,14 @@ class MailOperations:
             notice = "assigned" if system == "work.unblocked" else system.removeprefix("work.")
         if (archived and reason == "obsolete") or click.get("actionable") is False:
             return verdict(True, "work_obsolete")
-        f = (facts or {}).get(click.get("work_ref")) or {}
+        work_ref = click.get("work_ref")
+        if not work_ref and system == "work.delegated":
+            work_ref = cls._notice_work_ref(row["meta_json"])
+        f = (facts or {}).get(work_ref) or {}
+        if system == "work.delegated":
+            wait_key = str(click.get("fact_key") or "").removesuffix(":delegated")
+            if not f or f.get("state") != cls.WORK_ACTIVE or f.get("assignee") != box or f.get("wait_key") != wait_key:
+                return verdict(True, "work_obsolete")
         if notice in ("cancelled", "unassigned", "review_unassigned"):
             if (notice == "unassigned" and f.get("assignee") == box
                     or notice == "review_unassigned" and f.get("state") == "Submitted" and f.get("reviewer") == box):

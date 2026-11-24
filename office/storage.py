@@ -237,7 +237,7 @@ def _schema_lock(db_path):
 
 
 
-def _schema_is_current_readonly(db_path):
+def _schema_is_current_readonly(db_path, *, allow_missing_round_send=False):
     """Return whether the existing database already has the current schema.
 
     This path is read-only so ordinary opens do not take a schema write lock. Older or
@@ -271,7 +271,10 @@ def _schema_is_current_readonly(db_path):
             return False
         for table, columns in REQUIRED_COLUMNS.items():
             have_columns = {row[1] for row in conn.execute("PRAGMA table_info(%s)" % table)}
-            if not have_columns or not set(columns) <= have_columns:
+            missing = columns - have_columns
+            if allow_missing_round_send and table == "round":
+                missing -= {"send_id"}
+            if not have_columns or missing:
                 return False
         return True
     except sqlite3.Error:
@@ -474,7 +477,7 @@ CREATE INDEX IF NOT EXISTS project_refs_kind_ref ON project_refs(kind, ref);
 -- Existing rows are not rewritten. The partial unique index preserves one active attempt per (box, ref).
 CREATE TABLE IF NOT EXISTS round (
   token TEXT PRIMARY KEY, box TEXT NOT NULL, channel TEXT NOT NULL, proto TEXT,
-  binding_gen INTEGER, binding_id TEXT, state TEXT NOT NULL,
+  binding_gen INTEGER, binding_id TEXT, state TEXT NOT NULL, send_id TEXT,
   run_state TEXT, run_instance TEXT, run_ts REAL,
   begun_ts REAL NOT NULL, deadline_ts REAL,
   result TEXT, result_src TEXT, result_ts REAL,
@@ -686,7 +689,8 @@ class Storage:
     def _init_schema_locked(self):
         if self._ready:
             return
-        if _schema_is_current_readonly(self.db_path):
+        if _schema_is_current_readonly(self.db_path, allow_missing_round_send=True):
+            self._ensure_round_send_column()
             self._ensure_system_fact_index()
             self._ready = True
             return
@@ -757,6 +761,14 @@ class Storage:
                                en="Current Core schema failed verification after initialization")
         self._ensure_system_fact_index()
         self._ready = True
+
+    def _ensure_round_send_column(self):
+        with contextlib.closing(sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)) as conn:
+            if "send_id" not in {row[1] for row in conn.execute("PRAGMA table_info(round)")}:
+                conn.execute("BEGIN IMMEDIATE")
+                if "send_id" not in {row[1] for row in conn.execute("PRAGMA table_info(round)")}:
+                    conn.execute("ALTER TABLE round ADD COLUMN send_id TEXT")
+                conn.commit()
 
     def _ensure_system_fact_index(self):
         conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)

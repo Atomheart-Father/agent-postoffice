@@ -74,6 +74,17 @@ public struct RequestPage: Sendable, Equatable {
     }
 }
 
+public struct UnresolvedDelivery: Sendable, Equatable {
+    public let count: Int
+    public let letters: [String]
+    public let hasMore: Bool
+    static func parse(_ raw: Any?) -> UnresolvedDelivery? {
+        guard let r = raw as? [String: Any], let count = r["count"] as? Int,
+              let letters = r["letters"] as? [String], let more = r["has_more"] as? Bool else { return nil }
+        return UnresolvedDelivery(count: count, letters: letters, hasMore: more)
+    }
+}
+
 /// 一个活动绑定（release.status 的一项）。"有活动绑定"只表示已绑定；在线 / 运行中后端没有这个事实，永远是未知。
 public struct HostBinding: Sendable, Equatable, Identifiable {
     public let bindingID: String
@@ -83,6 +94,9 @@ public struct HostBinding: Sendable, Equatable, Identifiable {
     public let position: String?
     public var mailbox: String { position ?? actor }
     public let deliveryPending: Int?
+    public var deliveryAutomatic: Int? = nil
+    public var deliveryInFlight: Int? = nil
+    public var deliveryUnresolved: UnresolvedDelivery? = nil
     /// nil = 来源未知（后端给 null）；有值 = 后端给的一句话 / 一个状态词，原样显示。
     public let quota: String?
     public var id: String { bindingID }
@@ -93,12 +107,14 @@ public struct HostBinding: Sendable, Equatable, Identifiable {
         switch r["quota"] {
         case let s as String: q = s
         case let o as [String: Any]:
-            q = (o["blocked"] as? Bool).map { $0 ? tr("已耗尽", "Exhausted") : tr("可用", "Available") } ?? o["state"] as? String
+            q = (o["blocked"] as? Bool).map { $0 ? tr("已阻塞", "Blocked") : tr("未阻塞", "Not blocked") } ?? o["state"] as? String
         default: q = nil          // null / 缺 = 未知
         }
         return HostBinding(bindingID: bid, actor: actor, hostSessionRef: r["host_session_ref"] as? String,
                            harness: r["harness"] as? String, position: r["position"] as? String,
-                           deliveryPending: r["delivery_pending"] as? Int, quota: q)
+                           deliveryPending: r["delivery_pending"] as? Int,
+                           deliveryAutomatic: r["delivery_automatic"] as? Int, deliveryInFlight: r["delivery_in_flight"] as? Int,
+                           deliveryUnresolved: UnresolvedDelivery.parse(r["delivery_unresolved"]), quota: q)
     }
 }
 

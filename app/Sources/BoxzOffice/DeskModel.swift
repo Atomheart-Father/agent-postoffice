@@ -368,6 +368,18 @@ final class DeskModel: ObservableObject {
         hosts.value?.bindings.first { $0.mailbox == mailbox && $0.hostSessionRef != nil }?.deliveryPending
     }
 
+    func deliveryAutomatic(_ mailbox: String) -> Int? {
+        hosts.value?.bindings.first { $0.mailbox == mailbox && $0.hostSessionRef != nil }?.deliveryAutomatic
+    }
+
+    func deliveryInFlight(_ mailbox: String) -> Int? {
+        hosts.value?.bindings.first { $0.mailbox == mailbox && $0.hostSessionRef != nil }?.deliveryInFlight
+    }
+
+    func deliveryUnresolved(_ mailbox: String) -> UnresolvedDelivery? {
+        hosts.value?.bindings.first { $0.mailbox == mailbox && $0.hostSessionRef != nil }?.deliveryUnresolved
+    }
+
     /// 岗位使用逻辑地址，个人信箱沿用个人身份标签。
     func seatName(_ addr: String) -> String {
         if seatAddresses.contains("@" + addr) { return "@" + addr }

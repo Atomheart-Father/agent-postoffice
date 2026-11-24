@@ -196,15 +196,16 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     modelProgress?: (ev: any) => any; turnClosed?: (turnId: string) => any;
     reportUsage?: (entries: any[], actKey: string) => any} | null = null;
   let hostEvents: {observe: (kind: string, ev: any) => Promise<any>} | null = null;
+  let hostClient: any = null;
   let currentTurnId = '';
   const toolsInFlight = new Map<string, {turnId: string; v: number; last: string;
     started?: Promise<any>; ending?: Promise<void>; outcome?: 'ok' | 'error'}>();
   let wakeLoopBox = '';
-  let pendingAttemptKey = '';
   //: 本模块实例加载时（= 这一次回载的那一份产物）它的版本；没可信标识就为 null。
   const loadedVersion = releaseVersion(import.meta.url);
   const stopWakeLoop = () => {
     hostEvents = null;
+    hostClient = null;
     currentTurnId = '';
     toolsInFlight.clear();
     try { if (wakeLoop) wakeLoop.stop(); } catch { /* 关闭失败不许挡住退出 */ }
@@ -248,16 +249,10 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
           saveReceipt: (receipt: any) => host.appendEntry('office.receipt', receipt),
           canWake: () => ctx.isIdle?.() !== false,
           toolBoundary: true,
-          // Idle wakes use the native custom message. Active mail is inserted at a tool boundary.
           triggerTurn: async (batchText: string, details: Record<string, unknown>) => {
-            // 纯续工：把这次尝试的 attempt_key 记在这里，等原生 agent_start 时交回唤醒循环 ——
-            // 它只认这一个（精确关联），不认"下一个起点"。
-            pendingAttemptKey = String((details && (details as any).attempt_key) || '');
             const fn = (host as any).sendMessage;
             if (typeof fn !== 'function') throw new Error('host.sendMessage missing');
-            const customType = details?.officeWorkContinuation === true
-              ? 'office-work-continuation' : 'office-wake';
-            fn.call(host, {customType, content: batchText, display: true, details},
+            fn.call(host, {customType: 'office-wake', content: batchText, display: true, details},
               {triggerTurn: true, deliverAs: 'followUp'});
           },
           // ★ W439：这里原来只读原生 `getSessionFile()`，而它在真实形态里是**空串**（报路径走的是
@@ -281,6 +276,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
       const loop = wakeLoop;              // 局部引用：TS 的 null 收窄不跨闭包
       // 观测口与客户端同生共死：没连上就没有观测，也不替哪条事实编造身份（身份只由 socket 的可信 ctx 定）。
       hostEvents = createPiHostEvents({client});
+      hostClient = client;
       const resourceEvents = hostEvents;
       // Pi exposes the exact SKILL.md path for skills loaded into this session.
       const reportSkills = async () => {
@@ -401,6 +397,23 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     if (message?.role === 'toolResult') {
       finishTool(String(message.toolCallId || ''), Boolean(message.isError));
     }
+    if (message?.role !== 'assistant') return;
+    const at = Number.isFinite(message.timestamp) ? message.timestamp / 1000 : Date.now() / 1000;
+    if (message.provider === 'zai-coding-cn' && message.stopReason === 'error'
+        && Number.isFinite(message.timestamp) && typeof message.errorMessage === 'string') {
+      try {
+        const match = /^429:\s*(\{[\s\S]*\})\s*$/.exec(message.errorMessage);
+        const error = match && JSON.parse(match[1]);
+        if (String(error?.code) === '1310' && typeof error.message === 'string'
+            && /每周|每月/.test(error.message) && /使用上限/.test(error.message))
+          observe('quota', {ts:at, fields:{status:429, reason:'quota_exhausted',
+            act_key:`pi:quota:${currentTurnId || message.timestamp || randomUUID()}`}});
+      } catch { /* A malformed provider error is not quota evidence. */ }
+    } else if (['stop', 'length', 'toolUse'].includes(message.stopReason) && Number.isFinite(message.timestamp)
+        && currentTurnId && Array.isArray(message.content) && message.content.length) {
+      observeOutcome(() => hostClient?.hostEvent('model_progress', at,
+        {turn_id:currentTurnId, native_id:`pi:message:${currentTurnId}`}));
+    }
   });
   // ★ W4：这一回合的**真实**原生用量。`turn_end.messageEntryId` 是本回合已持久那条 assistant
   //   entry 的 id（实测：`message_end` 时还没有 id，`turn_end` 才有），`getEntry(id)` 里那个 `usage`
@@ -470,9 +483,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     await wakeLoop?.confirmToolBoundary(ctx);
   });
   on('agent_start', async (_event: any, ctx: any) => {
-    const attemptForStart = pendingAttemptKey;
-    pendingAttemptKey = '';
-    try { await wakeLoop?.agentStart?.(ctx, {pendingAttemptKey: attemptForStart}); }
+    try { await wakeLoop?.agentStart?.(ctx); }
     catch { /* Core 未确认则保留 unknown */ }
   });
   on('agent_settled', async (event: any, ctx: any) => {

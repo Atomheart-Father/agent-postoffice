@@ -176,6 +176,7 @@ class PositionOperations:
             raise self.CoreError("not_found",
                                  f"岗位 {position!r} 未注册（先 position.create，或经统一解析）",
                                  en=f"Position {position!r} is not registered", position=position)
+        holder = conn.execute("SELECT holder FROM position_holders WHERE position=?", (position,)).fetchone()[0]
         cur = self._position_active_binding(conn, position)
         prev_session = cur["host_session_ref"] if cur is not None else None
         replaced = cur is not None and prev_session != session_ref
@@ -197,11 +198,26 @@ class PositionOperations:
                 conn.execute("UPDATE position_holders SET prev_holder=CASE WHEN holder IS NOT ? THEN holder ELSE prev_holder END,"
                              " holder=?, updated_at=? WHERE position=?", (who, who, now, position))
                 self._gov_cache.clear()
+                if who != holder:
+                    self._position_inherited_work(conn, position, who, gen, now_ts)
             self._position_welcome(conn, position, position, "binding:%s" % gen, now_ts)
         return {"position": position, "binding_id": position, "generation": gen,
                 "session_ref": session_ref, "instance": instance,
                 "prev_session": prev_session, "replaced": replaced,
                 "changed": reg["changed"], "state": "active"}
+    def _position_inherited_work(self, conn, position, who, generation, now_ts):
+        runnable = _mod("work_runnable.py").runnable_work(conn, who, position, person=who, now_ts=now_ts)
+        from delivery.selection import candidates, FORMAL_KINDS
+        notices = {(row["meta"].get("work_ref"), row["meta"].get("system"))
+                   for row in candidates(conn, position)
+                   if row["created_at"] is not None and row["kind"] in FORMAL_KINDS}
+        for item in runnable["items"]:
+            event = "review_requested" if item["action"] == "review" else "assigned"
+            kinds = ("work.review_requested",) if event == "review_requested" else (
+                "work.assigned", "work.returned", "work.stage_accepted", "work.unblocked")
+            if not any((item["work_ref"], kind) in notices for kind in kinds):
+                self._notify_work(conn, item, event, None, now_ts, recipient=position, handover=generation)
+
     def position_facts(self, actor, *, all=False):
         """只读**地址投影**：全部已注册岗位的 `position / registered / box`（`box` = 权威逻辑地址 `positions/<岗位>`）。
 

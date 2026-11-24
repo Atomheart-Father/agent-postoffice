@@ -89,9 +89,13 @@ struct CountBlock: View {
     }
 }
 
-func deliveryText(_ count: Int?) -> String {
-    guard let count else { return tr("待投递 未知", "Delivery pending: unknown") }
-    return tr("待投递 \(count)", "Delivery pending: \(count)")
+func deliveryText(_ count: Int?, inFlight: Int?, unresolved: UnresolvedDelivery?) -> String {
+    let pending = count.map { tr("可自动待投 \($0)", "Automatic pending: \($0)") } ?? tr("可自动待投 未知", "Automatic pending: unknown")
+    let handoff = inFlight.map { tr(" · 交接中 \($0)", " · In handoff: \($0)") } ?? tr(" · 交接中 未知", " · In handoff: unknown")
+    guard let unresolved else { return pending + handoff + tr(" · 未决 未知", " · Unresolved: unknown") }
+    guard unresolved.count > 0 else { return pending + handoff + tr(" · 未决 0", " · Unresolved: 0") }
+    let refs = unresolved.letters.joined(separator: ", ") + (unresolved.hasMore ? " …" : "")
+    return pending + handoff + tr(" · 未决 \(unresolved.count)（\(refs)）", " · Unresolved: \(unresolved.count) (\(refs))")
 }
 
 /// 读口不是"读到了"时的单格显示：未知 / 未连接 / 被拒绝 各说各的，不画成 0。

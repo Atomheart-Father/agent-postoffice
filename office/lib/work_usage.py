@@ -10,7 +10,8 @@ import json
 import time
 from pathlib import Path
 
-from delivery.selection import pending_delivery_count
+from delivery.selection import delivery_projection
+from delivery.worker import quota_state
 from work_history import usage_sum
 from work_release import not_releaser, release_projects
 from work_result import may_read_work
@@ -180,15 +181,13 @@ class UsageOperations:
 
     def _release_windows(self, conn, latest=None, members=None, *, operator=False):
         members = json.dumps(members) if members is not None else None
-        windows = []
+        windows, quota_by_session = [], {}
         for row in conn.execute(
-                "SELECT b.binding_id, b.actor, b.generation, b.host_session_ref, bs.value_json,"
-                " (SELECT q.value_json FROM binding_state q WHERE ? AND q.binding_id=b.binding_id"
-                "  AND q.generation=b.generation AND q.key='quota') AS quota"
+                "SELECT b.binding_id, b.actor, b.generation, b.host_session_ref, bs.value_json"
                 " FROM bindings b LEFT JOIN binding_state bs ON bs.binding_id=b.binding_id"
                 " AND bs.generation=b.generation AND bs.key=? WHERE b.state='active' AND b.revoked_at IS NULL"
                 " AND (? IS NULL OR b.actor IN (SELECT value FROM json_each(?))) ORDER BY b.binding_id",
-                (operator, self.LOADED_KEY, members, members)):
+                (self.LOADED_KEY, members, members)):
             version = json.loads(row["value_json"] or "{}").get("version")
             window = {k: row[k] for k in ("binding_id", "actor", "generation")}
             window.update(version=version, known=version is not None,
@@ -200,8 +199,11 @@ class UsageOperations:
                 if ref and Path(ref).is_absolute() and Path(ref).suffix == ".jsonl":
                     harness = "pi"
                 position = "@" + row["actor"] if self._is_position_address(conn, row["actor"]) else None
+                if ref and ref not in quota_by_session:
+                    quota_by_session[ref] = quota_state(conn, row["binding_id"], row["generation"])
+                delivery = delivery_projection(conn, row["actor"]) if ref else {}
                 window.update(host_session_ref=ref or None, harness=harness, position=position,
-                              delivery_pending=pending_delivery_count(conn, row["actor"]) if ref else None,
-                              quota=json.loads(row["quota"] or "null"))
+                              delivery_pending=delivery.get("pending"), delivery_automatic=delivery.get("automatic"),
+                              delivery_in_flight=delivery.get("in_flight"), delivery_unresolved=delivery.get("unresolved"), quota=quota_by_session.get(ref))
             windows.append(window)
         return windows

@@ -189,13 +189,13 @@ private struct SeatRow: View {
                         if let submitted = party.submittedWorkCount, submitted > 0 { Text(tr("待审 \(submitted)", "In review \(submitted)")) }
                     } else { Text(tr("进行中 Work 未知", "Active Work unknown")) }
                 }
-                Text(deliveryText(desk.deliveryPending(mailbox)))
+                Text(deliveryText(desk.deliveryAutomatic(mailbox), inFlight: desk.deliveryInFlight(mailbox), unresolved: desk.deliveryUnresolved(mailbox)))
             }
             .font(Theme.Font.small).foregroundStyle(Theme.ink3)
             ForEach(personalMailboxes, id: \.self) { address in
-                if let count = desk.deliveryPending(address), count > 0 {
+                if (desk.deliveryPending(address) ?? 0) > 0 || (desk.deliveryUnresolved(address)?.count ?? 0) > 0 {
                     Button { desk.openSeat(address) } label: {
-                        Text(tr("个人待投递 \(count)", "Personal delivery pending: \(count)"))
+                        Text(tr("个人信箱 · ", "Personal inbox · ") + deliveryText(desk.deliveryAutomatic(address), inFlight: desk.deliveryInFlight(address), unresolved: desk.deliveryUnresolved(address)))
                             .font(Theme.Font.small).foregroundStyle(Theme.ink3).underline()
                     }
                     .buttonStyle(.plain).focusRing()

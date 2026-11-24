@@ -32,6 +32,7 @@ const OPS = {
   begin: "round.begin",
   recover: "round.recover",
   recordPayload: "round.record_payload",
+  authorizeSend: "round.authorize_send",
   recordAdmission: "round.record_admission",
   runBegin: "round.run.begin",
   settle: "round.settle",
@@ -45,7 +46,6 @@ const OPS = {
   ownerRevoke: "round.owner.revoke",
   hostEvent: "host.event",
   usageRecord: "usage.record",
-  workRunnable: "work.runnable",
 };
 
 /** 传输层自己产出的错误码：没有"业务答案"这回事，一律是**结果未知**（不是拒绝）。 */
@@ -106,6 +106,7 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
     // 裁决口径：`act_key` 是 `host.event` 的幂等键（只有它要）；`box` 不是任何 round.* 的字段 ——
     // 连接身份由**服务端**从 socket 的受信 ctx 定，客户端自报它本来就与"不从线路自报身份"相悖。
     const wire = { ...fields, op };
+    if (name === "begin" || name === "recordPayload" || name === "awaitRound") wire.send_protocol = 1;
     delete wire.retry_ref;
     if (op === "host.event") wire.act_key = fields.act_key || actKeyFor(op, fields);
     if (op.startsWith("round.") && name !== "ownerRegister" && name !== "roundState") {
@@ -136,7 +137,7 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
   return {
     /** 告诉客户端"我是哪个箱"：`round.*` 的 `box` 恒用它。 */
     setConnBox(box) { connBox = String(box || ""); return this; },
-    acquireSerial: () => sock.acquireSerial(),
+    acquireSerial: () => sock.acquireSerial({send_protocol:1}),
     releaseSerial: () => sock.releaseSerial(),
     async serialState(op, state) {
       const out = await sock.serialRequest({op: `host.serial.${op}`, ...(state ? {state} : {})});
@@ -166,13 +167,17 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
     recordPayload: (unit, roundToken, anchorRef, attemptKey, text) =>
       call("recordPayload", { unit, token: roundToken, ref: anchorRef, attempt_key: attemptKey, text }),
 
+    authorizeSend: (unit, token, attemptKey, sendId, {previousSendId, ownerToken} = {}) =>
+      call("authorizeSend", {unit, token, attempt_key:attemptKey, send_id:sendId,
+        previous_send_id:previousSendId, owner_token:ownerToken}),
+
     /**
      * **原生受理**回执：只认调用方给的原生尝试标识（`harnessRef`，Pi 自己的关联标识），
      * 持有绑定由传输侧的受控 ctx 证明 —— 这里**不自报** binding/identity。
      */
-    recordAdmission: (unit, roundToken, harnessRef, fallback, beforeEnqueue) =>
+    recordAdmission: (unit, roundToken, harnessRef, fallback, beforeEnqueue, sendId) =>
       call("recordAdmission", { unit, token: roundToken, harness_ref: harnessRef, fallback,
-        ...(beforeEnqueue ? {before_enqueue:true} : {}) }),
+        ...(beforeEnqueue ? {before_enqueue:true, send_id:sendId} : {}) }),
 
     /** **真正开始**：宿主的原生 start 已发生（同一尝试标识 + 持有绑定），再落 run-begin。 */
     runBegin: (unit, roundToken, ownerToken, harnessRef, nativeText) =>
@@ -188,7 +193,7 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
 
     endNative: (nativeRef) => call("endNative", {native_ref: nativeRef}),
 
-    roundState: (unit, token) => call("roundState", { unit, token }),
+    roundState: (unit, token, nativeRef) => call("roundState", { unit, token, native_ref: nativeRef }),
 
     /** Wait for the current binding's wake frames. `skip` belongs to the caller's in-flight work. */
     awaitFrames: ({waitMs, unit, skip, toolMail} = {}) => {
@@ -214,7 +219,6 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
 
     /** `host.event`：kind/ts 与业务字段由调用方给（路由与字段表是 runtime 的）。 */
     hostEvent: (kind, ts, fields = {}) => call("hostEvent", { kind, ts, ...fields }),
-    workRunnable: (unit) => call("workRunnable", unit ? {unit} : {}),
 
     /**
      * `usage.record`：只报**原生**用量。每一条的 `entry_id` 是宿主持久消息的 id（Core 按它去重），

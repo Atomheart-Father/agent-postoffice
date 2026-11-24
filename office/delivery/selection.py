@@ -113,7 +113,7 @@ def candidates(conn, box, *, only=None, exclude=None, own_round=None):
     drop = set(exclude or ())
     reserved = set(_reserved_refs(conn, box, own_round))
     from office_core import Core
-    facts = Core._work_notice_facts(conn, [Core._notice_work_ref(r["meta_json"]) for r in rows])
+    facts = Core._mail_facts(conn, rows)
     out = []
     for row in rows:
         ref = row["letter_id"]
@@ -123,7 +123,7 @@ def candidates(conn, box, *, only=None, exclude=None, own_round=None):
             continue
         meta = _meta(row["meta_json"])
         life = Core._letter_lifecycle(row, row, facts=facts, box=box)
-        if life["letter_class"] == "work_notice" and life["terminal"]:
+        if life["terminal"] and (life["letter_class"] == "work_notice" or life["terminal_reason"] == "alert_obsolete"):
             continue
         fields = letter_fields(row, row, ("subject", "need"))
         out.append({"ref": ref, "kind": _kind_of(row, meta, fields["need"]), "created_at": _epoch(row["created_at"]),
@@ -137,14 +137,44 @@ def candidates(conn, box, *, only=None, exclude=None, own_round=None):
 
 
 
-def pending_delivery_count(conn, box):
-    """Count queued or in-flight letters whose delivery is still pending."""
+def automatic_pending_count(conn, box):
+    """Current formal mail that can still be selected by the normal scheduler."""
     from delivery import due
-
     batch = due.get(conn, due.due_key("batch", box))
-    waiting = sum(item["kind"] in FORMAL_KINDS and item["created_at"] is not None
-                  for item in candidates(conn, box)) if batch and batch["state"] == "armed" else 0
-    return waiting + len(_reserved_refs(conn, box, include_unknown=False))
+    return sum(item["kind"] in FORMAL_KINDS and item["created_at"] is not None
+               for item in candidates(conn, box)) if batch and batch["state"] == "armed" else 0
+
+
+def pending_delivery_count(conn, box):
+    """Existing waiting and in-flight count; retained for existing consumers."""
+    return automatic_pending_count(conn, box) + len(_reserved_refs(conn, box, include_unknown=False))
+
+
+def unresolved_refs(conn, box, *, reserved=None, normal=None):
+    """Reserved sends without acceptance, including authorized but still in-flight."""
+    reserved = set(_reserved_refs(conn, box)) if reserved is None else reserved
+    normal = set(_reserved_refs(conn, box, include_unknown=False)) if normal is None else normal
+    unknown = reserved - normal
+    authorized = conn.execute(
+        "SELECT DISTINCT rr.ref FROM round_ref rr JOIN round r ON r.token=rr.token"
+        " JOIN letter_states s ON (s.box,s.letter_id)=(rr.box,rr.ref)"
+        " WHERE rr.box=? AND rr.ref_state='active' AND s.state='delivered' AND s.accepted_at IS NULL"
+        " AND r.state='begun' AND (r.send_id NOT IN ('', '-') OR"
+        " ((r.send_id IS NULL OR r.send_id='') AND ("
+        " EXISTS (SELECT 1 FROM round_payload p WHERE p.token=r.token) OR rr.harness_ref IS NOT NULL)))", (box,))
+    return unknown | {row[0] for row in authorized}
+
+
+def delivery_projection(conn, box):
+    """Keep the existing count while separating selectable work from uncertain sends."""
+    automatic = automatic_pending_count(conn, box)
+    reserved = set(_reserved_refs(conn, box))
+    normal = set(_reserved_refs(conn, box, include_unknown=False))
+    unresolved = unresolved_refs(conn, box, reserved=reserved, normal=normal)
+    letters = sorted(unresolved)
+    return {"pending": automatic + len(normal), "automatic": automatic,
+            "in_flight": len(normal - unresolved),
+            "unresolved": {"count": len(letters), "letters": letters[:20], "has_more": len(letters) > 20}}
 
 
 def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
@@ -206,13 +236,13 @@ def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
 
 
 def _reserved_refs(conn, box, own_round=None, *, include_unknown=True):
-    """Unaccepted handoffs, including Codex unknowns released by older versions."""
+    """Unaccepted handoffs, including ambiguous sends released by older versions."""
     rows = conn.execute(
         "SELECT rr.ref FROM round_ref rr JOIN round r ON r.token=rr.token"
         " JOIN letter_states s ON (s.box,s.letter_id)=(rr.box,rr.ref)"
         " WHERE rr.box=? AND rr.token IS NOT ? AND s.state='delivered' AND s.accepted_at IS NULL"
         " AND (? OR r.state<>'unknown')"
-        " AND (rr.ref_state='active' OR (r.channel='codex' AND r.state='unknown' AND NOT EXISTS"
+        " AND (rr.ref_state='active' OR ((r.send_id IS NULL OR r.send_id='') AND r.state='unknown' AND NOT EXISTS"
         " (SELECT 1 FROM round_ref newer WHERE newer.box=rr.box AND newer.ref=rr.ref AND newer.attempt>rr.attempt)))"
         " ORDER BY rr.rowid", (box, own_round, include_unknown))
     return list(dict.fromkeys(row[0] for row in rows))

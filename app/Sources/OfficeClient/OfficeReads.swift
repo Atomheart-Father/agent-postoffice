@@ -31,6 +31,7 @@ public struct LetterRow: Sendable, Equatable, Identifiable {
     public let system: Bool
     /// R5：服务端 meta.system 的种类（request.pending / request.to_user / …）；普通信 null。后端没返回这一列 = nil。
     public let systemKind: String?
+    public var deliveryUnresolved: Bool? = nil
 
     /// 申请类的系统信（只在"待批权限"里处理，信件列表不重复显示）：后端给了 system_kind 就只认那两类；
     /// R5 上线前后端不给 system_kind（nil）：按结构判——系统发的、要回复的信（这里本来就回不了，要去"待批权限"处理）。
@@ -337,7 +338,7 @@ public struct OfficeReads: Sendable {
                                  accepted: l["accepted"] as? Bool,
                                  terminal: l["terminal"] as? Bool,
                                  system: system,
-                                 systemKind: l["system_kind"] as? String)
+                                 systemKind: l["system_kind"] as? String, deliveryUnresolved: l["delivery_unresolved"] as? Bool)
             }
             // 有一封读不懂就是整页读不懂：宁可"未知"，也不把少了的行当成零。
             guard letters.count == rows.count else { return nil }

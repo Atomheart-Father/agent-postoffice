@@ -62,36 +62,24 @@ export function recordCodexUnsent(descriptorPath, state) {
   catch (error) { if (error.code !== 'EEXIST') throw error; }
 }
 
-async function verifyCodexHandoff(client, descriptor, current) {
-  if (current.frame.kind === 'idle_started') {
-    const work = await client.workRunnable(current.unit);
-    const due = await client.awaitFrames({unit:current.unit, waitMs:0});
-    if (work?.reason_code === 'unit_not_carried') return {status:'unknown', reason:'unit_not_carried'};
-    if (!good(work) || !work.count || !good(due) || !due.frames?.some(f =>
-      f.kind === 'idle_started' && f.unit === current.unit && f.due_key === current.frame.due_key
-      && f.attempt_key === current.attempt && f.text === current.frame.text))
-      return {status:'unknown', reason:'handoff_unverified'};
-  } else {
-    const round = await client.roundState(current.unit, current.token);
-    if (round?.reason_code === 'unit_not_carried') return {status:'unknown', reason:'unit_not_carried'};
-    if (!good(round) || round.channel !== 'codex' || round.binding_id !== descriptor.bindingId
-        || round.binding_gen !== descriptor.generation || !['begun', 'unknown'].includes(round.state) || round.run_state != null
-        || !round.payloads?.some(p => p.attempt_key === current.attempt && p.text === current.frame.text))
-      return {status:'unknown', reason:'handoff_unverified'};
-  }
-  return {status:'handoff', text:current.text, state:current};
-}
-
-async function recheckCodexHandoff(client, descriptor, descriptorPath, result) {
+async function recheckCodexHandoff(client, descriptorPath, result) {
   const until = Date.now() + 10000;
   const checked = await locked(client, async () => {
     const current = (await client.serialState('read')).state;
     if (JSON.stringify(current) !== JSON.stringify(result.state)) return {status:'unknown', reason:'handoff_changed'};
-    return verifyCodexHandoff(client, descriptor, current);
+    return {status:'handoff', text:current.text, state:current};
   }, () => Date.now() < until, true);
   if (checked) return checked;
   recordCodexUnsent(descriptorPath, result.state);
   return {status:'unknown', reason:'busy'};
+}
+
+async function authorizeBatch(client, state, sendId, previousSendId) {
+  const result = await client.authorizeSend(state.unit, state.token, state.attempt, sendId,
+    {previousSendId, ownerToken:state.owner});
+  if (result?.unknown && !previousSendId && sendId === state.token)
+    await client.settle(state.unit, state.token, 'rejected');
+  return result;
 }
 
 function exactPrompt(prompt, text) {
@@ -102,6 +90,18 @@ function exactPrompt(prompt, text) {
   const body = prompt.slice(prefix.length, -suffix.length);
   return /^Stop hook blocking error from command "[^"\n]+": /.test(body)
     && body.slice(body.indexOf('": ') + 3) === text;
+}
+
+async function receiveLateClaudeWake(client, event, promptMatches) {
+  if (event.hook_event_name !== 'UserPromptSubmit' || !nonempty(event.prompt_id)) return false;
+  const token = typeof event.prompt === 'string' && event.prompt.match(/\[Office wake ([a-f0-9]{32})\]/)?.[1];
+  if (!token) return false;
+  const round = await client.roundState(undefined, token);
+  if (round?.channel !== 'batch_round' || !round.send_authorized || !['begun', 'unknown'].includes(round.state)
+      || round.run_state != null) return false;
+  const payload = round.payloads?.find(part => promptMatches(event.prompt, `[Office wake ${token}]\n${part.text}`));
+  if (!payload || !(await client.recordAdmission(round.box, token, event.prompt_id))?.recorded) return false;
+  return (await client.runBegin(round.box, token, undefined, event.prompt_id, payload.text))?.recorded === true;
 }
 
 async function captureBatch(client, descriptor, frame, channel, textFor, ownerToken, stage) {
@@ -175,50 +175,15 @@ async function toolMail(client, descriptor, event) {
   const unit = Buffer.from(frame.unit).toString('base64url');
   const batch = await captureBatch(client, descriptor, frame, 'native_delivery', (token, refs) =>
     `[Office mail ${token} ${unit} ${event.prompt_id}]\n${messages.tool_batch} ${JSON.stringify(refs)}\n${messages.read_instruction}`);
-  if (batch.token) return batch.text;
+  if (!batch.token) return;
+  const permission = await authorizeBatch(client, {...batch, unit:frame.unit}, batch.token);
+  if (permission?.allowed === true) return batch.text;
 }
 
 function codexPayloads(state) {
   const payloads = [state.text];
   for (const part of state.appends || []) payloads.push(payloads.at(-1) + '\n\n' + (part.text ?? `[Office wake ${part.token}]\n${part.frame.text}`));
   return payloads;
-}
-
-async function mergeCodexBatch(client, descriptor, state, queue, dueKey) {
-  if (state?.phase !== 'handed' || state.frame.kind !== 'batch_round' || !state.owner) return;
-  for (const [index, part] of (state.appends || []).entries()) {
-    if (!part.anchor) continue;
-    const prior = await client.roundState(part.unit, part.token);
-    if (!good(prior) || !Array.isArray(prior.payloads)) return;
-    if (prior.payloads.some(p => p.ref === part.anchor && p.attempt_key === part.attempt && p.text === part.frame.text)) continue;
-    if (prior.state !== 'begun') {
-      state.appends = state.appends.slice(0, index);
-      if (!(await client.serialState('write', state))?.written) return;
-      break;
-    }
-    const saved = await client.recordPayload(part.unit, part.token, part.anchor, part.attempt, part.frame.text);
-    if (!good(saved) || !saved.text_available || !saved.text_matches || saved.conflict) return;
-  }
-  const marker = state.text.split('\n', 1)[0];
-  const item = await queue.read(marker);
-  const input = item?.input;
-  const payloads = codexPayloads(state);
-  const previous = input?.length === 1 && input[0].type === 'text' && payloads.indexOf(input[0].text);
-  if (!item?.id || previous === false || previous < 0) return;
-  if (previous === payloads.length - 1) {
-    const due = await client.awaitFrames({waitMs: 0});
-    const frame = due?.frames?.find(f => due.units?.includes(f.unit) && f.kind === 'batch_round'
-      && (!dueKey || f.due_key === dueKey)
-      && f.refs?.length && ![state, ...(state.appends || [])].some(part => part.frame.refs.some(ref => f.refs.includes(ref))));
-    if (!frame) return;
-    const batch = await captureBatch(client, descriptor, frame, 'codex', undefined, frame.unit === state.unit ? state.owner : undefined, async staged => {
-      const append = {...staged, frame, unit:frame.unit};
-      state.appends = [...(state.appends || []), append];
-      return (await client.serialState('write', state))?.written === true;
-    });
-    if (!batch.token) return;
-  }
-  await queue.write(item.id, codexPayloads(state).at(-1));
 }
 
 async function receiveCodexBatch(client, state, event) {
@@ -272,12 +237,20 @@ async function receiveCodexHistory(client, descriptor, event) {
   return {tokens:received};
 }
 
-export async function handleClaudeHook({event, mode, descriptorPath, clientFactory = createPiRoundClient, waitMs = 60000, promptMatches = exactPrompt, nativeStart = false, stopCanStart = true, dueKey = null, collectUsage = true, absentMarker = null, codexNative = false, codexQueue, expectedOffer, windowOpen = () => true, reportWaitError = () => {}}) {
+export async function handleClaudeHook({event, mode, descriptorPath, clientFactory = createPiRoundClient, waitMs = 60000, promptMatches = exactPrompt, nativeStart = false, stopCanStart = true, dueKey = null, collectUsage = true, absentMarker = null, codexNative = false, expectedOffer, windowOpen = () => true, reportWaitError = () => {}}) {
   const d = readDescriptor(descriptorPath);
   const session = event?.session_id;
   if (!d || !nonempty(session) || d.hostSessionRef !== session) return {status: 'unknown', reason: 'session_or_descriptor'};
   const client = clientFactory({socketPath: d.socketPath, tokenFile: d.tokenFile}).setConnBox(d.actor);
   try {
+    if (codexNative && mode === 'authorize') return await locked(client, async () => {
+      const s = (await client.serialState('read')).state;
+      if (s?.session !== session || s.frame.kind !== 'batch_round' || s.phase !== 'handed'
+          || !expectedOffer || s.offer !== expectedOffer) return {allowed:false, reason:'handoff_changed'};
+      const result = await authorizeBatch(client, s, s.offer, s.previousSendId);
+      if (result?.rejected) await client.serialState('clear');
+      return result;
+    });
     if (codexNative && mode === 'attempted') return await locked(client, async () => {
       const s = (await client.serialState('read')).state;
       if (s?.session !== session || !expectedOffer || s.offer !== expectedOffer || s.phase !== 'handed') return;
@@ -299,10 +272,10 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
       }
     }
     if (codexNative && mode === 'history') return await locked(client, () => receiveCodexHistory(client, d, event));
-    if (codexNative && ['merge', 'receipt'].includes(mode)) return await locked(client, async () => {
+    if (codexNative && mode === 'receipt') return await locked(client, async () => {
       const s = (await client.serialState('read')).state;
       if (s?.session !== session || s.frame.kind !== 'batch_round' || s.offer !== expectedOffer) return;
-      return mode === 'merge' ? mergeCodexBatch(client, d, s, codexQueue, dueKey) : receiveCodexBatch(client, s, event);
+      return receiveCodexBatch(client, s, event);
     });
     if (mode === 'wait' || mode === 'prepare') {
       if (!['SessionStart', 'Stop'].includes(event.hook_event_name)) return {status: 'unknown', reason: 'event'};
@@ -319,15 +292,31 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
         if (good(got) && lastWaitError) { reportWaitError('await_resumed'); lastWaitError = undefined; }
         return retryableHookFailure(got);
       });
-      const skip = new Set();
       while (true) {
         if (!windowOpen()) return {status: 'window_closed'};
         const pending = await locked(client, async () => {
           const s = (await client.serialState('read')).state;
           if (!s) return {cleared: true};
           if (codexNative && absentMarker && s.offer !== expectedOffer) return s;
+          if (s.frame?.kind === 'idle_started') {
+            // This only frees the local slot. It makes no assertion about native history.
+            if ((await client.serialState('clear'))?.cleared) return {cleared:true};
+            return s;
+          }
           if (s.frame.kind === 'batch_round' && s.phase === 'running' && !s.ackUnknown) {
             await client.serialState('clear'); return {cleared: true};
+          }
+          if (s.frame.kind === 'batch_round' && nonempty(s.token) && typeof client.roundState === 'function') {
+            const prior = await client.roundState(s.unit, s.token);
+            if (prior?.reason_code === 'unit_not_carried') {
+              const rest = await Promise.all((s.appends || []).map(part => client.roundState(part.unit, part.token)));
+              if (rest.every(row => row?.reason_code === 'unit_not_carried' || (good(row)
+                  && row.binding_id === d.bindingId && row.binding_gen === d.generation
+                  && (row.state === 'rejected' || row.state === 'accepted' && row.run_state === 'settled')))) {
+                if ((await client.serialState('clear'))?.cleared) return {cleared:true};
+              }
+              if (mode !== 'prepare') return s;
+            }
           }
           if (mode === 'prepare') {
             if (codexNative && s.frame.kind === 'batch_round' && s.phase === 'staged') {
@@ -339,11 +328,7 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
                 if (!good(saved) || !saved.text_available || !saved.text_matches || saved.conflict) return s;
               }
               s.phase = 'handed';
-              return writeCodexHandoff(client, s);
-            }
-            if (codexNative && s.frame.kind === 'idle_started' && s.phase === 'handed') {
-              const current = await client.workRunnable(s.unit);
-              if (good(current) && current.count === 0) { await client.serialState('clear'); return {cleared:true}; }
+              return writeCodexHandoff(client, {...s, previousSendId:`staged:${s.token}`});
             }
             if (codexNative && s.phase === 'handed' && s.offer && nonempty(absentMarker)
                 && s.text?.split('\n', 1)[0] === absentMarker) {
@@ -351,27 +336,19 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
               try { proof = codexUnsentPath(descriptorPath, d, s); if (!lstatSync(proof).isFile()) proof = null; }
               catch (error) { if (error.code !== 'ENOENT') throw error; proof = null; }
               if (proof) {
-                const verified = await verifyCodexHandoff(client, d, s);
-                if (verified.status === 'handoff') { unlinkSync(proof); return verified; }
-                if (verified.reason !== 'unit_not_carried') return s;
-                unlinkSync(proof);
-              }
-            }
-            // A queued Codex item can outlive its deadline. Recover only after the host confirms its absence.
-            if (codexNative && s.frame.kind === 'idle_started' && s.phase === 'handed'
-                && s.text?.split('\n', 1)[0] === absentMarker) {
-              const current = await client.awaitFrames({unit:s.unit, waitMs:0});
-              if (good(current) && Array.isArray(current.frames) && current.frames.some(f => f.kind === 'idle_started'
-                  && f.unit === s.unit && f.due_key === s.frame.due_key
-                  && nonempty(f.attempt_key) && f.attempt_key !== s.attempt)) {
-                await client.serialState('clear'); return {cleared:true};
+                const round = await client.roundState(s.unit, s.token);
+                if (!good(round) || !['begun', 'unknown'].includes(round.state) || round.run_state != null) return s;
+                if (round.send_id && ![s.offer, s.previousSendId].includes(round.send_id)) return s;
+                const next = await writeCodexHandoff(client, {...s, previousSendId:round.send_id || s.offer});
+                if (next.status === 'handoff') unlinkSync(proof);
+                return next;
               }
             }
             if (s.frame.kind === 'batch_round' && s.text?.split('\n', 1)[0] === absentMarker) {
               const parts = [s, ...(s.appends || [])];
               const ours = row => good(row) && row.binding_id === d.bindingId && row.binding_gen === d.generation;
               let rounds = await Promise.all(parts.map(part => client.roundState(part.unit, part.token)));
-              if (s.queueAttempted) {
+              if (s.queueAttempted || rounds[0]?.send_authorized) {
                 for (const [i, part] of parts.entries()) {
                   const row = rounds[i];
                   if (row?.reason_code === 'unit_not_carried') continue;
@@ -390,42 +367,47 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
                 rounds = await Promise.all(parts.map(part => client.roundState(part.unit, part.token)));
               }
               if (rounds.every(row => row?.reason_code === 'unit_not_carried'
-                  || (ours(row) && (row.state === 'unknown' || (row.state === 'rejected' && row.payloads?.length === 0))))) {
+                  || (ours(row) && (row.state === 'unknown' || row.state === 'rejected')))) {
                 await client.serialState('clear'); return {cleared:true};
               }
             }
             return s;
           }
-          if (s.frame.kind === 'idle_started' && s.stopTs && s.ackUnknown) {
-            const ack = await client.wakeAck(s.unit, s.frame.due_key, s.attempt);
-            const ended = await client.hostEvent('turn_end', s.stopTs, {attempt_id: s.attempt});
-            if (good(ack) && ack.taken && good(ended)) { await client.serialState('clear'); return {cleared: true}; }
-            return s;
-          }
           if (s.frame.kind !== 'batch_round' || !nonempty(s.token)) return s;
+          // A different real batch can proceed while this round awaits a native receipt.
+          const frames = (await client.awaitFrames({waitMs:0}))?.frames;
+          if (frames?.some(f => f.kind === 'batch_round'
+              && (f.unit !== s.unit || f.refs?.some(ref => !s.frame.refs.includes(ref))))) {
+            const old = await client.settle(s.unit, s.token, 'unknown');
+            if (old?.state === 'unknown') {
+              await client.serialState('clear');
+              return {cleared:true};
+            }
+          }
           const recovered = await client.recover(s.unit);
           if (!good(recovered) || !Array.isArray(recovered.tokens)) return {...s, recoveryFailed: true};
           const state = await client.roundState(s.unit, s.token);
           if (!good(state) || state.binding_id !== d.bindingId || state.binding_gen !== d.generation)
             return {...s, recoveryFailed: true};
-          if (state.state === 'rejected' || (state.state === 'unknown' && state.result_src === 'recover')
+          if (state.state === 'rejected' || state.state === 'unknown'
               || (state.state === 'accepted' && state.run_state === 'settled')) {
             await client.serialState('clear'); return {cleared: true};
           }
           return s;
         }, waitWindow);
         if (!pending) return {status: 'unknown', reason: 'busy'};
-        if (pending.status === 'recheck_handoff') return await recheckCodexHandoff(client, d, descriptorPath, pending);
+        if (pending.status === 'recheck_handoff') return await recheckCodexHandoff(client, descriptorPath, pending);
         if (pending.cleared) break;
-        if (pending.status === 'handoff') return pending;
+        if (pending.status) return pending;
+        if (mode === 'prepare' && pending.frame.kind !== 'batch_round') return {status:'unknown', reason:'retired_wake'};
         if (mode === 'prepare') return {status: 'unknown', reason: 'pending', text: pending.text, offer:pending.offer,
           ...(codexNative && pending.frame.kind === 'batch_round' ? {batch: true} : {})};
         if (pending.recoveryFailed) return {status: 'unknown', reason: 'recover'};
-        skip.add(pending.frame.due_key);
-        const waited = await awaitFrames({waitMs, skip: [...skip]});
+        const {due_key, due_version} = pending.frame;
+        const skip = [Number.isInteger(due_version) ? `${due_key}#${due_version}` : due_key];
+        const waited = await awaitFrames({waitMs, skip});
         if (!windowOpen()) return {status: 'window_closed'};
         if (!good(waited) || !Array.isArray(waited.frames)) return {status: 'unknown', reason: 'await', error:waited?.code};
-        for (const f of waited.frames) if (nonempty(f?.due_key)) skip.add(f.due_key);
       }
       while (true) {
       let frame;
@@ -434,7 +416,7 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
         if (!windowOpen()) return {status: 'window_closed'};
         if (!good(received) || !Array.isArray(received.frames)) return {status: 'unknown', reason: 'await', error:received?.code};
         const units = Array.isArray(received.units) ? received.units : [];
-        frame = received.frames.find(f => ['batch_round', 'idle_started'].includes(f?.kind) && units.includes(f.unit) && (!dueKey || f.due_key === dueKey));
+        frame = received.frames.find(f => f?.kind === 'batch_round' && units.includes(f.unit) && (!dueKey || f.due_key === dueKey));
         if (mode === 'prepare' && !frame) return {status: 'unknown', reason: 'frame'};
         if (received.frames.length && !frame) return {status: 'unknown', reason: 'unsupported_frame'};
       } while (!frame);
@@ -444,26 +426,24 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
         if ((await client.serialState('read')).state) return {status: 'unknown', reason: 'pending'};
         if (!nonempty(frame.due_key) || !nonempty(frame.text) || (frame.kind === 'batch_round' && (!Array.isArray(frame.refs) || !frame.refs.length)))
           return {status: 'unknown', reason: 'frame'};
-        if (frame.kind === 'idle_started') {
-          if (!nonempty(frame.attempt_key)) return {status: 'unknown', reason: 'attempt'};
-          const text = `[Office wake ${randomUUID()}]\n${frame.text}`;
-          const handed = {session, unit: frame.unit, frame, attempt: frame.attempt_key, text, phase: 'handed'};
-          if (codexNative) return writeCodexHandoff(client, handed);
-          await client.serialState('write', handed);
-          return {status: 'handoff', text};
-        }
         const batch = await captureBatch(client, d, frame, codexNative ? 'codex' : 'batch_round', undefined, undefined,
           codexNative ? async staged => (await client.serialState('write', {session, unit:frame.unit, frame, ...staged,
             text:`[Office wake ${staged.token}]\n${frame.text}`, phase:'staged'}))?.written === true : undefined);
         if (!batch.token) return batch;
-        const text = `[Office wake ${codexNative ? batch.token : randomUUID()}]\n${frame.text}`;
+        const text = `[Office wake ${batch.token}]\n${frame.text}`;
         const handed = {session, unit: frame.unit, frame, ...batch, text, phase: 'handed'};
         if (codexNative) return writeCodexHandoff(client, handed);
-        await client.serialState('write', handed);
+        if (!(await client.serialState('write', handed))?.written) return {status:'unknown', reason:'serial'};
+        const permission = await authorizeBatch(client, handed, batch.token);
+        if (permission?.allowed !== true || !windowOpen()) {
+          if (permission?.allowed === true) await client.settle(handed.unit, handed.token, 'rejected');
+          await client.serialState('clear');
+          return {status:permission?.rejected ? 'stale_frame' : 'unknown', reason:permission?.reason || 'authorize'};
+        }
         return {status: 'handoff', text};
       }, waitWindow);
       if (result?.status === 'stale_frame') continue;
-      if (result?.status === 'recheck_handoff') return await recheckCodexHandoff(client, d, descriptorPath, result);
+      if (result?.status === 'recheck_handoff') return await recheckCodexHandoff(client, descriptorPath, result);
       return result || {status: 'unknown', reason: 'busy'};
       }
     }
@@ -475,9 +455,11 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
         if (codexNative && event.historical) return {status:'finished'};
         const ended = await client.hostEvent('turn_end', event.terminal_ts ?? Math.floor(Date.now()/1000),
           {turn_id: event.prompt_id, act_key: `${codexNative ? 'codex' : 'claude'}:turn_end:${event.prompt_id}`});
-        return good(ended) ? {status: codexNative ? 'idle_reported' : 'finished'} :
+        return good(ended) ? {status: codexNative ? 'turn_end_reported' : 'finished'} :
           {status: 'unknown', reason: 'turn_end', retryStop: !codexNative && retryableHookFailure(ended)};
       }
+      if (!codexNative && event.hook_event_name === 'UserPromptSubmit' && (!s || !promptMatches(event.prompt, s.text))
+          && await receiveLateClaudeWake(client, event, promptMatches)) return {status:'running'};
       if (!s || s.session !== session) return {status: 'unknown', reason: 'no_pending'};
       if (mode === 'reject' && s.phase === 'handed') {
         if (s.frame.kind === 'batch_round') {
@@ -498,12 +480,10 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
       }
       if (!nonempty(event.prompt_id) || event.prompt_id !== s.prompt) return {status: 'unknown', reason: 'prompt_id'};
       if (event.hook_event_name === 'StopFailure' && s.phase === 'admitted') {
-        if (s.frame.kind === 'batch_round') {
-          const rejected = await client.settle(s.unit, s.token, 'rejected', s.prompt);
-          if (!good(rejected) || rejected.state !== 'rejected') return {status: 'unknown', reason: 'reject'};
-        }
+        const outcome = await client.settle(s.unit, s.token, 'unknown', s.prompt);
+        if (!good(outcome) || outcome.state !== 'unknown') return {status:'unknown', reason:'settle'};
         await client.serialState('clear');
-        return {status: 'not_started'};
+        return {status:'finished'};
       }
       if ((nativeStart || ['MessageDisplay', 'PostToolUse'].includes(event.hook_event_name)
            || (stopCanStart && event.hook_event_name === 'Stop')) && s.phase === 'admitted') {
@@ -527,7 +507,7 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
           if (!good(settled) || settled.state !== 'accepted') return {status: 'unknown', reason: 'settle'};
         }
         s.phase = 'running'; s.ackUnknown = true; await client.serialState('write', s);
-        const ack = await client.wakeAck(s.unit, s.frame.due_key, s.frame.kind === 'idle_started' ? s.attempt : undefined);
+        const ack = await client.wakeAck(s.unit, s.frame.due_key, undefined);
         s.ackUnknown = !(good(ack) && ack.taken); await client.serialState('write', s);
         if (event.hook_event_name !== 'Stop') {
           if (s.frame.kind === 'batch_round' && !s.ackUnknown) await client.serialState('clear');
@@ -547,10 +527,6 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
           const fields = codexNative ? {turn_id:s.prompt, act_key:`codex:turn_end:${s.prompt}`} : {attempt_id:s.attempt};
           const ended = await client.hostEvent('turn_end', s.stopTs, fields);
           if (!good(ended)) return {status: 'unknown', reason: 'turn_end', retryStop: !codexNative && retryableHookFailure(ended)};
-        }
-        if (s.frame.kind === 'idle_started' && s.ackUnknown) {
-          const ack = await client.wakeAck(s.unit, s.frame.due_key, s.attempt);
-          if (!good(ack) || !ack.taken) return {status: 'unknown', reason: 'idle_ack'};
         }
         await client.serialState('clear');
         return {status: 'finished'};

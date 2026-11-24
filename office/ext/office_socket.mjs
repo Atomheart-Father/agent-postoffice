@@ -199,9 +199,9 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 	}
 
 	return {
-        async acquireSerial() {
+        async acquireSerial(fields = {}) {
             if (leased || pending) return false;
-            const result = await exchange({op:"host.serial.acquire"});
+            const result = await exchange({...fields, op:"host.serial.acquire"});
             if (!result?.acquired || !pooled || pooled.destroyed) {
                 if (pooled) pooled.destroy();
                 pooled = null;

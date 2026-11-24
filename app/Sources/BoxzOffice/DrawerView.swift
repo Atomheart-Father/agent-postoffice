@@ -133,6 +133,7 @@ private struct LetterLine: View {
             HStack(spacing: 8) {
                 if let kind = Self.kind(letter) { Chip(text: kind, style: letter.needsReply && canReply ? .red : .plain) }      // 红只给"等老板回"的信；别人信箱里的不红
                 if letter.system { Chip(text: tr("系统", "System")) }
+                if letter.deliveryUnresolved == true { Chip(text: tr("投递结果未决", "Delivery unresolved"), style: .dashed) }
                 if letter.letterClass != "notice" {
                     Text(letter.accepted.map { $0 ? tr("已受理", "Accepted") : tr("未受理", "Not accepted") } ?? tr("受理 未知", "Acceptance unknown")).font(Theme.Font.small).foregroundStyle(Theme.ink2)
                 }

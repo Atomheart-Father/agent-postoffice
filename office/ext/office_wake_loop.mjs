@@ -251,6 +251,17 @@ export function createWakeLoop({
     }
 
     const associationId = randomUUID();
+    const permission = await client.authorizeSend(unit, token, attemptKey, associationId,
+      {ownerToken:owner.owner_token});
+    if (permission?.allowed !== true) {
+      // Even when the grant reply is lost, this process has never called the native host.
+      if (permission?.unknown) await settleUnsent(unit, token, "send grant response lost before dispatch", ctx);
+      return cfg.backoffBaseMs;
+    }
+    if (state.stopped || (!appendAtBoundary && !host.acceptWhileBusy && hostUnavailable())) {
+      await settleUnsent(unit, token, "host stopped or became busy before dispatch", ctx);
+      return 0;
+    }
     const messageDetails = {
       officeWakeId: associationId, officeRoundToken: token, officeAnchorRef: anchorRef,
       officeAttemptKey: attemptKey, officeSelectedRefs: selectedRefs, officeBatchSha256: batchSha256,
@@ -314,7 +325,7 @@ export function createWakeLoop({
     if (!frames.length) return 0;
     let backoff = 0;
     for (const frame of frames) {
-      if (state.stopped || state.inflightRound || state.pendingIdle) break;
+      if (state.stopped || state.inflightRound) break;
       const dueKey = (frame && frame.due_key) || "";
       if (host.toolBoundary && frame?.kind === "batch_round" && hostUnavailable()) {
         state.pending = frame;
@@ -339,7 +350,49 @@ export function createWakeLoop({
 
   /** Pi 的原生 pre-start 事件（形状严格；不匹配就什么都不记）。 */
   async function beforeAgentStart(event, ctx) {
+    const message = event?.message, details = message?.details;
+    if (event?.messageType === "custom" && message?.customType === "office-wake"
+        && details?.officeRoundToken && details.officeRoundToken !== state.inflightRound?.token) {
+      if (state.runningBatches.some(batch => batch.token === details.officeRoundToken)) return false;
+      const prior = await client.roundState(undefined, details.officeRoundToken);
+      const owner = state.ownerTokens.get(box);
+      const payload = prior?.payloads?.find(p => p.ref === details.officeAnchorRef
+        && p.attempt_key === details.officeAttemptKey && p.text === message.content
+        && p.payload_sha256 === details.officeBatchSha256 && p.binding_id === owner?.binding_id
+        && p.binding_gen === owner?.binding_gen && p.owner_instance === owner?.instance);
+      if (prior?.token !== details.officeRoundToken || prior.state !== "unknown" || prior.send_id !== details.officeWakeId
+          || prior.binding_id !== owner?.binding_id || prior.binding_gen !== owner?.binding_gen
+          || !payload || sha256Text(message.content) !== details.officeBatchSha256
+          || !await registerOwner(ctx, prior.box)) return false;
+      const cur = {unit: prior.box, token: prior.token, anchorRef: details.officeAnchorRef,
+        selectedRefs: details.officeSelectedRefs, attemptKey: details.officeAttemptKey,
+        text: message.content, batchSha256: details.officeBatchSha256,
+        sessionFile: sessionFileFor(ctx), associationId: details.officeWakeId,
+        ownerToken: state.ownerTokens.get(prior.box).owner_token, lateReceipt: true};
+      if (!cur.sessionFile || !matchesMessage(message, cur) || !await admitExact({text:cur.text, event, viaPiEvent:true}, ctx, cur)) return false;
+      state.runningBatches.push(cur);
+      return true;
+    }
     return admitExact({text: (event && event.message && event.message.content) || "", event, viaPiEvent: true}, ctx);
+  }
+
+  async function lateNativeStart(nativeId, ctx) {
+    if (typeof nativeId !== "string" || !nativeId) return false;
+    const prior = await client.roundState(undefined, undefined, nativeId);
+    const owner = state.ownerTokens.get(box);
+    if (prior?.state !== "unknown" || !prior.token || prior.token === state.inflightRound?.token
+        || prior.binding_id !== owner?.binding_id || prior.binding_gen !== owner?.binding_gen
+        || state.runningBatches.some(batch => batch.token === prior.token)) return false;
+    const payload = prior.payloads?.find(p => p.binding_id === owner.binding_id && p.binding_gen === owner.binding_gen
+      && p.owner_instance === owner.instance && typeof p.text === "string" && sha256Text(p.text) === p.payload_sha256);
+    if (!payload || !await registerOwner(ctx, prior.box)) return false;
+    const cur = {unit:prior.box, token:prior.token, anchorRef:payload.ref, attemptKey:payload.attempt_key,
+      text:payload.text, batchSha256:payload.payload_sha256, sessionFile:sessionFileFor(ctx),
+      associationId:prior.send_id, ownerToken:state.ownerTokens.get(prior.box).owner_token, lateReceipt:true};
+    if (!cur.sessionFile || !await admitExact({text:cur.text, nativeMessageId:nativeId, beforeEnqueue:false}, ctx, cur)) return false;
+    state.runningBatches.push(cur);
+    await agentStart(ctx);
+    return true;
   }
 
   /**
@@ -392,7 +445,7 @@ export function createWakeLoop({
           await restoreReceipts(ctx);
           await flushNativeReceipts(ctx);
           next = cfg.backoffMaxMs;
-          const blocked = state.inflightRound || state.pendingIdle || state.pending
+          const blocked = state.inflightRound || state.pending
             || (!host.toolBoundary && !host.acceptWhileBusy && hostUnavailable());
           next = blocked ? cfg.waitMs : await tick(ctx);
         } catch (e) {
@@ -467,8 +520,7 @@ export function createWakeLoop({
    *  - `submittedExact`：OpenCode 在原生入队前报出同一会话和正文，
    *    只认正文逐字相同 + 同一会话 —— 不伪造 Pi 的事件形状，也不多一个判据。
    */
-  async function admitExact({text, event = null, viaPiEvent = false, nativeMessageId, beforeEnqueue = Boolean(nativeMessageId)}, ctx) {
-    const cur = state.inflightRound;
+  async function admitExact({text, event = null, viaPiEvent = false, nativeMessageId, beforeEnqueue = Boolean(nativeMessageId)}, ctx, cur = state.inflightRound) {
     if (!cur) return false;
     const matches = viaPiEvent
       ? event?.messageType === "custom" && matchesMessage(event.message, cur)
@@ -493,9 +545,9 @@ export function createWakeLoop({
     const harnessRef = nativeMessageId || `content_time:${fallback.session_file}|${fallback.submitted_at}|${fallback.batch_sha256}`;
     cur.harnessRef = harnessRef;
     try {
-      const admission = await client.recordAdmission(cur.unit, cur.token, harnessRef, fallback, beforeEnqueue);
-      if (admission?.reason === "stale_frame") {
-        state.inflightRound = null;
+      const admission = await client.recordAdmission(cur.unit, cur.token, harnessRef, fallback, beforeEnqueue, cur.associationId);
+      if (admission?.rejected || admission?.reason === "stale_frame") {
+        if (state.inflightRound === cur) state.inflightRound = null;
         return false;
       }
       if (!admission || admission.refused || !hasRecorded(admission)) {
@@ -519,22 +571,11 @@ export function createWakeLoop({
 
   async function agentStart(ctx, info) {
     state.busy = true;
-    // ★ 纯续工走**同一条**原生起点事件：宿主把它替我触发的那一次 attempt_key 交回来，我只认这一个
-    //   （不认"下一个起点"——那会把人的 prompt 轮也算成我们的）。报事实 + 回执，然后不再重复。
-    const idle = state.pendingIdle;
-    if (idle && info && info.pendingAttemptKey && info.pendingAttemptKey === idle.attemptKey) {
-      state.pendingIdle = null;
-      // 这一次尝试从现在起就是本端在跑的那一次：后面的模型增量靠它关联（D2）。
-      state.activeAttempt = idle.attemptKey;
-      await reportAttemptStarted(idle.attemptKey, ctx);
-      await ackFrame(idle, ctx);
-      return true;
-    }
     return recordNativeStart(ctx);
   }
 
   async function recordNativeStart(ctx, modelStarting = true) {
-    const cur = state.inflightRound;
+    const cur = state.runningBatches.find(batch => batch.lateReceipt && batch.beforeStartSeen && !batch.sawStart) || state.inflightRound;
     if (!cur || cur.sequenceInvalidated) return false;
     if (!cur.beforeStartSeen) {
       await retainUnknown(cur, "Pi agent_start arrived without a matched preceding before_agent_start", ctx);
@@ -550,7 +591,7 @@ export function createWakeLoop({
     // before_agent_start. A later before-start would already have invalidated this association.
     cur.sawStart = true;
     if (modelStarting) state.activeAttempt = cur.attemptKey;
-    state.runningBatches.push(cur);
+    if (!state.runningBatches.includes(cur)) state.runningBatches.push(cur);
     await persistReceipt(cur, ctx);
     const received = await recordNativeReceipt(cur, ctx, modelStarting);
     if (state.inflightRound === cur) state.inflightRound = null;
@@ -564,15 +605,15 @@ export function createWakeLoop({
       if ((!cur.restored || host.restoreAdmission) && !cur.admissionRecorded && !hasRecorded(await client.recordAdmission(cur.unit, cur.token, cur.harnessRef)))
         throw new Error("round.record_admission did not confirm the native start");
       cur.admissionRecorded = true;
-      const run = await client.runBegin(cur.unit, cur.token, cur.ownerToken, cur.harnessRef, cur.restored ? cur.text : undefined);
+      const run = await client.runBegin(cur.unit, cur.token, cur.ownerToken, cur.harnessRef, cur.restored || cur.lateReceipt ? cur.text : undefined);
       if (!hasRecorded(run)) throw new Error("round.run_begin did not record the matched host run");
-      if (!cur.restored && !acceptedSettle(await client.settle(cur.unit, cur.token, "accepted", cur.harnessRef)))
+      if (!cur.restored && !cur.lateReceipt && !acceptedSettle(await client.settle(cur.unit, cur.token, "accepted", cur.harnessRef)))
         throw new Error("round.settle did not confirm accepted");
       cur.coreSettled = run.run_state === "settled";
       cur.accepted = true;
       if (modelStarting) await reportAttemptStarted(cur.attemptKey, ctx);
       diag("matched native start recorded run-begin and accepted settle", ctx);
-      await ackFrame(cur, ctx);
+      if (!cur.lateReceipt) await ackFrame(cur, ctx);
       return true;
     } catch (e) {
       diagFailure(`native receipt could not be recorded: ${String(e?.message || e)}`, ctx);
@@ -619,7 +660,7 @@ export function createWakeLoop({
     }
   }
 
-  /** 报「这一次尝试真的起轮了」：续工与业务轮共用**这一处**（同一个键、同一条通知）。 */
+  /** 报「这一次业务尝试真的起轮了」。 */
   async function reportAttemptStarted(attemptKey, ctx) {
     try {
       const ev = await sendAttemptEvent("round.started", attemptKey, Math.floor(Date.now() / 1000));
@@ -633,14 +674,11 @@ export function createWakeLoop({
   /**
    * 宿主回合关门（Pi `turn_end` / Codex `turn/completed`）：这个回合的增量到此为止。
    *
-   * 为什么需要：迟到的一条增量若照样上报，Core 会把 `turn_closed_at` 抹掉（`host_event(model_progress)`
-   * 传的是 `None`），而 `_silence_extend` 对"不在 armed"的行是**重新挂** —— 一个已经结束的回合
-   * 会变成下一次"模型无动静"的欠账。按回合标识比，不是个裸布尔：能说清是哪一次回合关了。
+   * 关闭后的迟到增量不能用作额度恢复证据。
    */
   function turnClosed(turnId) {
     state.closedTurn = String(turnId || "");
-    // 回报"关的是哪一次尝试"：`turn_end` 带上它才按**那一次**清心跳到期项（Core 的回退是
-    // "这个代次恰好一条 armed"，两次尝试挨得近时会清错行）。
+    // `turn_end` 携带确切的原生尝试标识。
     return { ok: true, closed_turn: state.closedTurn, attempt_id: state.activeAttempt };
   }
 
@@ -707,11 +745,13 @@ export function createWakeLoop({
 
   async function agentSettled(event, ctx) {
     await confirmToolBoundary(ctx, false);
+    if (typeof event?.aborted === "boolean" && state.inflightRound
+        && !state.runningBatches.some(batch => batch.lateReceipt && batch.sawStart && !batch.end))
+      await retainUnknown(state.inflightRound, "native terminal without matching start", ctx);
     state.pending = null;
     state.busy = false;
     state.activeAttempt = "";
     state.modelProgress = {attemptId: "", turn: "", lastMs: 0};
-    state.pendingIdle = null;
     state.awaitSkip.clear();
     requestPendingWake();
     if (typeof event?.aborted !== "boolean") {
@@ -719,7 +759,7 @@ export function createWakeLoop({
       return false;
     }
     for (const batch of state.runningBatches)
-      if (!batch.end && !batch.restored && batch.sessionFile === sessionFileFor(ctx)) {
+      if (!batch.end && !batch.restored && (!batch.lateReceipt || batch.sawStart) && batch.sessionFile === sessionFileFor(ctx)) {
         batch.end = {...event, type: "agent_settled"};
         await persistReceipt(batch, ctx);
       }
@@ -727,7 +767,7 @@ export function createWakeLoop({
   }
 
   function flushNativeReceipts(ctx) {
-    const pending = state.runningBatches.filter(batch => (!batch.accepted || batch.end) && batch !== state.inflightRound
+    const pending = state.runningBatches.filter(batch => (!batch.lateReceipt || batch.sawStart) && (!batch.accepted || batch.end) && batch !== state.inflightRound
       && batch.sessionFile === sessionFileFor(ctx));
     if (!pending.length) return false;
     return receiptFlush ??= (async () => {
@@ -769,7 +809,7 @@ export function createWakeLoop({
     }
   }
 
-  // Batch frames carry Core's frozen text. Idle frames carry only a Work prompt.
+  // Batch frames carry Core's frozen text.
   async function onWakeFrame(frame, ctx, appendAtBoundary = null) {
     const due = (frame && typeof frame.due_key === "string") ? frame.due_key : "(no due_key)";
     const reject = (reason) => {
@@ -783,7 +823,7 @@ export function createWakeLoop({
     const waitForIdle = !appendAtBoundary && (frame.kind !== "batch_round" || !host.acceptWhileBusy);
     if (waitForIdle && hostUnavailable()) return "host_busy";
     const unit = typeof frame.unit === "string" && frame.unit ? frame.unit : box;
-    if (typeof host.beforeBegin === "function" && ["batch_round", "idle_started"].includes(frame.kind)) {
+    if (typeof host.beforeBegin === "function" && frame.kind === "batch_round") {
       await host.beforeBegin(ctx, frame);
       if (state.stopped || !state.running || state.inflightRound) return "not_running";
       if (waitForIdle && hostUnavailable()) return "host_busy";
@@ -798,32 +838,6 @@ export function createWakeLoop({
         return "no_owner";
       }
       return await handleWake(ctx, {...frame, unit}, appendAtBoundary) || "batch_handled";
-    }
-    if (frame.kind === "idle_started") {
-      if (state.inflightRound) return "already_inflight";
-      if (typeof frame.text !== "string" || !frame.text) return reject("empty idle text");
-      if (typeof host.triggerTurn !== "function") return "no_trigger_turn";
-      const current = await client.workRunnable(unit === box ? undefined : unit);
-      if (current?.ok === false || !Number.isInteger(current?.count)) return "work_check_unavailable";
-      if (current.count === 0) return "obsolete_work";
-      if (state.stopped || hostUnavailable()) return "host_busy";
-      // ★ 纯续工**不造业务 round**（不 `round.begin`、不记 payload），但必须在调用原生**之前**登记
-      //   "这一次尝试的 attempt_key、这一帧的 due_key"。否则原生真的起轮了、Core 却没有任何记账，
-      //   帧会被反复拉起（独核反例 `32220768`：多于 2 个 agent_start）。
-      state.pendingIdle = {unit, dueKey: String(frame.due_key || ""), attemptKey: String(frame.attempt_key || "")};
-      state.turnRequests += 1;
-      // `details` 带上原生尝试标识与到期键，便于和 Core 的轮次对账（来信第三节）。
-      try {
-        await host.triggerTurn(frame.text, {
-          officeWorkContinuation: true,
-          attempt_key: frame.attempt_key,
-          due_key: frame.due_key,
-        });
-      } catch (e) {
-        state.pendingIdle = null;
-        throw e;
-      }
-      return "turn_requested";
     }
     return "unknown_kind:" + frame.kind;
   }
@@ -840,8 +854,9 @@ export function createWakeLoop({
       "before_agent_start_submitted", ctx, () => submittedExact(text, ctx, nativeMessageId)),
     beforeAgentStart: (event, ctx) => lifecycleBoundary(
       "before_agent_start", ctx, () => beforeAgentStart(event, ctx)),
-    // ★ 第二参必须**原样传下去**：宿主在 `agent_start` 时交回它替我触发的那一次 attempt_key，
-    //   wrapper 丢掉它 ⇒ 纯续工永远匹配不上、不记账、不回执，同一帧被反复拉起（真机实测几十轮）。
+    lateNativeStart: (nativeId, ctx) => lifecycleBoundary(
+      "late_native_start", ctx, () => lateNativeStart(nativeId, ctx)),
+    lateNativeRunning: () => state.runningBatches.some(batch => batch.lateReceipt && batch.sawStart && !batch.end),
     agentStart: (ctx, info) => lifecycleBoundary(
       "agent_start", ctx, () => agentStart(ctx, info)),
     agentSettled: (event, ctx) => lifecycleBoundary(
