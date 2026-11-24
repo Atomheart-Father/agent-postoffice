@@ -8,7 +8,7 @@ See [the BoxZ Office project page](https://boxzstudio.xyz/projects/agent-postoff
 
 The `office/` directory contains the service and native host adapters. The `app/` directory contains the SwiftUI app. Both build from the same release tag.
 
-Codex Desktop automatic mail wake-up is experimental in this Preview. The native queue and CLI delivery path have been verified. Long model silence no longer sends mail or starts work.
+With Codex Desktop running, Office can wake an existing, bound Desktop session for actionable mail. Long model silence no longer sends mail or starts work.
 
 ## Download the macOS package
 
