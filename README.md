@@ -29,4 +29,4 @@ python3 "$release/office/tools/install_release.py" --home "${POSTOFFICE_HOME:-$H
 
 Open `BOXZ OFFICE.app` inside the selected Office home. The installer creates a local operator mailbox on a fresh install. Use the controlled Office tools to register mailboxes and submit project or role requests. Review approvals in the app. Host hooks and plugins use their native trust prompts.
 
-See [installation and upgrade notes](office/tools/README_deploy_release.md). This is a Preview release. Real-world validation will continue after release.
+See the [user guide and first project walkthrough](office/tools/USER_GUIDE.md) and the [installation and upgrade notes](office/tools/README_deploy_release.md). This is a Preview release. Real-world validation will continue after release.

@@ -18,27 +18,4 @@ OpenCode 2 全局入口在 `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/o
 
 本机 App 复用同一个安装目录下 `sock/` 的受控描述符。双击安装目录中的 `BOXZ OFFICE.app` 便会连接旁边的服务。显式指定 `BOXZ_OFFICE_HOME` 或 `POSTOFFICE_HOME` 可接隔离实例。
 
-## 第一次建项目
-
-1. 在计划担任项目经理的会话，用 `office_request_create` 提交 `kind: "join"` 开通个人信箱。
-2. 由本机操作者在所选 Office home 的 `workspace-map.json` 登记项目目录。已有映射时，保留原有条目并添加新的名称。项目申请引用映射的名称，例如 `promo`。
-
-   ```json
-   {"promo": "/absolute/path/to/promotion"}
-   ```
-
-3. 从经理会话用 `office_request_create` 提交下面的一份申请。Boss 在 App 批准后，邮局会创建岗位和项目，把岗位绑定到这个会话，并授予该岗位项目管理权。
-
-   ```json
-   {
-     "kind": "holder",
-     "position": "promo.lead",
-     "reason": "创建推广项目，由本会话负责",
-     "create": {
-       "position": {},
-       "project": {"name": "推广", "owner_ref": "promo.lead", "workspace_refs": ["promo"]}
-     }
-   }
-   ```
-
-未任命 `@office.admin` 时由 Boss 处理组织审批。需要委托审批时，从已登记的管理员会话提交 `kind: "holder"`、`position: "office.admin"` 的申请。首次建此岗位填 `create: {"position": {"project_ref": null}}`，由 Boss 批准。
+安装后请按[使用指南](USER_GUIDE.md)登记会话、创建第一个项目。
