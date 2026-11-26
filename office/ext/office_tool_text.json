@@ -440,6 +440,21 @@
 				}
 			}
 		},
+		"office_position_profile": {
+			"label": { "en": "Read position duties", "zh": "读岗位职责" },
+			"description": { "en": "Read a position's current duties and whether you can edit them.", "zh": "查看岗位当前职责及你是否可以编辑。" },
+			"parameters": {
+				"position": { "en": "Position address, e.g. @app.dev", "zh": "岗位地址，如 @app.dev" }
+			}
+		},
+		"office_position_duties_set": {
+			"label": { "en": "Edit position duties", "zh": "改岗位职责" },
+			"description": { "en": "Replace duties as the operator, current holder, or project manager. The current holder is notified of changes made by others.", "zh": "组织用户、现任或所属项目经理可替换职责。由他人修改时会通知现任。" },
+			"parameters": {
+				"duties": { "en": "The full new list of duties", "zh": "完整的新职责列表" },
+				"expected_duties": { "en": "The current list from office_position_profile, unchanged", "zh": "原样填写 office_position_profile 读到的现有职责列表" }
+			}
+		},
 		"office_position_knowledge_read": {
 			"description": {
 				"en": "Read a position's practice notes: every entry (id, section, text, why, when) and the current version. Pass a version to read an older snapshot as text. Allowed for the current holder and anyone above on the reporting line.",

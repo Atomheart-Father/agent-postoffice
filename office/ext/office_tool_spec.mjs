@@ -271,6 +271,32 @@ export const OFFICE_TOOLS = [
 		},
 	},
 	{
+		name: "office_position_profile", op: "position.profile", write: false,
+		label: textPair("office_position_profile/label"),
+		description: textPair("office_position_profile/description"),
+		parameters: {
+			type: "object",
+			properties: { position: S("office_position_profile/position") },
+			required: ["position"],
+			additionalProperties: false,
+		},
+	},
+	{
+		name: "office_position_duties_set", op: "position.duties.set", write: true,
+		label: textPair("office_position_duties_set/label"),
+		description: textPair("office_position_duties_set/description"),
+		parameters: {
+			type: "object",
+			properties: {
+				position: S("office_position_profile/position"),
+				duties: { type: "array", items: { type: "string" }, ...textFields("office_position_duties_set/duties") },
+				expected_duties: { type: "array", items: { type: "string" }, ...textFields("office_position_duties_set/expected_duties") },
+			},
+			required: ["position", "duties", "expected_duties"],
+			additionalProperties: false,
+		},
+	},
+	{
 		name: "office_position_knowledge_read", op: "knowledge.read", write: false,
 		label: textPair("office_position_knowledge_read/label"),
 		description: textPair("office_position_knowledge_read/description"),

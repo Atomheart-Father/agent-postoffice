@@ -89,6 +89,11 @@ struct CountBlock: View {
     }
 }
 
+func pendingDeliveryText(_ count: Int?) -> String {
+    count.map { tr("待投递 \($0)", "Pending delivery: \($0)") }
+        ?? tr("待投递 未知", "Pending delivery: unknown")
+}
+
 func deliveryText(_ count: Int?, inFlight: Int?, unresolved: UnresolvedDelivery?) -> String {
     let pending = count.map { tr("可自动待投 \($0)", "Automatic pending: \($0)") } ?? tr("可自动待投 未知", "Automatic pending: unknown")
     let handoff = inFlight.map { tr(" · 交接中 \($0)", " · In handoff: \($0)") } ?? tr(" · 交接中 未知", " · In handoff: unknown")
@@ -267,11 +272,6 @@ struct FocusRing: ViewModifier {
     }
 }
 extension View { func focusRing() -> some View { modifier(FocusRing()) } }
-
-func projectManagerLabel(_ project: ProjectDetail) -> String {
-    let name = project.name.isEmpty ? project.ref : project.name
-    return name + tr(" · 经理", " · Manager")
-}
 
 /// 人的名字（M4）：标题 = 岗位名 / "项目经理" / "个人身份"，次级行 = 固定缩写 id；`full` 时（抽屉）再给完整 id，可选中复制。
 struct PersonName: View {

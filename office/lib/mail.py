@@ -342,7 +342,8 @@ class MailOperations:
             klass = "receipt"
         elif (informational_need(letter_fields(row, st, ("need",))["need"],
                                  system=row["from_actor"] == cls.SYSTEM_MAIL_SENDER)
-              or meta.get("system") == "position.welcome" and row["from_actor"] == cls.SYSTEM_MAIL_SENDER):
+              or meta.get("system") in ("position.welcome", "position.duties_updated")
+              and row["from_actor"] == cls.SYSTEM_MAIL_SENDER):
             klass = "notice"
         def verdict(terminal, terminal_reason=None, *, needs_reply=False):
             return {"letter_class": klass, "terminal": terminal,

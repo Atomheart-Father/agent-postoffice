@@ -83,7 +83,12 @@ public enum Unassigned {
                     roster.formUnion(p.managers.map(\.to)); roster.formUnion(p.participants.map(\.to))
                     roster.formUnion(p.positions.map(\.to)); roster.formUnion(p.positions.compactMap(\.holder))
                 }
-                return h.bindings.filter { !roster.contains($0.actor) && !roster.contains("@" + $0.actor) }
+                let assigned = Set(h.threads.filter { thread in
+                    thread.bindings.contains { binding in
+                        binding.position != nil || roster.contains(binding.actor) || roster.contains("@" + binding.actor)
+                    }
+                }.flatMap(\.bindings).map(\.bindingID))
+                return h.bindings.filter { !assigned.contains($0.bindingID) }
             }
         }
     }

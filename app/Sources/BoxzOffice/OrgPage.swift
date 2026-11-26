@@ -55,9 +55,15 @@ struct OrgPage: View {
     private var titleBlock: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Studio").font(Theme.Font.viewTitle).tracking(Theme.Track.viewTitle).padding(.vertical, -6).lineLimit(1).fixedSize()
-            (Text(desk.whoami.text { $0 }).font(Theme.Font.rowTitle).foregroundStyle(Theme.ink)
-             + Text(tr(" · 老板 · 全部项目", " · Boss · all projects")).font(Theme.Font.body.weight(.medium)).foregroundStyle(Theme.ink2))
-                .lineLimit(1).fixedSize()
+            if let address = desk.adminApproval.value?.studioAddress {
+                Button {
+                    if address == "@office.admin" { desk.openSeat(address) }
+                    else { desk.drawer = .inbox }
+                } label: {
+                    Text(address).font(Theme.Font.rowTitle).foregroundStyle(Theme.ink)
+                }
+                .buttonStyle(.plain).focusRing()
+            }
         }
         .padding(.leading, 30)
     }
@@ -226,14 +232,10 @@ private struct SeatRow: View {
         }
     }
 
-    private func pendingDeliveryText(_ count: Int?) -> String {
-        count.map { tr("待投递 \($0)", "Pending delivery: \($0)") }
-            ?? tr("待投递 未知", "Pending delivery: unknown")
-    }
 }
 
 
-/// 已登记宿主会话中未关联任何项目席位的成员。
+/// 未关联组织岗位或项目成员的宿主绑定。
 private struct UnassignedBlock: View {
     @ObservedObject var desk: DeskModel
     var body: some View {

@@ -1,7 +1,8 @@
 import SwiftUI
+import AppKit
 import OfficeClient
 
-/// 每个已登记的原生会话一张卡，在线状态未知。
+/// 每个已登记的原生会话一张卡，按宿主分组。
 struct HarnessPage: View {
     @ObservedObject var desk: DeskModel
 
@@ -11,15 +12,18 @@ struct HarnessPage: View {
                 PageTitle(title: Page.host.title, fixture: desk.isFixture) { stats }
                 PanelBody(panel: desk.hosts) { page in
                     let groups = groupedByHost(page.threads, harness: \.harness)
-                    VStack(alignment: .leading, spacing: 0) {
-                        summary(groups).padding(.top, 38)
+                    VStack(alignment: .leading, spacing: 28) {
+                        if groups.isEmpty {
+                            Text(tr("暂无会话", "No sessions")).font(Theme.Font.body).foregroundStyle(Theme.ink3)
+                        }
                         ForEach(groups, id: \.name) { g in section(g) }
                     }
+                    .padding(.top, 24)
                 }
                 ReadAt(desk: desk).padding(.top, 40)
             }
             .onAppear { scroll(proxy) }
-            .onChange(of: desk.hosts.value?.threads) { _ in scroll(proxy) }
+            .onChange(of: desk.hosts.value?.threads) { scroll(proxy) }
         }
     }
 
@@ -31,36 +35,17 @@ struct HarnessPage: View {
 
     // MARK: 统计
     @ViewBuilder private var stats: some View {
-        HStack(alignment: .bottom, spacing: Theme.statGap) {
-            Stat(value: desk.hosts.text { "\($0.threads.count)" }, label: tr("绑定组", "Binding groups"))
-            Stat(value: tr("未知", "Unknown"), label: tr("在线", "Online"), muted: true)        // 没有后端事实源；只在这里写一次
-        }
+        Stat(value: desk.hosts.text { "\($0.threads.count)" }, label: tr("会话", "Sessions"))
     }
 
     // MARK: 分组
 
-    private func summary(_ groups: [HostGroup<HostThread>]) -> some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 220, maximum: 280), spacing: 12, alignment: .topLeading)], alignment: .leading, spacing: 12) {
-            ForEach(groups, id: \.name) { g in
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 10) {
-                        Text(g.name).font(Theme.Font.small.weight(.bold))
-                        Text(tr("\(g.items.count) 组", "\(g.items.count) \(pl(g.items.count, "group"))")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
-                    }
-                    Text(g.items.map(\.title).joined(separator: "、")).font(Theme.Font.sub).foregroundStyle(Theme.ink3).lineLimit(2)
-                }
-                .padding(12).frame(maxWidth: .infinity, alignment: .leading)
-                .overlay(Rectangle().strokeBorder(Theme.ink, lineWidth: Theme.Line.hair))
-            }
-        }
-    }
-
     private func section(_ g: HostGroup<HostThread>) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Rectangle().fill(Theme.ink).frame(height: Theme.Line.hair)
+            Rule(color: Theme.ink)
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(g.name).font(Theme.Font.sectionTitle).tracking(Theme.Track.blockTitle)
-                Text(tr("\(g.items.count) 组", "\(g.items.count) \(pl(g.items.count, "group"))")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
+                Text(tr("\(g.items.count) 个会话", "\(g.items.count) \(pl(g.items.count, "session"))")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
                 Spacer(minLength: 0)
                 let blocked = g.items.first.map { desk.fixtureBlocksWrite(.unbind(bindingID: $0.id, label: $0.title)) } ?? true
                 BoxButton(title: tr("全部下线", "Take all offline"), disabled: blocked) {
@@ -68,12 +53,11 @@ struct HarnessPage: View {
                 }
                 .help(blocked ? tr("模拟数据，不能写", "Sample data: cannot write") : "")
             }
-            .padding(.top, 16).padding(.bottom, 18)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 230, maximum: 260), spacing: 14, alignment: .topLeading)], alignment: .leading, spacing: 14) {
+            .padding(.top, 12).padding(.bottom, 12)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 210, maximum: 310), spacing: 12, alignment: .topLeading)], alignment: .leading, spacing: 10) {
                 ForEach(g.items) { BindingCard(desk: desk, thread: $0) }
             }
         }
-        .padding(.top, 36)
     }
 }
 
@@ -104,47 +88,70 @@ private struct BindingCard: View {
 
     var body: some View {
         let binding = thread.primary
-        let title = thread.title
         let focused = thread.bindings.contains { $0.bindingID == desk.focusBinding }
-        let addresses = Set(thread.bindings.map(\.mailbox)).sorted()
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Square(filled: false, dashed: true, tone: Theme.ink3)
-                Text(title).font(Theme.Font.rowTitle).tracking(-0.17).lineLimit(1).help(title)
-            }
-            if thread.sessionRef.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text(tr("原生会话未知", "Native session unknown")).font(Theme.Font.small).foregroundStyle(Theme.ink3).padding(.top, 4)
-            }
-            ForEach(thread.managedProjects(in: desk.projects.value ?? [])) { project in
-                Text(projectManagerLabel(project))
-                    .font(Theme.Font.small).foregroundStyle(Theme.ink3).padding(.top, 4)
-            }
-
-            ForEach(addresses, id: \.self) { address in
-                Button { desk.openSeat(address) } label: {
-                    let label = address.hasPrefix("@") ? address : tr("个人信箱", "Personal inbox")
-                    let pending = deliveryText(desk.deliveryAutomatic(address), inFlight: desk.deliveryInFlight(address), unresolved: desk.deliveryUnresolved(address))
-                    Text(addresses.count == 1 ? pending : label + " · " + pending)
-                        .font(Theme.Font.small.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+        let roles = thread.positionAddresses
+        let personal = Set(thread.bindings.filter { $0.position == nil }.map(\.mailbox)).sorted()
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 6) {
+                if roles.isEmpty {
+                    let label = tr("未分配", "Unassigned")
+                    let suffix = thread.sessionRef.isEmpty ? "" : " · " + String(thread.title.suffix(6))
+                    mailbox(binding.mailbox, label: label + suffix, secondary: true, sessionID: thread.title)
+                } else {
+                    ForEach(roles, id: \.self) { address in
+                        mailbox(address, label: address)
+                    }
+                    ForEach(personal.filter { (desk.deliveryPending($0) ?? 0) > 0 }, id: \.self) { address in
+                        mailbox(address, label: tr("个人信箱", "Personal inbox"), secondary: true)
+                    }
                 }
-                .buttonStyle(.plain).focusRing().padding(.top, 10)
-            }
-            Chip(text: binding.quota.map { $0 == "exhausted" ? Labels.quota($0) : tr("额度 ", "Quota ") + Labels.quota($0) } ?? tr("额度 未知", "Quota unknown"), style: binding.quota == nil ? .dashed : .mid).padding(.top, 10)
-            HStack(spacing: 8) {
-                let blocked = desk.fixtureBlocksWrite(.unbind(bindingID: binding.bindingID, label: title))
-                BoxButton(title: tr("下线", "Take offline"), disabled: blocked) {
-                    desk.askOffline(title: tr("下线 · ", "Take offline · ") + title, bindings: thread.bindings)
+                if let quota = binding.quota, ["exhausted", "blocked", tr("已阻塞", "Blocked")].contains(quota) {
+                    Text(Labels.quota("exhausted")).font(Theme.Font.small).foregroundStyle(Theme.bad)
                 }
-                .help(blocked ? tr("模拟数据，不能写", "Sample data: cannot write") : "")
-                HeldMark(desk: desk, key: "unbind:" + binding.bindingID)
             }
-            .padding(.top, 12)
+            Spacer(minLength: 0)
+            Menu {
+                if !roles.isEmpty {
+                    ForEach(personal, id: \.self) { address in
+                        Button(personal.count == 1 ? tr("个人信箱", "Personal inbox") : address) { desk.openSeat(address) }
+                    }
+                }
+                if !thread.sessionRef.isEmpty {
+                    Button(tr("复制会话编号", "Copy session ID")) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(thread.sessionRef, forType: .string)
+                    }
+                }
+                Button(tr("下线", "Take offline"), role: .destructive) {
+                    desk.askOffline(title: tr("下线 · ", "Take offline · ") + thread.title, bindings: thread.bindings)
+                }
+                .disabled(desk.fixtureBlocksWrite(.unbind(bindingID: binding.bindingID, label: thread.title)))
+            } label: {
+                Image(systemName: "ellipsis").accessibilityLabel(tr("会话操作", "Session actions"))
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            HeldMark(desk: desk, key: "unbind:" + binding.bindingID)
         }
-        .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12).frame(maxWidth: .infinity, alignment: .leading)
         .overlay(Rectangle().strokeBorder(focused ? Theme.ink : Theme.wire,
-                                          style: StrokeStyle(lineWidth: focused ? 2 : Theme.Line.hair, dash: focused ? [] : [4, 3])))
-        .contentShape(Rectangle())
-        .onTapGesture { desk.openSeat(binding.mailbox) }
+                                          lineWidth: focused ? 2 : Theme.Line.hair).allowsHitTesting(false))
         .id(thread.id)
+    }
+
+    private func mailbox(_ address: String, label: String, secondary: Bool = false, sessionID: String? = nil) -> some View {
+        let delivery = deliveryText(desk.deliveryAutomatic(address), inFlight: desk.deliveryInFlight(address),
+                                    unresolved: desk.deliveryUnresolved(address))
+        let details = sessionID.map { $0 + "\n" + delivery } ?? delivery
+        return Button { desk.openSeat(address) } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label).font(secondary ? Theme.Font.small.weight(.semibold) : Theme.Font.rowTitle)
+                    .lineLimit(1)
+                Text(pendingDeliveryText(desk.deliveryPending(address)))
+                    .font(Theme.Font.small).foregroundStyle(Theme.ink3)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).focusRing()
+        .help(details)
     }
 }

@@ -44,12 +44,23 @@ class PositionOperations:
         self._check_actor(actor)
         position = self._profile_position(position)
         with self._txn(read_only=True) as conn:
-            operator = actor == self._request_user()
-            if not operator and not self._on_duty(conn, actor, position):
+            can_edit, _ = self._position_duty_access(conn, actor, position, now_ts)
+            if not can_edit and not self._on_duty(conn, actor, position):
                 raise self.CoreError("forbidden", "无权查看该岗位职责", en="You cannot view this position's duties")
             if not self._position_exists(conn, position):
                 raise self.CoreError("not_found", "岗位不存在或已撤销", en="The position does not exist or is retired")
-            return {"ok": True, **self._position_spec(conn, position), "can_edit": operator}
+            return {"ok": True, **self._position_spec(conn, position), "can_edit": can_edit}
+
+    def _position_duty_access(self, conn, actor, position, now_ts):
+        row = conn.execute("SELECT holder, project_ref FROM position_holders WHERE position=?",
+                           (position,)).fetchone()
+        if row is None:
+            return actor == self._request_user(), False
+        holder = row["holder"]
+        own = actor == position or bool(holder and (actor == holder or self._request_person(conn, actor) == holder))
+        can_edit = (actor == self._request_user() or own
+                    or self._can_manage_project(conn, actor, row["project_ref"], now_ts))
+        return can_edit, bool(holder and not own)
 
     def _profile_position(self, position):
         if not isinstance(position, str) or not (position := position.strip().removeprefix("@")):
@@ -66,18 +77,28 @@ class PositionOperations:
         params = {"position": position, "duties": duties, "expected_duties": expected_duties}
         op = "position.duties.set"
         with self._txn() as conn:
-            if actor != self._request_user():
-                raise self.CoreError("forbidden", "只有组织用户可以编辑岗位职责", en="Only the office operator can edit duties")
+            can_edit, notify = self._position_duty_access(conn, actor, position, now_ts)
+            if not can_edit:
+                raise self.CoreError("forbidden", "只有组织用户、现任或所属项目的经理可以编辑岗位职责",
+                                     en="Only the operator, current holder, or project manager can edit these duties")
             replay, digest = self.storage.action_replay(conn, actor, op, act_key, params)
             if replay is not None:
                 return replay
             if not self._position_exists(conn, position):
                 raise self.CoreError("not_found", "岗位不存在或已撤销", en="The position does not exist or is retired")
-            if self._position_spec(conn, position)["duties"] != expected_duties:
+            current = self._position_spec(conn, position)["duties"]
+            if current != expected_duties:
                 raise self.CoreError("conflict", "岗位职责已更新，请重新读取", en="Duties changed. Reload before editing.",
                                      reason_code="version_conflict")
-            conn.execute("UPDATE position_holders SET duties=? WHERE position=?",
-                         (self.canonical_json(duties), position))
+            if duties != current:
+                conn.execute("UPDATE position_holders SET duties=? WHERE position=?",
+                             (self.canonical_json(duties), position))
+                if notify:
+                    change = hashlib.sha256(self.canonical_json([actor, act_key]).encode("utf-8")).hexdigest()[:24]
+                    self.system_letter(
+                        letter_id="duties-" + change, boxes=[position], subject=f"岗位职责已更新：@{position}",
+                        body=f"@{position} 的职责已更新。请用 office_whoami 查看该岗位的最新职责。",
+                        need="查看最新职责", kind="position.duties_updated", conn=conn, now_ts=now_ts)
             result = {"ok": True, "position": position}
             self.storage.record_action(conn, actor, op, act_key, digest, result, now_ts)
             return result

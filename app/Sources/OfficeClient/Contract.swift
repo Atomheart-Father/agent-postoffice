@@ -175,6 +175,7 @@ public struct AdminApproval: Sendable, Equatable {
     public let hasApprover: Bool?
     /// 分段按钮的选中项：值未知（nil）时两个都不选，不把"未知"画成"在岗"。
     public var switchKey: String { switchOn.map { $0 ? "on" : "off" } ?? "" }
+    public var studioAddress: String? { switchOn.map { $0 ? "@office.admin" : "@Boss" } }
 }
 
 public struct OfficeContext: Sendable {
