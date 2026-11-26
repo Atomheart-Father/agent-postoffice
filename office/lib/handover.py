@@ -94,8 +94,9 @@ class HandoverOperations:
                                  reason_code="session_credentials_ambiguous")
         return {"session_ref": sessions[0], **facts}
 
-    def _request_person(self, conn, actor):
-        if not self._is_position_address(conn, actor):
+    @classmethod
+    def _request_person(cls, conn, actor):
+        if not cls._is_position_address(conn, actor):
             return actor
         row = conn.execute(
             "SELECT p.holder FROM position_holders p JOIN bindings b ON b.binding_id=p.position"
@@ -323,6 +324,9 @@ class HandoverOperations:
                            (target,)).fetchone()
         if row is None:
             raise self.CoreError("not_found", f"没有有效的绑定 {target!r}", en=f"There is no live binding {target!r}", field="target")
+        expected = rparams.get("target_generation")
+        if expected is not None and (type(expected) is not int or expected != row["generation"]):
+            raise self.CoreError("conflict", "绑定已换代，请刷新后重新确认", en="Binding generation changed; refresh and confirm again", reason_code="binding_changed", expected=expected, current=row["generation"])
         if row["actor"] == actor:
             raise self.CoreError("invalid_request", "自己的绑定直接撤（binding.revoke），不用申请",
                                  en="revoke your own binding directly (binding.revoke); no request needed", reason_code="own_binding")
@@ -477,13 +481,12 @@ class HandoverOperations:
         self.storage.record_action(conn, actor, "handover.return", act_key, digest, out, now_ts)
         return out
 
-    def handover_return(self, actor, *, position, expected_version=None, act_key, now_ts=None):
+    def handover_return(self, actor, *, position, act_key, now_ts=None):
         """现任本人交还岗位 ⇒ 岗位空缺（一个事务；没有活绑定 ⇒ `position_not_bound`）。"""
         with self._authority_lock():
             self._check_actor(actor)
-            position = (position or "").lstrip("@").strip()
-            if not position:
-                raise self.CoreError("invalid_request", "position 必填（岗位名）", field="position")
+            position = self._check_box_name(position.strip().removeprefix("@").strip()
+                                            if isinstance(position, str) else position, "position")
             with self._txn() as conn:
                 replay, digest = self.storage.action_replay(conn, actor, "handover.return", act_key,
                                             {"position": position})

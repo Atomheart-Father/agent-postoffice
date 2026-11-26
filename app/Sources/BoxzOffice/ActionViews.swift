@@ -45,6 +45,10 @@ struct ActionBox: View {
             if let request, request.ref == ref, request.version == version { requestParameters(request) }
             else { Text(tr("申请版本已变化，请重新读取", "The request changed; reload it")).font(Theme.Font.small) }
         }
+        if case .archive(let id) = a.intent {
+            Text(tr("归档信件：", "Archive letter: ") + id + (a.subject.isEmpty ? "" : " · " + a.subject))
+                .font(Theme.Font.f14).fixedSize(horizontal: false, vertical: true)
+        }
         if let to = a.intent.recipient {
             Text(tr("收件人 \(to)", "To \(to)")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
             field(tr("主题", "Subject"), text: Binding(get: { desk.actions[key]?.subject ?? "" }, set: { desk.actions[key]?.subject = $0 }), lines: 1)
@@ -54,12 +58,15 @@ struct ActionBox: View {
             field(needHint, text: Binding(get: { desk.actions[key]?.need ?? "" }, set: { desk.actions[key]?.need = $0 }), lines: 1)
         }
         if a.intent.needsText {
-            field(a.intent.textRequired ? tr("必填", "Required") : tr("原因（可不写）", "Reason (optional)"),
+            let hint = a.intent.textRequired ? tr("必填", "Required") : tr("原因（可不写）", "Reason (optional)")
+            let placeholder = if case .positionDuties = a.intent { tr("每行一条职责", "One duty per line") } else { hint }
+            field(placeholder,
                   text: Binding(get: { desk.actions[key]?.text ?? "" }, set: { desk.actions[key]?.text = $0 }),
                   lines: 3)
         }
         HStack(spacing: 8) {
-            BoxButton(title: tr("确认\(a.intent.title)", "Confirm: \(a.intent.title)"), primary: true, disabled: !desk.book.canSend(key)) { desk.confirmAction(key) }
+            let title = if case .positionDuties = a.intent { a.intent.title } else { tr("确认\(a.intent.title)", "Confirm: \(a.intent.title)") }
+            BoxButton(title: title, primary: true, disabled: !desk.book.canSend(key)) { desk.confirmAction(key) }
             BoxButton(title: tr("取消", "Cancel")) { desk.cancelAction(key) }
         }
     }
@@ -108,13 +115,17 @@ struct InboxTabs: View {
 struct RequestList: View {
     @ObservedObject var desk: DeskModel
     var body: some View {
+        VStack(alignment: .leading) {
+        if desk.requestCursor != nil { BoxButton(title: tr("回到首页", "First page")) { Task { await desk.loadRequests(cursor: nil) } } }
+        BoxButton(title: tr("重试本页", "Retry page")) { Task { await desk.loadRequests(cursor: desk.requestCursor) } }
         PanelBody(panel: desk.requests) { page in
             VStack(alignment: .leading, spacing: 0) {
                 if desk.isFixture { Chip(text: tr("模拟数据", "Sample data"), style: .dashed).padding(.bottom, 12) }
                 if page.items.isEmpty { Text(tr("0 条", "0 items")).font(Theme.Font.body).foregroundStyle(Theme.ink3) }
                 ForEach(page.items) { RequestRow(desk: desk, request: $0) }
-                if !page.complete { Text(tr("还有下一页，当前仅显示前 \(page.items.count) 条", "More pages exist; only the first \(page.items.count) are shown")).font(Theme.Font.small).foregroundStyle(Theme.ink2).padding(.top, 10) }
+                if let next = page.nextCursor { BoxButton(title: tr("下一页", "Next page")) { Task { await desk.loadRequests(cursor: next) } } }
             }
+        }
         }
     }
 }
@@ -122,7 +133,7 @@ struct RequestList: View {
 /// 后端码 → 中文；认得的才译，不认得的原样显示。
 enum Labels {
     static func requestKind(_ k: String) -> String {
-        switch k { case "grant": tr("授权", "Grant"); case "holder": tr("岗位持有人", "Position holder"); case "project": tr("项目", "Project"); default: k }
+        switch k { case "grant": tr("授权", "Grant"); case "holder": tr("岗位持有人", "Position holder"); case "project": tr("项目", "Project"); case "deactivate": tr("归档个人信箱", "Archive personal mailbox"); default: k }
     }
     /// 提交状态：认得的才译，不认得的原样显示。
     static func submissionState(_ s: String) -> String {
@@ -216,6 +227,10 @@ private struct RequestRow: View {
 }
 
 @ViewBuilder private func requestParameters(_ request: PendingRequest) -> some View {
+    if request.kind == "deactivate" {
+        Text(tr("归档个人信箱后不再接收新信，历史信仍可读；会话绑定和岗位授权不会撤销。", "The personal mailbox stops receiving new mail; existing mail remains readable. Session bindings and position authority remain active."))
+            .font(Theme.Font.f14.weight(.semibold))
+    }
     if let cancel = request.cancelWork {
         Text(cancel ? tr("撤岗时同时取消该岗位承办的未完成 Work；单独审核的 Work 须先换审或取消", "Retirement cancels unfinished Work assigned to this position; other Work it reviews must first be reassigned or cancelled") : tr("撤岗时不取消 Work；仍有未完成职责时须先处理", "Do not cancel Work; outstanding duties must be resolved first"))
             .font(Theme.Font.f14.weight(.semibold))

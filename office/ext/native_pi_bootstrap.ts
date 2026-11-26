@@ -2,7 +2,7 @@ import {appendFileSync} from 'node:fs';
 import {randomUUID} from 'node:crypto';
 import {homedir} from 'node:os';
 import {basename, dirname, join, resolve} from 'node:path';
-import {sessionIdentity} from './office_pi_session.mjs';
+import {sessionIdentity, piEndpointIdentity} from './office_pi_session.mjs';
 import {readDescriptor, createPiRoundClient, createPiHostEvents, releaseVersion} from './office_pi_round.mjs';
 // 本宿主的薄适配器：共享工具表 + 共享调用路径，登记成原生 Pi 工具（直接 `-e` 与安装两种形态同一个文件）。
 import officePiTools from './office_pi_tools.ts';
@@ -50,6 +50,10 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
   // are the only source for the modules that provide Office host behavior.
   delete process.env.PI_STAFF_CODE;
   delete process.env.PI_STAFF_PO;
+  const launchSessionFile = process.env.PI_SESSION_FILE;
+  pi.on('session_shutdown', () => {
+    if (launchSessionFile && process.env.PI_SESSION_FILE === launchSessionFile) delete process.env.PI_SESSION_FILE;
+  });
   // ★ W158 R3.4（退回意见 1）：**继承来的 env 一律不许凌驾身份**。
   //
   //   现场：在役 E/D 版本的扩展会在 `session_start` 自己写 `OFFICE_ENDPOINT_FILE`，而它
@@ -99,7 +103,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     if (!d) return {box: '', why: 'descriptor_unreadable:' + file + (err ? ':' + err : '')};
     const ref = typeof d.hostSessionRef === 'string' ? d.hostSessionRef : '';
     if (!ref) return {box: '', why: 'descriptor_without_session_ref:' + file};
-    const id = sessionIdentity(ref, sessionFile);
+    const id = piEndpointIdentity(home, file, sessionFile, d);
     return id === 'same' ? {box: String(d.actor || ''), why: ''}
       : {box: '', why: id + ':' + JSON.stringify({ref, sessionFile})};
   };
@@ -122,7 +126,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     const v = endpointWhy(ctx);
     if (v.box) return;
     endpointNote = v.why;
-    if (v.why.startsWith('different:')) delete process.env.OFFICE_ENDPOINT_FILE;
+    if (v.why.startsWith('different:') || v.why.startsWith('invalid:')) delete process.env.OFFICE_ENDPOINT_FILE;
   };
   // Session data is only a descriptor filename hint; the live socket remains the authority.
   const prepareSessionEndpoint = async (ctx: any, selected = "", gen?: number) => {
@@ -135,9 +139,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
       ? join(home, 'sock', hint) : candidate);
     if (!file || resolve(dirname(file)) !== resolve(home, 'sock')) return;
     const d = readDescriptor(file), session = sessionRefOf(ctx);
-    if (!d || !session || sessionIdentity(d.hostSessionRef, session) !== 'same'
-        || resolve(d.socketPath) !== resolve(home, 'sock', 'officed.sock')
-        || !d.tokenFile || resolve(dirname(d.tokenFile)) !== resolve(home, 'sock')) return;
+    if (!d || !session || piEndpointIdentity(home, file, session, d) !== 'same') return;
     const client = createPiRoundClient({socketPath: d.socketPath, tokenFile: d.tokenFile});
     let who: any;
     try { who = await client.context(); } finally { client.close(); }
@@ -201,6 +203,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
   const toolsInFlight = new Map<string, {turnId: string; v: number; last: string;
     started?: Promise<any>; ending?: Promise<void>; outcome?: 'ok' | 'error'}>();
   let wakeLoopBox = '';
+  let wakeLoopIdentity = '';
   //: 本模块实例加载时（= 这一次回载的那一份产物）它的版本；没可信标识就为 null。
   const loadedVersion = releaseVersion(import.meta.url);
   const stopWakeLoop = () => {
@@ -211,19 +214,22 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     try { if (wakeLoop) wakeLoop.stop(); } catch { /* 关闭失败不许挡住退出 */ }
     wakeLoop = null;
     wakeLoopBox = '';
+    wakeLoopIdentity = '';
   };
   const startWakeLoop = (ctx: any) => {
     let box = '';
     try { box = String(boxForSession(ctx) || ''); } catch { return; }
     if (!box) { stopWakeLoop(); return; }          // 没有唯一身份 ⇒ 不猜、不等待
-    if (wakeLoop && wakeLoopBox === box) return;   // 同一箱已在跑（幂等）
-    stopWakeLoop();                                // 换箱：先收旧的
     let desc: any = null;
     // 端点描述就是宿主交付的那一份（路径由 runtime 给）；本宿主不按箱名去目录里挑。
     try { desc = readDescriptor(process.env.OFFICE_ENDPOINT_FILE || ''); } catch { desc = null; }
     if (!desc || typeof desc.socketPath !== 'string' || !desc.socketPath) {
       return;                                                                      // 端点还没好：留给下次安全点
     }
+    const identity = JSON.stringify([box, desc.bindingId, desc.generation, desc.instance,
+      desc.hostSessionRef, desc.socketPath, desc.tokenFile, desc.authorityRef]);
+    if (wakeLoop && wakeLoopBox === box && wakeLoopIdentity === identity) return;
+    stopWakeLoop();
     let client: any = null;
     try {
       client = createPiRoundClient({
@@ -245,6 +251,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
         diagFailure: (m: string) => wakeLog('wake-fail: ' + String(m)),
         host: {
           restoreAdmission: true,
+          conditionalOwner: true,
           receiptEntries: (eventCtx: any) => eventCtx?.sessionManager?.getBranch?.(),
           saveReceipt: (receipt: any) => host.appendEntry('office.receipt', receipt),
           canWake: () => ctx.isIdle?.() !== false,
@@ -273,6 +280,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
           },
         },
       });
+      wakeLoopIdentity = identity;
       const loop = wakeLoop;              // 局部引用：TS 的 null 收窄不跨闭包
       // 观测口与客户端同生共死：没连上就没有观测，也不替哪条事实编造身份（身份只由 socket 的可信 ctx 定）。
       hostEvents = createPiHostEvents({client});
@@ -346,25 +354,28 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
   // `turn_id` 的来源只有一个：**这个回合的身份**。实测（真 Pi 1.5.0，扩展侧事件）：
   //   · 助手消息上没有 `message.id` —— 它的键只有 api/content/model/provider/role/stopReason/timestamp/usage；
   //   · `messageEntryId` 只在 `turn_end` 出现，而工具在这之前就已经执行完（那时拿不到）。
-  // 所以在 `turn_start`（工具之前）由宿主拼出：`pi-run-<pid>-<n>:<turnIndex>` —— 跨 run 不重数，
-  // 同一回合的三件工具事件共用同一个值（runtime 定的 B 的语义：回合身份，不是重数的序号）。
+  // agent_start 为整次原生执行分配身份，turn_start 加上 turnIndex；同一回合的工具事件共用此值。
+  // Pi 原位重载会保留 PID 并重建扩展，回合身份须跨重载唯一。
   // 宿主没有某个事件 ⇒ 只少一个安全点，不让整条装配失败（12 处同一段 try/catch，收成一处）。
   const on = (name: any, fn: (event: any, ctx: any) => unknown) => {
     try { host.on(name, fn); } catch { /* 没有该事件 */ }
   };
-  let runSeq = 0;
   let runId = '';
-  on('agent_start', () => { runSeq += 1; runId = `pi-run-${process.pid}-${runSeq}`; currentTurnId = ''; });
-  on('turn_start', (event: any) => {
+  let finalMessage: any;
+  on('agent_start', () => { runId = `pi-run-${randomUUID()}`; currentTurnId = ''; finalMessage = undefined; });
+  on('turn_start', async (event: any) => {
     if (!runId) return;
     const idx = Number.isFinite(event?.turnIndex) ? event.turnIndex : 0;
     currentTurnId = `${runId}:${idx}`;
+    await observe('turn_start', {turnId:currentTurnId, ts:Number.isFinite(event?.timestamp) ? event.timestamp / 1000 : Date.now() / 1000,
+      fields:{act_key:`pi:turn_start:${currentTurnId}`, process_pid:process.pid}});
   });
   on('tool_execution_start', (event: any) => {
     const id = String(event?.toolCallId || '');
     if (!id || !currentTurnId || !hostEvents) return;
     const turnId = currentTurnId;
-    toolsInFlight.set(id, {turnId, v: 0, last: '', started: observe('tool_start', {turnId, nativeId: id})});
+    toolsInFlight.set(id, {turnId, v: 0, last: '', started: observe('tool_start', {turnId, nativeId: id,
+      fields:{process_pid:process.pid, ...(typeof event?.toolName === 'string' ? {tool_name:event.toolName} : {})}})});
   });
   on('tool_execution_update', (event: any) => {
     const id = String(event?.toolCallId || '');
@@ -398,15 +409,19 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
       finishTool(String(message.toolCallId || ''), Boolean(message.isError));
     }
     if (message?.role !== 'assistant') return;
+    finalMessage = message;
     const at = Number.isFinite(message.timestamp) ? message.timestamp / 1000 : Date.now() / 1000;
     if (message.provider === 'zai-coding-cn' && message.stopReason === 'error'
         && Number.isFinite(message.timestamp) && typeof message.errorMessage === 'string') {
       try {
         const match = /^429:\s*(\{[\s\S]*\})\s*$/.exec(message.errorMessage);
         const error = match && JSON.parse(match[1]);
-        if (String(error?.code) === '1310' && typeof error.message === 'string'
-            && /每周|每月/.test(error.message) && /使用上限/.test(error.message))
+        if (typeof error?.message !== 'string' || !error.message.includes('使用上限')) return;
+        const code = String(error.code);
+        const fiveHour = code === '1308' && /\b5\s*小时/.test(error.message);
+        if (fiveHour || (code === '1310' && /每周|每月/.test(error.message)))
           observe('quota', {ts:at, fields:{status:429, reason:'quota_exhausted',
+            ...(fiveHour ? {limit_window:'five_hour'} : {}),
             act_key:`pi:quota:${currentTurnId || message.timestamp || randomUUID()}`}});
       } catch { /* A malformed provider error is not quota evidence. */ }
     } else if (['stop', 'length', 'toolUse'].includes(message.stopReason) && Number.isFinite(message.timestamp)
@@ -414,6 +429,9 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
       observeOutcome(() => hostClient?.hostEvent('model_progress', at,
         {turn_id:currentTurnId, native_id:`pi:message:${currentTurnId}`}));
     }
+  });
+  on('agent_end', (event: any) => {
+    if (Array.isArray(event?.messages)) finalMessage = event.messages.findLast((m: any) => m?.role === 'assistant');
   });
   // ★ W4：这一回合的**真实**原生用量。`turn_end.messageEntryId` 是本回合已持久那条 assistant
   //   entry 的 id（实测：`message_end` 时还没有 id，`turn_end` 才有），`getEntry(id)` 里那个 `usage`
@@ -460,7 +478,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     // 实测 `turn_end.messageEntryId` 是本回合的真身份，但这条线上没有读者读 `turn_id`，所以不送。
     let closed: any = null;
     try { closed = wakeLoop?.turnClosed?.(currentTurnId); } catch { /* 观测不影响回合状态 */ }
-    observe('turn_end', { turnId: currentTurnId, attemptId: closed && closed.attempt_id });
+    await observe('turn_end', { turnId: currentTurnId, attemptId: closed && closed.attempt_id });
     reportUsage(event, ctx);
     if (!ctx.signal?.aborted && event.outcome === 'completed' && event.toolResults?.length && Array.isArray(event.entries)) {
       const draft = await wakeLoop?.insertAtToolBoundary(ctx);
@@ -488,6 +506,18 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
   });
   on('agent_settled', async (event: any, ctx: any) => {
     try { await wakeLoop?.agentSettled?.(event, ctx); } catch { /* 同上 */ }
+    if (runId && currentTurnId) {
+      const outcome = event?.aborted === true ? 'interrupted' : finalMessage?.stopReason === 'error' ? 'failed'
+        : ['stop', 'length'].includes(finalMessage?.stopReason) ? 'completed' : undefined;
+      if (outcome || event?.aborted === true) {
+        const status = outcome === 'failed' && typeof finalMessage?.errorMessage === 'string'
+          ? /^(?:Upstream status )?([1-5]\d\d)\s*:/i.exec(finalMessage.errorMessage)?.[1] : undefined;
+        await observe('turn_end', {turnId:currentTurnId, ts:Date.now() / 1000, fields:{act_key:`pi:run_end:${runId}`, ...(outcome ? {outcome} : {}),
+          ...(outcome === 'failed' ? {reason:'provider_error'} : {}), ...(status ? {status:Number(status)} : {})}});
+      }
+      if (outcome && outcome !== 'interrupted' && ctx?.isIdle?.() === true) await observe('session_idle', {nativeId:currentTurnId, ts:Date.now() / 1000,
+        fields:{act_key:`pi:idle:${runId}`, process_pid:process.pid}});
+    }
   });
   // 端点选好之后起循环（`session_start` 时描述符可能还没写，故也挂在选端点之后）。
   on('session_start', (_e: any, ctx: any) => { try { startWakeLoop(ctx); } catch { /* 下一安全点再试 */ } });
@@ -524,7 +554,7 @@ export default async function nativeOffice(pi: any, options: {home?: string} = {
     try {
       const via = recordingPi();
       // 共享工具面：一张表（spec）+ 一条调用路径（office_tools），本宿主只负责登记与渲染。
-      officePiTools(via, {scope: 'full'});
+      officePiTools(via, {scope: 'full', home, session: (current: any) => ({ref: '', session_ref: sessionRefOf(current)})});
       wireBoundFeatures(via, ctx);
       dbg("load_ok");
     } catch (e) {

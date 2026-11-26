@@ -8,7 +8,7 @@ struct HarnessPage: View {
     var body: some View {
         ScrollViewReader { proxy in
             PageScaffold {
-                PageTitle(title: "Harness", fixture: desk.isFixture) { stats }
+                PageTitle(title: Page.host.title, fixture: desk.isFixture) { stats }
                 PanelBody(panel: desk.hosts) { page in
                     let groups = groupedByHost(page.threads, harness: \.harness)
                     VStack(alignment: .leading, spacing: 0) {
@@ -32,7 +32,7 @@ struct HarnessPage: View {
     // MARK: 统计
     @ViewBuilder private var stats: some View {
         HStack(alignment: .bottom, spacing: Theme.statGap) {
-            Stat(value: desk.hosts.text { "\($0.threads.count)" }, label: tr("已绑定会话", "Bound sessions"))
+            Stat(value: desk.hosts.text { "\($0.threads.count)" }, label: tr("绑定组", "Binding groups"))
             Stat(value: tr("未知", "Unknown"), label: tr("在线", "Online"), muted: true)        // 没有后端事实源；只在这里写一次
         }
     }
@@ -45,7 +45,7 @@ struct HarnessPage: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 10) {
                         Text(g.name).font(Theme.Font.small.weight(.bold))
-                        Text(tr("\(g.items.count) 会话", "\(g.items.count) \(pl(g.items.count, "session"))")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
+                        Text(tr("\(g.items.count) 组", "\(g.items.count) \(pl(g.items.count, "group"))")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
                     }
                     Text(g.items.map(\.title).joined(separator: "、")).font(Theme.Font.sub).foregroundStyle(Theme.ink3).lineLimit(2)
                 }
@@ -60,7 +60,7 @@ struct HarnessPage: View {
             Rectangle().fill(Theme.ink).frame(height: Theme.Line.hair)
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(g.name).font(Theme.Font.sectionTitle).tracking(Theme.Track.blockTitle)
-                Text(tr("\(g.items.count) 会话", "\(g.items.count) \(pl(g.items.count, "session"))")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
+                Text(tr("\(g.items.count) 组", "\(g.items.count) \(pl(g.items.count, "group"))")).font(Theme.Font.small).foregroundStyle(Theme.ink3)
                 Spacer(minLength: 0)
                 let blocked = g.items.first.map { desk.fixtureBlocksWrite(.unbind(bindingID: $0.id, label: $0.title)) } ?? true
                 BoxButton(title: tr("全部下线", "Take all offline"), disabled: blocked) {
@@ -111,6 +111,9 @@ private struct BindingCard: View {
             HStack(spacing: 8) {
                 Square(filled: false, dashed: true, tone: Theme.ink3)
                 Text(title).font(Theme.Font.rowTitle).tracking(-0.17).lineLimit(1).help(title)
+            }
+            if thread.sessionRef.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(tr("原生会话未知", "Native session unknown")).font(Theme.Font.small).foregroundStyle(Theme.ink3).padding(.top, 4)
             }
             ForEach(thread.managedProjects(in: desk.projects.value ?? [])) { project in
                 Text(projectManagerLabel(project))

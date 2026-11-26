@@ -237,7 +237,7 @@ def _schema_lock(db_path):
 
 
 
-def _schema_is_current_readonly(db_path, *, allow_missing_round_send=False):
+def _schema_is_current_readonly(db_path, *, verify_definitions=False):
     """Return whether the existing database already has the current schema.
 
     This path is read-only so ordinary opens do not take a schema write lock. Older or
@@ -247,7 +247,7 @@ def _schema_is_current_readonly(db_path, *, allow_missing_round_send=False):
     if not path.is_file():
         return False
     try:
-        conn = sqlite3.connect("file:%s?mode=ro" % str(path), uri=True,
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
                               timeout=5.0, isolation_level=None)
     except sqlite3.Error:
         return False
@@ -271,12 +271,9 @@ def _schema_is_current_readonly(db_path, *, allow_missing_round_send=False):
             return False
         for table, columns in REQUIRED_COLUMNS.items():
             have_columns = {row[1] for row in conn.execute("PRAGMA table_info(%s)" % table)}
-            missing = columns - have_columns
-            if allow_missing_round_send and table == "round":
-                missing -= {"send_id"}
-            if not have_columns or missing:
+            if not have_columns or not columns <= have_columns:
                 return False
-        return True
+        return not verify_definitions or _schema_definitions_match(conn)
     except sqlite3.Error:
         return False
     finally:
@@ -604,6 +601,8 @@ def required_columns_from_schema(schema_ddl):
 
 
 REQUIRED_COLUMNS = required_columns_from_schema(SCHEMA)
+_SYSTEM_FACT_INDEX = ("CREATE INDEX IF NOT EXISTS ix_letters_system_fact ON letters(from_actor, "
+                      "CASE WHEN json_valid(meta_json) THEN json_extract(meta_json,'$.fact_key') END)")
 
 
 
@@ -652,6 +651,37 @@ def snapshot_facts(snap, refs=()):
             "artifacts": len(objects)}
 
 
+def _schema_definitions_match(conn):
+    """Require the definitions created by Office, rather than guessing SQL equivalence."""
+    query = "SELECT name,type,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL"
+    with contextlib.closing(sqlite3.connect(":memory:")) as expected:
+        tables, indexes = _schema_groups(SCHEMA)
+        for stmt in (*tables, *indexes):
+            expected.execute(stmt)
+        expected.execute(_SYSTEM_FACT_INDEX)
+        wanted = {row[0]: row[1:] for row in expected.execute(query)}
+    found = {row[0]: row[1:] for row in conn.execute(query)}
+    if "ix_letters_system_fact" not in found:
+        del wanted["ix_letters_system_fact"]
+    if any(found.get(name) != definition for name, definition in wanted.items()):
+        return False
+    return not any(name not in wanted and kind in ("trigger", "index") and table in wanted
+                   for name, (kind, table, _) in found.items())
+
+
+@contextlib.contextmanager
+def _restore_lock(home):
+    fd = os.open(home / '.officed.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise StorageError('conflict', '还原前请停止 Office 服务', en='stop the Office daemon before restoring') from exc
+        with config_commit_lock(home):
+            yield
+    finally:
+        os.close(fd)
+
+
 class Storage:
     def __init__(self, db_path, artifacts=None):
         self.db_path = Path(db_path)
@@ -689,8 +719,7 @@ class Storage:
     def _init_schema_locked(self):
         if self._ready:
             return
-        if _schema_is_current_readonly(self.db_path, allow_missing_round_send=True):
-            self._ensure_round_send_column()
+        if _schema_is_current_readonly(self.db_path):
             self._ensure_system_fact_index()
             self._ready = True
             return
@@ -699,7 +728,7 @@ class Storage:
         # schema before executing any DDL so opening this Core cannot rewrite it partially.
         if self.db_path.is_file():
             try:
-                conn = sqlite3.connect("file:%s?mode=ro" % str(self.db_path), uri=True,
+                conn = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True,
                                       timeout=5.0, isolation_level=None)
                 try:
                     existing = conn.execute(
@@ -762,19 +791,10 @@ class Storage:
         self._ensure_system_fact_index()
         self._ready = True
 
-    def _ensure_round_send_column(self):
-        with contextlib.closing(sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)) as conn:
-            if "send_id" not in {row[1] for row in conn.execute("PRAGMA table_info(round)")}:
-                conn.execute("BEGIN IMMEDIATE")
-                if "send_id" not in {row[1] for row in conn.execute("PRAGMA table_info(round)")}:
-                    conn.execute("ALTER TABLE round ADD COLUMN send_id TEXT")
-                conn.commit()
-
     def _ensure_system_fact_index(self):
         conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
         try:
-            conn.execute("CREATE INDEX IF NOT EXISTS ix_letters_system_fact ON letters(from_actor, "
-                         "CASE WHEN json_valid(meta_json) THEN json_extract(meta_json,'$.fact_key') END)")
+            conn.execute(_SYSTEM_FACT_INDEX)
         finally:
             conn.close()
 
@@ -814,18 +834,57 @@ class Storage:
         return facts
 
     def restore(self, snap, refs=()):
-        """把一份**已验过**的快照落进本 home：先验字节再落盘，家里已有库就拒绝（还原不是合并）。"""
+        """Stage and verify a snapshot; expose the database only after its artifacts are durable."""
         snap = Path(snap)
-        facts = snapshot_facts(snap, refs)      # 校验全在写入之前：任何拒绝都不碰目标
-        if self.db_path.exists():
-            raise StorageError("conflict", "目标 home 已有库：%s（还原不是合并）" % self.db_path,
-                               en="the target home already has a database: %s" % self.db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(snap / self.db_path.name, self.db_path)
-        if (snap / "artifacts").is_dir():
-            shutil.copytree(snap / "artifacts", self.artifacts, dirs_exist_ok=True)
-        facts["db"] = str(self.db_path)         # 回执指向**这个家**的库，不是快照里那份
-        return facts
+        snapshot_facts(snap, refs)
+        home = self.db_path.parent
+        home.mkdir(parents=True, exist_ok=True)
+        with _restore_lock(home):
+            if self.db_path.exists():
+                raise StorageError("conflict", "目标 home 已有库：%s（还原不是合并）" % self.db_path,
+                                   en="the target home already has a database: %s" % self.db_path)
+            staging = Path(tempfile.mkdtemp(dir=home, prefix='.restore-'))
+            try:
+                with contextlib.closing(sqlite3.connect(str(snap / self.db_path.name), timeout=30)) as source, \
+                        contextlib.closing(sqlite3.connect(str(staging / self.db_path.name))) as target:
+                    source.backup(target)
+                if (snap / 'artifacts').is_dir():
+                    shutil.copytree(snap / 'artifacts', staging / 'artifacts')
+                facts = snapshot_facts(staging, refs)
+                if not _schema_is_current_readonly(staging / self.db_path.name, verify_definitions=True):
+                    raise StorageError("schema_version_mismatch", "备份库不是完整的当前 schema",
+                                       en="the backup database is not on the complete current schema",
+                                       expected=SCHEMA_VERSION, found=facts['schema'])
+                for path in staging.rglob('*'):
+                    if path.is_file():
+                        with path.open('rb') as stream:
+                            os.fsync(stream.fileno())
+                for path in (staging / 'artifacts', staging):
+                    if path.is_dir():
+                        fd = os.open(path, os.O_RDONLY)
+                        try: os.fsync(fd)
+                        finally: os.close(fd)
+                staged_artifacts = staging / 'artifacts'
+                if not staged_artifacts.is_dir() and self.artifacts.exists() and any(self.artifacts.iterdir()):
+                    raise StorageError("conflict", "目标成果库与快照不一致", en="target artifacts do not match the snapshot")
+                if staged_artifacts.is_dir():
+                    if self.artifacts.exists():
+                        existing = {p.name: _file_sha256(p) for p in self.artifacts.iterdir() if p.is_file()}
+                        expected = {p.name: _file_sha256(p) for p in staged_artifacts.iterdir() if p.is_file()}
+                        if existing != expected or any(not p.is_file() for p in self.artifacts.iterdir()):
+                            raise StorageError("conflict", "目标成果库与快照不一致", en="target artifacts do not match the snapshot")
+                    else:
+                        os.replace(staged_artifacts, self.artifacts)
+                fd = os.open(home, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                    os.replace(staging / self.db_path.name, self.db_path)
+                    os.fsync(fd)
+                finally: os.close(fd)
+                facts['db'] = str(self.db_path)
+                return facts
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
 
     def connect(self):
         """Open the shared Core database with the usual row shape and busy timeout."""

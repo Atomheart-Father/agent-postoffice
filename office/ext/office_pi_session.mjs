@@ -45,3 +45,14 @@ export function sessionIdentity(a, b) {
   const na = pendingName(a), nb = pendingName(b);
   return na && nb && na === nb ? 'same' : 'unknown';
 }
+
+// Pi may use only the descriptor and credentials of this Office home and native session.
+export function piEndpointIdentity(home, descriptor, session, endpoint) {
+  if (!home || !descriptor || !endpoint?.socketPath || !endpoint?.tokenFile) return 'invalid';
+  try {
+    const dir = realpathSync(join(home, 'sock'));
+    if (dirname(realpathSync(descriptor)) !== dir || dirname(realpathSync(endpoint.tokenFile)) !== dir
+        || realpathSync(endpoint.socketPath) !== join(dir, 'officed.sock')) return 'invalid';
+  } catch { return 'unknown'; }
+  return sessionIdentity(endpoint.hostSessionRef, session);
+}

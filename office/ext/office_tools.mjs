@@ -12,6 +12,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { DEFAULT_LOCALE, normLocale, OFFICE_TOOLS } from "./office_tool_spec.mjs";
+import { outcomeOf, OUTCOMES } from "./office_result.mjs";
 // The adapter messages live beside this module, keyed by the stable message name. The
 // *interpolation* stays here (which value goes into which sentence is calling-path knowledge);
 // only where the words live moved. Same load-time import as the other text resources.
@@ -39,7 +40,6 @@ const STRIP = new Set([
 const BUSY_RETRIES = 3;
 const BUSY_BACKOFF_MS = 200;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const UNKNOWN = new Set(["socket_error", "socket_closed", "outcome_unknown"]);
 
 // ★ W229（审计 6d563dd #6）：同一笔业务请求的身份不能因为**字段顺序**不同就变。
 //   JSON.stringify 按插入顺序输出，而对象顺序是模型/宿主随手给的：同一封信换个键序就得到另一个
@@ -101,7 +101,41 @@ function trustedFrom(endpoint) {
  *
  * 返回 null 表示通过；否则返回可直接交给模型的错误结果。
  */
-export function validateArgs(tool, args) {
+// Execute the structural keywords used by the catalog on the same arguments we forward.
+function invalidField(schema, value, path) {
+	if (schema.anyOf && !schema.anyOf.some(item => !invalidField(item, value, path))) return path;
+	if (schema.enum && !schema.enum.includes(value)) return path;
+	const type = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+	if (schema.type === "integer" ? !Number.isSafeInteger(value) : schema.type && schema.type !== type) return path;
+	switch (type) {
+	case "object":
+		for (const key of schema.required ?? [])
+			if (!Object.hasOwn(value, key)) return `${path}.${key}`;
+		for (const [key, child] of Object.entries(value)) {
+			const field = `${path}.${key}`;
+			if (Object.hasOwn(schema.properties ?? {}, key)) {
+				const invalid = invalidField(schema.properties[key], child, field);
+				if (invalid) return invalid;
+			} else if (schema.additionalProperties === false) return field;
+		}
+		return null;
+	case "array":
+		if (value.length < (schema.minItems ?? 0)
+			|| value.length > (schema.maxItems ?? Infinity)) return path;
+		for (let i = 0; schema.items && i < value.length; i++) {
+			const invalid = invalidField(schema.items, value[i], `${path}[${i}]`);
+			if (invalid) return invalid;
+		}
+		return null;
+	case "number":
+		return Number.isFinite(value)
+			&& value >= (schema.minimum ?? -Infinity) && value <= (schema.maximum ?? Infinity) ? null : path;
+	default:
+		return null;
+	}
+}
+
+export function validateArgs(tool, args = {}) {
 	const spec = tool.parameters ?? {};
 	const props = spec.properties ?? {};
 	const allowed = Object.keys(props);
@@ -113,11 +147,14 @@ export function validateArgs(tool, args) {
 		const v = args?.[k];
 		return v === undefined || v === null || (typeof v === "string" && v.trim() === "");
 	});
-	if (!unknown.length && !missing.length) return null;
+	const invalid = !unknown.length && !missing.length
+		? invalidField({ ...spec, required }, args, "arguments") : null;
+	if (!unknown.length && !missing.length && !invalid) return null;
+	const error = unknown.length ? "unknown_arguments" : missing.length ? "missing_required_arguments" : "invalid_arguments";
 	const V = TOOLS_TEXT.validate;
 	return {
 		ok: false,
-		error: unknown.length ? "unknown_arguments" : "missing_required_arguments",
+		error,
 		unknown: unknown.length ? unknown : undefined,
 		missing: missing.length ? missing : undefined,
 		allowed,
@@ -125,12 +162,14 @@ export function validateArgs(tool, args) {
 		// in the lists, because which list goes where is calling-path knowledge, not wording.
 		message_zh: fillText(V.zh, {
 			tool: tool.name,
-			problem: unknown.length ? `不认识的字段 ${unknown.join("、")}` : `缺少必填字段 ${missing.join("、")}`,
+			problem: invalid ? `字段 ${invalid} 不符合工具定义` :
+				unknown.length ? `不认识的字段 ${unknown.join("、")}` : `缺少必填字段 ${missing.join("、")}`,
 			allowed: `${allowed.join("、") || "（无）"}${required.length ? `；必填：${required.join("、")}` : ""}`,
 		}),
 		message_en: fillText(V.en, {
 			tool: tool.name,
-			problem: unknown.length ? `unknown field(s) ${unknown.join(", ")}` : `missing required field(s) ${missing.join(", ")}`,
+			problem: invalid ? `field ${invalid} does not match the tool schema` :
+				unknown.length ? `unknown field(s) ${unknown.join(", ")}` : `missing required field(s) ${missing.join(", ")}`,
 			allowed: `${allowed.join(", ") || "(none)"}${required.length ? `; required: ${required.join(", ")}` : ""}`,
 		}),
 	};
@@ -281,7 +320,7 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 		}
 		let body = buildBody(tool, args);
 		if (name === "office_letter_list") body.limit ??= 50;
-		if (body.op === "letter.read" && body.letter_id && body.direction !== "sent") body.accept_on_read = true;
+		if (name === "office_letter_read") body.accept_on_read = true;
 		if (tool.write) {
 			// ★ W229 R3：回执只在适配器里解释，绝不作为业务字段上线路。
 			const retryArg = typeof body.retry_ref === "string" ? body.retry_ref.trim() : "";
@@ -289,8 +328,12 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 			const usesReceipt = RETRY_OPS.has(tool.op), k = digest([name, body]);
 			const pending = !usesReceipt && unresolved.get(k);
 			if (pending) body = pending;
-			else if (tool.op !== "work.review" && versions.has(body.work_ref))
+			else if (body.expected_version === undefined && tool.op !== "work.review" && versions.has(body.work_ref))
 				body.expected_version = versions.get(body.work_ref);
+			else if (trusted && body.expected_version === undefined && (tool.op === "work.update" || tool.op === "work.publish"))
+				return {ok:false, error:"work_version_required", sent:false, message:normLocale(locale()) === "en"
+					? "Read this Work in this session or supply expected_version from a prior read."
+					: "先在当前会话读这件 Work，或提供此前读到的 expected_version。"};
 			let actKey;
 			if (retryArg) {
 				// 续接：回执必须与**这次身份、这个动作、这份业务参数**一致（没有时间门）；
@@ -322,7 +365,8 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 				if (!(res && res.ok === false && res.error === "busy" && i < BUSY_RETRIES)) break;
 				await sleep(BUSY_BACKOFF_MS * (i + 1));
 			}
-			if (res && res.ok === false && UNKNOWN.has(res.error)) {
+			const retryLostAuthority = (pending || retryArg) && res?.ok === false && res.error === "unauthorized_attempt";
+			if (outcomeOf(res) === OUTCOMES.unknown || retryLostAuthority) {
 				if (!usesReceipt) unresolved.set(k, sentBody);
 				const out = { ...res, error: "outcome_unknown",
 					message: say(usesReceipt ? "outcome_unknown_letter" : "outcome_unknown_write") };
@@ -345,6 +389,8 @@ export function createOfficeTools({ endpoint, core, now = () => Date.now(), loca
 			res = await send(body);
 		}
 		if (tool.op === "work.get" && res && res.ok !== false) observe(res);
+		if (tool.op === "work.list" && res?.ok !== false && Array.isArray(res?.items))
+			for (const item of res.items) observe(item);
 		if (tool.op === "work.runnable" && res?.ok !== false && Array.isArray(res?.items)) res = publicTodo(res);
 		if (tool.op === "work.get" && res?.ok !== false && Array.isArray(res?.todo?.items)) res = { ...res, todo: publicTodo(res.todo) };
 		return res;

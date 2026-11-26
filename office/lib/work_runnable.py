@@ -109,19 +109,17 @@ def _pending_subs(conn, rows):
     return out
 
 
-def same_submitter(conn, work_ref, sub_ref, submitted_by, actor, person):
-    if submitted_by == person:
-        return True
+def same_submitter(conn, work_ref, sub_ref, submitted_by, person):
+    if not person:
+        return None
     row = conn.execute("SELECT json_extract(payload_json,'$.submitted_person') FROM work_events"
                        " WHERE work_ref=? AND op='work.publish'"
                        " AND json_extract(payload_json,'$.sub_ref')=? LIMIT 1", (work_ref, sub_ref)).fetchone()
     if row and row[0]:
         return row[0] == person
-    if submitted_by == actor:
-        return True
     if conn.execute("SELECT 1 FROM position_holders WHERE position=?", (submitted_by,)).fetchone():
         return None
-    return False
+    return submitted_by == person
 
 
 def runnable_work(conn, actor, unit=None, *, now_ts=None, person=None):
@@ -175,7 +173,7 @@ def runnable_work(conn, actor, unit=None, *, now_ts=None, person=None):
                 # 在审状态却没有现行提交：事实对不上，不猜"该谁动手"。
                 skip(SKIP_NOT_MINE)
                 continue
-            if reviewing and same_submitter(conn, ref, *sub, actor, person or actor) is False:
+            if reviewing and same_submitter(conn, ref, *sub, person or actor) is False:
                 action = "review"
             else:
                 # 承办人在等审核人的结论（含"自己交的不能自己审"）。

@@ -15,11 +15,15 @@
 // gets its own connection so responses can never interleave out of order.
 
 import net from "node:net";
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const REPLY_TIMEOUT_MS = 15000;
+const MAX_REPLY_BYTES = 8 * 1024 * 1024;
+const replyDecoder = new TextDecoder("utf-8", {fatal: true, ignoreBOM: true});
+const isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
 // ★ W74-credential（T0 合批裁定 `20261026-062805`，owner=I，Lab 先在候选树验证）：
 // descriptor 出现后首个 whoami 被 R 的 token 门拒（`unauthorized_attempt — 线路持有凭据缺失或不符`），
@@ -93,10 +97,10 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 	}
 
 	function rawOn(sock, request) {
-		// Decode UTF-8 as a stream: a socket chunk can end inside a Chinese character.
-		sock.setEncoding("utf8");
 		return new Promise((resolve) => {
-			let buf = "";
+			const chunks = [];
+			let bytes = 0;
+			let wrote = false;
 			const done = (v) => {
 				clearTimeout(timer);
 				sock.off("data", onData);
@@ -104,19 +108,28 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 				sock.off("close", onClose);
 				resolve(v);
 			};
+			const invalidReply = () => {
+				done({ ok: false, error: "outcome_unknown", message: "endpoint sent an invalid reply", sent: wrote });
+				sock.destroy();
+			};
 			const onData = (chunk) => {
-				buf += chunk;
-				const nl = buf.indexOf("\n");
+				const nl = chunk.indexOf(10);
+				const part = nl < 0 ? chunk : chunk.subarray(0, nl);
+				bytes += part.length;
+				if (bytes > MAX_REPLY_BYTES) return invalidReply();
+				chunks.push(part);
 				if (nl < 0) return;
 				let parsed;
 				try {
-					parsed = JSON.parse(buf.slice(0, nl));
+					parsed = JSON.parse(replyDecoder.decode(Buffer.concat(chunks, bytes)));
 				} catch {
-					return done({ ok: false, error: "internal", message: "endpoint sent invalid JSON", sent: true });
+					return invalidReply();
 				}
+				if (!isRecord(parsed)) return invalidReply();
 				// Success -> hand the result up as-is, matching Core's method return shape.
 				// Refusal -> same {ok,error,message} envelope the rest of my layer expects.
-				if (parsed && parsed.ok === false) {
+				if (parsed.ok === false && typeof parsed.code === "string" && parsed.code.trim()
+					&& (parsed.message === undefined || typeof parsed.message === "string")) {
 					// Carry Core's own machine-readable reason through untouched. It is the field the
 					// endpoint put on the wire (endpoint.py forwards CoreError.detail["reason_code"]);
 					// nothing here reads the human message, and nothing is invented when it is absent.
@@ -139,25 +152,24 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 						out.detail = parsed.detail;
 					}
 					done(out);
-				} else {
+				} else if (parsed.ok === true && isRecord(parsed.result)) {
 					if (typeof frame.session_token === 'string' && frame.session_token) authenticatedToken = frame.session_token;
-					done(parsed?.result);
-				}
+					done(parsed.result);
+				} else invalidReply();
 			};
 			// `sent` is the whole reason these three states are distinguishable: a connect() failure
 			// means the letter never existed, while an error after write() means it may have been
 			// created and Core may have committed it. One flag, read off whether we actually wrote.
-			const wrote = () => sock.__ifxWrote === true;
 			const onErr = (e) => {
 				sock.__ifxConnected = false;
 				if (pooled === sock) pooled = null;
 				sock.destroy();
-				done({ ok: false, error: "socket_error", message: e?.code ?? e?.message ?? String(e), sent: wrote() });
+				done({ ok: false, error: "socket_error", message: e?.code ?? e?.message ?? String(e), sent: wrote });
 			};
 			const onClose = () => {
 				sock.__ifxConnected = false;
 				if (pooled === sock) pooled = null;
-				done({ ok: false, error: "socket_closed", message: "端点在回复前关闭", sent: wrote() });
+				done({ ok: false, error: "socket_closed", message: "端点在回复前关闭", sent: wrote });
 			};
 			// ★ W436 实测（真实 pi + officed）：`round.await` 是**有界长等待**（`wait_ms` 由调用方给，
 			//   等待循环用 30000）。固定 15s 的普通请求超时会把它自己打断 —— 客户端先判超时，
@@ -185,7 +197,7 @@ export function createOfficeSocket({ socketPath, tokenFile } = {}) {
 			// net.Socket#readyState is NOT a connection indicator: a brand new unconnected
 			// socket already reports "open", and writing to it fails with ERR_SOCKET_CLOSED.
 			// Connectivity is therefore tracked explicitly, per socket.
-			const send = () => { sock.__ifxWrote = true; sock.write(line); };
+			const send = () => { wrote = true; sock.write(line); };
 			if (sock.__ifxConnected) {
 				send();
 			} else {
@@ -309,10 +321,15 @@ export function splitFlags(argv) {
 }
 
 export function nativeDescriptor(home, surface, ref) {
-	if (!["codex", "claude"].includes(surface) || typeof ref !== "string"
-		|| !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(ref)) return "";
+	if (typeof ref !== "string") return "";
+	const native = surface === "opencode" ? /^ses_[A-Za-z0-9]+$/ :
+		["codex", "claude"].includes(surface) && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+	if (!native || !native.test(ref)) return "";
 	const root = home || process.env.POSTOFFICE_HOME || join(homedir(), "agent-postoffice");
-	return join(root, "sock", `${surface}-${ref}.endpoint.json`);
+	const id = `${surface}-${ref}`;
+	// Match officed's private filename namespace.
+	const stem = /^[a-z0-9][a-z0-9_.-]{0,199}$/.test(id) ? id : "~" + createHash("sha256").update(id).digest("hex");
+	return join(root, "sock", `${stem}.endpoint.json`);
 }
 
 /**

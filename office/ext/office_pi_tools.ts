@@ -19,6 +19,7 @@ import { createOfficeSocket, openControlledEndpoint } from "./office_socket.mjs"
 import { renderToolResult } from "./office_result.mjs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { piEndpointIdentity } from "./office_pi_session.mjs";
 import { toolSpecs, TOOL_NAMES, DEFAULT_LOCALE, normLocale } from "./office_tool_spec.mjs";
 import TOOL_TEXT from "./office_tool_text.json" with { type: "json" };
 
@@ -41,7 +42,7 @@ export default function officePiTools(pi: any, options: { scope?: "join" | "full
 	 * or a host restart changes the key, so the connection is rebuilt instead of reused. Nothing here scans a
 	 * directory or invents a path: no delivered descriptor means "no controlled endpoint".
 	 */
-	function current() {
+	function current(ctx: any) {
 		const delivered = process.env.OFFICE_ENDPOINT_FILE || "";
 		const located = openControlledEndpoint({ home, descriptor: delivered });
 		if (!located.ok) {
@@ -49,6 +50,11 @@ export default function officePiTools(pi: any, options: { scope?: "join" | "full
 			return { error: located.error, state: located.state, message: located.message };
 		}
 		const e = located.endpoint as Record<string, unknown>;
+		const session = options.session?.(ctx)?.session_ref || ctx?.sessionManager?.getSessionFile?.() || process.env.PI_SESSION_FILE || '';
+		if (piEndpointIdentity(home, located.path, session, e) !== 'same') {
+			closeLive();
+			return {error: 'no_controlled_endpoint', state: 'not_connected'};
+		}
 		const key = [located.socketPath, e.actor, e.bindingId, e.generation, e.instance].join("\u0000");
 		if (live && live.key === key) return { office: live.office };
 		closeLive();
@@ -57,8 +63,8 @@ export default function officePiTools(pi: any, options: { scope?: "join" | "full
 		return { office: live.office };
 	}
 
-	async function call(name: string, args: Record<string, unknown>) {
-		const l = current();
+	async function call(name: string, args: Record<string, unknown>, ctx: any) {
+		const l = current(ctx);
 		if (l.error) {
 			// 没有端点也是三态里的"未执行"：`sent:false` + 共享渲染层给的原因句，不编造结果。
 			return { ok: false, error: l.error, state: l.state, message: l.message, sent: false };
@@ -87,7 +93,7 @@ export default function officePiTools(pi: any, options: { scope?: "join" | "full
 						return renderToolResult(result, locale()) as never;
 					} finally { socket.close(); }
 				}
-				return renderToolResult(await call(spec.name, params ?? {}), locale()) as never;
+				return renderToolResult(await call(spec.name, params ?? {}, ctx), locale()) as never;
 			},
 		});
 	}

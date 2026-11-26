@@ -106,9 +106,7 @@ class Endpoints:
 
         为什么在这里：`to`/`cc` 是**工具面**的形状（spec public），`recipients` 是 Core 的形状；
         让每个客户端各翻一次，就会出现“CLI 认 @岗位、MCP 不认”这种两套解析。端点已经是唯一的
-        受控入口，翻译与登记核对都放这里，CLI/MCP/Pi 只把 `to` 原样交上来。
-
-        岗位按岗位记录核对；普通箱按现有目录或 Core 登记事实核对。
+        受控入口，CLI/MCP/Pi 只把 `to` 原样交上来。登记由 Core 在实际写入前核对。
         """
         to = req.get("to")
         cc = req.get("cc") or []
@@ -118,34 +116,14 @@ class Endpoints:
         if not isinstance(cc, list) or any(not isinstance(c, str) or not c.strip() for c in cc):
             raise self.mod.CoreError("invalid_request", "cc 必须是信箱名或 @岗位的数组",
                                      en="cc must be an array of mailboxes or @positions", field="cc")
-        positions = {p["position"] for p in
-                     (self.core.position_facts(actor, all=True).get("positions") or [])}
         recipients = []
         for value, category in [(to, "to")] + [(c, "cc") for c in cc]:
             raw = value.strip()
+            unit = self.mod.check_box_name(raw.removeprefix('@').strip())
+            recipient = {"box": unit, "category": category}
             if raw.startswith("@"):
-                unit = raw[1:].strip()
-                if not unit:
-                    raise self.mod.CoreError("invalid_request", "`@` 后面缺岗位名",
-                                             en="no position name after `@`", field="to")
-                if unit not in positions:
-                    raise self.mod.CoreError(
-                        "not_found", "没有登记这个岗位：%s（发信只能发给已登记的岗位或信箱）" % unit,
-                        en="no such registered position: %s (mail goes to a registered position or mailbox)"
-                           % unit, position=unit, reason_code="position_unregistered")
-                recipients.append({"box": unit, "logical_address": unit, "category": category})
-                continue
-            home = Path(self.core.home)
-            known = (home / raw).is_dir() or raw in positions
-            if not known:
-                with self.core._txn(read_only=True) as conn:
-                    known = self.core._is_registered_principal(raw, conn)
-            if not known:
-                raise self.mod.CoreError(
-                    "not_found", "没有登记这个信箱：%s（发信只能发给已登记的岗位或信箱）" % raw,
-                    en="no such registered mailbox: %s (mail goes to a registered position or mailbox)"
-                       % raw, box=raw, reason_code="box_unregistered")
-            recipients.append({"box": raw, "category": category})
+                recipient["logical_address"] = unit
+            recipients.append(recipient)
         return recipients, self.letter_id_for(actor, req.get("act_key"))
 
     @staticmethod
@@ -176,6 +154,7 @@ class Endpoints:
         "letter.send": {"op", "act_key", "to", "cc", "subject", "intent", "need", "body",
                         "reply_to", "keep_open", "retry_ref"},
         "letter.archive": {"op", "act_key", "letter_id", "unit"},
+        "work.publish": {"op", "act_key", "work_ref", "files", "note", "replaces", "expected_version", "final"},
         # `work.read` 的展示字段：读权与字节鉴别全在 Core 的 `work.read`（唯一判据），
         # 分页/搜看形状全在 `r/artifact_read.stream_view`（唯一投影器）。两者都不认这四个字段 ——
         # 原样透传只会被 Core 的签名校验拒掉（“请求含未知字段”），于是线路永远拿不到分页。
@@ -184,28 +163,18 @@ class Endpoints:
         "work.read": {"op", "work_ref", "sub_ref", "path", "lines", "search", "cursor", "limit"},
     }
 
-    def _with_prepared_change_set(self, req, trusted_ctx):
-        """工具收 `files`，Core 收 `change_set`：字节在 Core 的写事务里、`publish` 之前进库。
-
-        `commit` 必须与 `publish` 同一个写事务（否则字节与提交记录会分家）；`close` 交给调用层
-        （Core 在验证绑定/权限时就可能拒，那时 `prepare` 还没被叫过）。`precheck` 由 Core 给。"""
+    def _with_prepared_change_set(self, req):
+        """Wire files become a lazy snapshot, called only after Core authorizes access."""
         out = dict(req)
         files = out.pop("files")
         work_ref = out.get("work_ref")
-        groups = self._groups_for(work_ref, files)
-        prepared = self._publisher.prepare_change_sets(
-            groups, artifact_root=str(self.core._artifact_root()))
 
-        def prepare(precheck=None):
-            changes, skipped, commit = prepared[:3]
-            if precheck is not None:            # 车的另一头：先判业务，再落字节
-                precheck(changes)               # 原样的 change_set：`_outside_scope` 认的是 dict
-            commit()
-            return changes
+        def prepare(check_paths):
+            return self._publisher.prepare_change_sets(self._groups_for(work_ref, files),
+                artifact_root=str(self.core._artifact_root()), check_paths=check_paths)
 
-        out["change_set"] = None
         out["prepare"] = prepare
-        return out, prepared[3]                 # `close`：归调用层，Core 提前拒绝也有人收
+        return out
 
     #: 轮 op 在线上带 `box`（投递单元），Core 的形参叫 `unit`；`box == actor` 时不传
     #: （那是"自己的箱"，Core 的默认就是 actor）。这不是第二套轮次规则，是**同一条换算**：
@@ -300,13 +269,18 @@ class Endpoints:
         fallback = (scope or "").strip("/")
         mapping = self._workspace_map()
         keys = sorted((str(k).strip("/") for k in mapping), key=len, reverse=True)
+        if not isinstance(files, list) or not files:
+            raise self.mod.CoreError("invalid_request", "files 必须是非空列表", en="files must be a non-empty list")
         buckets = {}
-        for item in files if isinstance(files, list) else [files]:
+        for item in files:
             path = item if isinstance(item, str) else (
                 item.get("path") if isinstance(item, dict) else None)
             if not isinstance(path, str) or not path:
-                continue
-            rel = path.strip("/")
+                raise self.mod.CoreError("invalid_request", "每个文件必须提供路径", en="Each file must have a path")
+            if path.startswith('/'):
+                raise self.mod.CoreError('invalid_request', '交付路径须使用工作区相对路径',
+                                         en='Publication paths must be workspace-relative')
+            rel = path.rstrip("/")
             hit = next((k for k in keys if k and (rel == k or rel.startswith(k + "/"))), None)
             buckets.setdefault(hit, []).append(item)     # ★ 原样留着：`{path, op}` 里的 op 是删除的唯一表达
         groups = []
@@ -336,7 +310,6 @@ class Endpoints:
 
     def dispatch(self, req, trusted_ctx):
         """One request → one frame. Never raises for a business refusal."""
-        close_prepared = None         # 备好的临时对象/fd：无论 Core 怎么拒，都在 finally 收
         try:
             if isinstance(req, dict) and (internal := {"prepare", "render", "groups"} & req.keys()):
                 raise self.mod.CoreError("invalid_request", f"线路不接受内部字段 {sorted(internal)}",
@@ -367,8 +340,10 @@ class Endpoints:
                     req["letter_id"] = letter_id
             if op in self._ROUND_OPS:
                 req = self.translate_round(req, trusted_ctx)
-            if op == "work.publish" and "files" in req:
-                req, close_prepared = self._with_prepared_change_set(req, trusted_ctx)
+            if op == "work.publish":
+                if "files" not in req:
+                    raise self.mod.CoreError('invalid_request', '交付须提供 files', en='Publication requires files')
+                req = self._with_prepared_change_set(req)
             if op == "work.read":
                 options = {k: req.pop(k) for k in ("lines", "search", "cursor", "limit") if k in req}
                 req["render"] = partial(self._artifacts.stream_view, **options)
@@ -393,9 +368,6 @@ class Endpoints:
                 "internal" if "internal" in self.mod.CODES else "busy",
                 "内部错误：%s" % type(exc).__name__,
                 en="internal error: %s" % type(exc).__name__))
-        finally:
-            if close_prepared is not None:
-                close_prepared()
         return {"ok": True, "result": result}
 
     # ---------------------------------------------------------------- 三种帧

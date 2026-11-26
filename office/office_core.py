@@ -93,7 +93,7 @@ SUB_EFFECTIVE = "effective"
 _HANDLE_READ_OPS = frozenset({"office.context", "office.lookup", "letter.read", "work.runnable", "work.read",
                               "work.list", "work.get", "grant.show", "grant.list", "knowledge.read",
                               "resource.status", "usage.read", "release.status", "request.list",
-                              "round.owner.show", "round.payload"})
+                              "round.owner.show", "round.payload", "position.profile"})
 
 def read_only_request(request, ctx):
     """The read contract has one exception: opening an inbox letter may accept it."""
@@ -122,6 +122,8 @@ _HANDLE_OPS = {
     "organization.config.set": "organization_config_set",
     "identity.deactivate": "identity_deactivate",
     "position.retire": "position_retire",
+    "position.profile": "position_profile",
+    "position.duties.set": "position_duties_set",
     "grant.create": "grant_create",
     "grant.revoke": "grant_revoke",
     "grant.show": "grant_show",
@@ -135,6 +137,7 @@ _HANDLE_OPS = {
     "letter.send": "letter_send",
     "letter.read": "letter_read",
     "letter.archive": "letter_archive",
+    "letter.archive_completed": "letter_archive_completed",
     "letter.revise": "letter_revise",
     "letter.retract": "letter_retract",
     "work.runnable": "work_runnable",
@@ -147,7 +150,6 @@ _HANDLE_OPS = {
     "work.publish": "work_publish",
     "work.read": "work_read",
     "work.review": "work_review",
-    "letter.write": "letter_write",
     "host.event": "host_event",
     # 轮：谁在投、投到哪一步。选信在 `delivery/selection.py`；这里只判权与落库。
     "round.begin": "round_begin",
@@ -234,6 +236,14 @@ def check_ref(ref, what):
     if ref.startswith("/") or ref.endswith("/"):
         raise CoreError("invalid_request", f"{what} 不以 / 开头或结尾", en=f"{what} must not start or end with /")
     return ref
+
+
+def check_box_name(name, field="mailbox"):
+    if (not isinstance(name, str) or not name or len(name) > 200 or name in (".", "..")
+            or any(c in name for c in ("/", "\\", "\x00"))):
+        raise CoreError("invalid_request", "信箱地址须为单个名称",
+                        en="A mailbox address must be a single name", field=field)
+    return name
 
 
 ORG_CONFIG_BOX_PREFIX = "boxes."
@@ -421,6 +431,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
 
     #: 显式 mixin 契约：这些是 Core 拥有的规则/事实引用，不是复制的策略。
     CoreError = CoreError
+    _check_box_name = staticmethod(check_box_name)
     CODES = CODES
     check_ref = staticmethod(check_ref)
     check_op = staticmethod(check_op)
@@ -604,7 +615,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             return False
         return actor in self._governance_actors(conn)
 
-    def _is_position_address(self, conn, name):
+    @staticmethod
+    def _is_position_address(conn, name):
         """A registered position may be vacant."""
         return isinstance(name, str) and bool(name.strip()) and conn.execute(
             "SELECT 1 FROM position_holders WHERE position=?", (name,)).fetchone() is not None
@@ -703,8 +715,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         payload = self._normalize_blank_optionals(getattr(self, method), payload)
         # 先核一次（未知/未登记 Binding 立刻拒），再把 ctx 挂为 pending：业务方法的每个事务
         # 都会在开头按当前事实重读它（闭合「校验一次、提交时已撤权」的窗）。
-        read_only = read_only_request(request, tc)
-        with self._txn(read_only=read_only) as conn:
+        with self._txn(read_only=True) as conn:
             actor = self._verify_trusted_ctx(conn, tc)
         return self._with_pending(tc, lambda: getattr(self, method)(actor, **payload))
 
@@ -788,19 +799,13 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         普通箱：读者就是它自己。岗位箱：读者是**此刻承载它的活会话所属的人**；没有现任就返回空表，
         投递侧据此把到期项推后等待（岗位的信等合法现任），而不是发给谁都不知道的一群人。
 
-        只读、只认登记事实（`position_holders` + `bindings.active`），与治理判据同一份。
+        只读、使用与信箱登记相同的判据。
         """
         if not isinstance(unit, str) or not unit:
             return []
         if self._is_position_address(conn, unit):
             return self._live_holders(conn, unit)
-        # 普通箱：真的是这个家的信箱才给它读（有信箱目录，或已经有信落在里面）；
-        # 一个谁也不是的名字不该因此凭空建出一轮。
-        has_mail = conn.execute("SELECT 1 FROM letter_states WHERE box=? LIMIT 1",
-                                (unit,)).fetchone()
-        if has_mail is None and not (Path(self.home) / unit).is_dir():
-            return []
-        return [unit]
+        return [unit] if self._is_registered_principal(unit, conn) else []
 
     # ================================================================ Work 三入口
     def _artifact_root(self):
@@ -891,7 +896,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 raise CoreError("invalid_request", "负责人由 target 指定", en="Specify the owner as target")
         else:
             fields = {"grant": {"scope", "actions", "project_ref", "expires_at", "grant_ref"},
-                      "holder": {"target_session_ref"}, "join": {"session_ref"}, "retire": {"cancel_work"}, "broadcast": {"body"}, "read_mail": {"letter_ids"}}
+                      "holder": {"target_session_ref"}, "unbind": {"target_generation"}, "join": {"session_ref"}, "retire": {"cancel_work"}, "broadcast": {"body"}, "read_mail": {"letter_ids"}}
             unknown = sorted(rparams.keys() - fields.get(kind, set()))
             if unknown:
                 raise CoreError("invalid_request", "申请参数含未知字段", en="Unknown request parameters",
@@ -922,10 +927,10 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                     return replay
                 applicant_person = self._request_operator(conn, actor)
                 now = self._now(now_ts)
-                pos = ((position or "").lstrip("@").strip()) if kind in ("holder", "retire") else ""
-                if kind in ("holder", "retire") and not pos:
-                    raise CoreError("invalid_request", "kind=%s 需要 position" % kind,
-                                    en="kind=%s needs position" % kind, field="position")
+                pos = ""
+                if kind in ("holder", "retire"):
+                    pos = check_box_name(position.strip().removeprefix("@").strip()
+                                         if isinstance(position, str) else position, "position")
                 if kind == "retire" and not self._position_exists(conn, pos):
                     raise CoreError("not_found", "没有岗位 %r" % pos, en="There is no position %r" % pos, field="position")
                 if kind == "revoke" and not conn.execute("SELECT 1 FROM grants WHERE grant_ref=? AND revoked_at IS NULL",
@@ -1238,7 +1243,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         with self._txn() as conn:
             result, changed = mod.withdraw(
                 self.storage, conn, actor, work_ref=work_ref, sub_ref=sub_ref,
-                expected_version=expected_version, act_key=act_key, now_ts=now_ts)
+                expected_version=expected_version, act_key=act_key, now_ts=now_ts,
+                person=self._request_person(conn, actor))
             return result
 
     def release_record(self, actor, *, version, source_commit=None, work_refs, act_key,
@@ -1459,30 +1465,71 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
 
     def work_publish(self, actor, *, work_ref, change_set=None, act_key, note="", replaces=None,
                      expected_version=None, final=False, now_ts=None, prepare=None):
-        """交付一份：`prepare`（端点胶水）落字节前先跑 `work_flow.plan`，一个事务里写完。"""
+        """Authorize workspace access before taking a snapshot, and recheck before recording it."""
         self._check_actor(actor)
+        if type(final) is not bool:
+            raise CoreError("invalid_request", "final 必须是布尔值", en="final must be a boolean", field="final")
         mod = _work_module("work_flow.py", "office_work_flow")
+        with contextlib.ExitStack() as resources:
+            if prepare is not None:
+                if not act_key:
+                    raise CoreError('invalid_request', '交付需要 act_key', en='Publication requires an act_key')
+
+                def check_access(conn, refs):
+                    record = conn.execute("SELECT result_json FROM actions WHERE actor=? AND op='work.publish' AND act_key=?",
+                                          (actor, act_key)).fetchone()
+                    if record is not None:
+                        prior = json.loads(record['result_json'])
+                        if prior['work_ref'] != work_ref:
+                            raise CoreError('conflict', '同一 act_key 已用于其他交付', en='The act_key was already used for a different publication')
+                        from work_runnable import same_submitter
+                        if same_submitter(conn, work_ref, prior['sub_ref'], actor,
+                                          self._request_person(conn, actor)) is not True:
+                            raise CoreError('unauthorized_attempt', '只有原提交人可以重试该交付',
+                                            en='Only the original submitter may retry this publication', reason_code='not_submitter')
+                        known = {(item['ref'], item['op']) for item in prior['change_set']}
+                        extra = [item for item in refs if (item['ref'], item['op']) not in known]
+                        if extra:
+                            # The snapshot may have skipped filesystem metadata on the first call.
+                            row = mod._work_row(conn, work_ref)
+                            if (not mod._is_holder(conn, actor, row)
+                                    or mod._outside_scope(mod._scopes(row), extra, self.scope_covers)):
+                                raise CoreError('conflict', '同一 act_key 已用于其他交付',
+                                                en='The act_key was already used for a different publication')
+                        return
+                    mod.plan(conn, actor, work_ref=work_ref, change_set=refs, expected_version=expected_version,
+                             replaces=replaces, scope_covers=self.scope_covers, now_ts=now_ts,
+                             person=self._request_operator(conn, actor))
+
+                with self._txn(read_only=True) as conn:
+                    check_access(conn, [])
+
+                def check_paths(refs):
+                    with self._txn(read_only=True) as conn:
+                        check_access(conn, refs)
+
+                change_set, _, commit, close = prepare(check_paths)
+                resources.callback(close)
+            else:
+                commit = None
+            return self._commit_publication(mod, actor, work_ref=work_ref, change_set=change_set, act_key=act_key,
+                                            note=note, replaces=replaces, expected_version=expected_version,
+                                            final=final, now_ts=now_ts, commit=commit)
+
+    def _commit_publication(self, mod, actor, *, work_ref, change_set, act_key, note, replaces,
+                            expected_version, final, now_ts, commit):
         with self._txn() as conn:
-            if prepare is not None:                     # 落字节之前先判业务：越界/版本冲突不留对象
-                def precheck(refs):
-                    if self.storage.action_replay(conn, actor, "work.publish", act_key, mod.replay_key(
-                            work_ref, refs, note, replaces, final))[0] is None:
-                        mod.plan(conn, actor, work_ref=work_ref, change_set=refs,
-                                 expected_version=expected_version, replaces=replaces,
-                                 scope_covers=self.scope_covers, now_ts=now_ts)
-                change_set = prepare(precheck)
-            before = conn.execute("SELECT version, reviewer_ref FROM work WHERE work_ref=?", (work_ref,)).fetchone()
+            before = conn.execute("SELECT version FROM work WHERE work_ref=?", (work_ref,)).fetchone()
             result = mod.publish(self.storage, conn, actor, work_ref=work_ref,
                                change_set=change_set, store_root=str(self._artifact_root()),
                                act_key=act_key, note=note, replaces=replaces,
-                               expected_version=expected_version, final=bool(final),
+                               expected_version=expected_version, final=final, commit_snapshot=commit,
                                now_ts=now_ts, scope_covers=self.scope_covers,
                                operator=lambda: self._request_operator(conn, actor))
-            self._notify_unblocked(conn, result.get("unblocked"), upstream_ref=work_ref,
-                                   now_ts=now_ts)
-            advanced = before and result.get("version") == before["version"] + 1
-            if advanced and result.get("state") == "Submitted":
-                self._notify_work(conn, result, "review_requested", None, now_ts)
+            if before and result.get("version") == before["version"] + 1:
+                self._notify_unblocked(conn, result.get("unblocked"), upstream_ref=work_ref, now_ts=now_ts)
+                if result.get("state") == "Submitted":
+                    self._notify_work(conn, result, "review_requested", None, now_ts)
             return result
 
     def work_review(self, actor, *, work_ref, sub_ref, decision, act_key, reason=None,
@@ -1663,6 +1710,23 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                     out.append({"role": up})
         return out
 
+    def _monitor_work_managers(self, conn, items, now_ts):
+        managers = {}
+        for project in sorted({item['project_ref'] for item in items}):
+            for grant in self._project_grants(conn, project, now_ts):
+                managers.setdefault(grant['subject_ref'], []).append(project)
+        return managers
+
+    def _monitor_recipients(self, conn, actor, now_ts=None):
+        """Session faults use the reporting line, or affected project managers for direct assignments."""
+        managers = [p['role'] for p in self._managers_of(conn, actor, self._positions_of(conn, actor))]
+        if managers:
+            return managers, None
+        from work_runnable import runnable_work
+        items = runnable_work(conn, actor, person=self._request_person(conn, actor))['items']
+        projects = self._monitor_work_managers(conn, items, now_ts)
+        return list(projects), {'actor': actor, 'projects': projects} if projects else None
+
     # ================================================================ 信件与 due
     #: 受信来源只有这三种。声称（线路正文）与受信（入口固定）走两个键，永不互相冒充。
     _LETTER_SOURCES = ("official", "management_provisioned", "migration")
@@ -1679,10 +1743,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                     intent=None, reply_to=None, keep_open=False, now_ts=None):
         """**对外入口**：一封普通信，走**已翻译好**的收件列表。
 
-        公开线路给的是 `to` + `cc`；把它们翻成这张收件列表、并核对每个地址确实已登记，
-        是**唯一端点**的事（`r/endpoint.py::translate_letter`），Core 不做第二次翻译，
-        CLI/MCP/Pi 也不各自翻。编号同样由端点在拿到 `act_key` 时一并定出，所以同一笔动作
-        在每一层看到的是同一封。
+        端点将 `to` + `cc` 统一翻成收件列表，并从 `act_key` 生成编号。
+        Core 先查原动作的回执，再为新的写入核对每个地址的登记。
 
         信件与这一批收件箱的合批到期项在**同一事务**里提交；外部动作在提交之后。
         """
@@ -1698,7 +1760,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 return replay
             result = self._letter_write_body(conn, actor, letter_id=letter_id, subject=subject,
                                             body=body, recipients=recipients,
-                                            body_sha256=None, need=need, now_ts=now_ts)
+                                            body_sha256=None, need=need, now_ts=now_ts,
+                                            registered_recipients=True)
             if reply_to:
                 result.update(self._record_letter_reply(conn, actor, letter_id, reply_to,
                                                         recipients, keep_open, result["acted_at"]))
@@ -1759,7 +1822,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         }
 
     def _letter_write_body(self, conn, actor, *, letter_id, subject, body, recipients,
-                           body_sha256=None, need=None, now_ts=None):
+                           body_sha256=None, need=None, now_ts=None, registered_recipients=False):
         """**单一业务写体**：只认调用方给的 `conn`，不碰 `self.storage`，不自己开事务。
 
         这样它为谁开事务由调用方决定（对外 `letter.send`、内部 `letter_write`），而"一封信长
@@ -1826,6 +1889,16 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                                % (", ".join(blocked),
                                   ("; send to the position instead: %s" % named) if named else ""),
                             reason_code="mailbox_archived", archived=blocked, positions=hints)
+        if registered_recipients:
+            for row in rows:
+                box = row["box"]
+                position = row["logical_address"] is not None
+                if self._is_registered_principal(box, conn, position_only=position):
+                    continue
+                kind, label = ("position", "岗位") if position else ("box", "信箱")
+                raise CoreError("not_found", f"没有登记这个{label}：{box}",
+                                en=f"no such registered {'position' if position else 'mailbox'}: {box}",
+                                reason_code=kind + "_unregistered", **{kind: box})
         now = self._now(now_ts)
         row = conn.execute("SELECT * FROM letters WHERE letter_id=?", (letter_id,)).fetchone()
         if row is None:
@@ -1842,6 +1915,9 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                       "created": True, "added_boxes": boxes, "existing_boxes": [],
                       "acted_at": now, "acted_at_ts": time.time() if now_ts is None else float(now_ts)}
         else:
+            if row["from_actor"] != actor:
+                raise CoreError("conflict", "该信件编号已被使用",
+                                en="That letter ID is already in use", reason_code="letter_id_taken")
             if row["body_sha256"] != calc:
                 raise CoreError("conflict", "同名信件已存在且正文不同",
                                 en="A letter with this name already exists with a different body",
@@ -1939,7 +2015,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
     def host_event(self, actor, *, kind, ts, act_key, native_id=None, turn_id=None, outcome=None,
                    reason=None, attempt_id=None, status=None, limit_window=None,
                    version=None, resource_ref=None, loaded=None, usable=None, attempt_only=False,
-                   terminal_ts=None, now_ts=None):
+                   terminal_ts=None, process_pid=None, tool_name=None, now_ts=None):
         """适配层上报的一条原生观测。**只有受信适配器**能到这里：身份仍只来自 trusted_ctx。
 
         旧代次直接丢弃（不报错、不记账）——一条来自已换任窗口的观测不是“错”，是“不作数”。
@@ -1952,9 +2028,12 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         if not isinstance(kind, str) or not kind:
             raise CoreError("invalid_request", "host.event 需要 kind",
                             en="host.event needs kind", field="kind")
-        if ts is None:
-            raise CoreError("invalid_request", "host.event 需要 ts（原生时刻）",
-                            en="host.event needs ts (the native timestamp)", field="ts")
+        untimed_failure = (ts is None and isinstance(turn_id, str) and bool(turn_id)
+                           and attempt_id is None
+                           and (kind == "quota" or (kind == "turn_end" and outcome == "failed")))
+        if not untimed_failure and (type(ts) not in (int, float) or not math.isfinite(ts)):
+            raise CoreError("invalid_request", "host.event 需要有限的数值时刻",
+                            en="host.event requires a finite numeric time", field="ts")
         if kind not in self.HOST_EVENT_KINDS:
             raise CoreError("invalid_request",
                             f"host.event 的 kind 不在规格 §3.2 的闭集里：{kind!r}",
@@ -1986,6 +2065,10 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                       "limit_window": limit_window,
                       "version": version, "binding": binding, "resource_ref": resource_ref,
                       "loaded": loaded, "usable": usable}
+            if process_pid is not None:
+                params['process_pid'] = process_pid
+            if tool_name is not None:
+                params['tool_name'] = tool_name
             if attempt_only:
                 params["attempt_only"] = True
             if terminal_ts is not None:
@@ -1997,7 +2080,13 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 raise CoreError("conflict", "the original attempt was not recorded", reason_code="attempt_not_recorded")
             result = {"ok": True, "kind": kind, "binding_id": binding[0],
                       "generation": binding[1]}
-            if kind == "quota":
+            current = self._monitor_state(conn, binding) if untimed_failure else None
+            if current and current.get("active") and current.get("turn") == turn_id:
+                # Receipt time can close a known turn, but cannot establish a new one.
+                ts = max(float(current["at"]), time.time() if now_ts is None else float(now_ts))
+            if ts is None:
+                result.update(monitor_recorded=False, reason="native_time_unknown")
+            elif kind == "quota":
                 result.update(self._quota_in_txn(conn, actor, binding, status=status,
                                                  limit_window=limit_window,
                                                  reason=reason, ts=ts,
@@ -2013,8 +2102,13 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 result.update(self._resource_observe(conn, binding, resource_ref=resource_ref,
                                                      loaded=loaded, usable=usable, now_ts=now_ts))
             elif kind == "tool_start":
-                result.update(self._tool_arm(conn, binding, ts=ts, turn_id=turn_id,
-                                             native_id=native_id, version=version, now_ts=now_ts))
+                call = self._tool_call(binding, turn_id=turn_id, native_id=native_id)
+                if self._monitor_turn_closed(conn, binding, turn_id):
+                    result.update({'stale': True, 'reason': 'turn_closed'})
+                else:
+                    self._monitor_progress(conn, binding, ts, turn_id, only_if_inactive=True)
+                    result.update(self._tool_arm(conn, call, ts=ts, version=version, now_ts=now_ts,
+                                                 process_pid=process_pid, tool_name=tool_name))
             elif kind == "tool_progress":
                 result.update(self._tool_progress(conn, binding, ts=ts, turn_id=turn_id,
                                                   native_id=native_id, version=version,
@@ -2026,8 +2120,11 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             elif kind in ("round.started", "round.accepted"):
                 result.update(self._native_attempt(conn, binding, kind=kind, attempt_id=attempt_id,
                                                    ts=ts, turn_id=turn_id, terminal_ts=terminal_ts))
+                if kind == 'round.started' and result.get('native_attempt_recorded') and turn_id:
+                    self._monitor_progress(conn, binding, ts, turn_id, only_if_inactive=True, ended_at=terminal_ts)
             elif native_progress:
-                result["quota_recovered"] = self._quota_activity(conn, binding, ts=ts)
+                started = self._monitor_progress(conn, binding, ts, turn_id)
+                result["quota_recovered"] = bool(started is not None and self._quota_activity(conn, binding, ts=ts, started_ts=started))
             elif kind == "model_progress":
                 entry = self._attempt_entry(conn, binding, attempt_id)
                 if not entry or entry.get("kind") != "round.started":
@@ -2040,15 +2137,37 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 elif float(ts) <= float(entry.get("last_activity_ts") or entry.get("ts") or 0):
                     result.update({"attempt_known": True, "stale": True, "reason": "before_last_activity"})
                 else:
+                    self._monitor_progress(conn, binding, ts, entry.get('turn_id'))
                     result["quota_recovered"] = self._quota_activity(conn, binding, ts=ts, started_ts=entry.get("ts"))
                     self._attempt_patch(conn, binding, attempt_id, last_activity_ts=float(ts))
                     result.update({"attempt_known": True, "last_activity_ts": float(ts)})
+            elif kind == "session_idle":
+                result.update(self._monitor_idle(conn, binding, ts, native_id, now_ts, process_pid))
+            elif kind == "session_end":
+                result['monitor_recorded'] = self._monitor_session_end(conn, binding, ts)
+                if type(ts) in (int, float) and math.isfinite(ts):
+                    result['tools_retired'] = _delivery_due_module().retire_tools(conn, binding, float(ts))
+            elif kind == "turn_start":
+                result.update(self._monitor_turn(conn, actor, binding, kind, ts, turn_id or attempt_id, outcome, reason, now_ts, process_pid))
             elif kind == "turn_end":
                 result["outcome"] = outcome or "unknown"
-                if not attempt_only:
-                    self._quota_activity(conn, binding, ts=ts, closed=True)
+                if not attempt_only and outcome in ("completed", "failed", "cancelled", "interrupted"):
+                    result.update(self._monitor_turn(conn, actor, binding, kind, ts, turn_id or attempt_id, outcome, reason, now_ts, status=status))
+                    if isinstance(turn_id, str) and turn_id and type(ts) in (int, float) and math.isfinite(ts):
+                        result['tools_retired'] = _delivery_due_module().retire_tools(conn, binding, float(ts), turn=turn_id)
+                if not attempt_only and result.get('monitor_recorded') is not False:
+                    monitor = self._monitor_state(conn, binding)
+                    same_turn = not monitor or not turn_id or (monitor.get('turn') == turn_id and
+                                (result.get('monitor_recorded') is True or monitor.get('active')))
+                    if same_turn:
+                        self._quota_activity(conn, binding, ts=ts, closed=True)
                 if isinstance(attempt_id, str) and attempt_id:
-                    self._attempt_patch(conn, binding, attempt_id, turn_closed_at=float(ts))
+                    ended_at = float(ts)
+                    entry = self._attempt_patch(conn, binding, attempt_id, turn_closed_at=ended_at)
+                    original_turn = entry.get('turn_id') if entry else None
+                    if attempt_only and isinstance(original_turn, str) and original_turn and math.isfinite(ended_at):
+                        result['tools_retired'] = _delivery_due_module().retire_tools(
+                            conn, binding, ended_at, turn=original_turn)
                 elif surface == "codex" and turn_id:
                     matches = [key for key, entry in self._attempt_book(conn, binding).items()
                                if entry.get("turn_id") == turn_id and entry.get("turn_closed_at") is None]
@@ -2114,19 +2233,23 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 if prior.get("turn_id") not in (None, turn_id):
                     raise CoreError("conflict", "the terminal observation does not match the original attempt",
                                     reason_code="attempt_turn_mismatch")
-                if prior.get("turn_closed_at") is None:
+                if prior.get("turn_closed_at") is None or prior.get("turn_id") is None:
                     # A live observation can fall back to receipt time when native startedAt is absent.
                     prior.update(ts=float(ts), turn_id=turn_id, turn_closed_at=float(terminal_ts))
                     self._attempt_save(conn, binding, seen)
-            return result
-        seen[key] = {"ts": float(ts), "turn_id": turn_id, "kind": kind,
-                     "last_activity_ts": float(ts),
-                     "turn_closed_at": float(terminal_ts) if terminal_ts is not None else None}
-        if len(seen) > self.NATIVE_ATTEMPT_KEEP:
-            for old_key in sorted(seen, key=lambda k: seen[k].get("ts") or 0)[:-self.NATIVE_ATTEMPT_KEEP]:
-                seen.pop(old_key, None)
-        self._attempt_save(conn, binding, seen)
-        return {"native_attempt_recorded": True, "attempt_id": str(attempt_id)}
+                terminal_ts = prior['turn_closed_at']
+        else:
+            seen[key] = {"ts": float(ts), "turn_id": turn_id, "kind": kind,
+                         "last_activity_ts": float(ts),
+                         "turn_closed_at": float(terminal_ts) if terminal_ts is not None else None}
+            if len(seen) > self.NATIVE_ATTEMPT_KEEP:
+                for old_key in sorted(seen, key=lambda k: seen[k].get("ts") or 0)[:-self.NATIVE_ATTEMPT_KEEP]:
+                    seen.pop(old_key, None)
+            self._attempt_save(conn, binding, seen)
+            result = {"native_attempt_recorded": True, "attempt_id": key}
+        if terminal_ts is not None:
+            result['tools_retired'] = _delivery_due_module().retire_tools(conn, binding, terminal_ts, turn=turn_id)
+        return result
 
     def _attempt_patch(self, conn, binding, attempt_id, **fields):
         """改一条原生尝试记录上的字段（心跳事实的唯一写口）。尝试不存在 ⇒ None（不新造）。
@@ -2151,12 +2274,310 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         entry = self._attempt_entry(conn, (binding_id, generation), attempt_key)
         return bool(entry and entry.get("kind") == "round.started")
 
-    #: 一次原生工具调用"多久没进展算卡住"：默认 10 分钟，可用环境变量覆盖（同一处定义）。
-    TOOL_HANG_SECONDS = 600.0
+    #: Shell must have no progress for 30 minutes before a live process observation.
+    TOOL_HANG_SECONDS = 1800.0
 
     #: Valid native host events.
-    HOST_EVENT_KINDS = ("tool_start", "tool_progress", "tool_end", "turn_end", "quota", "loaded",
+    HOST_EVENT_KINDS = ("tool_start", "tool_progress", "tool_end", "turn_start", "turn_end", "session_idle", "session_end", "quota", "loaded",
                         "model_progress", "round.started", "round.accepted", "resource")
+
+    @staticmethod
+    def _monitor_state(conn, binding):
+        row = conn.execute("SELECT value_json FROM binding_state WHERE binding_id=? AND generation=? AND key='turn_monitor'", binding).fetchone()
+        try:
+            state = json.loads(row[0]) if row else {}
+        except (TypeError, ValueError):
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    @staticmethod
+    def _save_monitor(conn, binding, state, at):
+        conn.execute("INSERT INTO binding_state(binding_id,generation,key,value_json,updated_at) VALUES(?,?,'turn_monitor',?,?)"
+                     " ON CONFLICT(binding_id,generation,key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                     (*binding, canonical_json(state), at))
+
+    def _monitor_turn_closed(self, conn, binding, turn):
+        state = self._monitor_state(conn, binding)
+        closed = state.get('closed_turns') if isinstance(state.get('closed_turns'), list) else []
+        return (turn in closed or
+                (state.get('turn') == turn and not state.get('active') and
+                 state.get('outcome') in ('completed', 'failed', 'cancelled', 'interrupted')) or
+                any(entry.get('turn_id') == turn and entry.get('turn_closed_at') is not None
+                    for entry in self._attempt_book(conn, binding).values() if isinstance(entry, dict)))
+
+    def _monitor_progress(self, conn, binding, ts, turn, *, only_if_inactive=False, ended_at=None):
+        if not isinstance(turn, str) or not turn or type(ts) not in (int, float) or not math.isfinite(ts):
+            return
+        state = self._monitor_state(conn, binding)
+        if turn in state.get('closed_turns', []):
+            return
+        if turn == state.get('turn'):
+            if state.get('active'):
+                return state.get('started_ts', state.get('at') if not state.get('inferred') else None)
+            return
+        if only_if_inactive and state.get('active'):
+            return
+        if turn in state.get('previous_turns', []):
+            return
+        if float(ts) <= float(state.get('at', 0)):
+            return
+        previous = state.get('previous_turns', [])
+        if state.get('turn'):
+            previous = (previous + [state['turn']])[-16:]
+        self._clear_idle_monitor(conn, binding, state, ts)
+        state.update(turn=turn, at=float(ts), active=True, idle_turn=None, idle_facts={}, inferred=True, started_ts=None,
+                     previous_turns=previous, active_pid=None, active_birth=None)
+        if ended_at is not None:
+            state.update(active=False, at=float(ended_at), outcome='unknown')
+            closed = state.get('closed_turns') if isinstance(state.get('closed_turns'), list) else []
+            state['closed_turns'] = list(dict.fromkeys([*closed, turn]))[-16:]
+        self._save_monitor(conn, binding, state, float(ts))
+
+    def _monitor_turn(self, conn, actor, binding, kind, ts, turn, outcome, reason, now_ts, process_pid=None, *, status=None):
+        if not isinstance(turn, str) or not turn or type(ts) not in (int, float) or not math.isfinite(ts):
+            return {"monitor_recorded": False}
+        state = self._monitor_state(conn, binding)
+        # A failure notice uses the failure namespace. Retired interruption facts remain history.
+        failure = state.get('failure_fact')
+        if failure is not None and (not isinstance(failure, str) or not failure.startswith('turn-failure-')):
+            state.pop('failure_fact')
+        updated_at = time.time() if now_ts is None else float(now_ts)
+        at = float(ts)
+        recovered = False
+        requeue = []
+        if kind == 'turn_start':
+            if turn in state.get('closed_turns', []):
+                return {"monitor_recorded": False, "stale": True}
+            if state.get('turn') == turn and state.get('active') and state.get('inferred') and at <= float(state.get('at', 0)):
+                state.update(started_ts=at, inferred=False, active_pid=process_pid,
+                             active_birth=(self._pending_ctx_ctx() or {}).get('observed_process_birth'))
+                self._save_monitor(conn, binding, state, updated_at)
+                return {"monitor_recorded": True, "late_start": True, "quota_recovered": False}
+            if at <= float(state.get('at', 0)) or state.get('turn') == turn or turn in state.get('previous_turns', []):
+                return {"monitor_recorded": False, "stale": True}
+            self._clear_idle_monitor(conn, binding, state, ts)
+            if state.get('turn'):
+                state['previous_turns'] = (state.get('previous_turns', []) + [state['turn']])[-16:]
+            state.update(turn=turn, at=at, active=True, idle_turn=None, idle_facts={}, inferred=False, started_ts=at,
+                         active_pid=process_pid, active_birth=(self._pending_ctx_ctx() or {}).get('observed_process_birth'))
+        else:
+            previous = float(state.get('at', 0))
+            if outcome == 'cancelled':
+                facts = state.get('interruption_facts')
+                if isinstance(facts, dict):
+                    clarified = False
+                    for fact, record in list(facts.items()):
+                        turns = record.get('turns') if isinstance(record, dict) else None
+                        if isinstance(turns, dict) and turn in turns:
+                            del turns[turn]
+                            clarified = True
+                            if not turns:
+                                del facts[fact]
+                    if clarified:
+                        if not facts:
+                            state['interruption_visible'] = False
+                        if state.get('turn') == turn and not state.get('active'):
+                            state['outcome'] = 'cancelled'
+                        self._save_monitor(conn, binding, state, updated_at)
+                        return {'monitor_recorded': True, 'clarified': True, 'quota_recovered': False}
+                if not state.get('active'):
+                    if state.get('turn') == turn and state.get('outcome') in ('completed', 'failed', 'cancelled'):
+                        return {'monitor_recorded': False, 'stale': True}
+                    closed = state.get('closed_turns') if isinstance(state.get('closed_turns'), list) else []
+                    state['closed_turns'] = list(dict.fromkeys([*closed, turn]))[-16:]
+                    if not state.get('turn'):
+                        state.update(turn=turn, at=at, active=False, outcome='cancelled', inferred=True, started_ts=None)
+                    elif state.get('turn') == turn:
+                        state['outcome'] = 'cancelled'
+                    self._save_monitor(conn, binding, state, updated_at)
+                    return {'monitor_recorded': True, 'quota_recovered': False}
+            matched = state.get('turn') == turn and state.get('active') and math.floor(at) >= math.floor(previous)
+            if not matched:
+                new_terminal = outcome == 'failed' or (not state.get('active') and
+                    (outcome == 'interrupted' or (outcome == 'completed' and state.get('interruption_visible'))))
+                if (not new_terminal or turn == state.get('turn') or turn in state.get('previous_turns', [])
+                        or turn in state.get('closed_turns', []) or at <= previous or state.get('last_failed_turn') == turn):
+                    return {"monitor_recorded": False, "stale": True}
+                if not state.get('active'):
+                    self._clear_idle_monitor(conn, binding, state, ts)
+                    if state.get('turn'):
+                        state['previous_turns'] = (state.get('previous_turns', []) + [state['turn']])[-16:]
+                    state.update(turn=turn, at=at, active=False, idle_turn=None, idle_facts={}, outcome=outcome,
+                                 inferred=True, started_ts=None)
+                if outcome == 'failed':
+                    state['last_failed_turn'] = turn
+            else:
+                state.update(at=max(at, previous), active=False, outcome=outcome)
+            closed = state.get('closed_turns') if isinstance(state.get('closed_turns'), list) else []
+            state['closed_turns'] = (list(dict.fromkeys([*closed, turn])))[-16:]
+            if outcome == 'completed':
+                state['failure_fact'] = None
+                state['interruption_visible'] = False
+                state['interruption_facts'] = {}
+                started = state.get('started_ts', previous if not state.get('inferred') else None)
+                recovered = bool(started is not None and self._quota_activity(conn, binding, ts=max(at, previous), started_ts=started))
+            elif outcome in ('failed', 'interrupted'):
+                from delivery.worker import quota_blocked
+                actionable = not quota_blocked(conn, *binding)
+                if outcome == 'interrupted':
+                    if actionable and reason != 'superseded':
+                        runnable = _work_module('work_runnable.py', 'office_work_runnable').runnable_work(
+                            conn, actor, person=self._request_person(conn, actor))
+                        requeue = self._record_interruption(conn, actor, binding, state, turn, at, runnable['items'], now_ts)
+                    else:
+                        state['interruption_visible'] = False
+                elif actionable and not state.get('failure_fact'):
+                    self._notify_turn_failure(conn, actor, binding, state, reason, status, now_ts)
+        self._save_monitor(conn, binding, state, updated_at)
+        if requeue:
+            from delivery.selection import candidates
+            boxes = [box for fact, box in requeue if candidates(conn, box, only={fact})]
+            if boxes:
+                self._arm_batch_due(conn, [{'box': box} for box in boxes], touched=boxes,
+                                    need='统筹', now_ts=time.time() if now_ts is None else now_ts)
+        return {"monitor_recorded": True, "quota_recovered": recovered}
+
+    def _record_interruption(self, conn, actor, binding, state, turn, at, items, now_ts):
+        managers = self._monitor_work_managers(conn, items, now_ts)
+        responsibilities = {manager: {item['work_ref']: self._idle_fingerprint(item) for item in items
+                                      if item['project_ref'] in projects}
+                            for manager, projects in managers.items()}
+        previous = state.get('interruption_facts') if isinstance(state.get('interruption_facts'), dict) else {}
+        facts, requeue = {}, []
+        for fact, record in previous.items():
+            if not isinstance(record, dict) or not isinstance(record.get('works'), dict) or not isinstance(record.get('turns'), dict):
+                continue
+            manager = record.get('manager')
+            current = responsibilities.get(manager, {})
+            matching = {ref: signature for ref, signature in record['works'].items() if current.get(ref) == signature}
+            if not matching:
+                continue
+            record['works'] = matching
+            record['turns'][turn] = at
+            record['turns'] = dict(sorted(record['turns'].items(), key=lambda item: (item[1], item[0]))[-32:])
+            facts[fact] = record
+            requeue.append((fact, manager))
+            for ref in matching:
+                current.pop(ref, None)
+        from delivery.round import MESSAGES
+        for manager, works in responsibilities.items():
+            if not works:
+                continue
+            episode = int(state.get('episode', 0)) + 1
+            fact = 'turn-interruption-' + hashlib.sha256(('%s:%s:%s:%s' % (*binding, episode, manager)).encode()).hexdigest()[:24]
+            state['episode'] = episode
+            facts[fact] = {'manager': manager, 'works': works, 'turns': {turn: at}}
+            self.system_letter(conn=conn, letter_id=fact, boxes=[manager],
+                               subject=MESSAGES['turn_interrupted_subject'] % actor,
+                               body=MESSAGES['turn_interrupted_body'] % actor,
+                               need='统筹', kind='turn.interrupted', fact_key=fact, now_ts=now_ts)
+        state['interruption_facts'] = facts
+        state['interruption_visible'] = bool(facts)
+        return requeue
+
+    def _notify_turn_failure(self, conn, actor, binding, state, reason, status, now_ts):
+        boxes, route = self._monitor_recipients(conn, actor, now_ts)
+        if not boxes:
+            return
+        from delivery.round import MESSAGES
+        episode = int(state.get('episode', 0)) + 1
+        fact = 'turn-failure-' + hashlib.sha256(('%s:%s:%s' % (*binding, episode)).encode()).hexdigest()[:24]
+        state.update(episode=episode, failure_fact=fact)
+        label = reason if isinstance(reason, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_.-]{0,63}', reason) else 'unknown'
+        if type(status) is int and 100 <= status <= 599:
+            label += f' (HTTP {status})'
+        self.system_letter(conn=conn, letter_id=fact, boxes=boxes,
+                           subject=MESSAGES['turn_failed_subject'] % actor, body=MESSAGES['turn_failed_body'] % (actor, label),
+                           need='统筹', kind='turn.failed', fact_key=fact, now_ts=now_ts, monitor_route=route)
+
+    def _monitor_idle(self, conn, binding, ts, turn, now_ts, process_pid):
+        state = self._monitor_state(conn, binding)
+        if (not isinstance(turn, str) or not turn
+                or type(ts) not in (int, float) or not math.isfinite(ts)
+                or state.get('turn') != turn or state.get('active') or state.get('outcome') != 'completed'
+                or state.get('idle_turn') == turn
+                or float(ts) < float(state.get('at', 0))):
+            return {"monitor_recorded": False}
+        birth = (self._pending_ctx_ctx() or {}).get('observed_process_birth')
+        state.update(idle_turn=turn, at=float(ts), process_pid=process_pid, process_birth=birth)
+        self._save_monitor(conn, binding, state, time.time() if now_ts is None else float(now_ts))
+        due = _delivery_due_module().arm(conn, 'idle_work', binding[0], float(ts) + 900,
+                                         binding_id=binding[0], binding_gen=binding[1],
+                                         payload={'turn': turn, 'idle_at': float(ts)}, now_ts=now_ts)
+        return {"monitor_recorded": True, "due_at": due['due_at']}
+
+    def _clear_idle_monitor(self, conn, binding, state, ts):
+        if state.get('idle_turn') and ts >= float(state.get('at', 0)):
+            _delivery_due_module().clear(conn, 'idle_work', binding[0], now_ts=ts)
+
+    def _monitor_session_end(self, conn, binding, ts):
+        state = self._monitor_state(conn, binding)
+        if not state or type(ts) not in (int, float) or not math.isfinite(ts) or ts <= float(state.get('at', 0)):
+            return False
+        self._clear_idle_monitor(conn, binding, state, ts)
+        state.update(active=False, idle_turn=None, idle_facts={}, at=float(ts))
+        self._save_monitor(conn, binding, state, float(ts))
+        return True
+
+    def _monitor_idle_due(self, conn, row, actor, at):
+        due = _delivery_due_module()
+        binding = (row['binding_id'], row['binding_gen'])
+        state = self._monitor_state(conn, binding)
+        payload = row['payload']
+        if (not state.get('idle_turn') or state.get('active') or state['idle_turn'] != payload.get('turn')
+                or state.get('at') != payload.get('idle_at')):
+            due.clear(conn, 'idle_work', row['subject_ref'], now_ts=at)
+            return {'decision': 'stale'}
+        from delivery.worker import quota_blocked
+        if quota_blocked(conn, *binding):
+            due.fire(conn, 'idle_work', row['subject_ref'], expected_version=row['version'], now_ts=at)
+            return {'decision': 'quota_blocked'}
+        runnable = _work_module('work_runnable.py', 'office_work_runnable').runnable_work(
+            conn, actor, person=self._request_person(conn, actor), now_ts=at)
+        managers = self._monitor_work_managers(conn, runnable['items'], at)
+        due.fire(conn, 'idle_work', row['subject_ref'], expected_version=row['version'], now_ts=at)
+        if runnable['count'] and managers:
+            state['idle_facts'] = {}
+            old = state.get('idle_reported') if isinstance(state.get('idle_reported'), dict) else {}
+            reported, reactivated, sent = {}, {}, False
+            from delivery.round import MESSAGES
+            for manager, owned_projects in managers.items():
+                items = [item for item in runnable['items'] if item['project_ref'] in owned_projects]
+                prior = old.get(manager) if isinstance(old.get(manager), dict) else {}
+                entries, changed = {}, []
+                for item in items:
+                    ref, fingerprint = item['work_ref'], self._idle_fingerprint(item)
+                    old_entry = prior.get(ref) if isinstance(prior.get(ref), dict) else {}
+                    if old_entry.get('fingerprint') == fingerprint and old_entry.get('fact'):
+                        entries[ref] = old_entry
+                        state['idle_facts'][old_entry['fact']] = manager
+                        reactivated.setdefault(manager, set()).add(old_entry['fact'])
+                    else:
+                        changed.append((ref, fingerprint))
+                if changed:
+                    source = canonical_json([*binding, manager, sorted(changed)])
+                    fact = 'idle-work-' + hashlib.sha256(source.encode()).hexdigest()[:24]
+                    state['idle_facts'][fact] = manager
+                    for ref, fingerprint in changed:
+                        entries[ref] = {'fingerprint': fingerprint, 'fact': fact}
+                    self.system_letter(conn=conn, letter_id=fact, boxes=[manager],
+                                       subject=MESSAGES['idle_work_subject'] % actor,
+                                       body=MESSAGES['idle_work_body'] % actor,
+                                       need='统筹', kind='idle.work', fact_key=fact, now_ts=at)
+                    sent = True
+                reported[manager] = entries
+            state['idle_reported'] = reported
+            self._save_monitor(conn, binding, state, at)
+            from delivery.selection import candidates
+            for manager, refs in reactivated.items():
+                if candidates(conn, manager, only=refs):
+                    self._arm_batch_due(conn, [{'box': manager}], touched=[manager], now_ts=at, need='统筹')
+            return {'decision': 'notify' if sent else 'unchanged'}
+        return {'decision': 'no_work'}
+
+    @staticmethod
+    def _idle_fingerprint(item):
+        return canonical_json([item.get('work_ref'), item.get('version'), item.get('action'), item.get('sub_ref')])
 
     def _tool_call(self, binding, *, turn_id, native_id):
         """原生调用标识。缺 `turn_id` 或 `native_id` 就不是"双关联"，不受理。"""
@@ -2180,17 +2601,20 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             return int(version)
         return None
 
-    def _tool_arm(self, conn, binding, *, ts, turn_id, native_id, version, now_ts):
+    def _tool_arm(self, conn, call, *, ts, version, now_ts, process_pid=None, tool_name=None):
         """`tool_start`：登记这次原生调用的到期时刻（带它当时看到的进展版本）。
 
         为什么现在要真的登记：不登记就没有任何到期项会在工具卡住时醒来，"工具卡死"这条队列
         永远没有输入。截止时刻 = 原生开始时刻 + `TOOL_HANG_SECONDS`（不是"收到事件的时刻"）。
         """
         due_mod = _delivery_due_module()
-        call = self._tool_call(binding, turn_id=turn_id, native_id=native_id)
         revision = self._revision_of(version) or 0
-        row = due_mod.arm_tool(conn, call, float(ts) + float(self.TOOL_HANG_SECONDS),
-                               progress_revision=revision, owner_ref=binding[0], now_ts=now_ts)
+        birth = (self._pending_ctx_ctx() or {}).get('observed_process_birth')
+        observation = {'tool_started': float(ts)}
+        if type(process_pid) is int and birth and isinstance(tool_name, str) and tool_name.lower() in ('bash', 'shell', 'execute', 'terminal'):
+            observation.update(process_pid=process_pid, process_birth=birth)
+        row = due_mod.arm_tool(conn, call, ts + self.TOOL_HANG_SECONDS, progress_revision=revision,
+                               owner_ref=call.binding_id, observation=observation, now_ts=now_ts)
         return {"due_key": row["due_key"], "due_at": row["due_at"], "state": row["state"],
                 "progress_revision": revision}
 
@@ -2203,34 +2627,24 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         due_mod = _delivery_due_module()
         call = self._tool_call(binding, turn_id=turn_id, native_id=native_id)
         revision = self._revision_of(version)
-        subject = "%s:%s:%s" % (call.binding_id, call.turn_id, call.native_id)
+        key = due_mod.tool_key(call)
         if revision is None:
-            return {"due_key": due_mod.tool_key(call), "progress_revision": None,
-                    "advanced": False}
+            return {"due_key": key, "progress_revision": None, "advanced": False}
         # 只有**真的比行里记的新**才算进展：重复输出（版本没动）不推后，否则一次真卡住会被
         # 每一行重复输出说成"还在动"，告警永远不会来。
-        current = due_mod.get(conn, due_mod.tool_key(call))
+        current = due_mod.get(conn, key)
         seen = ((current or {}).get("payload") or {}).get("progress_revision")
         if current is None or not isinstance(seen, int) or revision <= seen:
-            return {"due_key": due_mod.tool_key(call), "progress_revision": seen,
-                    "advanced": False}
-        if current["state"] == "fired":
-            row = due_mod.arm_tool(conn, call, float(ts) + float(self.TOOL_HANG_SECONDS),
-                                   progress_revision=revision, owner_ref=binding[0], now_ts=now_ts)
-            conn.execute("UPDATE due SET fire_count=0 WHERE due_key=?", (row["due_key"],))
-        else:
-            row = due_mod.advance(conn, "tool_hang", subject,
-                                  float(ts) + float(self.TOOL_HANG_SECONDS),
-                                  progress_revision=revision, now_ts=now_ts)
-        return {"due_key": (row or {}).get("due_key") or due_mod.tool_key(call),
-                "progress_revision": revision, "advanced": row is not None}
+            return {"due_key": key, "progress_revision": seen, "advanced": False}
+        row = due_mod.advance_tool(conn, current, ts + self.TOOL_HANG_SECONDS,
+                                   progress_revision=revision, now_ts=now_ts)
+        return {"due_key": key, "progress_revision": revision, "advanced": row is not None}
 
     def _tool_end(self, conn, binding, *, ts, turn_id, native_id):
         """`tool_end`：这次调用结束了，到期项退休（已 clear 的再 clear 是无操作）。"""
         due_mod = _delivery_due_module()
         call = self._tool_call(binding, turn_id=turn_id, native_id=native_id)
-        row = due_mod.clear(conn, "tool_hang", "%s:%s:%s" % (call.binding_id, call.turn_id,
-                                                            call.native_id), now_ts=ts)
+        row = due_mod.clear(conn, "tool_hang", due_mod.tool_key(call).split(':', 1)[1], now_ts=ts)
         return {"due_key": due_mod.tool_key(call), "cleared": row is not None}
 
     #: 该绑定当前加载版本的持久键（与 `quota` / `native_attempts` 同一个 `binding_state`）。
@@ -2332,14 +2746,14 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             letter_id = "quota-%s-%s-%d" % (binding[0].replace("/", "_"), binding[1], episode)
             out["notice_letter"] = letter_id
             from delivery.round import MESSAGES
-            managers = self._managers_of(conn, actor, self._positions_of(conn, actor))
-            if managers:
+            boxes, route = self._monitor_recipients(conn, actor, now_ts)
+            if boxes:
                 self.system_letter(
                     conn=conn, letter_id=letter_id,
                     subject=MESSAGES["quota_subject"] % actor,
                     body=MESSAGES["quota_body"] % (actor, status, limit_window or "unknown"),
-                    boxes=[p["role"] for p in managers], need="统筹", kind="quota.exhausted",
-                    fact_key=letter_id, now_ts=now_ts)
+                    boxes=boxes, need="统筹", kind="quota.exhausted",
+                    fact_key=letter_id, now_ts=now_ts, monitor_route=route)
             else:
                 out.pop("notice_letter")
                 out["notified"] = False
@@ -2362,7 +2776,8 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
     def _quota_activity(self, conn, binding, *, ts, started_ts=None, closed=False):
         from delivery.worker import quota_bindings
         changed = False
-        for peer in quota_bindings(conn, *binding):
+        peers = quota_bindings(conn, *binding)
+        for peer in peers:
             row = conn.execute("SELECT value_json FROM binding_state WHERE binding_id=? AND generation=? AND key='quota'",
                                peer).fetchone()
             if not row:
@@ -2388,6 +2803,16 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             conn.execute("UPDATE binding_state SET value_json=?, updated_at=? WHERE binding_id=? AND generation=? AND key='quota'",
                          (canonical_json(state), float(ts), *peer))
             changed = True
+        if changed:
+            # Release the session's pending mail atomically with quota recovery.
+            units = set()
+            for peer in peers:
+                actor = conn.execute("SELECT actor FROM bindings WHERE binding_id=? AND generation=?", peer).fetchone()[0]
+                units.add(actor)
+                units.update(self._carried_position_units(conn, peer[0]))
+            due, at = _delivery_due_module(), time.time()
+            for unit in units:
+                due.push_back(conn, "batch", unit, at, now_ts=at)
         return changed
 
 

@@ -1,7 +1,7 @@
 {
   "_comment": "申请相关系统信的全部文字。代码只持有键和插值；改文案只改这里。",
   "list_invalid": {"zh": "申请列表筛选或分页参数无效", "en": "Invalid request-list filter or page parameter"},
-  "items": {"position": "岗位与绑定", "project": "新建项目", "grant": "授权", "revoke": "收回授权", "deactivate": "停用身份", "unbind": "撤销别人的绑定", "broadcast": "全员广播", "read_mail": "读信箱里点名的信", "join": "开个人信箱"},
+  "items": {"position": "岗位与绑定", "project": "新建项目", "grant": "授权", "revoke": "收回授权", "deactivate": "归档个人信箱（不撤销绑定或岗位权限）", "unbind": "撤销别人的绑定", "broadcast": "全员广播", "read_mail": "读信箱里点名的信", "join": "开个人信箱"},
   "pending": {"subject": "申请待批：{ref}", "need": "批准、拒绝，或转给用户",
               "body": "{applicant} 提了申请 {ref}（{kind}，目标 {target}，版本 {version}）：{reason}\n需要你批的项：{items}\n用 office_request_decide 处理，request_ref={ref}，expected_version={version}。"},
   "to_user": {"subject": "申请转给你：{ref}", "need": "决定这条申请",

@@ -75,6 +75,10 @@
 			"en": "Reviewer: a mailbox, or a role with one holder; write none for no review",
 			"zh": "审核者：员工信箱名或只有一人在岗的岗位；不需要审核写 none"
 		},
+		"WORK_VERSION": {
+			"en": "Version from your Work read. Omit when this session has already read the Work.",
+			"zh": "从 Work 读到的版本。当前会话已读过该 Work 时可省略。"
+		},
 		"WORK": {
 			"en": "Work reference such as prj-1/W17 (from office_work_list, a notice or office_work_get)",
 			"zh": "Work 引用，如 prj-1/W17（来自 office_work_list / 通知 / office_work_get）"
@@ -102,7 +106,7 @@
 			"label": { "zh": "提交申请", "en": "Submit request" },
 			"description": { "zh": "申请本人上岗：用 office_lookup 查项目，再提交 kind=holder。经理批准后，邮局把岗位绑定到本会话。新会话用 join 自助开个人信箱。", "en": "To join a project, find it with office_lookup and submit kind=holder. Manager approval binds the position to this session. Use join to open a personal mailbox." },
 			"parameters": {
-				"kind": { "zh": "holder 任职，grant/revoke 授权/收回，project 建项目，deactivate 停用个人，retire 撤岗，unbind 撤绑定，broadcast 广播，read_mail 读指定信件，join 自助开箱（只填 reason）。", "en": "holder: appoint; grant/revoke: change authority; project: create; deactivate: disable a person; retire: close a position; unbind: revoke a binding; broadcast: announce; read_mail: read specific letters; join: open a personal mailbox (reason only)." },
+				"kind": { "zh": "holder 任职，grant/revoke 授权/收回，project 建项目，deactivate 归档个人信箱（不撤销会话绑定或岗位权限），retire 撤岗，unbind 撤绑定，broadcast 广播，read_mail 读指定信件，join 自助开箱（只填 reason）。", "en": "holder: appoint; grant/revoke: change authority; project: create; deactivate: archive a personal mailbox (bindings and position authority remain); retire: close a position; unbind: revoke a binding; broadcast: announce; read_mail: read specific letters; join: open a personal mailbox (reason only)." },
 				"target": { "zh": "holder 申请自己上岗时省略，替他人申请填个人信箱。unbind 填绑定号，broadcast 填标题，retire 填 position，read_mail 填信箱名。", "en": "For holder, omit to appoint this session or give the successor's mailbox. For unbind use a binding ID, broadcast a title, retire a position, read_mail a mailbox." },
 				"reason": { "zh": "申请理由。", "en": "Reason for the request." },
 				"params": { "zh": "申请参数。授权填 scope、actions，可选 project_ref 和 expires_at。建项目填 name 和 workspace_refs，广播填 body，读信填信件编号数组 letter_ids。", "en": "For grants, specify scope and actions, optionally project_ref and expires_at. For projects, specify name and workspace_refs. For broadcasts, specify body. For read_mail, provide an array of letter IDs in letter_ids." },
@@ -127,8 +131,8 @@
 			"description": { "zh": "原审批人或老板撤销一条已批准的读信申请，立即收回这次授予的读取权限。", "en": "The original approver or the user can revoke an approved request to read specified letters. The access granted by that request ends immediately." }
 		},
 		"office_identity_deactivate": {
-			"label": { "zh": "停用本人身份", "en": "Deactivate own identity" },
-			"description": { "zh": "停用本人的个人身份。停用别人走申请。", "en": "Deactivate your own identity. Submit a request to deactivate someone else." }
+			"label": { "zh": "归档本人个人信箱", "en": "Archive your personal mailbox" },
+			"description": { "zh": "归档本人的个人信箱，之后不再接收新信，历史信仍可读。不会撤销会话绑定或岗位授权；撤销绑定请用 office_binding_revoke。归档他人信箱需提交申请。", "en": "Archive your personal mailbox: it stops receiving new mail, while existing mail remains readable. This does not revoke session bindings or position authority; use office_binding_revoke for your binding. Submit a request to archive another person’s mailbox." }
 		},
 		"office_position_retire": {
 			"label": { "zh": "撤岗", "en": "Retire a position" },
@@ -361,8 +365,8 @@
 		},
 		"office_letter_read": {
 			"description": {
-				"en": "Read a letter by ID, leaving its filing and completion state unchanged. Continue long bodies using body_page.cursor.",
-				"zh": "按编号读信。归档和处理状态保持原样。长信按 body_page.cursor 续读。"
+				"en": "Read a letter by ID. Reading incoming mail records receipt; filing, replying, and completing are separate actions. Continue long bodies using body_page.cursor.",
+				"zh": "按编号读信。读收件会记录受理，归档、回信和办结另行操作。长信按 body_page.cursor 续读。"
 			},
 			"label": {
 				"en": "Read a letter",
@@ -419,8 +423,8 @@
 					"zh": "intent=request 时写真实的下一步行动；intent=fyi 时省略。不传 intent 的原调用仅告知时请只写 FYI，说明放正文。"
 				},
 				"reply_to": {
-					"en": "Original letter ID. Leave to empty to reply to the sender of ordinary mail in your inbox. The original is filed after sending.",
-					"zh": "原信编号。回本人收件箱的普通信时可省略 to，由邮局找原发件人。发送后归档原信。"
+					"en": "Original letter ID. Leave to empty to reply to the sender of ordinary mail in your inbox. The original is filed only when its sender receives a primary copy; otherwise it stays open.",
+					"zh": "原信编号。回本人收件箱的普通信时可省略 to，由邮局找原发件人。仅原发件人收到主送时收纳原信，否则原信保持未处理。"
 				},
 				"retry_ref": {
 					"en": "After outcome_unknown, use the returned retry_ref with all other fields unchanged. Omit it for a new letter.",
@@ -817,8 +821,8 @@
 					"zh": "wait / cancel：原因"
 				},
 				"remove": {
-					"en": "references: items to remove, {\"seq\":…} or {\"relation_id\":…} (see office_work_get)",
-					"zh": "references：要移除的项 {\"seq\":…} 或 {\"relation_id\":…}（见 office_work_get）"
+					"en": "references: remove by {\"resource\":\"…\"} or {\"work\":\"…\",\"relation\":\"…\"}, using the values from office_work_get",
+					"zh": "references：按 office_work_get 的值，用 {\"resource\":\"…\"} 移除资料引用，或用 {\"work\":\"…\",\"relation\":\"…\"} 移除关系"
 				},
 				"reviewer": {
 					"en": "reviewer: the new reviewer. Use none if there is no submission awaiting review.",

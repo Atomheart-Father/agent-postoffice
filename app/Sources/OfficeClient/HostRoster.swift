@@ -16,7 +16,7 @@ public struct HostThread: Sendable, Equatable, Identifiable {
             if groups[ref] == nil { order.append(ref) }
             groups[ref, default: []].append(binding)
         }
-        return order.flatMap { ref -> [HostThread] in
+        let grouped = order.flatMap { ref -> [HostThread] in
             let rows = groups[ref, default: []]
             let known = rows.compactMap { row in supportedHost(row.harness).map { ($0, row) } }
             var hosts = Set(known.map { $0.0 })
@@ -29,6 +29,10 @@ public struct HostThread: Sendable, Equatable, Identifiable {
                 let aliases = singleHost ? rows.filter { $0.harness == nil } : []
                 return HostThread(harness: host, sessionRef: ref, bindings: [primary] + hosted.filter { $0 != primary } + aliases)
             }
+        }
+        let covered = Set(grouped.flatMap { $0.bindings.map(\.bindingID) })
+        return grouped + bindings.filter { !covered.contains($0.bindingID) }.map {
+            HostThread(harness: $0.harness ?? "", sessionRef: $0.hostSessionRef ?? "", bindings: [$0])
         }
     }
 
@@ -64,7 +68,8 @@ public struct HostThread: Sendable, Equatable, Identifiable {
                 return String(id)
             }
         }
-        return sessionRef
+        return sessionRef.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? tr("会话未知", "Session unknown") + " · " + primary.bindingID : sessionRef
     }
 }
 
@@ -78,9 +83,7 @@ public enum Unassigned {
                     roster.formUnion(p.managers.map(\.to)); roster.formUnion(p.participants.map(\.to))
                     roster.formUnion(p.positions.map(\.to)); roster.formUnion(p.positions.compactMap(\.holder))
                 }
-                return h.threads.filter { thread in
-                    !thread.bindings.contains { roster.contains($0.actor) || roster.contains("@" + $0.actor) }
-                }.map(\.primary)
+                return h.bindings.filter { !roster.contains($0.actor) && !roster.contains("@" + $0.actor) }
             }
         }
     }

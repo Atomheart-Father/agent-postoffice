@@ -50,6 +50,8 @@ class BindingOperations:
             out["surface"] = ctx.get("surface")
         if ctx.get("delivery_guard") is not None:
             out["delivery_guard"] = ctx.get("delivery_guard")
+        if ctx.get("observed_process_birth") is not None:
+            out["observed_process_birth"] = ctx["observed_process_birth"]
         return out
 
     def _verify_trusted_ctx(self, conn, ctx):
@@ -145,6 +147,14 @@ class BindingOperations:
                     channel_lifetime_ref=channel_lifetime_ref, host_session_ref=host_session_ref,
                     installed_at=installed_at, now_ms=now_ms, now=now)
 
+    @staticmethod
+    def _binding_high_water(conn, binding_id):
+        return conn.execute(
+            "SELECT COALESCE(MAX(generation), 0) FROM ("
+            " SELECT generation FROM bindings WHERE binding_id=? UNION ALL"
+            " SELECT generation FROM binding_events WHERE binding_id=?)",
+            (binding_id, binding_id)).fetchone()[0]
+
     def _binding_register_apply(self, conn, binding_id, actor, generation, instance, *,
                                 channel_lifetime_ref=None, host_session_ref=None,
                                 installed_at=None, now_ms, now):
@@ -154,15 +164,26 @@ class BindingOperations:
         投影（`_txn` 每次开新连接、不可重入），必须复用**同一份**绑定写入 SQL，不另抄一份。
         """
         row = conn.execute("SELECT * FROM bindings WHERE binding_id=?", (binding_id,)).fetchone()
-        if row is not None and row["state"] == "active" \
-                and row["actor"] == actor and row["generation"] == generation \
-                and row["instance"] == instance \
-                and row["channel_lifetime_ref"] == channel_lifetime_ref \
-                and row["host_session_ref"] == host_session_ref:
+        same_binding = (row is not None and row["state"] == "active" and row["revoked_at"] is None
+                        and row["actor"] == actor and row["generation"] == generation
+                        and row["instance"] == instance and row["host_session_ref"] == host_session_ref)
+        if same_binding and row["channel_lifetime_ref"] == channel_lifetime_ref:
             return {"ok": True, "binding_id": binding_id, "actor": actor,
                     "generation": generation, "instance": instance, "state": "active",
                     "channel_lifetime_ref": channel_lifetime_ref,
                     "host_session_ref": host_session_ref, "changed": False}
+        high_water = self._binding_high_water(conn, binding_id)
+        # A previously unset channel can be fixed when the same holder first attaches.
+        # This only narrows the set of connections accepted at this generation.
+        initial_channel = same_binding and not row["channel_lifetime_ref"] and bool(channel_lifetime_ref)
+        if generation < high_water or (generation == high_water and not initial_channel):
+            raise self.CoreError("stale", "绑定变更需要更高代次",
+                                 en="Changes to a binding require a higher generation",
+                                 binding_id=binding_id)
+        if row is not None and host_session_ref and row["host_session_ref"] == host_session_ref and row["actor"] != actor:
+            raise self.CoreError("conflict", "原生会话已绑定另一身份",
+                                 en="The native session is registered to another identity",
+                                 binding_id=binding_id)
         conn.execute(
             "INSERT INTO bindings(binding_id, actor, generation, instance,"
             " channel_lifetime_ref, host_session_ref, state, installed_at, updated_at, revoked_at)"
@@ -321,26 +342,17 @@ class BindingOperations:
                     "bindings": out, "count": len(out)}
 
     def next_generation(self, actor, *, target_binding_id, now_ts=None):
-        """The generation this binding would get next: last one on record + 1; never seen ⇒ 1.
-
-        ★ W436: this rule was spelled out twice — `officed._next_generation` and
-          `bin/office-endpoint-host::next_generation` — character for character, including the two
-          refusal codes that mean "never registered" (`not_found`, `unauthorized_attempt`: a
-          non-governance actor reading a binding that has no row yet is refused rather than told it
-          does not exist). Two copies of "what number comes next" is how two launchers come to hand
-          out the same generation to different sessions. It lives here because `binding_events` —
-          the fact it reads — lives here.
-
-        Refusals other than those two are raised: an unreadable history must not silently restart at
-        1, which would look like a fresh session and be accepted as one.
-        """
-        try:
-            evs = self.binding_events(actor, target_binding_id=target_binding_id).get("events") or []
-        except Exception as e:                                     # noqa: BLE001
-            if getattr(e, "code", None) in ("not_found", "unauthorized_attempt"):
+        """Allocate from the current fact as well as the event history."""
+        self._check_actor(actor)
+        with self._txn(read_only=True) as conn:
+            if not self._may_read_binding_history(conn, actor, target_binding_id):
                 return 1
-            raise
-        return max([int(e.get("generation") or 0) for e in evs] + [0]) + 1
+            return self._binding_high_water(conn, target_binding_id) + 1
+
+    def _may_read_binding_history(self, conn, actor, binding_id):
+        return (actor == self._request_user() or self._is_governance(conn, actor)
+                or conn.execute("SELECT 1 FROM bindings WHERE binding_id=? AND actor=?",
+                                (binding_id, actor)).fetchone() is not None)
 
     def binding_events(self, actor, *, target_binding_id, now_ts=None):
         """只读：一条 binding 的生命周期追加事实（registered/rebound/revoked）。
@@ -353,15 +365,12 @@ class BindingOperations:
         """
         self._check_actor(actor)
         with self._txn(read_only=True) as conn:
-            if actor != self._request_user() and not self._is_governance(conn, actor):
-                own = conn.execute(
-                    "SELECT 1 FROM bindings WHERE binding_id=? AND actor=?",
-                    (target_binding_id, actor)).fetchone()
-                if own is None:
-                    raise self.CoreError(
-                        "unauthorized_attempt",
-                        f"{actor!r} 只能读自己 Binding 的事件（读他人需治理能力）", en=f"{actor!r} can only read its own Binding's events (reading others needs governance ability)",
-                        actor=actor, target_binding_id=target_binding_id)
+            if not self._may_read_binding_history(conn, actor, target_binding_id):
+                raise self.CoreError(
+                    "unauthorized_attempt",
+                    f"{actor!r} 只能读自己 Binding 的事件（读他人需治理能力）",
+                    en=f"{actor!r} can only read its own Binding's events (reading others needs governance ability)",
+                    actor=actor, target_binding_id=target_binding_id)
             rows = conn.execute("SELECT * FROM binding_events WHERE binding_id=? ORDER BY seq",
                                 (target_binding_id,)).fetchall()
             if not rows:

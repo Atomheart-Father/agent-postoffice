@@ -18,17 +18,11 @@ struct OrgPage: View {
                         .overlay(alignment: .topLeading) {
                             Rectangle().fill(Theme.wire).frame(width: Theme.Line.outline, height: 56 + 14).padding(.leading, 4.75)
                         }
-                    let rows = stride(from: 0, to: projects.count, by: 4).map { Array(projects[$0..<min($0 + 4, projects.count)]) }
-                    VStack(alignment: .leading, spacing: 56) {
-                        ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                            HStack(alignment: .top, spacing: colSpacing) {
-                                ForEach(Array(row.enumerated()), id: \.element.id) { i, p in
-                                    ProjectColumn(desk: desk, project: p, number: number(of: p, in: projects), joinsRail: i > 0, spacing: colSpacing)
-                                        .frame(width: Self.colWidth, alignment: .topLeading)
-                                }
-                                Spacer(minLength: 0)
-                            }
-                        }
+                    ViewThatFits(in: .horizontal) {
+                        projectGrid(projects, columns: 4)
+                        projectGrid(projects, columns: 3)
+                        projectGrid(projects, columns: 2)
+                        projectGrid(projects, columns: 1)
                     }
                 default:
                     PanelBody(panel: desk.projects) { _ in Text(tr("0 个项目", "0 projects")).font(Theme.Font.body).foregroundStyle(Theme.ink3) }
@@ -37,6 +31,20 @@ struct OrgPage: View {
                 UnassignedBlock(desk: desk).padding(.top, 48).padding(.leading, 30)
                 ReadAt(desk: desk, what: tr("项目", "Projects"), fact: desk.projects.fact).padding(.top, 48).padding(.leading, 30)
         }
+    }
+
+    private func projectGrid(_ projects: [ProjectDetail], columns: Int) -> some View {
+        let rows = stride(from: 0, to: projects.count, by: columns).map { Array(projects[$0..<min($0 + columns, projects.count)]) }
+        return VStack(alignment: .leading, spacing: 56) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                HStack(alignment: .top, spacing: colSpacing) {
+                    ForEach(Array(row.enumerated()), id: \.element.id) { i, p in
+                        ProjectColumn(desk: desk, project: p, number: number(of: p, in: projects), joinsRail: i > 0, spacing: colSpacing)
+                            .frame(width: Self.colWidth, alignment: .topLeading)
+                    }
+                }
+            }
+        }.fixedSize(horizontal: true, vertical: false)
     }
 
     private func number(of p: ProjectDetail, in all: [ProjectDetail]) -> String {
@@ -189,13 +197,13 @@ private struct SeatRow: View {
                         if let submitted = party.submittedWorkCount, submitted > 0 { Text(tr("待审 \(submitted)", "In review \(submitted)")) }
                     } else { Text(tr("进行中 Work 未知", "Active Work unknown")) }
                 }
-                Text(deliveryText(desk.deliveryAutomatic(mailbox), inFlight: desk.deliveryInFlight(mailbox), unresolved: desk.deliveryUnresolved(mailbox)))
+                Text(pendingDeliveryText(desk.deliveryPending(mailbox)))
             }
             .font(Theme.Font.small).foregroundStyle(Theme.ink3)
             ForEach(personalMailboxes, id: \.self) { address in
-                if (desk.deliveryPending(address) ?? 0) > 0 || (desk.deliveryUnresolved(address)?.count ?? 0) > 0 {
+                if let pending = desk.deliveryPending(address), pending > 0 {
                     Button { desk.openSeat(address) } label: {
-                        Text(tr("个人信箱 · ", "Personal inbox · ") + deliveryText(desk.deliveryAutomatic(address), inFlight: desk.deliveryInFlight(address), unresolved: desk.deliveryUnresolved(address)))
+                        Text(tr("个人信箱 · ", "Personal inbox · ") + pendingDeliveryText(pending))
                             .font(Theme.Font.small).foregroundStyle(Theme.ink3).underline()
                     }
                     .buttonStyle(.plain).focusRing()
@@ -217,6 +225,11 @@ private struct SeatRow: View {
             .allowsHitTesting(false)
         }
     }
+
+    private func pendingDeliveryText(_ count: Int?) -> String {
+        count.map { tr("待投递 \($0)", "Pending delivery: \($0)") }
+            ?? tr("待投递 未知", "Pending delivery: unknown")
+    }
 }
 
 
@@ -229,7 +242,7 @@ private struct UnassignedBlock: View {
             Button { desk.unassignedOpen.toggle() } label: {
                 HStack(spacing: 12) {
                     Text(desk.unassignedOpen ? "−" : "+").font(Theme.Font.mono.weight(.bold)).frame(width: 14)
-                    Text(tr("未分配", "Unassigned")).font(Theme.Font.rowTitle)
+                    Text(tr("未分配绑定", "Unassigned bindings")).font(Theme.Font.rowTitle)
                     Text(panel.text { "\($0.count)" }).font(Theme.Font.count).foregroundStyle(Theme.ink2)
                     if desk.isFixture { Chip(text: tr("模拟数据", "Sample data"), style: .dashed) }
                 }

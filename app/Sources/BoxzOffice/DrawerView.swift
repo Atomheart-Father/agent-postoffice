@@ -9,15 +9,20 @@ struct DrawerView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 16) {
                 Text(title).font(Theme.Font.blockTitle).tracking(Theme.Track.blockTitle).lineLimit(1)
-                if case .inbox = desk.drawer { InboxTabs(desk: desk) }
                 Spacer(minLength: 0)
                 BoxButton(title: tr("关闭", "Close")) { desk.drawer = nil }
             }
             .padding(.leading, Theme.drawerPadLeading).padding(.trailing, Theme.drawerPad).padding(.vertical, Theme.drawerPad)
             .frame(minHeight: 72)
+            if case .inbox = desk.drawer {
+                InboxTabs(desk: desk).padding(.horizontal, Theme.drawerPad).padding(.bottom, 12)
+            }
             Rule(color: Theme.ink)
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 0) { content }
+                VStack(alignment: .leading, spacing: 0) {
+                    if case .inbox = desk.drawer { UnresolvedActions(desk: desk) }
+                    content
+                }
                     .padding(.horizontal, 24).padding(.top, 22).padding(.bottom, 40)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -49,19 +54,14 @@ struct DrawerView: View {
         case .inbox where desk.inboxTab == .requests:
             RequestList(desk: desk)
         case .inbox:
-            PanelBody(panel: desk.inbox) { box in
-                let shown = box.letters.filter { !$0.isRequestNotice }
-                if shown.isEmpty { Text(tr("0 封", "0 letters")).font(Theme.Font.body).foregroundStyle(Theme.ink3) }
-                if !box.complete { Text(tr("只读到 \(box.letters.count) 封，后端共 \(box.count) 封", "Read \(box.letters.count) \(pl(box.letters.count, "letter")); the office has \(box.count)")).font(Theme.Font.small).foregroundStyle(Theme.ink2).padding(.bottom, 8) }
-                ForEach(shown) { LetterLine(desk: desk, letter: $0, holders: desk.holders) }
-            }
+            MailboxContents(desk: desk, inbox: desk.inbox)
         case .project(let ref):
             PanelBody(panel: desk.projects) { ps in
                 if let p = ps.first(where: { $0.ref == ref }) { ProjectDetailView(desk: desk, project: p) }
                 else { Text(tr("未知  项目不在当前读到的列表里", "Unknown  project not in the list read")).font(Theme.Font.body).foregroundStyle(Theme.ink2) }
             }
         case .work(let ref):
-            PanelBody(panel: desk.workDetails[ref] ?? .loading) { WorkDetailView(desk: desk, detail: $0) }
+            PanelBody(panel: desk.workDetails[ref] ?? .loading) { WorkDetailView(desk: desk, detail: $0).id(ref) }
         case .seat(let addr):
             SeatDrawer(desk: desk, addr: addr).id(addr)
         case nil: EmptyView()
@@ -113,6 +113,7 @@ private struct LetterLine: View {
     let holders: [String: [String]]
     var target: String? = nil
     var canReply = true
+    var archived = false
     @State private var expanded = false
 
     var body: some View {
@@ -139,7 +140,7 @@ private struct LetterLine: View {
                 }
             }
             .padding(.top, 4)
-            if expanded { LetterBody(reads: desk.reads, letterID: letter.id, target: target).padding(.top, 8) }
+            if expanded { LetterBody(reads: desk.reads, letterID: letter.id, target: target, archived: archived).padding(.top, 8) }
             let key = "reply:" + letter.id
             let archiveKey = "archive:" + letter.id
             if canReply {
@@ -152,15 +153,16 @@ private struct LetterLine: View {
                     }
                     if desk.actions[archiveKey] == nil {
                         BoxButton(title: tr("归档", "Archive")) {
-                            desk.beginAction(archiveKey, .archive(letterID: letter.id))
-                            desk.confirmAction(archiveKey)
+                            desk.beginAction(archiveKey, .archive(letterID: letter.id), subject: letter.subject)
                         }
                         HeldMark(desk: desk, key: archiveKey)
                     }
                 }.padding(.top, 6)
             }
-            ActionBox(desk: desk, key: key)
-            ActionBox(desk: desk, key: archiveKey)
+            if canReply {
+                ActionBox(desk: desk, key: key)
+                ActionBox(desk: desk, key: archiveKey)
+            }
         }
         .padding(.vertical, 14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -178,6 +180,7 @@ private struct LetterBody: View {
     let reads: OfficeReads
     let letterID: String
     let target: String?
+    let archived: Bool
     @State private var page: Panel<LetterPage> = .loading
     @State private var cursors = [1]
     @State private var digest: String?
@@ -211,7 +214,7 @@ private struct LetterBody: View {
         }
         .task(id: request) {
             let cursor = cursors.last
-            let result = await Task.detached { reads.letterPage(letterID, target: target, cursor: cursor) }.value
+            let result = await Task.detached { reads.letterPage(letterID, target: target, cursor: cursor, archived: archived) }.value
             guard !Task.isCancelled else { return }
             if case .ok(let incoming) = result {
                 if let digest, digest != incoming.digest {
@@ -249,12 +252,145 @@ private struct SeatDrawer: View {
             }
         }
         ActionBox(desk: desk, key: key)
-        let panel = desk.seatMail[addr] ?? .loading
-        Sec(title: tr("信箱", "Mailbox"), count: panel.value.map { b in "\(b.letters.count)" } ?? tr("未知", "Unknown"))
-        PanelBody(panel: panel) { box in
-            if box.letters.isEmpty { Text(tr("0 封", "0 letters")).font(Theme.Font.body).foregroundStyle(Theme.ink3) }
-            if !box.complete { Text(tr("只读到 \(box.letters.count) 封，后端共 \(box.count) 封", "Read \(box.letters.count) \(pl(box.letters.count, "letter")); the office has \(box.count)")).font(Theme.Font.small).foregroundStyle(Theme.ink2).padding(.bottom, 8) }
-            ForEach(box.letters) { LetterLine(desk: desk, letter: $0, holders: desk.holders, target: addr, canReply: false) }
+        if addr.hasPrefix("@") || desk.hosts.value?.bindings.contains(where: { $0.position == addr }) == true {
+            PositionDuties(desk: desk, address: addr)
+        }
+        MailboxContents(desk: desk, inbox: desk.seatMail[addr] ?? .loading, target: addr)
+    }
+}
+
+private struct PositionDuties: View {
+    @ObservedObject var desk: DeskModel
+    let address: String
+    @State private var profile: Panel<PositionProfile> = .loading
+
+    var body: some View {
+        let key = "duties:" + address
+        VStack(alignment: .leading, spacing: 6) {
+            Sec(title: tr("岗位职责", "Position duties"))
+            PanelBody(panel: profile) { role in
+                if role.duties.isEmpty {
+                    Text(tr("尚未填写", "No duties listed")).font(Theme.Font.f14).foregroundStyle(Theme.ink3)
+                } else {
+                    ExpandableText(text: role.duties.joined(separator: "\n"))
+                }
+                if let reportsTo = role.reportsTo { KV(k: tr("汇报给", "Reports to"), v: "@" + reportsTo) }
+                if role.canEdit, !desk.isFixture, desk.actions[key] == nil {
+                    HStack(spacing: 8) {
+                        BoxButton(title: tr("编辑职责", "Edit duties")) {
+                            desk.beginAction(key, .positionDuties(position: address, expected: role.duties),
+                                             text: role.duties.joined(separator: "\n"))
+                        }
+                        HeldMark(desk: desk, key: key)
+                    }
+                }
+            }
+            ActionBox(desk: desk, key: key)
+        }
+        .task(id: desk.actions[key]?.phase) {
+            switch desk.actions[key]?.phase {
+            case nil, .done:
+                let reads = desk.reads
+                let result = await Task.detached { reads.positionProfile(address) }.value
+                if !Task.isCancelled { profile = .done(result) }
+            default: break
+            }
+        }
+    }
+}
+
+private struct MailboxContents: View {
+    @ObservedObject var desk: DeskModel
+    let inbox: Panel<Inbox>
+    var target: String? = nil
+    @State private var archived = false
+    @State private var archive: Panel<Inbox> = .loading
+    @State private var archiveCursors: [String] = []
+    @State private var archiveRequest = 0
+    @State private var visible = 15
+
+    var body: some View {
+        let key = "archive-completed:" + (inbox.value?.box ?? target ?? "")
+        let panel = archived ? archive : inbox
+        let count = panel.value.map { box in target == nil && !archived
+            ? bounded(box.letters.count(where: { !$0.isRequestNotice }), atLeast: !box.complete)
+            : "\(box.count)" }
+        VStack(alignment: .leading, spacing: 0) {
+            Sec(title: tr("信箱", "Mailbox"), count: count ?? tr("未知", "Unknown"))
+            HStack(spacing: 8) {
+                BoxButton(title: tr("收件箱", "Inbox"), primary: !archived) { archived = false }
+                BoxButton(title: tr("归档", "Archive"), primary: archived) {
+                    if !archived { archive = .loading; archiveCursors = []; archived = true }
+                }
+                Spacer(minLength: 0)
+                if !archived, !desk.isFixture, let box = inbox.value, !box.letters.isEmpty, desk.actions[key] == nil {
+                    BoxButton(title: tr("归档已结清", "Archive completed")) {
+                        desk.beginAction(key, .archiveCompleted(target: target))
+                        if desk.actions[key]?.phase == .editing { desk.confirmAction(key) }
+                    }
+                    .help(tr("把已结清的信移到归档", "Move completed letters to the archive"))
+                    HeldMark(desk: desk, key: key)
+                }
+            }.padding(.bottom, 8)
+            ActionBox(desk: desk, key: key)
+            PanelBody(panel: panel) { box in
+                let rows = target == nil && !archived ? box.letters.filter { !$0.isRequestNotice } : box.letters
+                if rows.isEmpty { Text(tr("0 封", "0 letters")).font(Theme.Font.body).foregroundStyle(Theme.ink3).padding(.vertical, 10) }
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(archived ? rows[...] : rows.prefix(visible)) {
+                        LetterLine(desk: desk, letter: $0, holders: desk.holders, target: target,
+                                   canReply: target == nil && !archived, archived: archived)
+                    }
+                }.id(archived)
+                if archived {
+                    HStack(spacing: 8) {
+                        if !archiveCursors.isEmpty {
+                            BoxButton(title: tr("上一页", "Previous page")) { archiveCursors.removeLast(); loadArchive() }
+                        }
+                        if let next = box.nextCursor {
+                            BoxButton(title: tr("下一页", "Next page")) { archiveCursors.append(next); loadArchive() }
+                        }
+                    }.padding(.top, 10)
+                } else if rows.count > visible {
+                    BoxButton(title: tr("显示更多", "Show more")) { visible += 15 }.padding(.top, 10)
+                }
+            }
+            if archived, archive.value == nil, case .done = archive {
+                BoxButton(title: tr("重新读取", "Read again"), action: loadArchive).padding(.top, 10)
+            }
+        }
+        .task(id: archived ? archiveRequest : nil) {
+            guard archived else { return }
+            let reads = desk.reads, cursor = archiveCursors.last
+            let result = await Task.detached { reads.inbox(target: target, archived: true, cursor: cursor) }.value
+            if !Task.isCancelled { archive = .done(result) }
+        }
+        .onChange(of: desk.actions[key]?.phase) { _, phase in
+            if archived, case .done = phase { archiveCursors = []; loadArchive() }
+        }
+    }
+
+    private func loadArchive() {
+        archive = .loading
+        archiveRequest += 1
+    }
+}
+
+private struct ExpandableText: View {
+    let text: String
+    @State private var expanded = false
+
+    var body: some View {
+        let compact = text.count > 100 || text.split(separator: "\n", omittingEmptySubsequences: false).count > 3
+        VStack(alignment: .leading, spacing: 6) {
+            Text(verbatim: text).font(Theme.Font.f14).lineSpacing(3)
+                .lineLimit(compact && !expanded ? 3 : nil)
+                .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            if compact {
+                BoxButton(title: expanded ? tr("收起全文", "Show less") : tr("展开全文", "Show full text")) {
+                    expanded.toggle()
+                }
+            }
         }
     }
 }
@@ -325,14 +461,14 @@ private struct WorkDetailView: View {
         KV(k: tr("创建", "Created"), v: shortTime(detail.createdAt))
         if !detail.acceptance.trimmingCharacters(in: .whitespaces).isEmpty {
             Sec(title: tr("验收", "Acceptance"))
-            Text(detail.acceptance).font(Theme.Font.f14).lineSpacing(3).textSelection(.enabled)
+            ExpandableText(text: detail.acceptance)
         }
-        relationsSection
-        provenance
-        usageSection
         submission(tr("当前提交", "Current submission"), detail.current)
         review
         submission(tr("最终提交", "Final submission"), detail.final)
+        relationsSection
+        provenance
+        usageSection
     }
 
     /// 接续：我指向谁（等待 / 依据 / …）+ 谁指向我（谁在等我）。后端没给 = 未知，不写"没有"。点编号打开那一件。
@@ -459,14 +595,40 @@ private struct WorkDetailView: View {
     }
 
     @ViewBuilder private func submission(_ k: String, _ s: SubmissionSummary?) -> some View {
-        Sec(title: k, count: s == nil ? tr("无", "None") : nil)
         if let s {
-            HStack { Text(s.ref).font(Theme.Font.mono); Spacer(); Chip(text: Labels.submissionState(s.state)) }
-            Text(shortTime(s.createdAt)).font(Theme.Font.small.weight(.regular)).monospacedDigit().foregroundStyle(Theme.ink3).padding(.top, 2)
-            if !s.note.isEmpty { Text(s.note).font(Theme.Font.f14).lineSpacing(3).padding(.top, 6).textSelection(.enabled) }
-            if let final = s.final { Text(final ? tr("最终成果", "Final delivery") : tr("阶段成果", "Interim delivery")).font(Theme.Font.small.weight(.semibold)) }
-            ForEach(s.files) { file in
-                SubmissionFileView(reads: desk.reads, subRef: s.ref, file: file).id(s.ref + ":" + file.ref)
+            Sec(title: k)
+            SubmissionDetails(reads: desk.reads, submission: s).id(s.ref)
+        }
+    }
+}
+
+private struct SubmissionDetails: View {
+    let reads: OfficeReads
+    let submission: SubmissionSummary
+    @State private var filesOpen = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack { Text(submission.ref).font(Theme.Font.mono); Spacer(); Chip(text: Labels.submissionState(submission.state)) }
+            Text(shortTime(submission.createdAt)).font(Theme.Font.small).monospacedDigit().foregroundStyle(Theme.ink3)
+            if !submission.note.isEmpty { ExpandableText(text: submission.note) }
+            if let final = submission.final {
+                Text(final ? tr("最终成果", "Final delivery") : tr("阶段成果", "Interim delivery"))
+                    .font(Theme.Font.small.weight(.semibold)).foregroundStyle(Theme.ink2)
+            }
+            if !submission.files.isEmpty {
+                let n = submission.files.count
+                DisclosureGroup(isExpanded: $filesOpen) {
+                    if filesOpen {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(submission.files) { file in
+                                SubmissionFileView(reads: reads, subRef: submission.ref, file: file)
+                            }
+                        }
+                    }
+                } label: {
+                    Text(tr("\(n) 个交付文件", "\(n) delivered \(pl(n, "file"))")).font(Theme.Font.f14Bold)
+                }.padding(.top, 3)
             }
         }
     }
@@ -482,22 +644,29 @@ private struct SubmissionFileView: View {
     @State private var request = 0
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(file.ref).font(Theme.Font.mono).textSelection(.enabled)
-            Text("\(file.op) · \(file.version ?? tr("版本未知", "Version unknown"))").font(Theme.Font.small).textSelection(.enabled)
-            if file.op != "delete" {
-                BoxButton(title: open ? tr("收起文件", "Close file") : tr("读取文件", "Read file")) {
-                    open.toggle()
-                    if open { cursor = nil; load() }
-                }
-                if open {
-                    PanelBody(panel: page) { value in
-                        Text(verbatim: value.content).font(Theme.Font.f14).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        if let next = value.cursor { BoxButton(title: tr("下一页", "Next page")) { cursor = next; load() } }
-                    }
-                    if page.value == nil, case .done = page { BoxButton(title: tr("重新读取", "Read again"), action: load) }
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(file.ref).font(Theme.Font.mono).lineLimit(open ? nil : 2)
+                        .truncationMode(.middle).help(file.ref).textSelection(.enabled)
+                    Text(open ? "\(file.op) · \(file.version ?? tr("版本未知", "Version unknown"))" : file.op)
+                        .font(Theme.Font.small).foregroundStyle(Theme.ink3)
+                        .help(file.version ?? "").textSelection(.enabled)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                if file.op != "delete" {
+                    BoxButton(title: open ? tr("收起", "Close") : tr("读取", "Read")) {
+                        open.toggle()
+                        if open { cursor = nil; load() }
+                    }.accessibilityLabel(open ? tr("收起文件", "Close file") : tr("读取文件", "Read file"))
                 }
             }
-        }.padding(.top, 6)
+            if open {
+                PanelBody(panel: page) { value in
+                    Text(verbatim: value.content).font(Theme.Font.f14).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    if let next = value.cursor { BoxButton(title: tr("下一页", "Next page")) { cursor = next; load() } }
+                }
+                if page.value == nil, case .done = page { BoxButton(title: tr("重新读取", "Read again"), action: load) }
+            }
+        }.padding(.vertical, 8).overlay(alignment: .top) { Rule() }
         .task(id: request) {
             guard open else { return }
             let next = cursor
@@ -529,4 +698,29 @@ struct UsageLine: View {
         .padding(.vertical, 3)
     }
     private func f(_ n: Int?) -> String { n.map(TokenFmt.short) ?? tr("未知", "Unknown") }
+}
+
+/// 原行可能已经消失；未决操作仍从待办可见，由人选择是否同键重试。
+private struct UnresolvedActions: View {
+    @ObservedObject var desk: DeskModel
+    var body: some View {
+        if let error = desk.journalError { Text(error).foregroundStyle(Theme.bad).padding(.bottom, 12) }
+        let entries = desk.book.unresolved
+        if !entries.isEmpty {
+            Text(tr("未决操作", "Unresolved actions")).font(Theme.Font.f14Bold).padding(.bottom, 8)
+            ForEach(entries.keys.sorted(), id: \.self) { key in
+                if let action = entries[key] {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(action.intent.title + " · " + key).font(Theme.Font.small.weight(.semibold))
+                        if !action.subject.isEmpty { Text(action.subject).font(Theme.Font.small) }
+                        if !action.text.isEmpty { Text(action.text).font(Theme.Font.small).textSelection(.enabled) }
+                        if desk.book.isHeld(key) {
+                            BoxButton(title: tr("查看并重试", "Review and retry")) { desk.beginAction(key, action.intent) }
+                        }
+                        ActionBox(desk: desk, key: key)
+                    }.padding(.bottom, 12)
+                }
+            }
+        }
+    }
 }

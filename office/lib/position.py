@@ -40,6 +40,48 @@ class PositionOperations:
                             (actor, actor)).fetchall()
         return [{"role": r["position"], "holder": actor} for r in rows]
 
+    def position_profile(self, actor, *, position, now_ts=None):
+        self._check_actor(actor)
+        position = self._profile_position(position)
+        with self._txn(read_only=True) as conn:
+            operator = actor == self._request_user()
+            if not operator and not self._on_duty(conn, actor, position):
+                raise self.CoreError("forbidden", "无权查看该岗位职责", en="You cannot view this position's duties")
+            if not self._position_exists(conn, position):
+                raise self.CoreError("not_found", "岗位不存在或已撤销", en="The position does not exist or is retired")
+            return {"ok": True, **self._position_spec(conn, position), "can_edit": operator}
+
+    def _profile_position(self, position):
+        if not isinstance(position, str) or not (position := position.strip().removeprefix("@")):
+            raise self.CoreError("invalid_request", "请填写岗位地址", en="Specify a position address", field="position")
+        return position
+
+    def position_duties_set(self, actor, *, position, duties, expected_duties, act_key, now_ts=None):
+        self._check_actor(actor)
+        position = self._profile_position(position)
+        for field, values in (("duties", duties), ("expected_duties", expected_duties)):
+            if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                raise self.CoreError("invalid_request", "职责须为字符串数组", en="Duties must be an array of strings", field=field)
+        duties = [d.strip() for d in duties if d.strip()]
+        params = {"position": position, "duties": duties, "expected_duties": expected_duties}
+        op = "position.duties.set"
+        with self._txn() as conn:
+            if actor != self._request_user():
+                raise self.CoreError("forbidden", "只有组织用户可以编辑岗位职责", en="Only the office operator can edit duties")
+            replay, digest = self.storage.action_replay(conn, actor, op, act_key, params)
+            if replay is not None:
+                return replay
+            if not self._position_exists(conn, position):
+                raise self.CoreError("not_found", "岗位不存在或已撤销", en="The position does not exist or is retired")
+            if self._position_spec(conn, position)["duties"] != expected_duties:
+                raise self.CoreError("conflict", "岗位职责已更新，请重新读取", en="Duties changed. Reload before editing.",
+                                     reason_code="version_conflict")
+            conn.execute("UPDATE position_holders SET duties=? WHERE position=?",
+                         (self.canonical_json(duties), position))
+            result = {"ok": True, "position": position}
+            self.storage.record_action(conn, actor, op, act_key, digest, result, now_ts)
+            return result
+
     def _on_duty(self, conn, actor, position):
         """"在岗"的唯一一份：本人是该岗现任（或本人就是岗位会话），或沿汇报线（`reports_to` 逐级向上）某一岗的现任。知识、资源、信箱共用。"""
         seen, cur = set(), position
@@ -52,7 +94,7 @@ class PositionOperations:
         return False
 
     def identity_deactivate(self, actor, *, act_key, now_ts=None):
-        """停用**自己**的个人身份（第 0 档，只验身份）。停用别人是组织层面的事：走申请（`request.create kind=deactivate`，第 3 档）。"""
+        """归档本人的个人信箱；他人的个人信箱须走申请。会话绑定及岗位授权不受影响。"""
         self._check_actor(actor)
         with self._txn() as conn:
             replay, digest = self.storage.action_replay(conn, actor, "identity.deactivate", act_key, {})
@@ -88,7 +130,7 @@ class PositionOperations:
             raise self.CoreError("not_found", "%r 不是已登记的个人" % person, en="%r is not a registered person" % person)
         held = ",".join(p["role"] for p in self._positions_of(conn, person)) or None
         conn.execute("INSERT OR IGNORE INTO box_archive(box, reason, by_ref, at, position_ref, act_key) VALUES(?,?,?,?,?,?)",
-                     (person, "停用个人身份", actor, self._now(now_ts), held, act_key))
+                     (person, "归档个人信箱", actor, self._now(now_ts), held, act_key))
         return {"ok": True, "person": person, "position_ref": held}
 
     def _position_retire_apply(self, conn, actor, position, cancel_work, act_key, now_ts):
@@ -140,6 +182,7 @@ class PositionOperations:
 
     def _position_install(self, conn, actor, position, holder, create, now_ts):
         """申请里的 `create`：同一事务写岗位（职责 / 汇报岗 + 现任），再按需建项目。绑定与上岗信由调用方接着做。"""
+        self._check_box_name(position, "position")
         spec, proj = create.get("position") or {}, create.get("project")
         duties, up = self._position_create_fields(conn, spec)
         if conn.execute("SELECT 1 FROM position_holders WHERE position=?", (position,)).fetchone():
@@ -180,15 +223,13 @@ class PositionOperations:
         cur = self._position_active_binding(conn, position)
         prev_session = cur["host_session_ref"] if cur is not None else None
         replaced = cur is not None and prev_session != session_ref
-        last = conn.execute("SELECT generation FROM bindings WHERE binding_id=?",
-                            (position,)).fetchone()
         if cur is not None and prev_session == session_ref and cur["instance"] == instance:
-            gen = cur["generation"]
+            gen, channel = cur["generation"], cur["channel_lifetime_ref"]
         else:
-            gen = (last["generation"] + 1) if last is not None else 1
+            gen, channel = self._binding_high_water(conn, position) + 1, None
         reg = self._binding_register_apply(
             conn, position, position, gen, instance,
-            channel_lifetime_ref=None, host_session_ref=session_ref, now_ms=now_ms, now=now)
+            channel_lifetime_ref=channel, host_session_ref=session_ref, now_ms=now_ms, now=now)
         if reg["changed"]:
             # 现任以 position_holders 为准：绑定同事务写（人 = 这个会话上的个人身份；只有岗位身份的会话不改现任）
             who = next((r[0] for r in conn.execute(

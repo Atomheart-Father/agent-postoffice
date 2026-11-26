@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 
 from delivery import due as due_mod
 from delivery.coord import manager_boxes
@@ -104,7 +105,7 @@ class Handler:
 
 
 def drain(store, *, on_batch: Handler | None = None, on_tool: Handler | None = None,
-          on_wait: Handler | None = None,
+          on_wait: Handler | None = None, on_idle_work: Handler | None = None,
           now_ts: float | None = None, limit: int = DEFAULT_LIMIT, rows=None) -> dict:
     """Settle the rows that are due **right now**, one transaction each; return post-commit actions.
 
@@ -122,7 +123,7 @@ def drain(store, *, on_batch: Handler | None = None, on_tool: Handler | None = N
       empty table without counting.
     """
     at = due_mod.now() if now_ts is None else float(now_ts)
-    handlers = {"batch": on_batch, "tool_hang": on_tool, "wait_deadline": on_wait}
+    handlers = {"batch": on_batch, "tool_hang": on_tool, "wait_deadline": on_wait, "idle_work": on_idle_work}
     registered = [kind for kind, h in handlers.items() if h is not None]
     out = {"handled": [], "actions": [], "skipped": [], "failed": [], "more": 0}
     if not registered:
@@ -160,10 +161,11 @@ def _apply_one(store, handler, row, facts, at, out):
             if not isinstance(answer, dict):
                 raise TypeError("handler returned %r" % (type(answer).__name__,))
             after = due_mod.get(conn, row["due_key"])
+        if answer.get("decision") != "stale":
             out["handled"].append({"due_key": row["due_key"], "kind": row["kind"],
                                    "decision": answer.get("decision"),
                                    "version": (after or {}).get("version")})
-            return answer
+        return answer
     except Exception as exc:                          # noqa: BLE001
         # The transaction above has already rolled back — including whatever the handler wrote
         # before it raised. That matters most when a handler fires a row and then fails to write the
@@ -174,6 +176,111 @@ def _apply_one(store, handler, row, facts, at, out):
 
 
 # --------------------------------------------------------------------------- handlers
+
+def _process_status(pid, expected):
+    from delivery.process_observer import birth
+    if type(pid) is not int or not expected:
+        return 'unknown'
+    observed = birth(pid)
+    if observed:
+        return 'alive' if observed == expected else 'dead'
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return 'dead'
+    except (PermissionError, OSError):
+        pass
+    return 'unknown'
+
+
+def fired_tool_alerts(conn, box, *, round_token=None):
+    """Current, unaccepted tool alerts in one box; caller owns the read transaction."""
+    from lib.mail import SYSTEM_MAIL_SENDER
+    fact = "CASE WHEN json_valid(l.meta_json) THEN json_extract(l.meta_json,'$.fact_key') END"
+    system = "CASE WHEN json_valid(l.meta_json) THEN json_extract(l.meta_json,'$.system') END"
+    if round_token is None:
+        rows = conn.execute(
+            "SELECT DISTINCT d.* FROM due d INDEXED BY due_state_due_at CROSS JOIN letters l INDEXED BY ix_letters_system_fact "
+            "CROSS JOIN letter_states s WHERE d.state='fired' AND d.kind='tool_hang' "
+            "AND l.from_actor=? AND " + fact + "='tool:' || d.due_key || '#' || d.version "
+            "AND " + system + "='tool.due' AND s.letter_id=l.letter_id AND s.box=? "
+            "AND s.state='delivered' AND s.accepted_at IS NULL", (SYSTEM_MAIL_SENDER, box)).fetchall()
+        return [due_mod._out(row) for row in rows]
+    refs = conn.execute(
+        "SELECT " + fact + " FROM round_ref rr INDEXED BY sqlite_autoindex_round_ref_1 CROSS JOIN letters l CROSS JOIN letter_states s "
+        "WHERE rr.token=? AND rr.box=? AND l.letter_id=rr.ref AND l.from_actor=? "
+        "AND " + system + "='tool.due' AND s.letter_id=l.letter_id AND s.box=rr.box "
+        "AND s.state='delivered' AND s.accepted_at IS NULL", (round_token, box, SYSTEM_MAIL_SENDER)).fetchall()
+    rows = {}
+    for (value,) in refs:
+        identity = due_mod.tool_alert_version(value)
+        if identity:
+            key, version = identity
+            row = due_mod.get(conn, key)
+            if row and row['kind'] == 'tool_hang' and row['state'] == 'fired' and str(row['version']) == version:
+                rows[key] = row
+    return list(rows.values())
+
+
+def dead_tool_alerts(rows):
+    """Observe exact process identities outside a transaction, once per distinct identity."""
+    observed, dead = {}, []
+    for row in rows:
+        payload = row['payload']
+        identities = ((payload.get('process_pid'), payload.get('process_birth')),
+                      (payload.get('tool_pid'), payload.get('tool_birth')))
+        for identity in identities:
+            pid, birth = identity
+            if type(pid) is not int or pid <= 0 or not isinstance(birth, str) or not birth:
+                continue
+            if identity not in observed:
+                observed[identity] = _process_status(pid, birth)
+            if observed[identity] == 'dead':
+                dead.append(row)
+                break
+    return dead
+
+
+def retire_dead_tool_alerts(conn, rows, at=None):
+    """CAS-retire observed dead alerts inside the caller's existing write transaction."""
+    retired = 0
+    for row in rows:
+        current = due_mod.get(conn, row['due_key'])
+        if (current and current['state'] == 'fired' and current['version'] == row['version']
+                and current['binding_id'] == row['binding_id'] and current['binding_gen'] == row['binding_gen']
+                and current['payload'] == row['payload']):
+            retired += bool(due_mod.clear(conn, row['kind'], row['subject_ref'],
+                                          expected_version=row['version'], now_ts=at))
+    return retired
+
+
+class IdleWorkHandler(Handler):
+    def __init__(self, core):
+        self.core = core
+
+    def gather(self, row, at, store):
+        with store.transaction(read_only=True) as conn:
+            data = self.core._monitor_state(conn, (row['binding_id'], row['binding_gen']))
+        return _process_status(data.get('process_pid'), data.get('process_birth'))
+
+    def apply(self, conn, row, facts, at):
+        current = due_mod.get(conn, row['due_key'])
+        if not current or current['state'] != 'armed' or current['version'] != row['version']:
+            return {'decision': 'stale'}
+        active = conn.execute("SELECT actor FROM bindings WHERE binding_id=? AND generation=? AND state='active' AND revoked_at IS NULL",
+                              (row['binding_id'], row['binding_gen'])).fetchone()
+        if not active or facts == 'dead':
+            due_mod.clear(conn, 'idle_work', row['subject_ref'], expected_version=row['version'], now_ts=at)
+            return {'decision': 'retired'}
+        if facts != 'alive':
+            payload = dict(current['payload'])
+            attempts = min(int(payload.get('unknown_checks', 0)) + 1, 5)
+            payload['unknown_checks'] = attempts
+            due_mod.set_payload(conn, 'idle_work', row['subject_ref'], payload, now_ts=at)
+            due_mod.push_back(conn, 'idle_work', row['subject_ref'], at + min(300 * 2 ** (attempts - 1), 3600), now_ts=at)
+            return {'decision': 'unknown'}
+        return self.core._monitor_idle_due(conn, row, active['actor'], at)
+
 
 class ToolHandler(Handler):
     """A tool deadline: re-read the native call outside the lock, then settle inside the row's txn."""
@@ -187,16 +294,28 @@ class ToolHandler(Handler):
         self.retry_seconds = retry_seconds
 
     def gather(self, row, at, store):
-        call = due_mod.tool_call_of(row)
-        if self.observe is None:
-            return None
+        try:
+            call = due_mod.tool_call_of(row)
+        except due_mod.DueRefused:
+            return (None, None, 'unknown')
         # A host that does have a live handle (the Pi adapter) reads it here, deliberately outside
         # any transaction: it can take seconds, and holding the write lock would stall every writer.
-        return self.observe(call)
+        payload = row.get('payload') or {}
+        status = _process_status(payload.get('process_pid'), payload.get('process_birth'))
+        return (call, self.observe(call) if self.observe is not None and status != 'dead' else None, status)
 
     def apply(self, conn, row, facts, at):
+        call, observation, status = facts
+        active = conn.execute("SELECT 1 FROM bindings WHERE binding_id=? AND generation=? AND state='active' AND revoked_at IS NULL",
+                              (row['binding_id'], row['binding_gen'])).fetchone()
+        if call is None or not active or status == 'dead':
+            current = due_mod.get(conn, row['due_key'])
+            if not current or current['state'] != 'armed' or current['version'] != row['version']:
+                return {'decision': 'stale'}
+            due_mod.clear(conn, row['kind'], row['subject_ref'], expected_version=row['version'], now_ts=at)
+            return {'decision': 'retired'}
         return due_mod.settle_tool_deadline(
-            conn, call=due_mod.tool_call_of(row), due_version=row["version"], observation=facts,
+            conn, call=call, due_version=row["version"], observation=observation,
             now_ts=at, rearm_seconds=self.rearm_seconds, retry_seconds=self.retry_seconds,
             notify=self.notify)
 
@@ -259,24 +378,34 @@ class WaitDeadlineHandler(Handler):
 class BatchHandler(Handler):
     """A unit's batch deadline: find the current legal readers, then start its round inside."""
 
-    def __init__(self, *, consumers, begin_round, retry_seconds: float = 30.0):
+    def __init__(self, *, consumers, begin_round, can_wait=None, retry_seconds: float = 30.0):
         self.consumers = consumers
         self.begin_round = begin_round
+        self.can_wait = can_wait
         self.retry_seconds = retry_seconds
 
     def gather(self, row, at, store):
         unit = row["subject_ref"]
         with store.transaction(read_only=True) as conn:
-            # Core's appointment facts, read outside the write lock so a slow read does not hold it.
-            return {"unit": unit, "consumers": list(self.consumers(conn, unit))}
+            consumers = list(self.consumers(conn, unit))
+            alerts = fired_tool_alerts(conn, unit) if consumers else []
+        return {"unit": unit, "consumers": consumers, "dead_alerts": dead_tool_alerts(alerts)}
 
     def apply(self, conn, row, facts, at):
+        current = due_mod.get(conn, row["due_key"])
+        if not current or current["state"] != "armed" or current["version"] != row["version"]:
+            return {"decision": "stale"}
         if not facts["consumers"]:
+            if self.can_wait is not None and not self.can_wait(conn, facts["unit"]):
+                # Keep the letter readable and stop scheduling an address that has been retired.
+                cleared = due_mod.clear_batch(conn, facts["unit"], expected_version=row["version"], now_ts=at)
+                return {"decision": "manual", "version": cleared["version"]}
             # §3: a position's mail waits for a legal incumbent. Pushing the row back keeps it in
             # this queue without inventing a round or sending to nobody.
             moved = due_mod.push_back(conn, "batch", facts["unit"],
                                       at + max(1.0, float(self.retry_seconds)), now_ts=at)
             return {"decision": "no_incumbent", "version": (moved or {}).get("version")}
+        retire_dead_tool_alerts(conn, facts.get("dead_alerts", ()), at)
         started = self.begin_round(conn, row, facts["consumers"])
         plan = started if isinstance(started, dict) else {}
         reason = plan.get("reason")

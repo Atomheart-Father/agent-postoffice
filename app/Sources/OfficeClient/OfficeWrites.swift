@@ -2,13 +2,13 @@ import Foundation
 
 /// App 写入走公开 op，并沿用受控 socket。
 /// 不碰 host.*、round.* 等内部 op。每个写必须带调用方生成的 act_key（幂等键）；同一件事重试用**同一个** act_key。
-public enum RequestDecision: String, Sendable { case approve, refuse }
-public enum ReviewDecision: String, Sendable { case accept, `return` }
+public enum RequestDecision: String, Sendable, Codable { case approve, refuse }
+public enum ReviewDecision: String, Sendable, Codable { case accept, `return` }
 
 /// 写的结果，比读多一件事：结果未知（要用同一个 act_key / retry_ref 重试）。
 public enum WriteOutcome: Sendable, Equatable {
     case done(WriteDone)
-    /// 后端明确拒绝：这一笔没有发生。`currentVersion` = 版本冲突时后端报的当前版本。
+    /// 本次尝试被拒；不能据此判断先前未决尝试。`currentVersion` 是后端报告的当前版本。
     case refused(code: String, message: String, reasonCode: String?, currentVersion: Int?)
     /// 没拿到可信答复：这一笔可能已经提交。**不是失败**——用同一个 act_key 再发，账本会给出是否已提交。
     case unknown(detail: String, retryRef: String?)
@@ -47,6 +47,16 @@ public struct OfficeWrites: Sendable {
         send("letter.archive", ["letter_id": letterID, "act_key": actKey])
     }
 
+    public func archiveCompleted(target: String?, actKey: String) -> WriteOutcome {
+        var args: [String: Any] = ["act_key": actKey]
+        args["target"] = target
+        return send("letter.archive_completed", args)
+    }
+
+    public func setPositionDuties(_ position: String, duties: [String], expected: [String], actKey: String) -> WriteOutcome {
+        send("position.duties.set", ["position": position, "duties": duties, "expected_duties": expected, "act_key": actKey])
+    }
+
     /// 写信（letter.send）。`replyTo` 给了就是回信，指向被回的那封。`retryRef` 只对 letter.send 有意义（线路只在这个 op 收它）。
     /// `need` 是单行字符串（后端校验）：换行压成空格，空的不带。
     public func letter(to: String, subject: String, body: String, replyTo: String? = nil, actKey: String,
@@ -60,8 +70,10 @@ public struct OfficeWrites: Sendable {
     }
 
     /// 下线一个绑定：request.create(kind=unbind, target=绑定号)。老板自己提的申请后端当场批。
-    public func unbind(bindingID: String, reason: String, actKey: String) -> WriteOutcome {
-        send("request.create", ["kind": "unbind", "target": bindingID, "reason": reason, "act_key": actKey])
+    public func unbind(bindingID: String, reason: String, actKey: String, generation: Int? = nil) -> WriteOutcome {
+        var p: [String: Any] = ["kind": "unbind", "target": bindingID, "reason": reason, "act_key": actKey]
+        if let generation { p["params"] = ["target_generation": generation] }
+        return send("request.create", p)
     }
 
     /// 审核一份提交：accept 通过，return 退回（退回必须写理由）。
@@ -77,15 +89,17 @@ public struct OfficeWrites: Sendable {
         switch socket.exchange(frame, isolatedOnly: mode == .isolated) {
         case .notConnected(let d): return .notConnected(detail: d)
         case .unknown(let d): return .unknown(detail: d, retryRef: nil)
-        case .refused(let c, let m): return .refused(code: c, message: m, reasonCode: nil, currentVersion: nil)
+        case .refused(let c, let m):
+            if ["unknown", "outcome_unknown", "internal"].contains(c) { return .unknown(detail: "\(c): \(m)", retryRef: nil) }
+            return .refused(code: c, message: m, reasonCode: nil, currentVersion: nil)
         case .ok(let f):
             if f["ok"] as? Bool == true {
                 guard let r = f["result"] as? [String: Any] else { return .unknown(detail: tr("答复缺少 result", "Reply is missing result"), retryRef: nil) }
                 return .done(Self.done(op, r))
             }
             let code = f["code"] as? String ?? ""
-            if code == "unknown" {
-                return .unknown(detail: f["message"] as? String ?? tr("后端报告结果未知", "The office reports the result as unknown"), retryRef: f["retry_ref"] as? String)
+            if ["unknown", "outcome_unknown", "internal"].contains(code) {
+                return .unknown(detail: code + ": " + (f["message"] as? String ?? tr("后端报告结果未知", "The office reports the result as unknown")), retryRef: f["retry_ref"] as? String)
             }
             guard !code.isEmpty else { return .unknown(detail: tr("答复既不是成功也不是拒绝", "Reply is neither success nor refusal"), retryRef: nil) }
             let detail = f["detail"] as? [String: Any]

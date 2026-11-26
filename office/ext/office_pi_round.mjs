@@ -159,7 +159,8 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
      * 字符串**（缺了直接 `invalid_request: 请求缺少必填字段 ['channel']`）。它只是被记下的"这一轮
      * 是经哪条通道起的"，不是政策；值由调用点给（帧消费给帧的 kind，长轮询给 "poll"）。
      */
-    begin: (unit, channel = "wake", frame) => call("begin", { unit, channel,
+    begin: (unit, channel = "wake", frame, ownerToken) => call("begin", { unit, channel,
+      ...(ownerToken ? {owner_token:ownerToken} : {}),
       ...(frame ? {expected_refs:frame.refs, due_version:frame.due_version} : {}) }),
     recover: (unit) => call("recover", {unit}),
 
@@ -208,7 +209,8 @@ export function createPiRoundClient({ socketPath, tokenFile } = {}) {
      * 回执：**只有真的受理/起轮之后**才发（`wake.ack` → `clear_batch` / `record_attempt` 就是结清
      * 到期项的那一步）。拒帧绝不发 —— 发了就等于把那封信从队列里抹掉而轮没人跑。
      */
-    wakeAck: (unit, dueKey, attemptKey) => call("wakeAck", {unit, due_key: dueKey, attempt_key: attemptKey}),
+    wakeAck: (unit, dueKey, attemptKey, dueVersion) =>
+      call("wakeAck", {unit, due_key: dueKey, attempt_key: attemptKey, due_version: dueVersion}),
 
     /** 活动：只在状态变化时发，只发这一个键（哪些相位、什么含义由线方法自己定）。 */
 
@@ -284,7 +286,7 @@ function quotaWindow(raw) {
  * 就会有一边把另一边的合法事实当畸形。
  */
 export const HOST_EVENT_KINDS = new Set([
-  "tool_start", "tool_progress", "tool_end", "turn_end", "quota", "loaded",
+  "tool_start", "tool_progress", "tool_end", "turn_start", "turn_end", "session_idle", "session_end", "quota", "loaded",
   "model_progress", "round.started", "round.accepted", "resource",
 ]);
 

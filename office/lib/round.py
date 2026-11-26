@@ -18,6 +18,8 @@ from delivery.round import ROUND_SETTLE_RESULTS as _ROUND_SETTLE_RESULTS
 _ROUND_UNSET = object()
 _ROUND_HARNESS_REF_NO_NATIVE = "no_native_key"
 _ROUND_HARNESS_REF_CONTENT_TIME_PREFIX = "content_time:"
+_UNSENT = ("send_id='-' AND run_state IS NULL AND NOT EXISTS"
+           " (SELECT 1 FROM round_ref rr WHERE rr.token=round.token AND rr.harness_ref IS NOT NULL)")
 
 
 def _round_harness_ref_value(harness_ref, fallback=None):
@@ -35,7 +37,7 @@ class RoundOperations:
     """Round facts and their state transitions, on Core's transaction primitives."""
 
     def round_begin(self, actor, *, channel, unit=None, proto=None, deadline=None,
-                    only_refs=None, exclude_refs=None, expected_refs=None, due_version=None):
+                    only_refs=None, exclude_refs=None, expected_refs=None, due_version=None, owner_token=None):
         """Select current file-backed candidates and create a delivery round atomically in Core.
 
         The caller owns the per-unit delivery lock. Core owns the authorization recheck, lifecycle
@@ -76,6 +78,10 @@ class RoundOperations:
 
         try:
             with self._txn() as conn:
+                ctx = self._pending_ctx_ctx() or {}
+                if owner_token is not None or (expected_refs is not None and ctx.get('surface') in ('pi', 'opencode')):
+                    unit_id, binding_id, generation, instance = self._round_unit_identity(conn, actor, unit)
+                    self._round_owner_verify_conn(conn, unit_id, owner_token, binding_id, generation, instance)
                 is_position = conn.execute(
                     "SELECT 1 FROM position_holders WHERE position=?", (target_box,)).fetchone() is not None
                 if unit is not None and target_box != actor:
@@ -133,14 +139,17 @@ class RoundOperations:
                 frozen_hashes = {}
                 selected = [(ref, "deliver") for ref in deliver] + [(ref, "carry") for ref in carry]
                 for ref, role in selected:
-                    # 冻结的是**信件正文摘要**（`letters.body_sha256` 是权威），不是文件字节：
-                    # 1.1 的信在库里，磁盘上没有可读的那一份。
-                    frozen = conn.execute("SELECT body_sha256 FROM letters WHERE letter_id=?",
-                                          (ref,)).fetchone()
+                    # Freeze the same recipient copy that letter.read presents.
+                    frozen = conn.execute(
+                        "SELECT l.body_sha256, l.subject, l.need, s.content_override_json,"
+                        " CASE WHEN s.content_override_json IS NOT NULL THEN l.body END AS body"
+                        " FROM letters l JOIN letter_states s ON s.letter_id=l.letter_id"
+                        " WHERE l.letter_id=? AND s.box=?", (ref, target_box)).fetchone()
                     if frozen is None:
                         raise self.CoreError("capability_missing", "selected round ref has no letter",
                                              en="selected round ref has no letter", ref=ref)
-                    digest = frozen["body_sha256"]
+                    digest = (self._letter_content(frozen, frozen)["body_sha256"]
+                              if frozen["content_override_json"] else frozen["body_sha256"])
                     frozen_hashes[ref] = digest
                     prior = conn.execute(
                         "SELECT COALESCE(MAX(attempt),0) AS n FROM round_ref WHERE box=? AND ref=?",
@@ -219,11 +228,33 @@ class RoundOperations:
         import secrets
         with self._txn() as conn:
             unit, binding_id, generation, instance = self._round_unit_identity(conn, actor, unit)
-            previous = conn.execute("SELECT COALESCE(MAX(owner_gen),0) AS n FROM channel_owner WHERE box=?",
-                                    (unit,)).fetchone()
-            current = int(previous["n"] or 0)
+            previous = conn.execute("SELECT * FROM channel_owner WHERE box=?", (unit,)).fetchone()
+            current = int(previous["owner_gen"] if previous else 0)
             if expected_owner_gen is not None and (type(expected_owner_gen) is not int or expected_owner_gen != current):
                 raise self.CoreError("conflict", "通道 ownership 已变更", en="Channel ownership changed", reason_code="owner_changed")
+            surface = (self._pending_ctx_ctx() or {}).get("surface")
+            if previous and surface in ("pi", "opencode"):
+                previous_binding = (unit, previous['binding_id'], previous['binding_gen'], 'inst:' + previous['instance'])
+                rows = conn.execute(
+                    "UPDATE round SET state='rejected',result='rejected',result_src='owner_takeover',result_ts=?,fx_done=1 "
+                    "WHERE box=? AND channel='batch_round' AND binding_id=? AND binding_gen=? AND proto=? "
+                    "AND state='begun' AND " + _UNSENT + " RETURNING token",
+                    (time.time(), *previous_binding)).fetchall()
+                if rows:
+                    for row in rows:
+                        self._release_round_refs(conn, row['token'])
+                    from delivery import due
+                    due.push_back(conn, 'batch', unit, time.time())
+                if surface == "opencode":
+                    # The pre-enqueue hook gives an inbox ID, not evidence of enqueue or start.
+                    # Preserve the original grant and refs so a later native event can settle it.
+                    conn.execute(
+                        "UPDATE round SET state='unknown',result='unknown',result_src='owner_takeover',"
+                        "result_ts=?,fx_done=1,counted=1 WHERE box=? AND binding_id=? AND binding_gen=?"
+                        " AND proto=? AND channel='batch_round' AND state='begun' AND run_state IS NULL"
+                        " AND send_id<>'-' AND EXISTS (SELECT 1 FROM round_ref"
+                        " WHERE token=round.token AND harness_ref IS NOT NULL)",
+                        (time.time(), *previous_binding))
             owner_gen = current + 1
             token = secrets.token_hex(32)
             now = time.time()
@@ -456,6 +487,10 @@ class RoundOperations:
         current = selection.candidates(conn, unit, only=refs, own_round=token)
         if not refs or refs != {item["ref"] for item in current}:
             return "stale_frame"
+        session = conn.execute("SELECT host_session_ref FROM bindings WHERE binding_id=? AND generation=?",
+                               (binding_id, generation)).fetchone()
+        if session and selection.own_alert_only(conn, session[0], refs, unit, items=current):
+            return "own_alert_only"
         return None
 
     def round_authorize_send(self, actor, *, token, attempt_key, send_id, previous_send_id=None,
@@ -465,7 +500,7 @@ class RoundOperations:
         The adapter may supply a different send id after proving it never invoked the host
         for the previous one. A replay of a successful call never grants another send.
         """
-        from delivery import due
+        from delivery import due, worker
 
         for field, value in (("token", token), ("attempt_key", attempt_key), ("send_id", send_id),
                              ("previous_send_id", previous_send_id)):
@@ -478,6 +513,10 @@ class RoundOperations:
         if previous_send_id == send_id:
             return {"allowed": False, "reason": "send_already_authorized"}
 
+        with self._txn(read_only=True) as conn:
+            box, _, _, _ = self._round_unit_identity(conn, actor, unit)
+            alerts = worker.fired_tool_alerts(conn, box, round_token=token)
+        dead_alerts = worker.dead_tool_alerts(alerts)
         with self._txn() as conn:
             unit, binding_id, generation, instance = self._round_unit_identity(conn, actor, unit)
             row = conn.execute("SELECT * FROM round WHERE token=?", (token,)).fetchone()
@@ -485,19 +524,12 @@ class RoundOperations:
                 raise self._round_not_in_unit(token)
             if (row["binding_id"], row["binding_gen"], row["proto"]) != (binding_id, generation, "inst:" + instance):
                 return {"allowed": False, "reason": "round_binding_stale"}
-            self._round_owner_verify_conn(conn, unit, owner_token, binding_id, generation, instance,
-                                          native=owner_token is None)
+            self._round_owner_verify_conn(conn, unit, owner_token, binding_id, generation, instance)
             claim = row["send_id"]
-            if claim == "-":
-                claim = ""
-            elif claim == "":
-                claim = None
-            if claim == send_id or (claim and claim != previous_send_id):
-                return {"allowed": False, "reason": "send_already_authorized"}
-            # A pre-upgrade captured payload could already have been sent by the former adapter.
-            # Only a trusted, exact no-call report permits promoting such a round.
-            if claim is None and previous_send_id is None:
+            if not claim:
                 return {"allowed": False, "reason": "send_outcome_unknown"}
+            if claim != "-" and claim != previous_send_id:
+                return {"allowed": False, "reason": "send_already_authorized"}
             retry = previous_send_id is not None
             if (row["state"] not in (("begun", "unknown") if retry else ("begun",))
                     or row["run_state"] is not None or conn.execute(
@@ -508,6 +540,7 @@ class RoundOperations:
                     "AND binding_id=? AND binding_gen=? AND owner_instance=?",
                     (token, attempt_key, binding_id, generation, instance)).fetchone():
                 return {"allowed": False, "reason": "payload_missing"}
+            worker.retire_dead_tool_alerts(conn, dead_alerts)
             reason = self._send_eligibility(conn, token, unit, binding_id, generation)
             if reason:
                 self._round_settle_in_tx(conn, actor, token=token, status="rejected", unit=unit)
@@ -525,15 +558,9 @@ class RoundOperations:
             return self._recover_rounds(conn, unit, time.time())
 
     def _recover_rounds(self, conn, unit, now, *, unsent_only=False):
-        # The new marker is created behind the adapter protocol check. In older databases,
-        # both NULL and empty send ids are ambiguous once payload capture succeeded.
-        unsent = ("(send_id='-' OR ((send_id IS NULL OR send_id='') "
-                  "AND NOT EXISTS (SELECT 1 FROM round_payload p WHERE p.token=round.token))) "
-                  "AND NOT EXISTS (SELECT 1 FROM round_ref rr WHERE rr.token=round.token "
-                  "AND rr.harness_ref IS NOT NULL)")
         rows = conn.execute(
             "UPDATE round SET state='rejected',result='rejected',result_src='recover',result_ts=?,fx_done=1 "
-            "WHERE box=? AND deadline_ts<=? AND state IN ('begun','unknown') AND run_state IS NULL AND " + unsent
+            "WHERE box=? AND deadline_ts<=? AND state IN ('begun','unknown') AND " + _UNSENT
             + " RETURNING token,begun_ts", (now, unit, now)).fetchall()
         released = [ref for row in rows for ref in self._release_round_refs(conn, row["token"])]
         if not unsent_only:
@@ -825,7 +852,7 @@ class RoundOperations:
                 matches = conn.execute(
                     "SELECT r.token FROM round r WHERE r.binding_id=? AND r.binding_gen=? AND r.proto=?"
                     " AND r.channel='batch_round' AND r.state='unknown' AND r.run_state IS NULL"
-                    " AND r.send_id NOT IN ('', '-') AND EXISTS (SELECT 1 FROM round_ref rr"
+                    " AND r.send_id<>'-' AND EXISTS (SELECT 1 FROM round_ref rr"
                     " WHERE rr.token=r.token AND rr.harness_ref=?) LIMIT 2",
                     (binding_id, generation, "inst:" + instance, native_ref)).fetchall()
                 if len(matches) != 1:
@@ -833,7 +860,7 @@ class RoundOperations:
                 token = matches[0]["token"]
             round_row = conn.execute(
                 "SELECT box,binding_id,binding_gen,state,run_state,result_src,deadline_ts,channel,"
-                "NULLIF(send_id, '-') AS send_id, COALESCE(send_id NOT IN ('', '-'), 0) AS send_authorized "
+                "NULLIF(send_id, '-') AS send_id, COALESCE(send_id<>'-', 0) AS send_authorized "
                 "FROM round WHERE token=?",
                 (token,)).fetchone()
             if unit is None and round_row is not None:

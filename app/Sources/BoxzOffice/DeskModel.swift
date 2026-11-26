@@ -57,11 +57,20 @@ final class DeskModel: ObservableObject {
     @Published var drawer: Drawer? {
         didSet {
             guard drawer != oldValue else { return }
-            if case .project = drawer { queueProjectWork() } else { load(needs(drawer)) }
+            if case .project = drawer {
+                queueProjectWork()
+                return
+            }
+            if case .work(let ref) = drawer, page == .work,
+               doneInTab.contains(where: { $0.ref == ref }), workDetails[ref]?.value != nil {
+                return
+            }
+            load(needs(drawer))
         }
     }
     /// 宿主页"全部下线 / 下线"的确认框。
     @Published var offlineDraft: OfflineDraft?
+    @Published var offlineRunning = false
     /// 每个席位信箱（letter.read 带 target）。只在组织页 / 宿主页 / 席位抽屉可见时读。
     @Published var seatMail: [String: Panel<Inbox>] = [:]
     @Published var threads: Panel<ThreadUsagePage> = .loading
@@ -86,6 +95,7 @@ final class DeskModel: ObservableObject {
     @Published var workDetails: [String: Panel<WorkDetail>] = [:]
     @Published var refreshedAt: Date?
     @Published var requests: Panel<RequestPage> = .loading
+    @Published private(set) var requestCursor: String?
     @Published var hosts: Panel<HostPage> = .loading
     @Published var inboxTab: InboxTab = .letters
     private var inboxTabChosen = false
@@ -98,6 +108,11 @@ final class DeskModel: ObservableObject {
     /// 没挂在任何项目花名册上的活动绑定：R2 窗口减花名册（不是后端给的列表）。任何一边没读到 = 未知。
     @Published private(set) var unassigned: Panel<[HostBinding]> = .loading
 
+    let socket: OfficeSocket
+    var journal: ActionJournal?
+    var journalIdentity: String?
+    var journalActor: String?
+    @Published var journalError: String?
     let reads: OfficeReads
     let writes: OfficeWrites
     private let contract: ContractSource
@@ -108,6 +123,13 @@ final class DeskModel: ObservableObject {
     // （没有任何定时器在转）；回到前台立刻读一次，再恢复 30 秒。没有别的定时器。
     private var isForeground = true
     private var waiter: CheckedContinuation<Void, Never>?
+    private var waitID = 0
+    private var pollTask: Task<Void, Never>?
+    private var subscribers = 0
+    private var serial = 0
+    private var generations: [String: Int] = [:]
+    private func ticket(_ key: String) -> Int { serial += 1; generations[key] = serial; return serial }
+    private func current(_ key: String, _ value: Int) -> Bool { generations[key] == value }
     private var observers: [NSObjectProtocol] = []
     /// 截图时窗口可能不在前台，照样读一轮，否则截不到图。
     private let alwaysForeground: Bool
@@ -115,8 +137,10 @@ final class DeskModel: ObservableObject {
     private var loading: Task<Void, Never>?
 
     init(socket: OfficeSocket, contract: ContractSource, alwaysForeground: Bool = false) {
-        reads = OfficeReads(socket: socket)
-        writes = OfficeWrites(socket: socket)
+        let transport = contract.isFixture ? OfficeSocket(home: socket.home, offline: true) : socket
+        self.socket = transport
+        reads = OfficeReads(socket: transport)
+        writes = OfficeWrites(socket: transport)
         self.contract = contract
         self.alwaysForeground = alwaysForeground
         lang = Lang(rawValue: UserDefaults.standard.string(forKey: Prefs.languageKey) ?? "zh") ?? .zh
@@ -136,8 +160,8 @@ final class DeskModel: ObservableObject {
     private func currentlyForeground() -> Bool {
         if alwaysForeground { return true }
         guard NSApp.isActive else { return false }
-        guard let w = NSApp.windows.first(where: { $0.canBecomeMain }) else { return true }   // 窗口还没建出来
-        return !w.isMiniaturized && w.occlusionState.contains(.visible)
+        let windows = NSApp.windows.filter { $0.canBecomeMain }
+        return windows.isEmpty || windows.contains { !$0.isMiniaturized && $0.occlusionState.contains(.visible) }
     }
 
     private func foregroundMayHaveChanged() {
@@ -147,57 +171,99 @@ final class DeskModel: ObservableObject {
         wake()          // 变前台：立刻读；变后台：把当前的 30 秒睡眠取消，转入无限等待
     }
 
-    private func wake() { let w = waiter; waiter = nil; w?.resume() }
+    private func wake(_ id: Int? = nil) {
+        guard id == nil || id == waitID else { return }
+        let w = waiter; waiter = nil; w?.resume()
+    }
 
     /// 睡 seconds 秒（nil = 一直等到被叫醒）；被叫醒或睡醒就返回。
     private func sleepOrWake(_ seconds: UInt64?) async {
+        waitID += 1
+        let id = waitID
         let sleeper = seconds.map { s in
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: s * 1_000_000_000)
-                if !Task.isCancelled { self.wake() }
+                if !Task.isCancelled { self.wake(id) }
             }
         }
-        await withCheckedContinuation { waiter = $0 }
+        await withTaskCancellationHandler {
+            if !Task.isCancelled { await withCheckedContinuation { waiter = $0 } }
+        } onCancel: { Task { @MainActor in self.wake(id) } }
         sleeper?.cancel()
     }
 
     /// `afterFirstRound`：首轮读完后跑一次（启动脚本用）。
     func run(afterFirstRound: (@MainActor (DeskModel) async -> Void)? = nil) async {
-        Prefs.applyAppearance()
-        isForeground = currentlyForeground()
-        var hook = afterFirstRound
-        while !Task.isCancelled {
-            if isForeground {
-                await refresh()
-                if let h = hook { hook = nil; await h(self) }
+        subscribers += 1
+        if pollTask == nil {
+            pollTask = Task { @MainActor in
+                Prefs.applyAppearance()
+                isForeground = currentlyForeground()
+                var hook = afterFirstRound
+                while !Task.isCancelled {
+                    if isForeground {
+                        await refresh()
+                        if let h = hook { hook = nil; await h(self) }
+                    }
+                    if !Task.isCancelled { await sleepOrWake(isForeground ? 30 : nil) }
+                }
             }
-            await sleepOrWake(isForeground ? 30 : nil)
         }
+        defer {
+            subscribers -= 1
+            if subscribers == 0 { pollTask?.cancel(); pollTask = nil; wake() }
+        }
+        while !Task.isCancelled { try? await Task.sleep(nanoseconds: 3_600_000_000_000) }
     }
 
     func refresh() async {
+        let generation = ticket("refresh")
+        let requestGeneration = ticket("requests")
+        let reviewGeneration = ticket("reviews")
         let reads = self.reads
         let contract = self.contract
+        let identity = isFixture ? nil : socket.identity()
         async let w = Task.detached { reads.context() }.value
         async let p = Task.detached { reads.projectDetails() }.value
         async let k = Task.detached { reads.workList() }.value
         let cursor = reviewCursor
         async let q = Task.detached { reads.reviewPage(cursor: cursor) }.value
         async let i = Task.detached { reads.inbox() }.value
-        async let r = Task.detached { contract.requests() }.value
+        let requestPage = requestCursor
+        async let r = Task.detached { contract.requests(cursor: requestPage) }.value
         let context = await w
         let who = context.map(\.actor)
         async let h = Task.detached { contract.hosts(boss: who) }.value
+        let (projectResult, workResult, reviewResult, inboxResult, requestResult, hostResult) = await (p, k, q, i, r, h)
+        guard current("refresh", generation) else { return }
+        if let identity, identity == socket.identity(), case .ok(let actor) = who {
+            if journalIdentity != identity || journalActor != actor {
+                let candidate = ActionJournal(home: socket.home, actor: actor, endpointIdentity: identity)
+                do {
+                    let restored = try candidate.load()
+                    book = ActionBook(); book.restore(restored)
+                    journal = candidate; journalIdentity = identity; journalActor = actor; journalError = nil
+                } catch {
+                    journal = nil; journalIdentity = nil; journalActor = nil
+                    journalError = tr("未决操作无法读取，暂不能发送", "Cannot read unresolved actions; sending is unavailable")
+                }
+            } else if let journal {
+                do { book.sync(try journal.load()) }
+                catch { journalError = tr("未决操作无法读取，暂不能发送", "Cannot read unresolved actions; sending is unavailable"); self.journal = nil }
+            }
+        } else if !isFixture {
+            journal = nil; journalIdentity = nil; journalActor = nil
+        }
         whoami = .done(who)
-        projects = .done(await p)
-        work = .done(await k)
-        let reviewResult = await q
-        if reviewCursor == cursor { reviews = .done(reviewResult) }
-        inbox = .done(await i)
-        requests = .done(await r)
-        hosts = .done(await h)
+        projects = .done(projectResult)
+        work = .done(workResult)
+        if current("reviews", reviewGeneration), reviewCursor == cursor { reviews = .done(reviewResult) }
+        inbox = .done(inboxResult)
+        if current("requests", requestGeneration), requestCursor == requestPage { requests = .done(requestResult) }
+        hosts = .done(hostResult)
         if page == .work { await fetchCompleted(cursor: completedCursor) }
         if case .project = drawer { await fetchProjectWork(cursor: projectCursor) }
+        guard current("refresh", generation) else { return }
         adminApproval = .done(contract.adminApproval(context: context))
         if !inboxTabChosen, let rs = requests.value {         // 待办抽屉默认落在有事要做的那一页
             inboxTabChosen = true
@@ -248,12 +314,21 @@ final class DeskModel: ObservableObject {
 
     /// 当前页签里画在图上的 Work：已完成的。进行中 / 待审核 / 已取消的不画，也不读详情。
     var doneInTab: [WorkRow] { completed.value?.items ?? [] }
+    func loadRequests(cursor: String?) async {
+        requestCursor = cursor
+        requests = .loading
+        let generation = ticket("requests"), contract = self.contract
+        let result = await Task.detached { contract.requests(cursor: cursor) }.value
+        if current("requests", generation), requestCursor == cursor { requests = .done(result) }
+    }
+
     func loadReviews(cursor: String?) async {
+        let generation = ticket("reviews")
         reviewCursor = cursor
         reviews = .loading
         let reads = self.reads
         let result = await Task.detached { reads.reviewPage(cursor: cursor) }.value
-        if reviewCursor == cursor { reviews = .done(result) }
+        if current("reviews", generation), reviewCursor == cursor { reviews = .done(result) }
     }
     /// 这件的用量卡：夹具有就用夹具的（模拟数据），否则用 work.get 自己带的。
     func usageCard(_ d: WorkDetail) -> (card: WorkUsageCard?, simulated: Bool) { contract.workUsage(ref: d.row.ref, real: d.usage) }
@@ -261,9 +336,10 @@ final class DeskModel: ObservableObject {
     private func fetchCompleted(cursor: String?) async {
         guard let project = currentWorkTab else { completed = .loading; return }
         completedCursor = cursor
+        let generation = ticket("completed")
         let reads = self.reads
         let result = await Task.detached { reads.workList(projectRef: project, state: "Done", cursor: cursor, limit: 30) }.value
-        if currentWorkTab == project && completedCursor == cursor {
+        if current("completed", generation) && currentWorkTab == project && completedCursor == cursor {
             completed = .done(result)
             if case .ok(let page) = result { workPicked = workPicked.filter { ref in page.items.contains { $0.ref == ref } } }
         }
@@ -279,9 +355,10 @@ final class DeskModel: ObservableObject {
     private func fetchProjectWork(cursor: String?) async {
         guard case .project(let project) = drawer else { return }
         projectCursor = cursor
+        let generation = ticket("projectWork")
         let reads = self.reads
         let result = await Task.detached { reads.workList(projectRef: project, cursor: cursor) }.value
-        if drawer == .project(project) && projectCursor == cursor { projectWork = .done(result) }
+        if current("projectWork", generation) && drawer == .project(project) && projectCursor == cursor { projectWork = .done(result) }
     }
 
     func loadProjectWork(cursor: String?) async {
@@ -342,14 +419,18 @@ final class DeskModel: ObservableObject {
     private func read(_ n: Needs) async {
         let reads = self.reads
         let contract = self.contract
+        let mailTickets = Dictionary(uniqueKeysWithValues: n.mail.map { ($0, ticket("mail:" + $0)) })
+        let workTickets = Dictionary(uniqueKeysWithValues: n.works.map { ($0, ticket("work:" + $0)) })
+        let adminTicket = n.admin ? ticket("admin") : 0
+        let usageTicket = n.usage ? ticket("usage") : 0
         for k in n.mail where seatMail[k] == nil { seatMail[k] = .loading }
         for k in n.works where workDetails[k] == nil { workDetails[k] = .loading }
         await withTaskGroup(of: Void.self) { group in
             // 读到一个落一个；没读到之前显示"读取中"。
-            for k in n.mail { group.addTask { let o = reads.inbox(target: k); await MainActor.run { self.seatMail[k] = .done(o) } } }
-            for k in n.works { group.addTask { let o = reads.workDetail(k); await MainActor.run { self.workDetails[k] = .done(o) } } }
-            if n.admin { group.addTask { let o = reads.adminHolder(); await MainActor.run { self.adminHolder = .done(o) } } }
-            if n.usage { group.addTask { let o = contract.threadUsage(); await MainActor.run { self.threads = .done(o) } } }
+            for k in n.mail { group.addTask { let o = reads.inbox(target: k); await MainActor.run { if self.current("mail:" + k, mailTickets[k]!) { self.seatMail[k] = .done(o) } } } }
+            for k in n.works { group.addTask { let o = reads.workDetail(k); await MainActor.run { if self.current("work:" + k, workTickets[k]!) { self.workDetails[k] = .done(o) } } } }
+            if n.admin { group.addTask { let o = reads.adminHolder(); await MainActor.run { if self.current("admin", adminTicket) { self.adminHolder = .done(o) } } } }
+            if n.usage { group.addTask { let o = contract.threadUsage(); await MainActor.run { if self.current("usage", usageTicket) { self.threads = .done(o) } } } }
         }
     }
 
@@ -365,19 +446,19 @@ final class DeskModel: ObservableObject {
     }
 
     func deliveryPending(_ mailbox: String) -> Int? {
-        hosts.value?.bindings.first { $0.mailbox == mailbox && $0.hostSessionRef != nil }?.deliveryPending
+        hosts.value?.bindings.first { $0.mailbox == mailbox }?.deliveryPending
     }
 
     func deliveryAutomatic(_ mailbox: String) -> Int? {
-        hosts.value?.bindings.first { $0.mailbox == mailbox && $0.hostSessionRef != nil }?.deliveryAutomatic
+        hosts.value?.bindings.first { $0.mailbox == mailbox }?.deliveryAutomatic
     }
 
     func deliveryInFlight(_ mailbox: String) -> Int? {
-        hosts.value?.bindings.first { $0.mailbox == mailbox && $0.hostSessionRef != nil }?.deliveryInFlight
+        hosts.value?.bindings.first { $0.mailbox == mailbox }?.deliveryInFlight
     }
 
     func deliveryUnresolved(_ mailbox: String) -> UnresolvedDelivery? {
-        hosts.value?.bindings.first { $0.mailbox == mailbox && $0.hostSessionRef != nil }?.deliveryUnresolved
+        hosts.value?.bindings.first { $0.mailbox == mailbox }?.deliveryUnresolved
     }
 
     /// 岗位使用逻辑地址，个人信箱沿用个人身份标签。

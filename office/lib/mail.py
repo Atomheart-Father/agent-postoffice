@@ -113,7 +113,7 @@ class MailOperations:
                               if raw else row["body_sha256"])
         return out
     def system_letter(self, *, letter_id, boxes, subject, body, need="", kind, headers=None, now_ts=None,
-                      fact_key=None, work_ref=None, sub_ref=None, conn=None, _observed_ctx=None):
+                      fact_key=None, work_ref=None, sub_ref=None, conn=None, _observed_ctx=None, monitor_route=None):
         """邮局自己的系统信（闹钟、广播汇总、交接、对外发送被拒）：由持有 Core 的进程内宿主（邮差）记入同一信件账，
         发信人固定为 postoffice。不是线路操作（不在 handle 里），会话无法以它的名义发信。
         幂等 = letter_id + 正文；不是普通信（meta 标 system），不能被改撤。
@@ -143,6 +143,8 @@ class MailOperations:
             meta["work_ref"] = work_ref
         if sub_ref is not None:
             meta["sub_ref"] = sub_ref
+        if monitor_route is not None:
+            meta['monitor_route'] = monitor_route
         if fact_key is not None:
             # §1.3 "`meta_json.fact_key` 按事实及责任去重": the fact, plus who must act on it, is
             # what makes two sends the same send. Stored beside `system` so a reader can answer
@@ -440,7 +442,7 @@ class MailOperations:
         `(terminal_ids, reason_map, class_map, state_map, needs_reply_map)`，其中后两张
         覆盖**全部**行（不只是终结的）—— 提醒侧需要"还没终结、但本来就不用动手"的那一档。
         """
-        _facts = cls._mail_facts(conn, rows)
+        _facts = cls._mail_facts(conn, rows, box=box)
         done, why, kind = [], {}, {}
         state, needs_reply = {}, {}
         for r in rows:
@@ -485,13 +487,16 @@ class MailOperations:
         return next((box for (box,) in rows if (allowed is None or box in allowed)
                      and self._may_accept_for(conn, box, actor)), default_box)
 
-    def letter_read(self, actor, *, letter_id=None, target=None, direction="inbox", include_archived=False,
+    def letter_read(self, actor, *, letter_id=None, target=None, direction="inbox", include_archived=False, archived_only=False,
                     cursor=None, limit=None, accept_on_read=False, now_ts=None):
         """A native tool opening an inbound letter can record delivery in the same transaction."""
         self._check_actor(actor)
         if direction not in ("inbox", "sent"):
             raise self.CoreError("invalid_request", "direction 必须是 inbox 或 sent",
                                  en="direction must be inbox or sent")
+        if type(archived_only) is not bool or (archived_only and (letter_id or direction != "inbox")):
+            raise self.CoreError("invalid_request", "archived_only 仅适用于列出收件箱",
+                                 en="archived_only is a boolean for inbox listings only", field="archived_only")
         box = actor if target is None else target
         if not isinstance(box, str) or not box.strip():
             raise self.CoreError("invalid_request", "target 必须是非空信箱名", en="target must be a non-empty mailbox name")
@@ -584,7 +589,7 @@ class MailOperations:
                 heads = self._imported_header_lines(row["meta_json"], box)
                 _life = self._letter_lifecycle(
                     row, st,
-                    facts=self._mail_facts(conn, [row]))
+                    facts=self._mail_facts(conn, [row], box=box))
                 from delivery.selection import unresolved_refs
                 unresolved = letter_id in unresolved_refs(conn, box)
                 return {"ok": True, "box": box, "state": st["state"], "letter": {
@@ -604,7 +609,9 @@ class MailOperations:
                     "system_kind": self._system_kind(row["meta_json"])}}
             paged = limit is not None or cursor is not None
             where = " FROM letter_states s JOIN letters l USING(letter_id) WHERE s.box=?"
-            if not include_archived:
+            if archived_only:
+                where += " AND s.state='archived'"
+            elif not include_archived:
                 where += " AND s.state<>'archived'"
             params = [box]
             if paged:
@@ -634,7 +641,7 @@ class MailOperations:
             more = paged and len(rows) > limit
             if more:
                 rows.pop()
-            _facts = self._mail_facts(conn, rows)
+            _facts = self._mail_facts(conn, rows, box=box)
             from delivery.selection import unresolved_refs
             unresolved = unresolved_refs(conn, box)
             out = []
@@ -679,7 +686,7 @@ class MailOperations:
         if not isinstance(reply_to, str) or reply_to == letter_id:
             return {"original": "not_filed"}
         originals = conn.execute(
-            "SELECT s.box FROM letter_states s JOIN letters l ON l.letter_id=s.letter_id"
+            "SELECT s.box, l.from_actor FROM letter_states s JOIN letters l ON l.letter_id=s.letter_id"
             " WHERE s.letter_id=? AND COALESCE(s.category,'to')='to' AND s.retracted_at IS NULL"
             " AND l.from_actor NOT IN (?,?)",
             (reply_to, self.NOTICE_SENDER, self.SYSTEM_MAIL_SENDER)).fetchall()
@@ -690,6 +697,10 @@ class MailOperations:
             raise self.CoreError("invalid_request", "请从要回复的主送岗位发信",
                                  en="Reply using the intended primary recipient position", letter_id=reply_to)
         box = self._letter_recipient_unit(conn, actor, reply_to, actor, boxes)
+        if not conn.execute("SELECT 1 FROM letter_states WHERE letter_id=? AND box=?"
+                            " AND COALESCE(category,'to')='to' AND retracted_at IS NULL",
+                            (letter_id, originals[0]['from_actor'])).fetchone():
+            return {"original": "not_filed"}
         self._merge_export_headers(conn, letter_id, {
             r["box"]: ["回复原信：" + reply_to] for r in recipients if r.get("category") != "cc"
         })
@@ -717,10 +728,15 @@ class MailOperations:
         return ref if isinstance(ref, str) and ref else None
 
     @classmethod
-    def _mail_facts(cls, conn, rows):
+    def _mail_facts(cls, conn, rows, *, box=None):
         """Batch current facts for Work notices and generated alerts in this read."""
         facts = cls._work_notice_facts(conn, [cls._notice_work_ref(r["meta_json"]) for r in rows])
-        alerts, tools, quotas = {}, {}, {}
+        from delivery.due import tool_alert_version
+        from delivery.worker import quota_blocked
+
+        alert_refs, origins = set(), {}
+        tools, quotas, failures, interruptions, idle = {}, {}, {}, {}, {}
+        monitor_routes = {}
         for row in rows:
             if row["from_actor"] != cls.SYSTEM_MAIL_SENDER:
                 continue
@@ -731,45 +747,134 @@ class MailOperations:
             if not isinstance(meta, dict):
                 continue
             kind, fact = meta.get("system"), meta.get("fact_key")
-            if kind not in ("tool.due", "model.silent", "quota.exhausted"):
+            if kind not in ("tool.due", "model.silent", "quota.exhausted", "turn.failed", "turn.interrupted", "idle.work"):
                 continue
             # Retired model-silence letters remain readable history only.
             ref = row["letter_id"]
-            alerts[ref] = False
+            alert_refs.add(ref)
+            route = meta.get('monitor_route')
+            if isinstance(route, dict) and kind in ('tool.due', 'quota.exhausted', 'turn.failed'):
+                monitor_routes[ref] = route
             if not isinstance(fact, str):
                 continue
-            if kind == "tool.due" and fact.startswith("tool:tool_hang:"):
-                raw = fact[5:]
-                key, _, version = raw.rpartition("#")
-                # Versionless tool alerts predate verified stall observations.
-                if version.isascii() and version.isdecimal():
-                    tools[ref] = (key, version)
+            if kind == "tool.due" and (identity := tool_alert_version(fact)):
+                tools[ref] = identity
             elif kind == "quota.exhausted":
                 quotas[ref] = fact
-        active_tools = set()
-        ids = list({key for key, _ in tools.values()})
-        for i in range(0, len(ids), 500):
-            chunk = ids[i:i+500]
-            q = ("SELECT d.due_key,d.version FROM due d JOIN bindings b"
-                 " ON b.binding_id=d.binding_id AND b.generation=d.binding_gen"
-                 " WHERE d.state='fired' AND b.state='active' AND b.revoked_at IS NULL"
-                 " AND d.due_key IN (%s)" % ",".join("?" * len(chunk)))
-            active_tools.update((key, str(version)) for key, version in conn.execute(q, chunk))
-        for ref, facts_key in tools.items():
-            alerts[ref] = facts_key in active_tools
+            elif kind == "turn.failed":
+                failures[ref] = fact
+            elif kind == "turn.interrupted":
+                interruptions[ref] = fact
+            elif kind == "idle.work":
+                idle[ref] = fact
+        runnable_by_actor = {}
+        manager_projects = {}
+
+        def runnable_items(actor):
+            from work_runnable import runnable_work
+            if actor not in runnable_by_actor:
+                runnable_by_actor[actor] = runnable_work(conn, actor, person=cls._request_person(conn, actor))['items']
+            return runnable_by_actor[actor]
+
+        def managed_projects(manager):
+            if manager not in manager_projects:
+                grants = conn.execute("SELECT g.project_ref,g.expires_at FROM grants g JOIN position_holders p"
+                                      " ON p.position=g.subject_ref AND p.project_ref=g.project_ref"
+                                      " WHERE g.subject_ref=? AND g.revoked_at IS NULL AND json(g.actions_json)=json_array('project.manage')",
+                                      (manager,)).fetchall()
+                now = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+                manager_projects[manager] = {g['project_ref'] for g in grants if not cls._expiry_expired(g['expires_at'], now)}
+            return manager_projects[manager]
+        def record_origins(refs, matches):
+            origins.update({ref: matches[fact] for ref, fact in refs.items() if fact in matches})
+
+        def ids(refs):
+            return (json.dumps(sorted(set(refs.values()))),)
+
+        if tools:
+            rows = conn.execute(
+                "SELECT d.due_key,d.version,b.host_session_ref FROM due d JOIN bindings b"
+                " ON b.binding_id=d.binding_id AND b.generation=d.binding_gen"
+                " WHERE d.state='fired' AND b.state='active' AND b.revoked_at IS NULL"
+                " AND d.due_key IN (SELECT value FROM json_each(?))",
+                (json.dumps(sorted({key for key, _ in tools.values()})),))
+            record_origins(tools, {(key, str(version)): session for key, version, session in rows})
+        if failures:
+            rows = conn.execute(
+                "SELECT json_extract(s.value_json,'$.failure_fact'),b.host_session_ref"
+                " FROM bindings b JOIN binding_state s"
+                " ON s.binding_id=b.binding_id AND s.generation=b.generation AND s.key='turn_monitor'"
+                " WHERE b.state='active' AND b.revoked_at IS NULL AND json_valid(s.value_json)"
+                " AND json_extract(s.value_json,'$.failure_fact') IN (SELECT value FROM json_each(?))", ids(failures))
+            record_origins(failures, dict(rows))
+
+        # Idle and interruption notices both depend on current Work and manager authority.
+        # A session can have several notices in the same projection, so read its quota once.
+        blocked = {}
+        for kind, refs in (('interruption_facts', interruptions), ('idle_facts', idle)):
+            if not refs:
+                continue
+            relevant = conn.execute(
+                "SELECT b.actor,b.binding_id,b.generation,b.host_session_ref,s.value_json,e.key AS fact,e.value AS record"
+                " FROM bindings b JOIN binding_state s ON s.binding_id=b.binding_id AND s.generation=b.generation"
+                " AND s.key='turn_monitor' JOIN json_each(s.value_json, ?) e"
+                " WHERE b.state='active' AND b.revoked_at IS NULL AND json_valid(s.value_json)"
+                " AND e.key IN (SELECT value FROM json_each(?))", ('$.' + kind, *ids(refs)))
+            valid = {}
+            for row in relevant:
+                binding = (row['binding_id'], row['generation'])
+                if binding not in blocked:
+                    blocked[binding] = quota_blocked(conn, *binding)
+                if blocked[binding]:
+                    continue
+                state = json.loads(row['value_json'])
+                if kind == 'interruption_facts':
+                    try:
+                        record = json.loads(row['record'])
+                    except (TypeError, ValueError):
+                        continue
+                    if (state.get('active') or state.get('outcome') != 'interrupted' or not state.get('interruption_visible')
+                            or not isinstance(record, dict) or not isinstance(record.get('works'), dict)
+                            or not isinstance(record.get('turns'), dict) or state.get('turn') not in record['turns']):
+                        continue
+                    manager = record.get('manager')
+                    projects = {item['project_ref'] for item in runnable_items(row['actor'])
+                                if record['works'].get(item['work_ref']) == cls._idle_fingerprint(item)}
+                else:
+                    manager = row['record']
+                    reported = state.get('idle_reported')
+                    entries = reported.get(manager) if isinstance(reported, dict) else None
+                    if not isinstance(entries, dict):
+                        continue
+                    projects = {item['project_ref'] for item in runnable_items(row['actor'])
+                                if (isinstance(entry := entries.get(item['work_ref']), dict)
+                                    and entry.get('fact') == row['fact']
+                                    and entry.get('fingerprint') == cls._idle_fingerprint(item))}
+                if projects & managed_projects(manager):
+                    valid[row['fact']] = row['host_session_ref']
+            record_origins(refs, valid)
+
         if quotas:
-            for i in range(0, len(quotas), 500):
-                chunk = list(quotas.values())[i:i+500]
-                q = ("SELECT b.binding_id,b.generation,s.value_json FROM bindings b JOIN binding_state s"
-                     " ON s.binding_id=b.binding_id AND s.generation=b.generation AND s.key='quota'"
-                     " WHERE b.state='active' AND b.revoked_at IS NULL AND json_valid(s.value_json)"
-                     " AND ('quota-'||replace(b.binding_id,'/','_')||'-'||b.generation||'-'||json_extract(s.value_json,'$.episode')) IN (%s)"
-                     % ",".join("?" * len(chunk)))
-                valid = {"quota-%s-%s-%s" % (r["binding_id"].replace("/", "_"), r["generation"], json.loads(r["value_json"]).get("episode"))
-                         for r in conn.execute(q, chunk) if json.loads(r["value_json"]).get("blocked") is True}
-                for ref, fact in quotas.items():
-                    if fact in valid: alerts[ref] = True
-        facts["_derived_alerts"] = alerts
+            quota_fact = "('quota-'||replace(b.binding_id,'/','_')||'-'||b.generation||'-'||json_extract(s.value_json,'$.episode'))"
+            rows = conn.execute(
+                "SELECT " + quota_fact + ",b.host_session_ref FROM bindings b JOIN binding_state s"
+                " ON s.binding_id=b.binding_id AND s.generation=b.generation AND s.key='quota'"
+                " WHERE b.state='active' AND b.revoked_at IS NULL AND json_valid(s.value_json)"
+                " AND json_type(s.value_json,'$.blocked')='true'"
+                " AND " + quota_fact + " IN (SELECT value FROM json_each(?))", ids(quotas))
+            record_origins(quotas, dict(rows))
+        for ref, route in monitor_routes.items():
+            if ref not in origins:
+                continue
+            actor = route.get('actor')
+            routed = route.get('projects')
+            projects = routed.get(box) if isinstance(routed, dict) else None
+            if (not isinstance(actor, str) or not actor or not isinstance(projects, list)
+                    or not (managed_projects(box).intersection(projects)
+                            & {item['project_ref'] for item in runnable_items(actor)})):
+                del origins[ref]
+        facts["_derived_alerts"] = {ref: ref in origins for ref in alert_refs}
+        facts["_alert_origins"] = origins
         return facts
     @classmethod
     def _work_notice_facts(cls, conn, work_refs):
@@ -804,7 +909,7 @@ class MailOperations:
                 if person:
                     from office_core import _work_module
                     same = _work_module("work_runnable.py", "office_work_runnable").same_submitter(
-                        conn, r["work_ref"], r["sub_ref"], r["submitted_by"], reviewer, person)
+                        conn, r["work_ref"], r["sub_ref"], r["submitted_by"], person)
                     out[r["work_ref"]]["review_unavailable"] = same is not False
         return out
     @classmethod
@@ -1076,4 +1181,33 @@ class MailOperations:
             result = {"ok": True, "letter_id": letter_id, "box": box, "state": "archived",
                       "already_archived": already, "acted_at": now}
             self.storage.record_action(conn, actor, "letter.archive", act_key, digest, result, now_ts)
+            return result
+
+    def letter_archive_completed(self, actor, *, target=None, act_key, now_ts=None):
+        """Archive settled copies in one inbox, using the same lifecycle as the read side."""
+        from delivery.selection import unresolved_refs
+
+        self._check_actor(actor)
+        box = actor if target is None else target
+        if not isinstance(box, str) or not (box := box.strip().removeprefix("@")):
+            raise self.CoreError("invalid_request", "请填写收件箱地址", en="Specify a mailbox address", field="target")
+        params, op = {"target": box}, "letter.archive_completed"
+        with self._txn() as conn:
+            if actor != self._request_user() and not self._may_accept_for(conn, box, actor):
+                raise self._refuse_unit_not_carried(box)
+            replay, digest = self.storage.action_replay(conn, actor, op, act_key, params)
+            if replay is not None:
+                return replay
+            rows = conn.execute(
+                "SELECT l.letter_id, l.from_actor, l.meta_json, l.need, s.state, s.category, "
+                "s.content_override_json, s.state_reason, s.accepted_at FROM letter_states s"
+                " JOIN letters l USING(letter_id) WHERE s.box=? AND s.state='delivered'", (box,)).fetchall()
+            completed, _, _, _, _ = self._terminal_report(conn, rows, box=box)
+            pending = unresolved_refs(conn, box)
+            archived = [ref for ref in completed if ref not in pending]
+            now = self._now(now_ts)
+            conn.executemany("UPDATE letter_states SET state='archived', updated_at=? WHERE box=? AND letter_id=?",
+                             ((now, box, ref) for ref in archived))
+            result = {"ok": True, "box": box, "archived_count": len(archived)}
+            self.storage.record_action(conn, actor, op, act_key, digest, result, now_ts)
             return result

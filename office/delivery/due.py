@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import json
 import time
+from urllib.parse import quote
 
 #: Spec §4.2's vocabulary. A row outside it is refused rather than written: a typo'd kind is a
 #: deadline nothing ever asks for, which looks exactly like "not due yet" for the rest of time.
-KINDS = ("batch", "tool_hang", "wait_deadline", "address_expiry",
+KINDS = ("batch", "tool_hang", "wait_deadline", "idle_work", "address_expiry",
          "cooldown")
 
 #: `armed` — waiting. `fired` — its time came and the judgement ran. `cleared` — the reason went
@@ -132,29 +133,26 @@ def get(conn, key: str):
     return _out(_row(conn, key))
 
 
+def armed_rows(conn, *, at=None, kinds=None):
+    """Yield armed facts in deadline order, optionally stopping at a time or restricting kinds."""
+    where = ["state='armed'"]
+    values = []
+    if at is not None:
+        where.append("due_at<=?")
+        values.append(float(at))
+    if kinds is not None:
+        wanted = tuple(dict.fromkeys(k for k in kinds if isinstance(k, str) and k))
+        if not wanted:
+            return
+        where.append("kind IN (%s)" % ",".join("?" for _ in wanted))
+        values.extend(wanted)
+    for row in conn.execute("SELECT * FROM due WHERE " + " AND ".join(where) + " ORDER BY due_at,due_key", values):
+        yield _out(row)
+
+
 def due_rows(conn, at: float | None = None, *, kinds=None) -> list:
-    """Every **armed** row already due at `at`, earliest first — one indexed query.
-
-    Order is the index's (`due_at, due_key`), which is also the order a backlog built while the
-    daemon was down should be worked: the oldest judgement first. A row whose time has not come is
-    not returned at all, so a caller cannot mistake "armed" for "actionable".
-
-    `kinds` restricts the answer to the kinds the caller can actually decide. That filter is not an
-    optimisation: a row whose kind nobody handles is permanently overdue, so returning it makes every
-    pass wake on it immediately and answer "unhandled" — a spin loop that looks like work. Such a row
-    stays armed and stays out of the way until a handler exists.
-    """
-    at = now() if at is None else float(at)
-    if kinds is None:
-        return [_out(r) for r in conn.execute(
-            "SELECT * FROM due WHERE state='armed' AND due_at<=? ORDER BY due_at, due_key", (at,))]
-    wanted = [k for k in dict.fromkeys(kinds or ()) if isinstance(k, str) and k]
-    if not wanted:
-        return []
-    marks = ",".join("?" * len(wanted))
-    return [_out(r) for r in conn.execute(
-        "SELECT * FROM due WHERE state='armed' AND due_at<=? AND kind IN (%s)"
-        " ORDER BY due_at, due_key" % marks, (at, *wanted))]
+    """Read the armed rows already due at `at` (the current time by default)."""
+    return list(armed_rows(conn, at=now() if at is None else at, kinds=kinds))
 
 
 # --------------------------------------------------------------------------- writes
@@ -175,7 +173,7 @@ def arm(conn, kind: str, subject: str, due_at: float, *, owner_ref=None, payload
 
     Two properties this has that "insert the row" does not:
 
-    * **Re-arming keeps the history.** `fire_count` and `last_fired_at` survive, because §1.5 says
+    * **Re-arming within a binding generation keeps the history.** `fire_count` and `last_fired_at` survive, because §1.5 says
       a fault that comes back is *the same fault* — "同一故障再次触发：只更新次数和最近时间，不再
       发信". A count that reset on re-arm could not answer that question.
     * **A cleared row can come back.** `cleared` means the reason went away, not that the kind is
@@ -192,11 +190,14 @@ def arm(conn, kind: str, subject: str, due_at: float, *, owner_ref=None, payload
         _insert(conn, key, kind, subject, due_at, owner_ref, payload, binding_id, binding_gen, at)
         return _out(_row(conn, key))
     version = int(existing["version"]) + 1
+    same_generation = binding_gen is None or binding_gen == existing["binding_gen"]
     conn.execute(
         "UPDATE due SET due_at=?, state='armed', version=?, owner_ref=COALESCE(?, owner_ref),"
         " binding_id=COALESCE(?, binding_id), binding_gen=COALESCE(?, binding_gen),"
-        " payload_json=?, updated_at=? WHERE due_key=?",
+        " fire_count=?, last_fired_at=?, payload_json=?, updated_at=? WHERE due_key=?",
         (due_at, version, owner_ref, binding_id, binding_gen,
+         existing["fire_count"] if same_generation else 0,
+         existing["last_fired_at"] if same_generation else None,
          json.dumps(payload or {}, ensure_ascii=False, sort_keys=True), at, key))
     return _out(_row(conn, key))
 
@@ -259,8 +260,11 @@ def clear(conn, kind: str, subject: str, *, expected_version: int | None = None,
     return _out(_row(conn, key))
 
 
-def fire(conn, kind: str, subject: str, *, expected_version: int, now_ts: float | None = None):
+def fire(conn, kind: str, subject: str, *, expected_version: int, now_ts: float | None = None,
+         payload: dict | None = None):
     """Record that one deadline's judgement ran. **Requires the version the caller acted on.**
+
+    A supplied payload records the observation under the same version as the fired deadline.
 
     Returns the fired row, or None when the write must not happen — a different version (something
     changed the deadline between the read and this call), not armed, or gone. None is not an error:
@@ -280,26 +284,48 @@ def fire(conn, kind: str, subject: str, *, expected_version: int, now_ts: float 
     version = expected_version + 1
     conn.execute(
         "UPDATE due SET state='fired', version=?, fire_count=fire_count+1, last_fired_at=?,"
-        " updated_at=? WHERE due_key=? AND version=?",
-        (version, at, at, key, expected_version))
+        " updated_at=?, payload_json=COALESCE(?,payload_json) WHERE due_key=? AND version=?",
+        (version, at, at, None if payload is None else json.dumps(payload, ensure_ascii=False, sort_keys=True),
+         key, expected_version))
     return _out(_row(conn, key))
 
 
-def tool_call_of(row):
-    """The `ToolCall` a tool row was armed for, read back off the row itself.
+def tool_alert_version(fact):
+    """Return the deadline and version named by a current-format tool alert."""
+    if isinstance(fact, str) and fact.startswith('tool:tool_hang:'):
+        key, _, version = fact[5:].rpartition('#')
+        if version.isascii() and version.isdecimal():
+            return key, version
+    return None
 
-    The key is `tool_hang:<binding>:<turn>:<call>` (§4.2), and the generation is the row's
-    `binding_gen`. Both are read back rather than re-supplied by the caller: the whole point of
-    persisting the generation was that the identity must come from the record, not from whoever is
-    asking now.
-    """
+
+def tool_call_of(row):
+    """Reconstruct only a recorded native identity and check it against the storage key."""
     from lib.watchdog import ToolCall
-    parts = row["due_key"].split(":", 3)
-    if len(parts) != 4 or parts[0] != "tool_hang":
-        raise DueRefused("invalid_key", "not a tool deadline: %r" % (row["due_key"],))
-    binding_id = row["binding_id"] if row["binding_id"] is not None else parts[1]
-    generation = row["binding_gen"] if row["binding_gen"] is not None else 0
-    return ToolCall(binding_id, int(generation), parts[2], parts[3])
+    binding_id, generation = row['binding_id'], row['binding_gen']
+    turn, native = row['payload'].get('turn_id'), row['payload'].get('native_id')
+    if type(generation) is not int or any(not isinstance(value, str) or not value for value in (binding_id, turn, native)):
+        raise DueRefused('invalid_key', 'tool deadline has no recorded native identity')
+    call = ToolCall(binding_id, generation, turn, native)
+    if tool_key(call) != row['due_key']:
+        raise DueRefused('invalid_key', 'tool identity does not match its deadline')
+    return call
+
+
+def retire_tools(conn, binding, ts, *, turn=None):
+    """Retire frontend monitoring for exact recorded calls, without claiming process exit."""
+    rows = conn.execute("SELECT * FROM due WHERE kind='tool_hang' AND binding_id=? AND binding_gen=?"
+                        " AND state IN ('armed','fired') AND json_valid(payload_json)", binding).fetchall()
+    retired = 0
+    for raw in rows:
+        row = _out(raw)
+        payload = row['payload']
+        started = payload.get('tool_started')
+        if (type(started) not in (int, float) or started > ts or not payload.get('turn_id')
+                or (turn is not None and payload['turn_id'] != turn)):
+            continue
+        retired += bool(clear(conn, 'tool_hang', row['subject_ref'], expected_version=row['version'], now_ts=ts))
+    return retired
 
 
 def set_payload(conn, kind: str, subject: str, payload: dict, *, now_ts: float | None = None):
@@ -370,11 +396,12 @@ def tool_key(call) -> str:
     `ToolCall`), instead of matching "some call in this turn" and reporting a stall about the wrong
     command.
     """
-    return due_key("tool_hang", "%s:%s:%s" % (call.binding_id, call.turn_id, call.native_id))
+    return due_key("tool_hang", ':'.join(quote(value, safe='') for value in
+                                          (call.binding_id, call.turn_id, call.native_id)))
 
 
 def arm_tool(conn, call, due_at: float, *, progress_revision: int = 0, owner_ref=None,
-             now_ts: float | None = None) -> dict:
+             observation=None, now_ts: float | None = None) -> dict:
     """Arm a tool deadline whose payload carries the progress revision the caller has seen.
 
     `progress_revision` is stored with the row because that is what the decision compares against
@@ -386,41 +413,23 @@ def arm_tool(conn, call, due_at: float, *, progress_revision: int = 0, owner_ref
     # The binding and its generation are written on the row as well as in the key: a native call id
     # is only unique **within one binding generation**, so a row whose generation no longer matches
     # the connection must not be fired against that connection's call of the same name.
-    return arm(conn, "tool_hang", "%s:%s:%s" % (call.binding_id, call.turn_id, call.native_id),
+    return arm(conn, "tool_hang", tool_key(call).split(':', 1)[1],
                due_at, owner_ref=owner_ref,
-               payload={"progress_revision": progress_revision},
+               payload={**(observation or {}), "progress_revision": progress_revision,
+                        "turn_id": call.turn_id, "native_id": call.native_id},
                binding_id=call.binding_id, binding_gen=int(call.generation), now_ts=now_ts)
 
 
-def advance(conn, kind: str, subject: str, due_at: float, *, progress_revision=None,
-            now_ts: float | None = None):
-    """Real progress: push the deadline back, persist the new revision, end the alerted segment.
-
-    **The revision has to be written here, in this same statement.** Advancing without it leaves the
-    row saying "last seen revision is 1" while the host is already at 2, so the next deadline compares
-    2 > 1 and advances again — for ever, and the alert that should follow a real stall never fires.
-    Measured on a real database: arm at rev 1, host at rev 2, advance, next settle at rev 2 — if the
-    payload still says 1 that second settle is *again* "progress". So the revision is not a note
-    about the past; it is the baseline every later comparison is against.
-
-    Ending the segment is `fire_count = 0`: §1.5's "恢复后清掉这条；以后再卡住会重新报一次" is about
-    the *segment*, not the row — a command that stalls again after making progress must speak again,
-    and a count carried across the segment would silence it as "already notified". `last_fired_at`
-    stays, because when it last spoke is history, not segment state.
-    """
-    at, key, due_at, row = _armed(conn, kind, subject, due_at, now_ts)
-    if row is None:
+def advance_tool(conn, row, due_at, *, progress_revision, now_ts=None):
+    """Record real progress and start a fresh alert segment on the same deadline."""
+    if row['state'] not in ('armed', 'fired'):
         return None
-    payload = _payload(row)
-    if progress_revision is not None:
-        if not isinstance(progress_revision, int) or progress_revision < 0:
-            raise DueRefused("invalid_progress", "progress_revision must be a non-negative int")
-        payload["progress_revision"] = progress_revision
-    version = int(row["version"]) + 1
-    conn.execute("UPDATE due SET due_at=?, version=?, fire_count=0, payload_json=?, updated_at=?"
-                 " WHERE due_key=?",
-                 (due_at, version, json.dumps(payload, ensure_ascii=False, sort_keys=True), at, key))
-    return _out(_row(conn, key))
+    at = now() if now_ts is None else float(now_ts)
+    payload = dict(row['payload'], progress_revision=progress_revision)
+    conn.execute("UPDATE due SET due_at=?, state='armed', version=version+1, fire_count=0, payload_json=?, updated_at=?"
+                 " WHERE due_key=?", (_finite(due_at, "due_at"), json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                                       at, row['due_key']))
+    return get(conn, row['due_key'])
 
 
 def settle_tool_deadline(conn, *, call, due_version: int, observation,
@@ -499,7 +508,7 @@ def settle_tool_deadline(conn, *, call, due_version: int, observation,
         # The new revision goes into the row **in this statement**: without it the next deadline
         # compares the host's same revision against the old baseline and advances for ever, so the
         # alert that should follow a real stall never fires.
-        moved = advance(conn, "tool_hang", subject, at + max(1.0, float(rearm_seconds)),
+        moved = advance_tool(conn, row, at + max(1.0, float(rearm_seconds)),
                         progress_revision=observation.progress_revision, now_ts=at)
         return {"decision": decision, "version": (moved or {}).get("version"),
                 "fired": None, "letter_id": None}
@@ -508,7 +517,14 @@ def settle_tool_deadline(conn, *, call, due_version: int, observation,
                              now_ts=at)
         return {"decision": decision, "version": (deferred or {}).get("version"),
                 "fired": None, "letter_id": None}
-    fired = fire(conn, "tool_hang", subject, expected_version=due_version, now_ts=at)
+    payload = None
+    if decision == 'notify':
+        payload = row['payload'].copy()
+        payload.pop('tool_pid', None)
+        payload.pop('tool_birth', None)
+        if observation.process_tree_root:
+            payload['tool_pid'], payload['tool_birth'] = observation.process_tree_root
+    fired = fire(conn, "tool_hang", subject, expected_version=due_version, now_ts=at, payload=payload)
     if fired is None:
         return {"decision": "raced", "version": due_version, "fired": None, "letter_id": None}
     letter_id = None

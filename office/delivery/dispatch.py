@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 import time
 
 
@@ -60,12 +61,16 @@ def write_frame(box_dir, frame: dict) -> str:
     wake_dir = os.path.join(box_dir, "wake")
     os.makedirs(wake_dir, exist_ok=True)
     path = frame_path(box_dir, frame["kind"], frame.get("due_key"))
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(frame, fh, ensure_ascii=False, sort_keys=True)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=".wake-", dir=wake_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(frame, fh, ensure_ascii=False, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     return path
 
 

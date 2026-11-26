@@ -158,6 +158,10 @@ process.stdin.on("data", (chunk) => {
 		let msg;
 		try { msg = JSON.parse(line); }
 		catch { write({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }); continue; }
+		if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+			write({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "invalid request" } });
+			continue;
+		}
 		inflight += 1;
 		Promise.resolve(handle(msg))
 			.then((result) => {

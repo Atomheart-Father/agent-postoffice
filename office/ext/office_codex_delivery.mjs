@@ -1,16 +1,38 @@
 import {spawn, spawnSync} from 'node:child_process';
+import {readFileSync} from 'node:fs';
 import {createInterface} from 'node:readline';
 import {handleClaudeHook, recordCodexUnsent} from './office_claude_hook.mjs';
 import {nativeDescriptor, openSession} from './office_socket.mjs';
 import {reportCodexUsage} from './office_codex_usage.mjs';
 
-const [mode, session, arg] = process.argv.slice(2);
+async function reportTurn(core, turn) {
+  const report = (kind, ts, fields = {}) => core.handle({op:'host.event', kind, ts, turn_id:turn.id,
+    act_key:'codex:observation:' + kind + ':' + turn.id, ...fields});
+  const outcome = {completed:'completed', failed:'failed', interrupted:'interrupted'}[turn.status];
+  if (!outcome || !Number.isFinite(turn.completedAt)) return;
+  const failure = turn.error?.codexErrorInfo;
+  const category = typeof failure === 'string' ? failure : Object.keys(failure || {})[0];
+  const status = failure?.[category]?.httpStatusCode;
+  if (outcome === 'failed' && failure === 'usageLimitExceeded')
+    await report('quota', turn.completedAt, {reason:'quota_exhausted', status:429});
+  await report('turn_end', turn.completedAt, {...(outcome ? {outcome} : {}),
+    ...(outcome === 'failed' && category ? {reason:category} : {}),
+    ...(Number.isInteger(status) ? {status} : {})});
+}
+
+const [mode, session, arg, monitoredTurn] = process.argv.slice(2);
 const dueKey = mode === 'send' ? arg : undefined;
 const candidates = mode === 'poll' && arg ? JSON.parse(arg) : [];
 const wanted = new Set(candidates.map(row => row.token));
 const nativeRefs = new Set(candidates.map(row => row.native_ref).filter(ref => typeof ref === 'string' && ref));
 const earliest = Math.min(...candidates.map(row => row.begun_ts).filter(Number.isFinite));
 try {
+  if (mode === 'monitor') {
+    const event = JSON.parse(readFileSync(0, 'utf8'));
+    await handleClaudeHook({event, mode, descriptorPath:nativeDescriptor(null, 'codex', event.session_id),
+      hostPid:process.ppid, codexNative:true});
+    process.exit(0);
+  }
   if (!['send', 'poll'].includes(mode)) process.exit(0);
   const ref = session, descriptorPath = nativeDescriptor(null, 'codex', ref);
   const nativeSession = {surface: 'codex', ref};
@@ -94,6 +116,13 @@ try {
         const terminal = turn => ['completed', 'interrupted', 'failed'].includes(turn?.status) && Boolean(turn.id);
         const turns = msg.result.data;
         const initial = firstPage; if (initial) { currentTurn = turns[0]; firstPage = false; }
+        if (initial && monitoredTurn && currentTurn?.id === monitoredTurn && terminal(currentTurn)) {
+          const bound = openSession({nativeSession});
+          if (bound?.ok) {
+            try { await reportTurn(bound.core, currentTurn); }
+            finally { await bound.core.close(); }
+          }
+        }
         for (const turn of turns) for (const item of turn.items || []) {
           if (item.type !== 'userMessage' || item.clientId === marker || item.content?.length !== 1
               || typeof item.content[0]?.text !== 'string' || !item.clientId?.startsWith('[Office wake ')

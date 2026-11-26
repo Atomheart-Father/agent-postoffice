@@ -23,6 +23,8 @@ The daemon never decides business facts. It resolves a credential to a trusted c
 request to `Core.handle`, and — after the commit — asks the due table when the next thing is due.
 """
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -34,10 +36,12 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -65,23 +69,18 @@ selection_mod = _load("delivery/selection.py", "office_delivery_selection_daemon
 
 # --------------------------------------------------------------------------- supply file
 
-def read_bindings(path: Path) -> list:
-    """读受控供给文件。**拒绝**：不是 0600/0400、属主不是本进程用户、形状不对。"""
-    st = path.stat()
-    if st.st_uid != os.geteuid():
-        raise ValueError("供给文件属主不是本进程用户（%d ≠ %d）：不读别人写的身份清单"
-                         % (st.st_uid, os.geteuid()))
-    if stat.S_IMODE(st.st_mode) not in (0o600, 0o400):
-        raise ValueError("供给文件权限必须是 0600/0400（现在是 %o）：身份清单不许别人可写"
-                         % stat.S_IMODE(st.st_mode))
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        raise ValueError("供给文件读不了/不是 JSON：%s" % e)
+def read_bindings(path: Path, *, with_document=False):
+    """Validate and read the same supply inode, with no symlink or pipe traversal."""
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), encoding="utf-8") as supply:
+        st = os.fstat(supply.fileno())
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
+                or stat.S_IMODE(st.st_mode) not in (0o600, 0o400)):
+            raise ValueError("binding supply must be a regular file owned by this user with mode 0600 or 0400")
+        data = json.load(supply)
     items = data.get("bindings") if isinstance(data, dict) else data
     if not isinstance(items, list):
         raise ValueError("供给文件必须是 {\"version\":1,\"bindings\":[…]} 或一个数组")
-    out, seen = [], set()
+    out, seen, tokens = [], set(), set()
     for i, it in enumerate(items):
         if not isinstance(it, dict):
             raise ValueError("bindings[%d] 不是对象" % i)
@@ -91,17 +90,50 @@ def read_bindings(path: Path) -> list:
         if bid in seen:
             raise ValueError("binding_id 重复：%s" % bid)
         seen.add(bid)
+        core_mod.check_box_name(actor, "actor")
+        if "token" in it:
+            token = it["token"]
+            if not isinstance(token, str) or not token or any(c.isspace() for c in token):
+                raise ValueError(f"bindings[{i}].token must be a nonempty string without whitespace")
+            if token in tokens:
+                raise ValueError("duplicate credential in binding supply")
+            tokens.add(token)
         for k in ("generation", "scope", "surface", "source",
                   "instance", "channel_lifetime_ref", "host_session_ref"):
             if k in it and it[k] is not None and not isinstance(it[k], (str, int)):
                 raise ValueError("bindings[%d].%s 类型不对" % (i, k))
         out.append(dict(it))
-    return out
+    return (out, data) if with_document else out
 
 
-def _safe(name: str) -> str:
-    """文件名里只留可安全落盘的字符：binding_id 是地址名，不是路径。"""
-    return "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in str(name))
+def _path_stem(name: str) -> str:
+    # Common native names keep their paths. The separate hash namespace also prevents
+    # case-insensitive and Unicode-normalizing filesystems from aliasing logical identities.
+    return name if re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,199}", name) else "~" + _digest(name)
+
+
+def _prepare_endpoint_dir(path, *, managed):
+    # Existing directory permissions belong to the operator, not the daemon.
+    if path.absolute() != path.resolve():
+        raise ValueError("endpoint directory must not cross a symbolic link")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError("endpoint directory must be owned by the current user")
+    if info.st_mode & 0o077:
+        if path != managed:
+            raise ValueError("custom endpoint directory must be private (0700)")
+        path.chmod(0o700)
+
+
+def _write_private(path, content):
+    fd, temp = tempfile.mkstemp(prefix=".credential-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(content)
+        os.replace(temp, path)
+    finally:
+        Path(temp).unlink(missing_ok=True)
 
 
 def _digest(token: str) -> str:
@@ -156,14 +188,17 @@ def build_handlers(core, *, observe=None, notify=None, begin_round=None):
     # 没有 `begin_round` 就不登记 batch：选信是投递策略（`delivery.selection.select`），
     # 默认一个"大概能发"的列表只会让未过窗的信和副本混进轮里。
     if begin_round is not None:
-        out["batch"] = worker_mod.BatchHandler(consumers=core.due_consumers,
-                                               begin_round=begin_round)
+        out["batch"] = worker_mod.BatchHandler(
+            consumers=core.due_consumers, begin_round=begin_round,
+            can_wait=lambda conn, unit: core._is_registered_principal(unit, conn)
+            and not core._archived_recipients(conn, (unit,)))
     if observe is not None and notify is not None:
         out["tool_hang"] = worker_mod.ToolHandler(observe=observe, notify=notify)
     # ★ D3 第二段：「继续等到 X」到期重读。要的只有 Core 自己
     #   （升级信是 `system_letter`、判据全在 `delivery.worker`），所以无条件注册 ——
     #   没有它，`coord.respond(wait)` 的 deadline 到了没人读，经理永收不到升级。
     out["wait_deadline"] = worker_mod.WaitDeadlineHandler(core=core)
+    out["idle_work"] = worker_mod.IdleWorkHandler(core=core)
     return out
 
 
@@ -185,7 +220,8 @@ class Officed:
         self._stop = threading.Event()
         self._wake = threading.Condition()
         self._next_due_at = None
-        self._due_seq = 0
+        self._frames_ready = threading.Condition()
+        self._frame_seq = 0
         #: 投递层的到期处理器（`batch`/`tool_hang`）；不注册就什么都不结算，
         #: 到期行留在表里等宿主装上处理器 —— daemon 不替业务决定"这条该谁办"。
         self.handlers = dict(handlers or {})
@@ -198,12 +234,80 @@ class Officed:
         self._host_serial = {}
         self._server = None
         self._threads = []
+        self._instance_lock = None
+        self._socket_identity = None
+        self._serving = False
 
     # ---------------------------------------------------------------- prepare
     def prepare(self):
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.socket_path.parent, 0o700)
+        if self._instance_lock is not None:
+            raise ValueError("Office daemon is already prepared")
+        self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self.home / ".officed.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        self._instance_lock = fd
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError("daemon lock is not a regular file")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError("Office daemon already running for this home") from exc
+            if not self.store.db_path.exists() and any(self.home.glob(".restore-*")):
+                raise ValueError("Office restore was interrupted; rerun restore before starting the daemon")
+            _prepare_endpoint_dir(self.socket_path.parent, managed=self.home / "sock")
+            _prepare_endpoint_dir(self.descriptor_dir, managed=self.home / "sock")
+            self._check_socket()
+            self._server = socket.socket(socket.AF_UNIX)
+            self._server.bind(str(self.socket_path))
+            self._socket_identity = self.socket_path.lstat()
+            os.chmod(self.socket_path, 0o600)
+            self._server.listen(16)
+            return self._prepare()
+        except BaseException:
+            self._cleanup_listener()
+            raise
+
+    def _cleanup_listener(self):
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        try:
+            current = self.socket_path.lstat()
+            if self._socket_identity and (current.st_dev, current.st_ino) == (self._socket_identity.st_dev, self._socket_identity.st_ino):
+                self.socket_path.unlink()
+        except FileNotFoundError:
+            pass
+        self._socket_identity = None
+        if self._instance_lock is not None:
+            os.close(self._instance_lock)
+            self._instance_lock = None
+
+    def _check_socket(self):
+        try:
+            current = self.socket_path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(current.st_mode) or current.st_uid != os.getuid():
+            raise ValueError("socket path is occupied by a non-owned socket or another file")
+        probe = socket.socket(socket.AF_UNIX)
+        try:
+            probe.settimeout(1)
+            probe.connect(str(self.socket_path))
+        except OSError as exc:
+            if exc.errno != errno.ECONNREFUSED or not self.socket_path.parent.resolve().is_relative_to(self.home.resolve()):
+                raise ValueError("socket state cannot be safely reclaimed") from exc
+            latest = self.socket_path.lstat()
+            if (latest.st_dev, latest.st_ino) != (current.st_dev, current.st_ino):
+                raise ValueError("socket changed during inspection")
+            self.socket_path.unlink()
+        else:
+            raise ValueError("socket is already in use")
+        finally:
+            probe.close()
+
+    def _prepare(self):
         items = read_bindings(self.bindings_path)
+        tokens = {it["token"] for it in items if "token" in it}
         for it in items:
             bid = it["binding_id"]
             actor = it["actor"]
@@ -218,14 +322,18 @@ class Officed:
                         current["state"] != "active" or current["revoked_at"] is not None
                         or current["actor"] != actor or current["instance"] != inst
                         or (current["host_session_ref"] or None) != (host or None)
-                        or (current["channel_lifetime_ref"] or None) != (it.get("channel_lifetime_ref") or "ch-" + bid)))):
+                        or (current["channel_lifetime_ref"] and current["channel_lifetime_ref"] !=
+                            (it.get("channel_lifetime_ref") or "ch-" + bid))))):
                     self._log("忽略已撤销或过期的绑定供给：%s" % bid)
                     continue
                 ctx = self.ep.bind_and_open(bid, actor, gen, inst,
                                            host_session_ref=host,
                                            channel_lifetime_ref=it.get("channel_lifetime_ref"),
                                            source=it.get("source"), surface=it.get("surface"))
-            token = it.get("token") or secrets.token_hex(32)
+            token = it.get("token")
+            if token is None:
+                token = self._fresh_token(tokens)
+                tokens.add(token)
             b = Binding(binding_id=bid, actor=actor, generation=gen, instance=inst,
                         ctx=ctx, token=token, scope=it.get("scope"), host_session_ref=host)
             self._bindings.append(b)
@@ -233,12 +341,18 @@ class Officed:
         self._write_descriptor()
         return self
 
+    def _fresh_token(self, reserved=()):
+        while True:
+            token = secrets.token_hex(32)
+            if token not in reserved and _digest(token) not in self._by_digest:
+                return token
+
     def descriptor_path_for(self, binding):
         """This binding's descriptor file. One file per binding: a host never sees another's token."""
-        return self.descriptor_dir / ("%s.endpoint.json" % _safe(binding.binding_id))
+        return self.descriptor_dir / ("%s.endpoint.json" % _path_stem(binding.binding_id))
 
     def token_path_for(self, binding):
-        return self.descriptor_dir / ("%s.token" % _safe(binding.binding_id))
+        return self.descriptor_dir / ("%s.token" % _path_stem(binding.binding_id))
 
     def _write_descriptor(self, bindings=None):
         """写每个绑定自己的描述文件与凭据（两份都 0600）。
@@ -247,14 +361,15 @@ class Officed:
         `instance`（外加 `version`）。**没有**全员共享的描述文件 —— 一个人的凭据不该出现在
         别人的文件里。找不到自己的描述文件 = 还没有受控连接，不是“差不多能用”。
         """
-        self.descriptor_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.descriptor_dir, 0o700)
-        for b in self._bindings if bindings is None else bindings:
+        _prepare_endpoint_dir(self.descriptor_dir, managed=self.home / "sock")
+        bindings = self._bindings if bindings is None else bindings
+        if not bindings:
+            return
+        database = self.store.db_path.stat()
+        storage_identity = (database.st_dev, database.st_ino, getattr(database, "st_birthtime", None))
+        for b in bindings:
             tpath = self.token_path_for(b)
-            fd = os.open(str(tpath), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(b.token)
-            os.chmod(str(tpath), 0o600)
+            _write_private(tpath, b.token)
             payload = {
                 "version": 1,
                 "socketPath": str(self.socket_path),
@@ -263,15 +378,12 @@ class Officed:
                 "bindingId": b.binding_id,
                 "generation": b.generation,
                 "instance": b.instance,
+                "authorityRef": _digest(json.dumps((*storage_identity, b.binding_id, b.actor,
+                                                    b.generation, b.instance))),
                 "hostSessionRef": b.host_session_ref,
             }
             dpath = self.descriptor_path_for(b)
-            tmp = dpath.with_suffix(".tmp")
-            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.chmod(str(tmp), 0o600)
-            os.replace(str(tmp), str(dpath))
+            _write_private(dpath, json.dumps(payload, ensure_ascii=False, indent=2))
             if b.ctx.get("surface") == "pi" and b.binding_id == b.actor and b.host_session_ref:
                 try:
                     _, ref = self.core._pi_session_ref(b.host_session_ref)
@@ -315,15 +427,31 @@ class Officed:
                 return {"ok": False, "code": "invalid_request", "message": "需要 OpenCode 原生会话 ID"}
 
             def same_session(ref):
-                return ref == session_ref or (surface == "pi" and os.path.isabs(ref)
+                return ref == session_ref or (surface == "pi" and isinstance(ref, str) and os.path.isabs(ref)
                                               and str(Path(ref).resolve()) == session_ref)
 
+            if expected_binding and surface != "pi" and expected_binding != surface + "-" + session_ref:
+                return {"ok": False, "code": "conflict", "message": "申请与原生会话不符"}
             with self.core._txn(read_only=True) as conn:
-                existing = conn.execute("SELECT host_session_ref FROM binding_events WHERE host_session_ref<>''").fetchall()
-                if any(same_session(row[0]) for row in existing):
+                events = conn.execute("SELECT binding_id,actor,op,generation,instance,host_session_ref FROM binding_events WHERE host_session_ref<>''").fetchall()
+                history = [row for row in events if same_session(row['host_session_ref'])]
+                if history and expected_binding:
+                    items, supply = read_bindings(self.bindings_path, with_document=True)
+                    matches = [it for it in items if same_session(it.get("host_session_ref") or "")]
+                    resumed = self._resume_join(conn, expected_binding, surface, session_ref, matches, history, items)
+                else:
+                    resumed = None
+            if history:
+                if not resumed:
                     return {"ok": False, "code": "conflict", "message": "该会话已经有绑定历史，不能作为新人签发"}
-            items = read_bindings(self.bindings_path)
-            supply = json.loads(self.bindings_path.read_text(encoding="utf-8"))
+                binding, is_new = resumed
+                self._write_descriptor([binding])
+                if is_new:
+                    self._bindings.append(binding)
+                    self._by_digest[_digest(binding.token)] = binding
+                return {"ok": True, "result": {"actor": binding.actor, "binding_id": binding.binding_id, "generation": 1,
+                                               "host_session_ref": session_ref, "descriptor": str(self.descriptor_path_for(binding))}}
+            items, supply = read_bindings(self.bindings_path, with_document=True)
             if any(same_session(it.get("host_session_ref") or "") for it in items):
                 return {"ok": False, "code": "conflict", "message": "该会话已经在受控供给中"}
             # The requester does not choose an existing mailbox or position.
@@ -352,12 +480,54 @@ class Officed:
                 temp.unlink(missing_ok=True)
             ctx = self.ep.bind_and_open(binding_id, actor, 1, instance, host_session_ref=session_ref, surface=surface)
             binding = Binding(binding_id=binding_id, actor=actor, generation=1, instance=instance,
-                              ctx=ctx, token=secrets.token_hex(32), host_session_ref=session_ref)
+                              ctx=ctx, token=self._fresh_token(), host_session_ref=session_ref)
             self._write_descriptor([binding])
             self._bindings.append(binding)
             self._by_digest[_digest(binding.token)] = binding
         return {"ok": True, "result": {"actor": actor, "binding_id": binding_id, "generation": 1,
                                        "host_session_ref": session_ref, "descriptor": str(self.descriptor_path_for(binding))}}
+
+    def _resume_join(self, conn, expected, surface, session, matches, history, items):
+        """Only finish issuance of the exact, still-active first personal binding."""
+        if len(matches) != 1 or len(history) != 1:
+            return None
+        item, event = matches[0], history[0]
+        actor, instance = item.get('actor', ''), item.get('instance', '')
+        if (set(item) != {'binding_id', 'actor', 'generation', 'instance', 'surface', 'host_session_ref'}
+                or item['binding_id'] != expected or item['surface'] != surface or item['generation'] != 1
+                or not re.fullmatch(r'employee-[0-9a-f]{32}', actor)
+                or not re.fullmatch(re.escape(surface) + r'-[0-9a-f]{32}', instance)
+                or (event['binding_id'], event['actor'], event['op'], event['generation'], event['instance'])
+                   != (expected, actor, 'registered', 1, instance)):
+            return None
+        box = self.home / actor
+        box_info = box.lstat() if box.exists() else None
+        if (not box_info or not stat.S_ISDIR(box_info.st_mode) or box_info.st_uid != os.getuid()
+                or sum(it.get('actor') == actor for it in items) != 1
+                or conn.execute("SELECT 1 FROM bindings WHERE actor=? AND binding_id<>? UNION ALL SELECT 1 FROM position_holders WHERE position=? LIMIT 1", (actor, expected, actor)).fetchone()
+                or conn.execute("SELECT count(*) FROM binding_events WHERE binding_id=?", (expected,)).fetchone()[0] != 1):
+            return None
+        ctx = {'binding_id': expected, 'actor': actor, 'generation': 1, 'instance': instance,
+               'channel_lifetime_ref': 'ch-' + expected, 'host_session_ref': session, 'surface': surface}
+        try:
+            self.core._verify_trusted_ctx(conn, ctx)
+        except core_mod.CoreError:
+            return None
+        row = conn.execute("SELECT host_session_ref FROM bindings WHERE binding_id=?", (expected,)).fetchone()
+        if not row or (row['host_session_ref'] or '') != item['host_session_ref']:
+            return None
+        current = [b for b in self._bindings if b.binding_id == expected]
+        if len(current) > 1:
+            return None
+        if current:
+            b = current[0]
+            if (b.ctx != ctx or (b.actor, b.generation, b.instance, b.host_session_ref) != (actor, 1, instance, session)
+                    or self._by_digest.get(_digest(b.token)) is not b):
+                return None
+            return b, False
+        token = self._fresh_token({it['token'] for it in items if 'token' in it})
+        return Binding(binding_id=expected, actor=actor, generation=1, instance=instance,
+                       ctx=ctx, token=token, host_session_ref=session), True
 
     # ---------------------------------------------------------------- identity
     def _serial_path(self, binding):
@@ -376,14 +546,10 @@ class Officed:
 
     # ---------------------------------------------------------------- serve
     def serve(self):
-        path = str(self.socket_path)
-        if os.path.exists(path):
-            os.unlink(path)
-        srv = socket.socket(socket.AF_UNIX)
-        srv.bind(path)
-        os.chmod(path, 0o600)
-        srv.listen(16)
-        self._server = srv
+        srv = self._server
+        if srv is None:
+            raise RuntimeError("daemon must be prepared before serving")
+        self._serving = True
         self.handlers = self.handlers or {}  # 构造时可给：{kind: delivery.worker.Handler}
         self._start_waker()
         try:
@@ -392,19 +558,22 @@ class Officed:
             while not self._stop.is_set():
                 try:
                     conn, _ = srv.accept()
-                except OSError:
-                    break
+                except OSError as exc:
+                    if self._stop.is_set():
+                        break
+                    if exc.errno in (errno.EINTR, errno.ECONNABORTED, errno.EMFILE, errno.ENFILE,
+                                     errno.ENOBUFS, errno.ENOMEM):
+                        self._log(f"accept 暂不可用（errno={exc.errno}），稍后重试")
+                        self._stop.wait(0.25)
+                        continue
+                    raise
                 t = threading.Thread(target=self._serve_conn, args=(conn,), daemon=True)
                 t.start()
         finally:
             try:
-                srv.close()
-            except OSError:
-                pass
-            try:
-                os.unlink(str(self.socket_path))
-            except FileNotFoundError:
-                pass
+                self._cleanup_listener()
+            finally:
+                self._serving = False
 
     def _serve_conn(self, conn):
         """一条连接上**并发**应答：慢的那个请求不能饿死别的请求。
@@ -599,16 +768,15 @@ class Officed:
             if receipt.get("taken") and not receipt.get("idempotent"):
                 self._rearm()
             return frame
-        frame = self.ep.dispatch(req, dict(b.ctx))
+        ctx = dict(b.ctx)
+        req.pop('req_id', None)  # echoed by _one(), never passed to Core's business signature
+        if req.get('op') == 'host.event' and req.get('kind') in ('turn_start', 'tool_start', 'session_idle'):
+            pid = req.get('process_pid')
+            if type(pid) is int and pid > 0:
+                from delivery.process_observer import birth
+                ctx['observed_process_birth'] = birth(pid)
+        frame = self.ep.dispatch(req, ctx)
         op, result = req.get("op"), frame.get("result") or {}
-        if frame.get("ok") and op == "host.event" and result.get("quota_recovered"):
-            peers = [p for p in self._bindings if p is b or (b.host_session_ref and p.host_session_ref == b.host_session_ref)]
-            units = {unit for peer in peers for unit in self._carried_units(peer)}
-            with self.core._txn() as conn:
-                for unit in units:
-                    row = due_mod.get(conn, due_mod.due_key("batch", unit))
-                    if row and row["state"] == "armed":
-                        due_mod.push_back(conn, "batch", unit, time.time())
         unchanged_due = (op == "usage.record" or (op == "host.event" and result.get("idempotent"))
                          or (op == "round.authorize_send" and not result.get("rejected"))
                          or (op == "round.run.end" and req.get("native_ref") is not None and result.get("recorded") == []))
@@ -616,7 +784,10 @@ class Officed:
             self._rearm()
         done = (frame.get("result") or {}).get("executed") or {}
         if req.get("op") == "request.decide" and done.get("op") == "identity.join":
-            frame["result"]["issuance"] = self._issue_join(done["surface"], done["session_ref"], done["binding_id"])
+            try:
+                frame["result"]["issuance"] = self._issue_join(done["surface"], done["session_ref"], done["binding_id"])
+            except Exception:  # The request decision has already committed.
+                return {"ok": False, "code": "outcome_unknown", "message": "审批已提交，身份签发结果未知；请用原操作键重试"}
         return frame
 
     def _join_entry(self, req):
@@ -631,34 +802,50 @@ class Officed:
         except core_mod.CoreError as exc:
             return self.ep.refused(exc)
         if result["state"] == "done":
-            result["issuance"] = self._issue_join(ns["surface"], ns.get("session_ref", ns["ref"]), who)
+            try:
+                result["issuance"] = self._issue_join(ns["surface"], ns.get("session_ref", ns["ref"]), who)
+            except Exception:  # The request decision has already committed.
+                return {"ok": False, "code": "outcome_unknown", "message": "登记已提交，身份签发结果未知；请用原操作键重试"}
         return {"ok": True, "result": result}
 
     def _issue_join(self, surface, session_ref, binding_id):
-        try:
-            out = self._issue_personal_binding({"surface": surface, "session_ref": session_ref}, expected_binding=binding_id if surface == "pi" else None)
-        except OSError as exc:
-            return "未签发：%s" % exc
-        return "issued" if out["ok"] else out["message"]
+        out = self._issue_personal_binding({"surface": surface, "session_ref": session_ref}, expected_binding=binding_id)
+        if not out.get("ok"):
+            raise ValueError(out.get("message", "身份签发失败"))
+        return "issued"
 
     # ---------------------------------------------------------------- wake
     #: 一次等待，按**绝对 due_at**。没有到期项就无限等（不轮询），提交或注册会 notify。
     def _rearm(self):
-        """提交/登记之后重算最早的到期时刻，并把等待者叫醒（绝对时刻，不累加相对等待）。"""
+        """Recalculate the scheduler's next deadline after a write."""
         with self._wake:
-            self._next_due_at = self._earliest_due_at()
-            self._due_seq += 1
-            self._wake.notify_all()
+            due_at = self._earliest_due_at()
+            if due_at != self._next_due_at:
+                self._next_due_at = due_at
+                self._wake.notify()
+
+    def _eligible_due(self, row):
+        if self._handed.get(row["due_key"]) == row["version"]:
+            return False
+        if row["kind"] == "tool_hang":
+            observe = getattr(self.handlers["tool_hang"], "observe", None)
+            if getattr(observe, "__self__", None) is self:
+                return bool(row["payload"].get("process_birth"))
+        return True
 
     def _earliest_due_at(self):
-        """最早一个 armed 行的**绝对** due_at；没有 ⇒ None（那就无限等下一次提交）。"""
+        """Earliest deadline including retries. Later nominal deadlines cannot beat it."""
         try:
+            earliest = None
             with self.core._txn(read_only=True) as conn:
-                rows = conn.execute("SELECT due_key, due_at, kind, version FROM due WHERE state='armed'"
-                                    " ORDER BY due_at, due_key")
-                return min((max(float(r['due_at']), self._retry_at(r)) for r in rows
-                            if self.handlers.get(r['kind']) is not None
-                            and self._handed.get(r['due_key']) != r['version']), default=None)
+                kinds = (kind for kind, handler in self.handlers.items() if handler is not None)
+                for row in due_mod.armed_rows(conn, kinds=kinds):
+                    if earliest is not None and row["due_at"] >= earliest:
+                        break
+                    if self._eligible_due(row):
+                        effective = max(row["due_at"], self._retry_at(row))
+                        earliest = effective if earliest is None else min(earliest, effective)
+            return earliest
         except Exception as exc:                                   # noqa: BLE001
             self._log(f"读取投递期限失败，将重试：{exc}")
             return time.time() + self.DUE_RETRY_SECONDS
@@ -706,16 +893,24 @@ class Officed:
                             (binding.binding_id, binding.generation)).fetchall()
                         outstanding = [row for row in outstanding if row['box'] in units]
                         quota = worker_mod.quota_blocked(conn, binding.binding_id, binding.generation)
+                        monitor_state = self.core._monitor_state(conn, (binding.binding_id, binding.generation))
                     now = time.time()
+                    active_pid = monitor_state.get('active_pid')
+                    if monitor_state.get('active') and type(active_pid) is int and monitor_state.get('active_birth'):
+                        from delivery.process_observer import birth
+                        active = birth(active_pid) == monitor_state['active_birth']
+                    else:
+                        active = False
                     observing = any(
                         row["state"] == "begun" or row["run_state"] == "running"
                         or (row["deadline_ts"] or row["begun_ts"]) > now for row in outstanding)
-                    if not (observing or self._codex_business_serial(binding, units)
-                            or (not quota and any(f.get('kind') == 'batch_round'
-                                                 for f in self._frames_of(units, binding)))):
+                    if not (observing or active or self._codex_business_serial(binding, units)
+                            or (not quota and self._frames_of(units, binding))):
                         continue
                     sessions.add(binding.host_session_ref)
-                    subprocess.run(self._codex_command(binding, "poll", json.dumps([dict(row) for row in outstanding if row["captured"]])), env=self._codex_env(),
+                    turn = monitor_state.get('turn') if active else None
+                    turn_args = [turn] if isinstance(turn, str) and turn else []
+                    subprocess.run(self._codex_command(binding, "poll", json.dumps([dict(row) for row in outstanding if row["captured"]]), *turn_args), env=self._codex_env(),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=20)
                 except Exception as exc:  # one unavailable binding must not stop other observations
                     self._log("Codex 原生回执读取失败 %s：%s" % (binding.host_session_ref, exc))
@@ -751,7 +946,11 @@ class Officed:
                     self._wake.wait(gap)
                     continue
             # 已到期：交班一次。消费者转态/提交后会 notify，这里再进入下一轮。
-            handed = self._consume_due()
+            try:
+                handed = self._consume_due()
+            except Exception as exc:  # Keep the single scheduler alive after a failed pass.
+                self._log(f"投递调度未完成，将重试：{type(exc).__name__}: {exc}")
+                handed = None
             with self._wake:
                 if not handed:
                     self._next_due_at = self._earliest_due_at()
@@ -761,16 +960,21 @@ class Officed:
     def _consume_due(self):
         """把选中的到期版本交给 worker，按本批处理结果记账。"""
         try:
+            now = time.time()
             with self.core._txn(read_only=True) as conn:
-                kinds = [kind for kind, handler in self.handlers.items() if handler is not None]
-                now = time.time()
-                rows = [r for r in due_mod.due_rows(conn, now, kinds=kinds)
-                        if self._handed.get(r["due_key"]) != r["version"] and self._retry_at(r) <= now]
+                def take(kinds, limit):
+                    return list(islice((row for row in due_mod.armed_rows(conn, at=now, kinds=kinds)
+                                       if self._retry_at(row) <= now and self._eligible_due(row)), limit))
+
+                ordinary = (kind for kind, handler in self.handlers.items()
+                            if handler is not None and kind != "tool_hang")
+                rows = take(ordinary, worker_mod.DEFAULT_LIMIT)
+                if not rows and self.handlers.get("tool_hang") is not None:
+                    # Publish mail between process-tree observations.
+                    rows = take(("tool_hang",), 1)
         except Exception as exc:                                   # noqa: BLE001
             self._log(f"读取到期任务失败，将重试：{exc}")
             return None
-        more = len(rows) > 64
-        rows = rows[:64]
         # 交给投递层去**转态**：`worker.drain` 每行一个写事务，返回动作在提交之后才执行。
         # daemon 自己不写 due 行 —— 否则唤醒路径就成了第二个转态者。
         outcome = self._drain(rows)
@@ -783,11 +987,6 @@ class Officed:
         actions = outcome.get('actions', [])
         if actions:
             self._dispatch(actions)
-        if more:
-            # 积压没处理完：立刻再来一轮（不等定时器），否则剩下的行要等下一次有人 arm 才被看见。
-            with self._wake:
-                self._next_due_at = 0.0
-                self._wake.notify_all()
         return rows
 
     def _drain(self, rows, now_ts=None):
@@ -800,7 +999,7 @@ class Officed:
         if not handlers or not rows:
             return {}
         try:
-            kw = {"limit": 64, "rows": rows}
+            kw = {"rows": rows}
             if now_ts is not None:
                 kw["now_ts"] = now_ts
             # `build_handlers` 的键是 kind（`batch`/`tool_hang`），
@@ -842,52 +1041,94 @@ class Officed:
         """daemon 的诊断行：一律 stderr，不进业务库、不进信件。"""
         print("officed: %s" % message, file=sys.stderr, flush=True)
 
-    def box_dir_for(self, unit):
-        """这个投递单元的目录：普通箱 `<home>/<unit>`，已登记的岗位 `<home>/positions/<name>`。
+    def _observe_tool(self, call):
+        from delivery.process_observer import observe
+        with self.core._txn(read_only=True) as conn:
+            row = due_mod.get(conn, due_mod.tool_key(call))
+            if not row or row['state'] != 'armed' or row['binding_gen'] != call.generation:
+                return None
+            binding = conn.execute("SELECT host_session_ref FROM bindings WHERE binding_id=? AND generation=?"
+                                   " AND state='active' AND revoked_at IS NULL", (call.binding_id, call.generation)).fetchone()
+            if not binding or not binding[0]:
+                return None
+            pid = row['payload'].get('process_pid')
+            if type(pid) is not int:
+                return None
+            count = conn.execute("SELECT COUNT(*) FROM due d JOIN bindings b ON b.binding_id=d.binding_id AND b.generation=d.binding_gen"
+                                 " WHERE d.kind='tool_hang' AND d.state='armed' AND b.state='active' AND b.revoked_at IS NULL"
+                                 " AND json_valid(d.payload_json) AND (json_extract(d.payload_json,'$.process_pid')=? OR b.host_session_ref=?)",
+                                 (pid, binding[0])).fetchone()[0]
+            if count != 1:
+                return None
+            payload = row['payload']
+        return observe(call, payload)
 
-        与投递的其他地方同一句话（岗位的信在 `positions/<name>/` 下），不在 daemon 里另立一套。
-        """
-        name = str(unit or "")
-        if not name:
-            return self.home
+    def _notify_tool(self, conn, row):
+        binding = conn.execute("SELECT actor FROM bindings WHERE binding_id=? AND generation=? AND state='active' AND revoked_at IS NULL",
+                               (row['binding_id'], row['binding_gen'])).fetchone()
+        if not binding:
+            return None
+        actor = binding['actor']
+        boxes, route = self.core._monitor_recipients(conn, actor)
+        if not boxes:
+            return None
+        from delivery.round import MESSAGES
+        fact = 'tool:%s#%s' % (row['due_key'], row['version'])
+        return self.core.system_letter(conn=conn, letter_id='tool-' + hashlib.sha256(fact.encode()).hexdigest()[:24],
+                                       boxes=boxes, subject=MESSAGES['tool_stall_subject'] % actor,
+                                       body=MESSAGES['tool_stall_body'] % actor, need='统筹', kind='tool.due',
+                                       fact_key=fact, monitor_route=route)['letter_id']
+
+    def box_dir_for(self, unit):
+        """Resolve the private wake directory from a validated logical mailbox."""
+        name = core_mod.check_box_name(unit)
         with self.core._txn(read_only=True) as conn:
             is_position = self.core._is_position_address(conn, name)
-        return (self.home / "positions" / name) if is_position else (self.home / name)
+        home = self.home.resolve()
+        root = home / "positions" if is_position else home
+        path = root / _path_stem(name)
+        if (path / "wake").resolve() != path / "wake":
+            raise ValueError("mailbox wake directory must not use symbolic links")
+        return path
 
     def _dispatch(self, actions):
         """提交后写持久帧，再启动对应的 Codex 消费者。"""
         sender = getattr(self, "dispatch", None)
         if sender is None or not actions:
-            return []
+            return
         written = []
         for action in actions:
             try:
                 with self._frame_lock:
-                    written.append(sender(action))
+                    sender(action)
             except Exception as exc:                               # noqa: BLE001
                 self._log("唤醒帧未写出 %s：%s: %s"
                           % (action.get("due_key"), type(exc).__name__, exc))
                 continue
+            written.append(action)
+        if written:
+            with self._frames_ready:
+                self._frame_seq += 1
+                self._frames_ready.notify_all()
+        for action in written:
             sent_to = set()
             for binding in self._bindings:
                 ref = binding.host_session_ref
-                if (binding.ctx.get("surface") == "codex" and ref and ref not in sent_to
-                        and action.get("unit") in self._carried_units(binding)):
+                if binding.ctx.get("surface") != "codex" or not ref or ref in sent_to:
+                    continue
+                try:
+                    if action.get("unit") not in self._carried_units(binding):
+                        continue
                     with self.core._txn(read_only=True) as conn:
-                        if worker_mod.quota_blocked(conn, binding.binding_id, binding.generation):
+                        if (worker_mod.quota_blocked(conn, binding.binding_id, binding.generation)
+                                or selection_mod.own_alert_only(conn, binding.host_session_ref, action.get('refs'), action.get('unit'))):
                             continue
                     sent_to.add(ref)
-                    try:
-                        subprocess.Popen(self._codex_command(binding, "send", action["due_key"]),
-                                         env=self._codex_env(),
-                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                    except OSError as exc:
-                        self._log("Codex 消费者未启动 %s：%s" % (action.get("due_key"), exc))
-        if written:
-            with self._wake:
-                self._due_seq += 1
-                self._wake.notify_all()
-        return written
+                    subprocess.Popen(self._codex_command(binding, "send", action["due_key"]),
+                                     env=self._codex_env(),
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                except Exception as exc:  # The frame is durable; the regular poll can still pick it up.
+                    self._log(f"Codex 消费者未启动 {ref} {action.get('due_key')}：{type(exc).__name__}: {exc}")
 
     # ------------------------------------------------- 唤醒回执（同一条受控连接上）
     #: 帧文件仍是持久记录（`delivery/dispatch.py` 的边界不变：socket 是宿主→Core 方向）。
@@ -901,7 +1142,9 @@ class Officed:
         d = self.box_dir_for(unit) / "wake"
         for path in sorted(d.glob("batch_round-*.json"))[:max(1, int(limit))]:
             try:
-                out.append((path, json.loads(path.read_text(encoding="utf-8"))))
+                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), encoding="utf-8") as src:
+                    if stat.S_ISREG(os.fstat(src.fileno()).st_mode):
+                        out.append((path, json.load(src)))
             except (OSError, ValueError):
                 continue
         return out
@@ -919,52 +1162,46 @@ class Officed:
         frames = [frame for unit in units for _path, frame in self._wake_frames(unit, 64)
                   if frame.get("kind") == "batch_round" and frame.get("due_key") not in skip
                   and f"{frame.get('due_key')}#{frame.get('due_version')}" not in skip]
-        if any(frame.get("kind") == "batch_round" for frame in frames):
-            with self.core._txn(read_only=True) as conn:
-                versions = {f.get("due_key"): due_mod.get(conn, f.get("due_key"))
-                            for f in frames if f.get("kind") == "batch_round"}
-            frames = [f for f in frames if f.get("kind") != "batch_round" or
-                      (versions.get(f.get("due_key")) and versions[f["due_key"]]["state"] == "armed"
-                       and versions[f["due_key"]]["version"] == f.get("due_version"))]
-        return frames
+        if not frames:
+            return []
+        with self.core._txn(read_only=True) as conn:
+            versions = {key: due_mod.get(conn, key) for key in {f.get("due_key") for f in frames}}
+            return [frame for frame in frames if (row := versions[frame.get("due_key")])
+                    and row["state"] == "armed" and row["version"] == frame.get("due_version")
+                    and not selection_mod.own_alert_only(conn, binding.host_session_ref, frame.get('refs'), frame.get('unit'))]
 
     #: `round.await` 的默认与上限（毫秒）。上限是**协议**而不是调度：宿主不许自己去轮询。
     AWAIT_DEFAULT_MS = 25000
     AWAIT_MAX_MS = 60000
 
     def _await_wake(self, units, binding, wait_ms, skip):
-        """阻塞到"这个单元有可交付的帧"或 `wait_ms` 到点；返回帧表（**不删**，回执才删）。
-
-        等待只用 `_wake` 这一个信号（提交后写出帧会叫醒它），没有轮询、没有服务端之外的计时器。
-
-        ★ 取号和扫帧的**顺序是协议**：先取 `_due_seq`、再扫盘。反过来的话，一次真实的
-          `_dispatch` 可能正好落在"扫完空表"与"进锁取号"之间 —— 它 notify 的是我们还没读的旧序号，
-          于是这一趟白等到超时，而盘上明明有一帧（真机上就是这样空返回一次的）。
-          取号之后进锁再比一次：变了就立刻重扫，没变才真的睡。
-        """
+        """Wait for a persisted frame. Snapshot the signal before scanning to avoid missing one."""
         skip = set(skip or ())
         units = list(units or ())
         deadline = time.monotonic() + max(0, min(int(wait_ms), self.AWAIT_MAX_MS)) / 1000.0
-        while True:
-            with self._wake:
-                seq = self._due_seq                      # 先取信号
-            frames = self._frames_of(units, binding, skip)        # 再扫盘
+        while not self._stop.is_set():
+            with self._frames_ready:
+                seq = self._frame_seq
+            frames = self._frames_of(units, binding, skip)
             if frames:
                 return frames
-            with self._wake:
-                if self._due_seq != seq:
-                    continue                             # 扫盘期间有帧写出 ⇒ 立刻重扫，不睡
+            with self._frames_ready:
+                if self._stop.is_set():
+                    break
+                if self._frame_seq != seq:
+                    continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                self._wake.wait(remaining)               # 没变才睡；醒来无条件重扫
-        return self._frames_of(units, binding, skip)              # 超点前最后一帧也要交给宿主
+                self._frames_ready.wait(remaining)
+        return [] if self._stop.is_set() else self._frames_of(units, binding, skip)
 
     def _ack_ready(self, frame, binding):
         """Acknowledge only the current binding's exact frame after native receipt.
 
         A new turn proves receipt via its recorded run. Claude can also receive
         mail at a tool boundary in an existing turn, with a matching native item.
+        None means the frame is no longer current.
         """
         unit, refs = frame.get("unit"), list(frame.get("refs") or ())
         if not isinstance(unit, str) or not unit or not refs:
@@ -974,6 +1211,10 @@ class Officed:
         instance = binding.ctx.get("instance") if isinstance(binding.ctx, dict) else None
         wanted = set(refs)
         with self.core._txn(read_only=True) as conn:
+            if key := frame.get("due_key"):
+                current = due_mod.get(conn, key)
+                if not current or current["state"] != "armed" or current["version"] != frame.get("due_version"):
+                    return None
             marks = ",".join("?" * len(wanted))
             rows = conn.execute(
                 "SELECT r.token, r.binding_id, r.binding_gen, r.state, r.run_state, r.channel,"
@@ -1039,14 +1280,25 @@ class Officed:
             return {"ok": True, "result": result}
         if req.get("op") == "wake.ack":
             key, due_key = req.get("attempt_key"), req.get("due_key")
+            version = req.get("due_version")
             if key is not None and (not isinstance(key, str) or not key):
                 return {"ok": False, "code": "invalid_request", "message": "attempt_key must be non-empty"}
+            if version is not None and (type(version) is not int or version < 1):
+                return {"ok": False, "code": "invalid_request", "message": "due_version must be a positive integer"}
             with self._frame_lock:
                 for unit in units:
                     for path, frame in self._wake_frames(unit, 64):
-                        if frame.get("due_key") != due_key or (key and frame.get("attempt_key") != key):
+                        if (frame.get("due_key") != due_key or (key and frame.get("attempt_key") != key)
+                                or (version is not None and frame.get("due_version") != version)):
                             continue
-                        if frame.get("kind") == "batch_round" and not self._ack_ready(frame, binding):
+                        ready = self._ack_ready(frame, binding) if frame.get("kind") == "batch_round" else True
+                        if ready is None:
+                            try:
+                                path.unlink()
+                            except OSError:
+                                pass
+                            continue
+                        if not ready:
                             # 不是"这一轮"发出的、或还没有原生受理/尝试：待办不清，帧留着。
                             return {"ok": True, "result": {
                                 "taken": False, "kind": frame.get("kind"), "unit": frame.get("unit"),
@@ -1070,12 +1322,16 @@ class Officed:
     def stop(self):
         self._stop.set()
         with self._wake:
-            self._wake.notify_all()
+            self._wake.notify()
+        with self._frames_ready:
+            self._frames_ready.notify_all()
         if self._server is not None:
             try:
                 self._server.close()
             except OSError:
                 pass
+        if not self._serving:
+            self._cleanup_listener()
 
 
 def main(argv=None):
@@ -1119,14 +1375,14 @@ def main(argv=None):
     if not args.bindings:
         print("officed: --bindings is required to serve", file=sys.stderr)
         return 2
-    bindings = Path(args.bindings).expanduser().resolve()
-    socket_path = Path(args.socket).expanduser().resolve() if args.socket \
+    bindings = Path(args.bindings).expanduser().absolute()
+    socket_path = Path(args.socket).expanduser().absolute() if args.socket \
         else home / "sock" / "officed.sock"
     daemon = Officed(home, socket_path, bindings,
-                     Path(args.descriptor).expanduser().resolve() if args.descriptor else None)
+                     Path(args.descriptor).expanduser().absolute() if args.descriptor else None)
     try:
         daemon.prepare()
-    except ValueError as e:
+    except (OSError, ValueError) as e:
         print("officed: %s" % e, file=sys.stderr)
         return 2
     # Core recovers unsubmitted rounds and selects mail before rendering the next frame.
@@ -1152,7 +1408,8 @@ def main(argv=None):
                 "reason": plan.get("reason"), "hold_until": plan.get("hold_until"),
                 "bad_created_at": plan.get("bad_created_at")}
 
-    daemon.handlers = build_handlers(daemon.core, begin_round=begin_round)
+    daemon.handlers = build_handlers(daemon.core, begin_round=begin_round,
+                                     observe=daemon._observe_tool, notify=daemon._notify_tool)
     daemon.dispatch = dispatch_mod.wake_host(box_dir_for=daemon.box_dir_for)
 
     print("officed: home=%s socket=%s bindings=%d descriptors=%s"

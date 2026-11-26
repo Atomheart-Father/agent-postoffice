@@ -8,7 +8,7 @@ See [the BoxZ Office project page](https://boxzstudio.xyz/projects/agent-postoff
 
 The `office/` directory contains the service and native host adapters. The `app/` directory contains the SwiftUI app. Both build from the same release tag.
 
-With Codex Desktop running, Office can wake an existing, bound Desktop session for actionable mail. Long model silence no longer sends mail or starts work.
+With Codex Desktop running, Office can wake an existing, bound Desktop session for actionable mail. Office can notify the responsible manager when an assigned session reports an interruption and has actionable Work. These notices do not resume the interrupted session.
 
 ## Download the macOS package
 
@@ -19,9 +19,9 @@ Download the [prebuilt macOS ZIP](https://github.com/Atomheart-Father/BOXZ-Offic
 Requires macOS 14+, full Xcode, Git, Node.js, Bun, and Python 3.12 or newer.
 
 ```sh
-git clone --branch v1.1.0-preview.1 https://github.com/Atomheart-Father/BOXZ-Office.git
+git clone --branch v1.1.0-preview.2 https://github.com/Atomheart-Father/BOXZ-Office.git
 cd BOXZ-Office
-release="$HOME/office-releases/office-1.1.0-preview.1"
+release="$HOME/office-releases/office-1.1.0-preview.2"
 mkdir -p "$HOME/office-releases"
 python3 office/tools/stage_release.py "$(git rev-parse HEAD)" "$release"
 python3 "$release/office/tools/install_release.py" --home "${POSTOFFICE_HOME:-$HOME/office11}"

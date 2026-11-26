@@ -7,6 +7,7 @@ import Foundation
 enum ReadOp: String {
     case whoami = "office.context"
     case lookup = "office.lookup"
+    case position = "position.profile"
     case letter = "letter.read"
     case workList = "work.list"       // office_work_list
     case workGet = "work.get"
@@ -173,8 +174,15 @@ public struct Inbox: Sendable, Equatable {
     public let box: String
     public let count: Int
     public let letters: [LetterRow]
+    public internal(set) var nextCursor: String? = nil
     /// 后端报的总数和这次读到的行数一致才算读全；不一致，"几封在等你"只是下限。
     public var complete: Bool { count == letters.count }
+}
+
+public struct PositionProfile: Sendable {
+    public let duties: [String]
+    public let reportsTo: String?
+    public let canEdit: Bool
 }
 
 public struct LetterPage: Sendable {
@@ -325,8 +333,15 @@ public struct OfficeReads: Sendable {
     }
 
     /// 读信箱。`target` 省略 = 自己的箱；给了就是直读那个地址的箱（老板可读，后端判权）。
-    public func inbox(target: String? = nil) -> Outcome<Inbox> {
-        call(.letter, target.map { ["target": $0] } ?? [:]) { r in
+    public func inbox(target: String? = nil, archived: Bool = false, cursor: String? = nil) -> Outcome<Inbox> {
+        var args: [String: Any] = [:]
+        args["target"] = target
+        if archived {
+            args["archived_only"] = true
+            args["limit"] = 20
+            args["cursor"] = cursor
+        }
+        return call(.letter, args) { r in
             guard let box = r["box"] as? String, let rows = r["letters"] as? [[String: Any]] else { return nil }
             let letters = rows.compactMap { l -> LetterRow? in
                 // 缺 needs_reply / system 就是读不懂（整页未知），不默认成 false；accepted 缺 / null = 未知，保留 nil。
@@ -343,15 +358,17 @@ public struct OfficeReads: Sendable {
             // 有一封读不懂就是整页读不懂：宁可"未知"，也不把少了的行当成零。
             guard letters.count == rows.count else { return nil }
             return Inbox(box: box, count: r["count"] as? Int ?? letters.count,
-                         letters: letters.sorted { $0.createdAt > $1.createdAt })
+                         letters: letters.sorted { $0.createdAt > $1.createdAt },
+                         nextCursor: r["next_cursor"] as? String)
         }
     }
 
     /// 单封正文定位到当前信箱。长信下一页直接用 Core 返回的游标。
-    public func letterPage(_ id: String, target: String? = nil, cursor: Int? = nil) -> Outcome<LetterPage> {
+    public func letterPage(_ id: String, target: String? = nil, cursor: Int? = nil, archived: Bool = false) -> Outcome<LetterPage> {
         var params: [String: Any] = ["letter_id": id]
         params["target"] = target
         params["cursor"] = cursor
+        if archived { params["include_archived"] = true }
         return call(.letter, params) { r in
             guard let letter = r["letter"] as? [String: Any], letter["letter_id"] as? String == id,
                   let text = letter["body"] as? String, let digest = letter["body_sha256"] as? String else { return nil }
@@ -363,7 +380,14 @@ public struct OfficeReads: Sendable {
         }
     }
 
-    /// 三态在这里统一折：`ok:true` → 解析（读不懂 = 未知）；`ok:false` + `unknown` → 未知；其余 `ok:false` → 明确拒绝。
+    public func positionProfile(_ position: String) -> Outcome<PositionProfile> {
+        call(.position, ["position": position]) { r in
+            guard let duties = r["duties"] as? [String], let editable = r["can_edit"] as? Bool else { return nil }
+            return PositionProfile(duties: duties, reportsTo: r["reports_to"] as? String, canEdit: editable)
+        }
+    }
+
+    /// 解析失败和服务故障保留为未知，只有明确业务拒绝才显示原因。
     func call<T: Sendable>(_ op: ReadOp, _ params: [String: Any] = [:], parse: ([String: Any]) -> T?) -> Outcome<T> {
         switch socket.exchange(params.merging(["op": op.rawValue]) { _, op in op }) {
         case .notConnected(let d): return .notConnected(detail: d)
@@ -377,7 +401,9 @@ public struct OfficeReads: Sendable {
                 return .ok(value)
             }
             let code = frame["code"] as? String ?? ""
-            if code == "unknown" { return .unknown(detail: frame["message"] as? String ?? tr("后端报告结果未知", "The office reports the result as unknown")) }
+            if ["unknown", "outcome_unknown", "internal", "busy"].contains(code) {
+                return .unknown(detail: frame["message"] as? String ?? tr("后端报告结果未知", "The office reports the result as unknown"))
+            }
             guard !code.isEmpty else { return .unknown(detail: tr("答复既不是成功也不是拒绝", "Reply is neither success nor refusal")) }
             return .refused(code: code, message: frame["message"] as? String ?? "")
         }

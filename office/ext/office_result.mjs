@@ -137,9 +137,11 @@ const UNREACHABLE = new Set(["no_controlled_endpoint", "no_socket_path", "no_cor
 
 /** Which of the three outcomes one result is. Unknown codes are refusals, never silently "ok". */
 export function outcomeOf(result) {
-	if (!result || result.ok !== false) return OUTCOMES.ok;
+	if (!result || typeof result !== "object" || Array.isArray(result)) return OUTCOMES.unknown;
+	if (result.ok !== false) return OUTCOMES.ok;
 	const code = result.error ?? result.code ?? "";
-	if (code === "outcome_unknown") return OUTCOMES.unknown;
+	if (code === "outcome_unknown" || code === "unknown" || code === "internal")
+		return result.sent === false ? OUTCOMES.refused : OUTCOMES.unknown;
 	// A connect failure and a post-write failure are the same code but opposite facts: only the
 	// second one can have created the letter, so only the second one is `unknown`.
 	if (TRANSPORT_UNKNOWN.has(code)) return result.sent === false ? OUTCOMES.refused : OUTCOMES.unknown;

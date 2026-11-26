@@ -167,7 +167,7 @@ def _check_rel(rel, where):
     if not isinstance(rel, str) or not rel or rel.startswith("/") or "\x00" in rel:
         raise where.outside(rel)
     parts = rel.split("/")
-    if any(p in ("", ".", "..") for p in parts) or parts[0] == "_priv":
+    if any(p in ("", ".", "..") or p.casefold() == "_priv" for p in parts):
         raise where.outside(rel)
     return parts
 
@@ -413,7 +413,7 @@ def _snapshot_group(scope, prefix, where, items, store_fd, max_bytes):
         os.close(scope_fd)
 
 
-def prepare_change_sets(groups, *, artifact_root=None, max_bytes=MAX_BYTES):
+def prepare_change_sets(groups, *, artifact_root=None, max_bytes=MAX_BYTES, check_paths=None):
     """Prepare a multi-workspace snapshot without publishing formal content-addressed blobs.
 
     Returns ``(change_set, skipped_shadow_paths, commit, close)``. The caller must pass
@@ -421,14 +421,17 @@ def prepare_change_sets(groups, *, artifact_root=None, max_bytes=MAX_BYTES):
     ``finally`` block. Until Core invokes ``commit`` after its write-transaction checks, all
     result bytes remain temporary and ``close`` removes them on refusal or conflict.
     """
+    plans = [(root, prefix, *_plan_group(root, prefix, files)) for root, prefix, files in groups]
+    if check_paths is not None:
+        check_paths([{"ref": f"{prefix}/{path}", "op": op}
+                     for _, prefix, _, items in plans for path, op in items])
     store_fd = _open_store(artifact_root)
     pending = []
     closed = False
     committed = False
     try:
         out, skipped = [], []
-        for scope_root, prefix, files in groups:
-            where, items = _plan_group(scope_root, prefix, files)
+        for scope_root, prefix, where, items in plans:
             g_out, g_skipped, g_temps = _snapshot_group(scope_root, prefix, where, items,
                                                          store_fd, max_bytes)
             out.extend(g_out)

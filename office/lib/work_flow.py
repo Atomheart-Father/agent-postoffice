@@ -143,7 +143,7 @@ def release_dependents(conn, work_ref):
 # --------------------------------------------------------------------------- publish
 
 def plan(conn, actor, *, work_ref, change_set, expected_version=None, replaces=None,
-         scope_covers=None, now_ts=None):
+         scope_covers=None, now_ts=None, person=None):
     """交付前的**业务预检**（承办/状态/范围/版本/在途）：`publish` 与 Core 的"落字节之前"共用它
     —— 同一个函数调两次，不是两套规则。返回 `(row, pending, now)`，不成立就抛 `ResultRefused`。"""
     row = _work_row(conn, work_ref)
@@ -175,7 +175,7 @@ def plan(conn, actor, *, work_ref, change_set, expected_version=None, replaces=N
                                    % (pending["sub_ref"], pending["sub_ref"]),
                                 work_ref=work_ref, current_sub=pending["sub_ref"],
                                 reason_code="pending_submission")
-        if pending["submitted_by"] != actor:
+        if same_submitter(conn, work_ref, pending["sub_ref"], pending["submitted_by"], person) is not True:
             raise ResultRefused("unauthorized_attempt", "只能替换本人的在途提交",
                                 en="You can only replace your own submission in flight",
                                 sub_ref=pending["sub_ref"], reason_code="not_submitter", needs="submitter")
@@ -188,14 +188,9 @@ def plan(conn, actor, *, work_ref, change_set, expected_version=None, replaces=N
     return row, pending, now
 
 
-def replay_key(work_ref, change_set, note, replaces, final):
-    """`work.publish` 的幂等键：Core 也用它问"这一批是不是回放"——回放不该被预检拦下。"""
-    return {"work_ref": work_ref, "change_set": change_set, "note": note,
-            "replaces": replaces, "final": bool(final)}
-
-
 def publish(storage, conn, actor, *, work_ref, change_set, store_root, act_key, note="",
-            replaces=None, expected_version=None, final=False, now_ts=None, scope_covers=None, operator=None):
+            replaces=None, expected_version=None, final=False, now_ts=None, scope_covers=None,
+            operator=None, commit_snapshot=None):
     """交付一件 Work 的成果。返回这次提交的事实（含哪些下游因此被解开）。
 
     在**调用方的事务里**执行；不自己开事务、不提交。
@@ -203,14 +198,17 @@ def publish(storage, conn, actor, *, work_ref, change_set, store_root, act_key, 
     require_actor(actor)
     note = note or ""
     replay, digest = storage.action_replay(conn, actor, "work.publish", act_key,
-                                          replay_key(work_ref, change_set, note, replaces, final))
+                                          {"work_ref": work_ref, "change_set": change_set, "note": note,
+                                           "replaces": replaces, "final": final})
     if replay is not None:
         return replay
 
     person = operator() if operator else actor
     row, pending, now = plan(conn, actor, work_ref=work_ref, change_set=change_set,
                              expected_version=expected_version, replaces=replaces,
-                             scope_covers=scope_covers, now_ts=now_ts)
+                             scope_covers=scope_covers, now_ts=now_ts, person=person)
+    if commit_snapshot is not None:
+        commit_snapshot()
     if pending is not None and replaces:                 # 预检只读，替换在这里落（一次）
         conn.execute("UPDATE subs SET state=? WHERE sub_ref=?", (SUB_REPLACED, replaces))
 
@@ -285,7 +283,7 @@ def review(storage, conn, actor, *, work_ref, sub_ref, decision, reason=None, ev
                             work_ref=work_ref, state=row["state"], reason_code="not_submitted")
     current = _require_current_sub(conn, row, sub_ref)
     person = operator() if operator else actor
-    own = same_submitter(conn, work_ref, sub_ref, current["submitted_by"], actor, person)
+    own = same_submitter(conn, work_ref, sub_ref, current["submitted_by"], person)
     if own is None:
         raise ResultRefused("unauthorized_attempt", "这份旧岗位提交无法核实经办人，请重新发布",
                             en="This older position submission has no verified submitter. Publish it again.",

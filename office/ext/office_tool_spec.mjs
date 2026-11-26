@@ -35,10 +35,19 @@ const WORK = S("_shared/WORK");
 // Review is one plain field; the adapter turns it into the wire's {mode, reviewer}. "none" is the explicit
 // no-review choice (never inferred from a missing reviewer).
 const REVIEWER = S("_shared/REVIEWER");
-// A list item that is either a plain locator string or an object with details.
-const STR_OR_OBJ = { anyOf: [{ type: "string" }, { type: "object" }] };
 const REFERENCE = { description_zh: textOf("_shared/REFERENCE").zh,
 	description_en: textOf("_shared/REFERENCE").en };
+const RESOURCE_REFERENCE = {
+	type: "object",
+	properties: { resource: { type: "string" }, version: { type: "string" },
+		sub: { type: "string" }, note: { type: "string" } },
+	required: ["resource"], additionalProperties: false,
+};
+const FILE_CHANGE = {
+	type: "object",
+	properties: { path: { type: "string" }, op: { type: "string", enum: ["write", "delete"] } },
+	required: ["path"], additionalProperties: false,
+};
 const RELATION = {
 	type: "object",
 	description_zh: textOf("_shared/RELATION").zh,
@@ -176,7 +185,7 @@ export const OFFICE_TOOLS = [
 				assignee: S("office_work_create/assignee"),
 				reviewer: REVIEWER,
 				acceptance: S("office_work_create/acceptance"),
-				references: { type: "array", items: STR_OR_OBJ, ...REFERENCE },
+				references: { type: "array", items: { anyOf: [{ type: "string" }, RESOURCE_REFERENCE] }, ...REFERENCE },
 				relations: { type: "array", items: RELATION, ...textFields("office_work_create/relations") },
 				scope: S("office_work_create/scope"),
 			},
@@ -186,12 +195,14 @@ export const OFFICE_TOOLS = [
 	},
 	{
 		name: "office_work_update", op: "work.update", write: true,
+		business_fields: ["expected_version"],
 		label: textPair("office_work_update/label"),
 		description: textPair("office_work_update/description"),
 		parameters: {
 			type: "object",
 			properties: {
 				work_ref: WORK,
+				expected_version: I("_shared/WORK_VERSION", {minimum: 1}),
 				action: S("office_work_update/action",
 					{ enum: ["assign", "reviewer", "edit", "references", "wait", "continue", "cancel"] }),
 				assignee: S("office_work_update/assignee"),
@@ -199,8 +210,9 @@ export const OFFICE_TOOLS = [
 				reviewer: S("office_work_update/reviewer"),
 				objective: S("office_work_update/objective"),
 				acceptance: S("office_work_update/acceptance"),
-				add: { type: "array", items: STR_OR_OBJ, ...textFields("office_work_update/add") },
-				remove: { type: "array", items: { type: "object" },
+				add: { type: "array", items: { anyOf: [{ type: "string" }, RESOURCE_REFERENCE, RELATION] },
+					...textFields("office_work_update/add") },
+				remove: { type: "array", items: { anyOf: [RESOURCE_REFERENCE, RELATION] },
 					...textFields("office_work_update/remove") },
 				reason: S("office_work_update/reason"),
 				on: S("office_work_update/on"),
@@ -223,13 +235,16 @@ export const OFFICE_TOOLS = [
 	},
 	{
 		name: "office_work_publish", op: "work.publish", write: true,
+		business_fields: ["expected_version"],
 		label: textPair("office_work_publish/label"),
 		description: textPair("office_work_publish/description"),
 		parameters: {
 			type: "object",
 			properties: {
 				work_ref: WORK,
-				files: { type: "array", items: STR_OR_OBJ, ...textFields("office_work_publish/files") },
+				expected_version: I("_shared/WORK_VERSION", {minimum: 1}),
+				files: { type: "array", minItems: 1, items: { anyOf: [{ type: "string" }, FILE_CHANGE] },
+					...textFields("office_work_publish/files") },
 				note: S("office_work_publish/note"),
 				replaces: S("office_work_publish/replaces"),
 				final: B("office_work_publish/final"),

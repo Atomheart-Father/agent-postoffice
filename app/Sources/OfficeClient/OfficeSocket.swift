@@ -1,10 +1,12 @@
 import Darwin
 import Foundation
+import CryptoKit
 
 /// 老板这一端点的描述文件（`<home>/sock/boss.endpoint.json`）。令牌本体不在里面，只给路径。
 struct EndpointDescriptor: Decodable {
     let socketPath: String
     let tokenFile: String
+    let authorityRef: String?
 }
 
 /// 最小 AF_UNIX 客户端：一行一个 JSON，一次请求一条连接。
@@ -12,17 +14,45 @@ struct EndpointDescriptor: Decodable {
 public struct OfficeSocket: Sendable {
     public let home: URL
     public let timeout: TimeInterval
+    public let offline: Bool
+    private let expectedIdentity: String?
+    private let testOnly: Bool
     /// 读取日志（默认关，由 App 注入）：给了路径就每次读 op 追加一行"时间 op"。只记时间和 op 名，不记参数、不记令牌。
     /// 用来实测每轮读了多少次、窗口不在前台时读取确实停了。
     public let readLog: URL?
     static let maxReply = 8 * 1024 * 1024
 
-    public init(home: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("office11"),
+    public init(testOnly: Bool = false, home: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("office11"),
                 timeout: TimeInterval = 8,
-                readLog: URL? = nil) {
+                readLog: URL? = nil, offline: Bool = false, expectedIdentity: String? = nil) {
         self.home = home
+        self.testOnly = testOnly
+        self.offline = offline
+        self.expectedIdentity = expectedIdentity
         self.timeout = timeout
         self.readLog = readLog
+    }
+
+    private var requiresIsolation: Bool {
+        testOnly || ProcessInfo.processInfo.processName.hasSuffix("PackageTests") ||
+            CommandLine.arguments.contains { $0.contains(".xctest") }
+    }
+
+    /// 未决写跟随同一数据库与绑定代次，令牌轮换时使用新令牌认证。
+    public func identity() -> String? {
+        let testing = requiresIsolation
+        if offline || (testing && !WriteGate.isIsolated(path: home.path)) { return nil }
+        let url = home.appendingPathComponent("sock/boss.endpoint.json")
+        guard let raw = try? Data(contentsOf: url), let desc = try? JSONDecoder().decode(EndpointDescriptor.self, from: raw),
+              !testing || (WriteGate.isIsolated(path: desc.socketPath) && WriteGate.isIsolated(path: desc.tokenFile)),
+              let token = try? String(contentsOfFile: desc.tokenFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return nil }
+        return desc.authorityRef ?? Self.fingerprint(path: desc.socketPath, token: token)
+    }
+    private static func fingerprint(path: String, token: String) -> String {
+        SHA256.hash(data: Data((WriteGate.realPath(path) + "\0" + token).utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+    public func bound(to identity: String) -> OfficeSocket {
+        OfficeSocket(testOnly: testOnly, home: home, timeout: timeout, readLog: readLog, offline: offline, expectedIdentity: identity)
     }
 
     private static let logLock = NSLock()
@@ -41,6 +71,9 @@ public struct OfficeSocket: Sendable {
     /// `isolatedOnly`：写入用——端点描述里的 socket 与令牌文件也必须在隔离目录下，
     /// 否则 /private/tmp 里放一个指向正式 officed 的描述文件就能绕过开关。
     func exchange(_ request: [String: Any], isolatedOnly: Bool = false) -> Outcome<[String: Any]> {
+        guard !offline else { return .notConnected(detail: tr("模拟数据，未连接", "Sample data: offline")) }
+        let isolated = isolatedOnly || requiresIsolation
+        if isolated && !WriteGate.isIsolated(path: home.path) { return .notConnected(detail: "test home is not isolated") }
         if !isolatedOnly { logRead(request["op"] as? String ?? "?") }
         let descriptorURL = home.appendingPathComponent("sock/boss.endpoint.json")
         guard let raw = try? Data(contentsOf: descriptorURL),
@@ -48,9 +81,9 @@ public struct OfficeSocket: Sendable {
             return .notConnected(detail: tr("没有可用的端点描述文件", "No usable endpoint file"))
         }
         // 写入：检查的和实际连的 / 读的是同一份解析后的路径（检查之后再换符号链接也没用）。
-        let socketPath = isolatedOnly ? WriteGate.realPath(desc.socketPath) : desc.socketPath
-        let tokenFile = isolatedOnly ? WriteGate.realPath(desc.tokenFile) : desc.tokenFile
-        if isolatedOnly, !(WriteGate.isIsolated(path: socketPath) && WriteGate.isIsolated(path: tokenFile)) {
+        let socketPath = isolated ? WriteGate.realPath(desc.socketPath) : desc.socketPath
+        let tokenFile = isolated ? WriteGate.realPath(desc.tokenFile) : desc.tokenFile
+        if isolated, !(WriteGate.isIsolated(path: socketPath) && WriteGate.isIsolated(path: tokenFile)) {
             return .notConnected(detail: tr("写入被拒：端点不在隔离目录", "Write refused: endpoint is not in the isolated directory"))
         }
         guard var token = try? String(contentsOfFile: tokenFile, encoding: .utf8)
@@ -58,6 +91,9 @@ public struct OfficeSocket: Sendable {
             return .notConnected(detail: tr("没有可用的令牌文件", "No usable token file"))
         }
         defer { token = "" }
+        if let expectedIdentity, expectedIdentity != (desc.authorityRef ?? Self.fingerprint(path: socketPath, token: token)) {
+            return .notConnected(detail: tr("端点身份已变化", "Endpoint identity changed"))
+        }
         var frame = request
         frame["session_token"] = token
         guard var line = try? JSONSerialization.data(withJSONObject: frame) else {

@@ -8,7 +8,7 @@ import OfficeClient
 ///   BOXZ_SNAPSHOT      <路径>[@宽x高]：首轮读完摆好视图后，把窗口自己存成 PNG（默认 1440x900）
 ///   BOXZ_PAGE          org | host | work | usage | settings；可带参数 work:<项目> / org:unassigned / host:<绑定>
 ///   BOXZ_DRAWER        inbox | requests | project:<ref> | work:<ref> | seat:<地址>
-///   BOXZ_OPEN_ACTION   decide:<申请>:approve|refuse | reply:<信号> | compose:<地址> | review:<work>:accept|return | offline-host:<宿主名>
+///   BOXZ_OPEN_ACTION   decide:<申请>:approve|refuse | reply:<信号> | archive:<信号> | compose:<地址> | review:<work>:accept|return | offline-host:<宿主名>
 /// 外观 / 语言不在这里：走 UserDefaults 的命令行参数域，`--args -appearance dark -uiLanguage en`。
 struct LaunchScript {
     let socket: OfficeSocket
@@ -98,6 +98,9 @@ struct LaunchScript {
         case "reply":
             guard let l = desk.inbox.value?.letters.first(where: { $0.id == p[1] }) else { return }
             desk.beginAction("reply:" + l.id, .reply(to: l.from, replyTo: l.id), subject: "Re: " + l.subject, text: tr("收到，同意。", "Got it, approved."))
+        case "archive":
+            guard let letter = desk.inbox.value?.letters.first(where: { $0.id == p[1] }) else { return }
+            desk.beginAction("archive:" + letter.id, .archive(letterID: letter.id), subject: letter.subject)
         case "compose":
             desk.beginAction("compose:" + p[1], .compose(to: p[1]), subject: tr("演示项目的进度", "Demo project progress"), text: tr("请告诉我现在的进度。", "Please tell me the current progress."))
         case "review":

@@ -86,6 +86,17 @@ def _epoch(value):
     return None
 
 
+def _item(row, origins):
+    from lib.mail import letter_fields
+
+    ref = row["letter_id"]
+    meta = _meta(row["meta_json"])
+    fields = letter_fields(row, row, ("subject", "need"))
+    return {"ref": ref, "kind": _kind_of(row, meta, fields["need"]), "created_at": _epoch(row["created_at"]),
+            "subject": fields["subject"], "logical_address": row["logical_address"],
+            "meta": meta, "alert_origin": origins.get(ref)}
+
+
 def candidates(conn, box, *, only=None, exclude=None, own_round=None):
     """This box's deliverable letters, oldest first, as plain dicts.
 
@@ -97,38 +108,32 @@ def candidates(conn, box, *, only=None, exclude=None, own_round=None):
     `only`/`exclude` are the caller's ref filters (`round_begin(only_refs=, exclude_refs=)`), applied
     here rather than at the round so "what would go" and "what goes" see the same list.
     """
-    from lib.mail import letter_fields
-
+    keep = set(only) if only is not None else None
+    if keep == set():
+        return []
     rows = conn.execute(
         "SELECT l.letter_id, l.from_actor, l.created_at, l.subject, l.need, l.meta_json, s.state, s.state_reason,"
         " s.accepted_at, s.category, s.logical_address, s.content_override_json"
         " FROM letter_states s JOIN letters l ON l.letter_id=s.letter_id"
-        " WHERE s.box=? AND s.state='delivered' AND s.accepted_at IS NULL"
+        " WHERE s.box=? AND s.state='delivered' AND s.accepted_at IS NULL" +
+        (" AND s.letter_id IN (SELECT value FROM json_each(?))" if keep is not None else "") +
         # No `ORDER BY l.created_at`: the column can hold both text and epoch rows during the
         # transition, and SQLite sorts numbers before text, so a mixed table would silently reorder
         # the queue (measured: the epoch row jumped ahead of an older text row). Ordering happens in
         # Python on the parsed value instead, which is the only shape this module reasons about.
-        " ORDER BY s.letter_id", (box,)).fetchall()
-    keep = set(only) if only is not None else None
-    drop = set(exclude or ())
-    reserved = set(_reserved_refs(conn, box, own_round))
+        " ORDER BY s.letter_id", (box,) if keep is None else (box, json.dumps(sorted(keep)))).fetchall()
+    drop = set(exclude or ()) | set(_reserved_refs(conn, box, own_round))
+    rows = [row for row in rows if row["letter_id"] not in drop]
+    if not rows:
+        return []
     from office_core import Core
-    facts = Core._mail_facts(conn, rows)
+    facts = Core._mail_facts(conn, rows, box=box)
     out = []
     for row in rows:
-        ref = row["letter_id"]
-        if keep is not None and ref not in keep:
-            continue
-        if ref in drop or ref in reserved:
-            continue
-        meta = _meta(row["meta_json"])
         life = Core._letter_lifecycle(row, row, facts=facts, box=box)
         if life["terminal"] and (life["letter_class"] == "work_notice" or life["terminal_reason"] == "alert_obsolete"):
             continue
-        fields = letter_fields(row, row, ("subject", "need"))
-        out.append({"ref": ref, "kind": _kind_of(row, meta, fields["need"]), "created_at": _epoch(row["created_at"]),
-                    "subject": fields["subject"], "logical_address": row["logical_address"],
-                    "meta": meta})
+        out.append(_item(row, facts["_alert_origins"]))
     # Unparseable rows last, then oldest first, then by ref so the answer is stable across passes.
     out.sort(key=lambda item: (item["created_at"] is None,
                                item["created_at"] if item["created_at"] is not None else 0.0,
@@ -137,12 +142,35 @@ def candidates(conn, box, *, only=None, exclude=None, own_round=None):
 
 
 
+def _formal_and_passive(conn, box, items):
+    formal = [item for item in items if item["kind"] in FORMAL_KINDS]
+    if not any(item["alert_origin"] for item in formal):
+        return formal, set()
+    sessions = {row[0] for row in conn.execute(
+        "SELECT host_session_ref FROM bindings WHERE actor=? AND state='active'"
+        " AND revoked_at IS NULL AND host_session_ref<>''", (box,))}
+    primary, peer, passive = [], [], set()
+    for item in formal:
+        origin = item["alert_origin"]
+        if origin not in sessions:
+            primary.append(item)
+        elif len(sessions) == 1:
+            passive.add(item["ref"])
+        else:
+            # A peer can be woken for an alert about another session. Leave room for independent
+            # business in the shared batch so the affected session can receive its own real mail.
+            peer.append(item)
+    return primary + peer, passive
+
+
 def automatic_pending_count(conn, box):
     """Current formal mail that can still be selected by the normal scheduler."""
     from delivery import due
     batch = due.get(conn, due.due_key("batch", box))
-    return sum(item["kind"] in FORMAL_KINDS and item["created_at"] is not None
-               for item in candidates(conn, box)) if batch and batch["state"] == "armed" else 0
+    if not batch or batch["state"] != "armed":
+        return 0
+    formal, _ = _formal_and_passive(conn, box, candidates(conn, box))
+    return sum(item["created_at"] is not None for item in formal)
 
 
 def pending_delivery_count(conn, box):
@@ -159,9 +187,7 @@ def unresolved_refs(conn, box, *, reserved=None, normal=None):
         "SELECT DISTINCT rr.ref FROM round_ref rr JOIN round r ON r.token=rr.token"
         " JOIN letter_states s ON (s.box,s.letter_id)=(rr.box,rr.ref)"
         " WHERE rr.box=? AND rr.ref_state='active' AND s.state='delivered' AND s.accepted_at IS NULL"
-        " AND r.state='begun' AND (r.send_id NOT IN ('', '-') OR"
-        " ((r.send_id IS NULL OR r.send_id='') AND ("
-        " EXISTS (SELECT 1 FROM round_payload p WHERE p.token=r.token) OR rr.harness_ref IS NOT NULL)))", (box,))
+        " AND r.state='begun' AND r.send_id<>'-'", (box,))
     return unknown | {row[0] for row in authorized}
 
 
@@ -175,6 +201,27 @@ def delivery_projection(conn, box):
     return {"pending": automatic + len(normal), "automatic": automatic,
             "in_flight": len(normal - unresolved),
             "unresolved": {"count": len(letters), "letters": letters[:20], "has_more": len(letters) > 20}}
+
+
+def own_alert_only(conn, session, refs, box, *, items=None):
+    """A session may read its own alert, but that alert alone must not start it."""
+    refs = refs or []
+    if not refs or not session:
+        return False
+    if items is None:
+        from office_core import Core
+
+        rows = conn.execute("SELECT l.*,s.category,s.content_override_json,s.logical_address"
+                            " FROM letters l JOIN letter_states s ON s.letter_id=l.letter_id"
+                            " WHERE s.box=? AND s.letter_id IN (SELECT value FROM json_each(?))",
+                            (box, json.dumps(sorted(set(refs))))).fetchall()
+        if len(rows) != len(set(refs)):
+            return False
+        origins = Core._mail_facts(conn, rows, box=box)["_alert_origins"]
+        items = [_item(row, origins) for row in rows]
+    formal = [item for item in items if item["kind"] in FORMAL_KINDS]
+    return bool(formal and all(item["alert_origin"] == session for item in formal))
+
 
 
 def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
@@ -197,8 +244,9 @@ def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
     # row — instead of being sorted to 1970 and pushed to the front of the queue.
     bad = [item["ref"] for item in items if item["created_at"] is None]
     items = [item for item in items if item["created_at"] is not None]
-    formal = [item for item in items if item["kind"] in FORMAL_KINDS]
+    formal, passive = _formal_and_passive(conn, box, items)
     ride = [item for item in items if item["kind"] in ("receipt", "notice")]
+    ride.extend(item for item in items if item["ref"] in passive)
     cc = [item for item in items if item["kind"] == "cc"]
 
     due = [item for item in formal if at - item["created_at"] >= window]
@@ -236,14 +284,13 @@ def select(conn, box, *, window, batch, now=None, only=None, exclude=None):
 
 
 def _reserved_refs(conn, box, own_round=None, *, include_unknown=True):
-    """Unaccepted handoffs, including ambiguous sends released by older versions."""
+    """Unaccepted handoffs that still reserve the original letter."""
     rows = conn.execute(
         "SELECT rr.ref FROM round_ref rr JOIN round r ON r.token=rr.token"
         " JOIN letter_states s ON (s.box,s.letter_id)=(rr.box,rr.ref)"
         " WHERE rr.box=? AND rr.token IS NOT ? AND s.state='delivered' AND s.accepted_at IS NULL"
         " AND (? OR r.state<>'unknown')"
-        " AND (rr.ref_state='active' OR ((r.send_id IS NULL OR r.send_id='') AND r.state='unknown' AND NOT EXISTS"
-        " (SELECT 1 FROM round_ref newer WHERE newer.box=rr.box AND newer.ref=rr.ref AND newer.attempt>rr.attempt)))"
+        " AND rr.ref_state='active'"
         " ORDER BY rr.rowid", (box, own_round, include_unknown))
     return list(dict.fromkeys(row[0] for row in rows))
 

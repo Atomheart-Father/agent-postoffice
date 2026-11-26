@@ -7,7 +7,7 @@ python office/tools/stage_release.py <发布完整提交> <新发布目录>
 python <新发布目录>/office/tools/install_release.py --home "${POSTOFFICE_HOME:-$HOME/office11}"
 ```
 
-暂存从同一提交的 `office/` 和 `app/` 构建联合包，版本清单记录两份源码的提交。需要测试独立 App 检出时，可以指定 `--app-repo`。
+暂存从同一固定提交的 `office/` 和 `app/` 构建联合包，版本清单记录两份源码的提交。
 目录的父目录须已存在，发布目录必须不存在，路径中的任何部分不能是符号链接。命令导出该提交的 `office/`，写入 `DEPLOY_SOURCE.json`，检查 CLI、officed、MCP 和 Pi/OpenCode 原生入口，并用现有 `releaseVersion` 读取版本。失败时移除本次创建的目录；不会覆盖已有目录。
 
 安装备份受影响的入口，把 CLI、后台服务、Pi、OpenCode、Claude Code 和 Codex 指到所选 home 的 `runtime/office`，把 App 放在同一个 home，启动服务并回读身份。首次安装保留宿主各自的原生信任流程。Codex MCP 已登记时只更新命令和参数，保留工具审批设置。

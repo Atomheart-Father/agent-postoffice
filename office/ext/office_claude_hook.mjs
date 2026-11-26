@@ -14,6 +14,35 @@ const nonempty = x => typeof x === 'string' && x.length > 0;
 const retryableHookFailure = x => x?.unknown === true || ['internal', 'busy'].includes(x?.code) ||
   (x?.code === 'unauthorized_attempt' && x.credential_changed === true);
 
+async function observeHostEvent(client, event, hostPid) {
+  const {hook_event_name: hook, tool_use_id: toolId} = event;
+  const turnId = event.turn_id ?? event.prompt_id;
+  const ts = Number.isFinite(event.terminal_ts) ? event.terminal_ts :
+    hook === 'StopFailure' ? null : Date.now() / 1000;
+  if (hook === 'SessionEnd') return client.hostEvent('session_end', ts, {process_pid:hostPid});
+  if (!nonempty(turnId)) return;
+  const report = (kind, fields) => client.hostEvent(kind, ts, {turn_id:turnId, ...fields});
+  if (hook === 'UserPromptSubmit') return report('turn_start', {process_pid:hostPid});
+  if (hook === 'Interrupt') return report('turn_end', {outcome:'cancelled'});
+  if (hook === 'Stop') {
+    await report('turn_end', {outcome:'completed'});
+    if (!event.background_tasks?.length) return report('session_idle', {native_id:turnId, process_pid:hostPid});
+  }
+  if (hook === 'StopFailure') {
+    const reason = event.error;
+    const errorText = event.last_assistant_message ?? '';
+    const explicitExhaustion =
+      (reason === 'billing_error' && /credit balance is too low/i.test(errorText)) ||
+      (reason === 'rate_limit' && /\b(?:hit|reached|exceeded) (?:your |the )?(?:(?:weekly|monthly|5-hour) (?:usage )?|usage )limit\b/i.test(errorText));
+    if (explicitExhaustion) await report('quota', {reason:'quota_exhausted', status:reason === 'billing_error' ? 402 : 429});
+    return report('turn_end', {outcome:'failed', reason});
+  }
+  if (event.tool_name !== 'Bash' || !nonempty(toolId) || event.tool_input?.run_in_background) return;
+  if (hook === 'PreToolUse') return report('tool_start', {native_id:toolId, process_pid:hostPid, tool_name:event.tool_name});
+  if (hook === 'PostToolUse' || hook === 'PostToolUseFailure')
+    return report('tool_end', {native_id:toolId, outcome:hook === 'PostToolUse' ? 'completed' : 'failed'});
+}
+
 async function reconnect(windowOpen, call, disconnected) {
   for (let delay = 250; !windowOpen || windowOpen(); delay = Math.min(delay * 2, 5000)) {
     const result = await call();
@@ -104,13 +133,12 @@ async function receiveLateClaudeWake(client, event, promptMatches) {
   return (await client.runBegin(round.box, token, undefined, event.prompt_id, payload.text))?.recorded === true;
 }
 
-async function captureBatch(client, descriptor, frame, channel, textFor, ownerToken, stage) {
-  let owner = ownerToken || channel === 'native_delivery' ? await client.ownerShow(frame.unit) : null;
-  const owns = row => good(row) && row.binding_id === descriptor.bindingId
-    && row.binding_gen === descriptor.generation && row.instance === descriptor.instance;
-  if (!ownerToken && (!owns(owner) || owner.revoked)) owner = await client.ownerRegister(frame.unit);
-  if (!owns(owner) || owner.revoked) return {status: 'unknown', reason: 'owner'};
-  const batch = await client.begin(frame.unit, channel, frame);
+async function captureBatch(client, descriptor, frame, channel, textFor, stage) {
+  const owner = await client.ownerRegister(frame.unit);
+  if (!good(owner) || owner.revoked || !nonempty(owner.owner_token) || owner.binding_id !== descriptor.bindingId
+      || owner.binding_gen !== descriptor.generation || owner.instance !== descriptor.instance)
+    return {status: 'unknown', reason: 'owner'};
+  const batch = await client.begin(frame.unit, channel, frame, owner.owner_token);
   if (batch?.reason === 'stale_frame') return {status: 'stale_frame'};
   if (!good(batch) || !isCreated(batch.created) || !nonempty(batch.token)
       || !Array.isArray(batch.deliver) || !batch.deliver.length || !Array.isArray(batch.carry))
@@ -121,13 +149,13 @@ async function captureBatch(client, descriptor, frame, channel, textFor, ownerTo
     return {status: 'unknown', reason: 'refs'};
   const attempt = `${descriptor.bindingId}|${descriptor.generation}|${descriptor.instance}|claude-${batch.token}`;
   const text = textFor ? textFor(batch.token, refs) : frame.text;
-  if (stage && !(await stage({token:batch.token, owner:ownerToken || owner.owner_token, attempt, anchor:batch.deliver[0]})))
+  if (stage && !(await stage({token:batch.token, owner:owner.owner_token, attempt, anchor:batch.deliver[0]})))
     return {status:'unknown', reason:'serial'};
   const captured = await client.recordPayload(frame.unit, batch.token, batch.deliver[0], attempt, text);
   if (!good(captured) || captured.recorded !== true || captured.text_available !== true
       || captured.text_matches !== true || captured.conflict !== false)
     return {status: 'unknown', reason: 'payload'};
-  return {token: batch.token, owner: ownerToken || owner.owner_token, attempt, text};
+  return {token: batch.token, owner: owner.owner_token, attempt, text};
 }
 
 const mailMarker = /^\[Office mail ([a-f0-9]{32}) ([A-Za-z0-9_-]+) ([A-Za-z0-9_-]+)\]\n/;
@@ -164,7 +192,7 @@ async function confirmToolMail(client, event) {
     } finally { lines.close(); stream.destroy(); }
   }
   for (const frame of due.frames || [])
-    if (frame.kind === 'batch_round') await client.wakeAck(frame.unit, frame.due_key);
+    if (frame.kind === 'batch_round') await client.wakeAck(frame.unit, frame.due_key, undefined, frame.due_version);
 }
 
 async function toolMail(client, descriptor, event) {
@@ -187,7 +215,8 @@ function codexPayloads(state) {
 }
 
 async function receiveCodexBatch(client, state, event) {
-  const delivered = codexPayloads(state).indexOf(event.prompt);
+  // Codex Desktop can append one LF to the last line when recording a queued message.
+  const delivered = codexPayloads(state).findIndex(text => event.prompt === text || event.prompt === text + '\n');
   if (delivered < 0 || !nonempty(event.prompt_id)) return {status: 'unknown', reason: 'prompt'};
   const parts = [state, ...(state.appends || [])];
   const received = [];
@@ -206,7 +235,7 @@ async function receiveCodexBatch(client, state, event) {
     received.push(part);
   }
   for (const part of received) {
-    const ack = await client.wakeAck(part.unit, part.frame.due_key);
+    const ack = await client.wakeAck(part.unit, part.frame.due_key, undefined, part.frame.due_version);
     if (!good(ack) && ack?.code !== 'not_found' && ack?.reason_code !== 'unit_not_carried') pending = true;
   }
   if (Number.isFinite(event.terminal_ts)) {
@@ -223,12 +252,14 @@ async function receiveCodexHistory(client, descriptor, event) {
   const parsed = pieces.map(text => /^\[Office wake ([a-f0-9]{32})\]\n([\s\S]*)$/.exec(text));
   if (parsed.some(match => !match) || `[Office wake ${parsed[0][1]}]` !== event.client_id) return;
   const matches = [];
-  for (const [, token, text] of parsed) {
+  for (const [index, [, token, text]] of parsed.entries()) {
     const row = await client.roundState(undefined, token);
     if (row?.reason_code === 'unit_not_carried') continue;
     if (!good(row) || !nonempty(row.box) || row.channel !== 'codex' || row.binding_id !== descriptor.bindingId
-        || row.binding_gen !== descriptor.generation || !row.payloads?.some(p => p.text === text)) continue;
-    matches.push({unit:row.box, token, text});
+        || row.binding_gen !== descriptor.generation) continue;
+    const payload = row.payloads?.find(p => p.text === text)
+      ?? (index === parsed.length - 1 ? row.payloads?.find(p => typeof p.text === 'string' && text === p.text + '\n') : undefined);
+    if (payload) matches.push({unit:row.box, token, text:payload.text});
   }
   const received = [];
   for (const part of matches)
@@ -237,12 +268,16 @@ async function receiveCodexHistory(client, descriptor, event) {
   return {tokens:received};
 }
 
-export async function handleClaudeHook({event, mode, descriptorPath, clientFactory = createPiRoundClient, waitMs = 60000, promptMatches = exactPrompt, nativeStart = false, stopCanStart = true, dueKey = null, collectUsage = true, absentMarker = null, codexNative = false, expectedOffer, windowOpen = () => true, reportWaitError = () => {}}) {
+export async function handleClaudeHook({event, mode, descriptorPath, clientFactory = createPiRoundClient, waitMs = 60000, promptMatches = exactPrompt, nativeStart = false, stopCanStart = true, dueKey = null, collectUsage = true, absentMarker = null, codexNative = false, expectedOffer, windowOpen = () => true, reportWaitError = () => {}, hostPid}) {
   const d = readDescriptor(descriptorPath);
   const session = event?.session_id;
   if (!d || !nonempty(session) || d.hostSessionRef !== session) return {status: 'unknown', reason: 'session_or_descriptor'};
   const client = clientFactory({socketPath: d.socketPath, tokenFile: d.tokenFile}).setConnBox(d.actor);
   try {
+    if (mode === 'monitor') {
+      if (hostPid > 1) await observeHostEvent(client, event, hostPid);
+      return {status:'observed'};
+    }
     if (codexNative && mode === 'authorize') return await locked(client, async () => {
       const s = (await client.serialState('read')).state;
       if (s?.session !== session || s.frame.kind !== 'batch_round' || s.phase !== 'handed'
@@ -265,6 +300,7 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
       catch (error) { if (error.code !== 'ENOENT') throw error; }
     });
     if (mode === 'observe' && !codexNative) {
+      if (hostPid > 1) await observeHostEvent(client, event, hostPid);
       await confirmToolMail(client, event);
       if (event.hook_event_name === 'PostToolBatch') {
         const text = await locked(client, () => toolMail(client, d, event));
@@ -426,7 +462,7 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
         if ((await client.serialState('read')).state) return {status: 'unknown', reason: 'pending'};
         if (!nonempty(frame.due_key) || !nonempty(frame.text) || (frame.kind === 'batch_round' && (!Array.isArray(frame.refs) || !frame.refs.length)))
           return {status: 'unknown', reason: 'frame'};
-        const batch = await captureBatch(client, d, frame, codexNative ? 'codex' : 'batch_round', undefined, undefined,
+        const batch = await captureBatch(client, d, frame, codexNative ? 'codex' : 'batch_round', undefined,
           codexNative ? async staged => (await client.serialState('write', {session, unit:frame.unit, frame, ...staged,
             text:`[Office wake ${staged.token}]\n${frame.text}`, phase:'staged'}))?.written === true : undefined);
         if (!batch.token) return batch;
@@ -507,8 +543,8 @@ export async function handleClaudeHook({event, mode, descriptorPath, clientFacto
           if (!good(settled) || settled.state !== 'accepted') return {status: 'unknown', reason: 'settle'};
         }
         s.phase = 'running'; s.ackUnknown = true; await client.serialState('write', s);
-        const ack = await client.wakeAck(s.unit, s.frame.due_key, undefined);
-        s.ackUnknown = !(good(ack) && ack.taken); await client.serialState('write', s);
+        const ack = await client.wakeAck(s.unit, s.frame.due_key, undefined, s.frame.due_version);
+        s.ackUnknown = !(ack?.code === 'not_found' || (good(ack) && ack.taken)); await client.serialState('write', s);
         if (event.hook_event_name !== 'Stop') {
           if (s.frame.kind === 'batch_round' && !s.ackUnknown) await client.serialState('clear');
           return {status: 'running', ack: s.ackUnknown ? 'unknown' : 'taken'};
@@ -552,14 +588,14 @@ if (import.meta.main ?? (process.argv[1] && import.meta.url === pathToFileURL(re
     const input = JSON.parse(readFileSync(0, 'utf8'));
     descriptorPath = nativeDescriptor(null, 'claude', input.session_id);
     const parent = process.ppid;
-    const args = {event: input, descriptorPath, reportWaitError: logWait,
+    const args = {event: input, descriptorPath, reportWaitError: logWait, hostPid: parent,
       windowOpen: () => parent > 1 && process.ppid === parent};
     if (['wait', 'stop'].includes(mode))
       process.once('SIGTERM', () => { logWait('SIGTERM'); process.exit(143); });
     let result;
     if (mode === 'stop') {
       // The same native Stop must keep the same action parameters across daemon recovery.
-      input.terminal_ts ??= Math.floor(Date.now()/1000);
+      input.terminal_ts ??= Date.now() / 1000;
       let retrying = false;
       const done = await reconnect(args.windowOpen, () => handleClaudeHook({...args, mode: 'observe'}), outcome => {
         if (!outcome?.retryStop) return false;

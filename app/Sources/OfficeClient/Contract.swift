@@ -99,6 +99,7 @@ public struct HostBinding: Sendable, Equatable, Identifiable {
     public var deliveryUnresolved: UnresolvedDelivery? = nil
     /// nil = 来源未知（后端给 null）；有值 = 后端给的一句话 / 一个状态词，原样显示。
     public let quota: String?
+    public var generation: Int? = nil
     public var id: String { bindingID }
 
     public static func parse(_ r: [String: Any]) -> HostBinding? {
@@ -114,7 +115,7 @@ public struct HostBinding: Sendable, Equatable, Identifiable {
                            harness: r["harness"] as? String, position: r["position"] as? String,
                            deliveryPending: r["delivery_pending"] as? Int,
                            deliveryAutomatic: r["delivery_automatic"] as? Int, deliveryInFlight: r["delivery_in_flight"] as? Int,
-                           deliveryUnresolved: UnresolvedDelivery.parse(r["delivery_unresolved"]), quota: q)
+                           deliveryUnresolved: UnresolvedDelivery.parse(r["delivery_unresolved"]), quota: q, generation: r["generation"] as? Int)
     }
 }
 
@@ -216,8 +217,10 @@ public struct ContractSource: Sendable {
                   })
     }
 
-    public func requests() -> Outcome<RequestPage> {
-        loaded?.requests ?? reads.call(.requests, ["limit": 100], parse: RequestPage.parse)
+    public func requests(cursor: String? = nil) -> Outcome<RequestPage> {
+        var args: [String: Any] = ["limit": 100]
+        if let cursor, let offset = Int(cursor) { args["cursor"] = offset }
+        return loaded?.requests ?? reads.call(.requests, args, parse: RequestPage.parse)
     }
     /// R2 release.status。**统一在这里去掉老板自己的绑定**；不知道谁是老板（whoami 没读到）= 整个名单跟着 whoami 的结果，不替它猜。
     public func hosts(boss: Outcome<String>) -> Outcome<HostPage> {

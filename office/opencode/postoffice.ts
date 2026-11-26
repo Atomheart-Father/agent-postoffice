@@ -2,7 +2,7 @@ import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { join } from 'node:path';
-import { openControlledEndpoint, createOfficeSocket } from '../ext/office_socket.mjs';
+import { openControlledEndpoint, createOfficeSocket, nativeDescriptor } from '../ext/office_socket.mjs';
 import { createOfficeTools, validateArgs } from '../ext/office_tools.mjs';
 import { toolSpecs } from '../ext/office_tool_spec.mjs';
 import { renderToolResult } from '../ext/office_result.mjs';
@@ -10,7 +10,7 @@ import { createPiRoundClient, releaseVersion } from '../ext/office_pi_round.mjs'
 import { createWakeLoop } from '../ext/office_wake_loop.mjs';
 import TOOL_TEXT from '../ext/office_tool_text.json' with { type: 'json' };
 
-const hintPath = (home: string, name: any) => typeof name === 'string' && /^[A-Za-z0-9_.-]+\.endpoint\.json$/.test(name)
+const hintPath = (home: string, name: any) => typeof name === 'string' && /^(?:[A-Za-z0-9_.-]+|~[a-f0-9]{64})\.endpoint\.json$/.test(name)
   ? join(home, 'sock', name) : '';
 export async function receiptPages(storage: any, prefix: string) {
   const entries: any[] = []; let after: string | undefined;
@@ -35,6 +35,7 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     let pending: any = null;
     let closed = false;
     let officeRunning = false, officeStep = '', officeStarted = 0, stepStarted = 0;
+    let nativeTurn = '';
     const controller = new AbortController();
     const loop = createWakeLoop({client, box: endpoint.endpoint.actor,
       diagFailure: (message: string) => console.error('OpenCode Office:', message), host: {
@@ -60,10 +61,13 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
       triggerTurn: async (text: string, details: any) => {
         const owned = await ownsSession().catch(() => false);
         if (closed || signal?.aborted || !owned) throw Object.assign(new Error('Office session is unavailable or belongs to another OpenCode location'), {notSent:true});
-        const current = pending = {text, details, messageID: '', events: [], ready: false};
+        const current = pending = {text, details, messageID: '', events: [], ready: false, delivered: () => {}};
+        const deliveredMarker = Symbol('delivered');
+        const deliveredFirst = new Promise<symbol>(resolve => { current.delivered = () => resolve(deliveredMarker); });
         let admitted: any;
-        try { admitted = await ctx.session.prompt({sessionID, text, delivery: 'steer'}); }
+        try { admitted = await Promise.race([ctx.session.prompt({sessionID, text, delivery: 'steer'}), deliveredFirst]); }
         catch (error) { if (pending === current) pending = null; throw error; }
+        if (admitted === deliveredMarker) return;
         if (!admitted?.id || admitted.id !== current.messageID || admitted.sessionID !== sessionID || admitted.payload?.text !== text)
           { pending = null; throw new Error('OpenCode prompt admission did not match the submitted batch'); }
         current.ready = true;
@@ -88,18 +92,35 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     });
     if (signal?.aborted) { await hook.dispose(); await responseHook.dispose(); await socket.close(); await client.close(); return; }
     const terminal = (event: any) => ['session.execution.succeeded', 'session.execution.failed', 'session.execution.interrupted'].includes(event.type);
-    async function reportEnd(event: any) {
+    async function reportEnd(event: any, endedTurn = nativeTurn) {
       officeRunning = false; officeStep = '';
       const closed = loop.turnClosed('');
       await loop.agentSettled({aborted: event.type !== 'session.execution.succeeded'}, {});
+      const error = event.data?.error;
+      const outcome = event.type === 'session.execution.succeeded' ? 'completed'
+        : event.type === 'session.execution.failed' ? 'failed'
+        : event.data?.reason === 'user' ? 'cancelled' : 'interrupted';
+      const reason = outcome === 'failed' ? error?.type
+        : outcome === 'interrupted' && event.data?.reason === 'superseded' ? 'superseded' : undefined;
       const result = await client.hostEvent('turn_end', event.created / 1000, {
         act_key: `oc2:turn_end:${event.id}`, ...(closed?.attempt_id ? {attempt_id: closed.attempt_id} : {}),
+        ...(endedTurn ? {turn_id:endedTurn} : {}), ...(outcome ? {outcome} : {}),
+        ...(typeof reason === 'string' ? {reason} : {}),
+        ...(Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599 ? {status:error.status} : {}),
       });
       if (result?.ok === false) throw new Error(`OpenCode turn_end: ${result.code || 'unknown'}`);
+      if (nativeTurn === endedTurn) nativeTurn = '';
+      const session = await ctx.session.get({sessionID});
+      const idle = session?.time?.idle, busy = session?.time?.busy;
+      if (endedTurn && session?.id === sessionID && session?.location?.directory === directory
+          && Number.isFinite(idle) && Number.isFinite(busy) && idle >= busy && idle >= event.created) {
+        await client.hostEvent('session_idle', idle / 1000, {native_id:endedTurn, process_pid:process.pid,
+          act_key:`oc2:idle:${sessionID}:${idle}`});
+      }
     }
-    const toolsInFlight = new Map<string, {revision: number; seen: Set<string>; skill?: string; name?: string}>();
+    const toolsInFlight = new Map<string, {revision: number; seen: Set<string>; turn: string; skill?: string; name?: string}>();
     const toolNames = new Map<string, string>();
-    const stepUsage = new Map<string, {refs: Set<string>, model?: string, started?: number, startId?: string, progress?: boolean}>();
+    const stepUsage = new Map<string, {refs: Set<string>, model?: string, started?: number, startId?: string, turn?: string, progress?: boolean}>();
     const fingerprint = (value: any): string => JSON.stringify(value, (_key, item) =>
       item && typeof item === 'object' && !Array.isArray(item)
         ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
@@ -108,7 +129,7 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
         'session.tool.progress': 'tool_progress', 'session.tool.success': 'tool_end', 'session.tool.failed': 'tool_end'};
       const kind = kinds[event.type], data = event.data;
       if (event.type === 'session.tool.input.started' && data?.sessionID === sessionID
-          && data.assistantMessageID && data.id && ['skill', 'office_work_publish', 'office_work_review'].includes(data.name) && await ownsSession()) {
+          && data.assistantMessageID && data.id && typeof data.name === 'string' && await ownsSession()) {
         toolNames.set(JSON.stringify([data.assistantMessageID, data.id]), data.name);
       }
       if (!kind || data?.sessionID !== sessionID || !event.id || !Number.isFinite(event.created)
@@ -120,7 +141,7 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
         const name = toolNames.get(key);
         const skill = name === 'skill' ? data.input?.id : undefined;
         toolNames.delete(key);
-        state = {revision: 0, seen: new Set(), skill, name};
+        state = {revision: 0, seen: new Set(), turn: nativeTurn || data.assistantMessageID, skill, name};
         toolsInFlight.set(key, state);
       } else if (!state) return;
       if (kind === 'tool_progress') {
@@ -131,9 +152,11 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
         state.revision += 1;
       }
       const result = await client.hostEvent(kind, event.created / 1000, {
-        act_key: `oc2:tool:${event.id}`, turn_id: data.assistantMessageID, native_id: data.id,
+        act_key: `oc2:tool:${event.id}`, turn_id: state.turn, native_id: data.id,
+        ...(kind === 'tool_start' ? {process_pid:process.pid, ...(state.name ? {tool_name:state.name} : {})} : {}),
         ...(kind === 'tool_progress' ? {version: String(state.revision)} : {}),
-        ...(kind === 'tool_end' ? {outcome: event.type === 'session.tool.success' ? 'ok' : 'error'} : {}),
+        ...(kind === 'tool_end' ? {outcome: event.type === 'session.tool.success'
+          && !(Number.isInteger(data.metadata?.exit) && data.metadata.exit !== 0) ? 'ok' : 'error'} : {}),
       });
       if (result?.ok === false) throw new Error(`OpenCode ${kind}: ${result.code || 'unknown'}`);
       if (kind === 'tool_end') {
@@ -166,7 +189,8 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
       const data = event.data, id = data?.assistantMessageID;
       if (data?.sessionID !== sessionID || !id) return;
       if (event.type === 'session.step.started') {
-        stepUsage.set(id, {refs: new Set(), model: typeof data.model?.id === 'string' ? data.model.id : undefined, started: event.created, startId: event.id});
+        stepUsage.set(id, {refs: new Set(), model: typeof data.model?.id === 'string' ? data.model.id : undefined,
+          started: event.created, startId: event.id, turn: nativeTurn || id});
       }
       if (event.type !== 'session.step.ended'
           || !event.id || !Number.isFinite(event.created) || !await ownsSession()) return;
@@ -202,7 +226,7 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
       current.processing = true;
       try {
         while (current.events.length) {
-          const event = current.events.shift();
+          const {event, turn} = current.events.shift();
           if (event.type === 'session.inbox.delivered' && event.data?.inboxID === current.messageID) {
             if (await loop.agentStart({})) {
               officeRunning = Number.isFinite(event.created); officeStarted = event.created; officeStep = '';
@@ -210,7 +234,7 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
             }
           } else if (terminal(event)) {
             const late = loop.lateNativeRunning();
-            try { await reportEnd(event); }
+            try { await reportEnd(event, turn); }
             finally { if (!late && pending === current) pending = null; }
           } else await reportProgress(event);
         }
@@ -220,6 +244,15 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
       for await (const event of ctx.event.subscribe({signal: controller.signal})) {
         try {
           const error = event.data?.error;
+          if (event.data?.sessionID === sessionID && Number.isFinite(event.created) && event.id
+              && event.type === 'session.execution.started' && await ownsSession()) {
+            const turn = event.id;
+            if (typeof turn === 'string' && turn) {
+              nativeTurn = turn;
+              await client.hostEvent('turn_start', event.created / 1000,
+                {turn_id:turn, process_pid:process.pid, act_key:`oc2:turn_start:${event.id}`});
+            }
+          }
           if (event.type === 'session.execution.failed' && event.data?.sessionID === sessionID
               && ((error?.type === 'provider.quota' && error.status === 402)
                 || (error?.type === 'provider.go-limit' && error.status === 429))
@@ -236,13 +269,13 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
               && Number.isFinite(event.created) && event.created >= step.started!
               && typeof event.data.delta === 'string' && event.data.delta.trim() && await ownsSession()) {
             const result = await client.hostEvent('model_progress', step.started! / 1000, {
-              act_key: `oc2:progress:${step.startId}`, native_id: step.startId, turn_id: event.data.assistantMessageID,
+              act_key: `oc2:progress:${step.startId}`, native_id: step.startId, turn_id: step.turn,
             });
             if (result?.ok !== false && !result?.unknown) step.progress = true;
           }
           await reportTool(event);
           await reportUsage(event);
-          if (event.data?.sessionID === sessionID && terminal(event)) stepUsage.clear();
+          if (event.data?.sessionID === sessionID && terminal(event)) { stepUsage.clear(); toolNames.clear(); }
           if (event.type === 'session.inbox.delivered' && event.data?.sessionID === sessionID
               && event.data.inboxID && event.data.inboxID !== pending?.messageID
               && await loop.lateNativeStart(event.data.inboxID, {})) {
@@ -250,7 +283,12 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
             continue;
           }
           if (pending && event.data?.sessionID === sessionID) {
-            pending.events.push(event);
+            pending.events.push({event, turn:nativeTurn});
+            if (event.type === 'session.inbox.delivered' && pending.messageID
+                && event.data.inboxID === pending.messageID) {
+              pending.ready = true;
+              pending.delivered();
+            }
             await drain(pending);
           } else if (event.data?.sessionID === sessionID && terminal(event)) {
             await reportEnd(event);
@@ -261,7 +299,8 @@ async function bind(ctx: any, endpoint: any, expectedSession?: string, signal?: 
     loop.start({});
     const version = releaseVersion(import.meta.url)?.version ?? null;
     void client.hostEvent('loaded', Math.floor(Date.now() / 1000), {version});
-    return {office, close: async () => { closed = true; controller.abort(); loop.stop(); await hook.dispose(); await responseHook.dispose(); socket.close({final:true}); }};
+    return {office, endpoint: endpoint.endpoint, canRetire: () => !pending && loop.canRetire(),
+      close: async () => { closed = true; controller.abort(); loop.stop(); await hook.dispose(); await responseHook.dispose(); socket.close({final:true}); }};
 }
 export function createOfficePlugin(configuredHome?: string) { return {
   id: 'postoffice-delivery',
@@ -276,9 +315,22 @@ export function createOfficePlugin(configuredHome?: string) { return {
       && /^ses_[A-Za-z0-9]+$/.test(id)
       && (await ctx.session.get({sessionID: id}))?.location?.directory === directory;
     async function attached(id: string, supplied = '') {
+      const cached = sessions.get(id);
+      if (cached) {
+        const current = await cached;
+        if (sessions.get(id) !== cached) return attached(id, supplied);
+        if (!current) return;
+        const observed = openControlledEndpoint({descriptor: nativeDescriptor(home, 'opencode', id)});
+        const next = observed.ok && observed.endpoint;
+        const old = current.endpoint;
+        if (!next || next.hostSessionRef !== id || next.actor !== old.actor || next.bindingId !== old.bindingId
+            || !Number.isInteger(next.generation) || next.generation <= old.generation || !current.canRetire()) return current;
+        sessions.delete(id);
+        await current.close();
+      }
       if (!sessions.has(id)) {
         const opening = (async () => {
-          const native = hintPath(home, 'opencode-' + id + '.endpoint.json');
+          const native = nativeDescriptor(home, 'opencode', id);
           let pending = false, refused = false;
           for (const file of new Set([supplied, native, configured, remembered])) {
             if (!file) continue;

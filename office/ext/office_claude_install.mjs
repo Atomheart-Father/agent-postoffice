@@ -16,10 +16,12 @@ function isOfficeHook(h) {
 export function installClaudeHooks(config, executable = process.execPath, entry = hook) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw Error('invalid settings');
   const hooks = {...(config.hooks || {})};
-  for (const [event, mode, asyncRewake] of [
+  for (const [event, mode, asyncRewake, matcher] of [
     ['SessionStart', 'wait', true], ['Stop', 'stop', true],
-    ['UserPromptSubmit', 'observe', false], ['PostToolUse', 'observe', false], ['PostToolBatch', 'observe', false],
+    ['UserPromptSubmit', 'observe', false], ['PreToolUse', 'observe', false, 'Bash'],
+    ['PostToolUse', 'observe', false], ['PostToolUseFailure', 'observe', false, 'Bash'], ['PostToolBatch', 'observe', false],
     ['MessageDisplay', 'observe', false], ['StopFailure', 'observe', false],
+    ['SessionEnd', 'observe', false],
   ]) {
     const entries = Array.isArray(hooks[event]) ? hooks[event] : [];
     const remaining = entries.map(entry => ({...entry, hooks: (entry.hooks || []).filter(h =>
@@ -27,7 +29,7 @@ export function installClaudeHooks(config, executable = process.execPath, entry 
       .filter(entry => entry.hooks.length);
     const command = {type: 'command', command: executable, args: [entry, mode]};
     if (asyncRewake) Object.assign(command, {asyncRewake: true, timeout: 604800});
-    hooks[event] = [...remaining, {hooks: [command]}];
+    hooks[event] = [...remaining, {...(matcher ? {matcher} : {}), hooks: [command]}];
   }
   return {...config, hooks};
 }

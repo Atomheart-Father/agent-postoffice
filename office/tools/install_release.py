@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Install one staged BOXZ OFFICE release for the current macOS user."""
 import argparse
+import fcntl
+import stat
 import json
 import os
 import plistlib
@@ -12,13 +14,20 @@ import time
 from pathlib import Path
 
 
+_INSTALL_LOCK_FD = None
+
+
+def _lock_inheritance():
+    return {"pass_fds": (_INSTALL_LOCK_FD,)} if _INSTALL_LOCK_FD is not None else {}
+
+
 def run(*args, **kw):
-    return subprocess.run(args, check=True, **kw)
+    return subprocess.run(args, check=True, **_lock_inheritance(), **kw)
 
 
 def install_codex(codex, node, runtime, home):
     args = [str(runtime / "ext/office-mcp-server.mjs"), "--codex-native", "--home", str(home)]
-    old = subprocess.run([codex, "mcp", "get", "office", "--json"], capture_output=True, text=True)
+    old = subprocess.run([codex, "mcp", "get", "office", "--json"], capture_output=True, text=True, **_lock_inheritance())
     if old.returncode:
         run(codex, "mcp", "add", "office", "--", node, *args)
     else:
@@ -28,7 +37,7 @@ def install_codex(codex, node, runtime, home):
                  for key, value in fields.items() if transport.get(key) != value]
         if edits:
             with subprocess.Popen([codex, "app-server", "--stdio"], text=True,
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, **_lock_inheritance()) as process:
                 for i, method, params in ((1, "initialize", {"clientInfo": {"name": "office-install", "version": "1"}}),
                                           (2, "config/batchWrite", {"edits": edits})):
                     process.stdin.write(json.dumps(dict(id=i, method=method, params=params)) + "\n")
@@ -53,7 +62,68 @@ def copy(src, dst):
         shutil.copy2(src, dst, follow_symlinks=False)
 
 
-def install(package, home):
+def _sync_tree(root):
+    for path in root.rglob('*'):
+        if path.is_file() and not path.is_symlink():
+            with path.open('rb') as f: os.fsync(f.fileno())
+    for path in [*sorted((p for p in root.rglob('*') if p.is_dir() and not p.is_symlink()), key=lambda p: len(p.parts), reverse=True), root]:
+        fd = os.open(path, os.O_RDONLY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+
+
+def _sync_items(items):
+    for path in map(Path, items):
+        if path.is_dir() and not path.is_symlink():
+            _sync_tree(path)
+        elif path.is_file() and not path.is_symlink():
+            with path.open('rb') as f: os.fsync(f.fileno())
+        if path.parent.is_dir():
+            fd = os.open(path.parent, os.O_RDONLY)
+            try: os.fsync(fd)
+            finally: os.close(fd)
+
+
+def _recover_install(journal):
+    if not journal.exists():
+        return
+    backup = Path(json.loads(journal.read_text())['backup'])
+    paths = json.loads((backup / 'paths.json').read_text())
+    domain, label = f"gui/{os.getuid()}", "com.agent-postoffice.officed"
+    stopped = subprocess.run(['launchctl', 'bootout', f'{domain}/{label}'], capture_output=True, **_lock_inheritance())
+    if stopped.returncode and not subprocess.run(['launchctl', 'print', f'{domain}/{label}'], capture_output=True, **_lock_inheritance()).returncode:
+        raise RuntimeError('Office install recovery could not stop the service; files were not restored')
+    for i, name in enumerate(paths):
+        path = Path(name)
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+        if (backup / str(i)).exists() or (backup / str(i)).is_symlink():
+            copy(backup / str(i), path)
+    _sync_items(paths)
+    journal.unlink()
+    fd = os.open(journal.parent, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+def _write_journal(journal, backup):
+    _sync_tree(backup)
+    fd = os.open(backup.parent, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+    tmp = journal.with_name(journal.name + '.tmp')
+    with tmp.open('w') as f:
+        json.dump({'backup': str(backup)}, f)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, journal)
+    fd = os.open(journal.parent, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+def _install(package, home, journal):
     user = Path.home()
     label = "com.agent-postoffice.officed"
     app = "BOXZ OFFICE.app"
@@ -87,7 +157,8 @@ def install(package, home):
         if path.exists() or path.is_symlink():
             copy(path, backup / str(i))
     (backup / "paths.json").write_text(json.dumps(list(map(str, items)), indent=2))
-    loaded = subprocess.run(["launchctl", "print", f"{domain}/{label}"], capture_output=True).returncode == 0
+    _write_journal(journal, backup)
+    loaded = subprocess.run(["launchctl", "print", f"{domain}/{label}"], capture_output=True, **_lock_inheritance()).returncode == 0
     if loaded:
         run("launchctl", "bootout", f"{domain}/{label}")
     try:
@@ -121,23 +192,38 @@ def install(package, home):
         copy(source_app, home / app)
         run("launchctl", "bootstrap", domain, str(launch))
         for _ in range(40):
-            check = subprocess.run([node, cli, "--home", home, "--descriptor", home / "sock/boss.endpoint.json", "whoami"], capture_output=True)
+            check = subprocess.run([node, cli, "--home", home, "--descriptor", home / "sock/boss.endpoint.json", "whoami"], capture_output=True, **_lock_inheritance())
             if not check.returncode:
+                _sync_items(items)
+                journal.unlink()
+                fd = os.open(journal.parent, os.O_RDONLY)
+                try: os.fsync(fd)
+                finally: os.close(fd)
                 return backup
             time.sleep(.25)
         raise RuntimeError("Installed Office did not answer whoami")
-    except BaseException as error:
-        stopped = subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
-        if stopped.returncode and not subprocess.run(["launchctl", "print", f"{domain}/{label}"], capture_output=True).returncode:
-            raise RuntimeError("Office install failed and could not stop the service; files were not restored") from error
-        for i, path in enumerate(items):
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            else:
-                path.unlink(missing_ok=True)
-            if (backup / str(i)).exists() or (backup / str(i)).is_symlink():
-                copy(backup / str(i), path)
+    except BaseException:
+        _recover_install(journal)
         raise
+
+
+def install(package, home):
+    global _INSTALL_LOCK_FD
+    # One user has one set of host configuration and launchd entries, even with multiple Office homes.
+    lock_dir = Path.home() / ".local/share/boxz-office"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(lock_dir / "install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError("Office install lock is not a regular file")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        _INSTALL_LOCK_FD = fd
+        journal = lock_dir / 'install.pending.json'
+        _recover_install(journal)
+        return _install(package, home, journal)
+    finally:
+        _INSTALL_LOCK_FD = None
+        os.close(fd)
 
 
 if __name__ == "__main__":

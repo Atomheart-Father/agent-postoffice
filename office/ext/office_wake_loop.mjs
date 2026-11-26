@@ -52,6 +52,7 @@ export function createWakeLoop({
     stopController: new AbortController(),
     /** 连续 empty wake 次数（用于把间隔放长）。 */
     awaitFailures: 0,
+    frameFailures: 0,
     /** Pi 正在执行时收到、尚未交给工具边界的邮件帧。 */
     pending: null,
     /** ★ Core batch 已 begun；native wake 的 admission/consume 仍未知时保留此槽。 */
@@ -81,17 +82,20 @@ export function createWakeLoop({
   };
 
   async function persistReceipt(batch, ctx, done = false) {
-    if (!host.saveReceipt) return;
+    if (!host.saveReceipt) return true;
     const owner = state.ownerTokens.get(batch.unit);
-    if (!owner) return;
-    const {unit, token, anchorRef, selectedRefs, attemptKey, dueKey, batchSha256, sessionFile, associationId, harnessRef, end} = batch;
+    if (!owner) return false;
+    const {unit, token, anchorRef, selectedRefs, attemptKey, dueKey, dueVersion, batchSha256, sessionFile, associationId, harnessRef, end} = batch;
     try {
-      await host.saveReceipt({unit, token, anchorRef, selectedRefs, attemptKey, dueKey, batchSha256, sessionFile,
+      await host.saveReceipt({unit, token, anchorRef, selectedRefs, attemptKey, dueKey, dueVersion, batchSha256, sessionFile,
         associationId, harnessRef, actor: owner.actor, bindingId: owner.binding_id,
         generation: owner.binding_gen, instance: owner.instance,
+        ...(batch.ackPending ? {ackPending:true} : {}),
         ...(end ? {end: {type: "agent_settled", aborted: end.aborted}} : {}), done}, ctx);
+      return true;
     } catch (e) {
       diagFailure(`session could not save the observed Office receipt: ${e.message}`, ctx);
+      return false;
     }
   }
 
@@ -168,12 +172,12 @@ export function createWakeLoop({
   }
 
   async function handleWake(ctx, frame, appendAtBoundary) {
-    const {unit, text, due_key: dueKey, refs: frameRefs} = frame;
+    const {unit, text, due_key: dueKey, due_version: dueVersion, refs: frameRefs} = frame;
     const owner = state.ownerTokens.get(unit);
     if (state.inflightRound || !owner) return;
     let batch;
     try {
-      batch = await client.begin(unit, frame.kind, frame);
+      batch = await client.begin(unit, frame.kind, frame, owner.owner_token);
     } catch (e) {
       diagFailure(`round.begin outcome unknown: ${e.message}`, ctx);
       return cfg.backoffBaseMs;
@@ -182,7 +186,12 @@ export function createWakeLoop({
       diagFailure(`round.begin refused or did not confirm the batch for ${unit}`, ctx);
       return cfg.backoffBaseMs;
     }
-    if (!isCreated(batch.created)) return;
+    if (!isCreated(batch.created)) {
+      const wait = Math.min(cfg.backoffMaxMs, cfg.backoffBaseMs * 2 ** Math.min(state.frameFailures, 6));
+      state.frameFailures += 1;
+      return wait;
+    }
+    state.frameFailures = 0;
     const token = batch.token;
     if (typeof token !== "string" || !token) {
       diagFailure("round.begin created a batch without a token; retain unknown", ctx);
@@ -267,7 +276,7 @@ export function createWakeLoop({
       officeAttemptKey: attemptKey, officeSelectedRefs: selectedRefs, officeBatchSha256: batchSha256,
     };
     const current = state.inflightRound = {
-      unit, token, anchorRef, selectedRefs, attemptKey, dueKey,
+      unit, token, anchorRef, selectedRefs, attemptKey, dueKey, dueVersion,
       text, batchSha256, sessionFile, associationId, ownerToken: owner.owner_token,
       beforeStartSeen: false, admissionRecorded: false,
       accepted: false, sawStart: false, sequenceInvalidated: false,
@@ -592,7 +601,8 @@ export function createWakeLoop({
     cur.sawStart = true;
     if (modelStarting) state.activeAttempt = cur.attemptKey;
     if (!state.runningBatches.includes(cur)) state.runningBatches.push(cur);
-    await persistReceipt(cur, ctx);
+    cur.ackPending = !cur.lateReceipt;
+    cur.receiptPending = !await persistReceipt(cur, ctx);
     const received = await recordNativeReceipt(cur, ctx, modelStarting);
     if (state.inflightRound === cur) state.inflightRound = null;
     state.awaitSkip.clear();
@@ -613,7 +623,7 @@ export function createWakeLoop({
       cur.accepted = true;
       if (modelStarting) await reportAttemptStarted(cur.attemptKey, ctx);
       diag("matched native start recorded run-begin and accepted settle", ctx);
-      if (!cur.lateReceipt) await ackFrame(cur, ctx);
+      if (!cur.lateReceipt && !cur.receiptPending) cur.ackPending = !await ackFrame(cur, ctx);
       return true;
     } catch (e) {
       diagFailure(`native receipt could not be recorded: ${String(e?.message || e)}`, ctx);
@@ -622,16 +632,16 @@ export function createWakeLoop({
   }
 
 
-  async function ackFrame({unit, dueKey}, ctx) {
-    if (!dueKey) return;
+  async function ackFrame({unit, dueKey, dueVersion}, ctx) {
+    if (!dueKey) return true;
     try {
-      const ack = await client.wakeAck(unit, dueKey);
-      if (ack?.ok === false || (ack?.result ?? ack)?.taken === false) {
-        diagFailure(`wake.ack did not take the frame: ${ack.code || "pending"} due_key=${dueKey}`, ctx);
-      }
+      const ack = await client.wakeAck(unit, dueKey, undefined, dueVersion);
+      if (ack?.code === "not_found" || (ack?.result ?? ack)?.taken === true) return true;
+      diagFailure(`wake.ack did not take the frame: ${ack?.code || "pending"} due_key=${dueKey}`, ctx);
     } catch (e) {
       diagFailure(`wake.ack outcome unknown: ${String((e && e.message) || e)} due_key=${dueKey}`, ctx);
     }
+    return false;
   }
 
   /**
@@ -767,21 +777,26 @@ export function createWakeLoop({
   }
 
   function flushNativeReceipts(ctx) {
-    const pending = state.runningBatches.filter(batch => (!batch.lateReceipt || batch.sawStart) && (!batch.accepted || batch.end) && batch !== state.inflightRound
+    const pending = state.runningBatches.filter(batch => (!batch.lateReceipt || batch.sawStart) && (!batch.accepted || batch.end || batch.receiptPending || batch.ackPending) && batch !== state.inflightRound
       && batch.sessionFile === sessionFileFor(ctx));
     if (!pending.length) return false;
     return receiptFlush ??= (async () => {
       let recorded = false;
       for (const batch of pending) {
         try {
+          if (batch.receiptPending) {
+            batch.receiptPending = !await persistReceipt(batch, ctx);
+            if (batch.receiptPending) continue;
+          }
           if (!batch.accepted && !await recordNativeReceipt(batch, ctx, !batch.end && state.activeAttempt === batch.attemptKey)) continue;
-          if (!batch.end && !batch.restored) continue;
+          else if (batch.ackPending && !batch.lateReceipt) batch.ackPending = !await ackFrame(batch, ctx);
+          if (batch.ackPending || (!batch.end && !batch.restored)) continue;
           if (batch.end && !batch.coreSettled
               && !hasRecorded(await client.consume(batch.unit, batch.end, batch.ownerToken, batch.token))) {
             diagFailure("round.consume did not record the matched agent_settled", ctx);
             continue;
           }
-          await persistReceipt(batch, ctx, true);
+          if (!await persistReceipt(batch, ctx, true)) continue;
           state.runningBatches.splice(state.runningBatches.indexOf(batch), 1);
           recorded = true;
         } catch (e) {
@@ -857,6 +872,7 @@ export function createWakeLoop({
     lateNativeStart: (nativeId, ctx) => lifecycleBoundary(
       "late_native_start", ctx, () => lateNativeStart(nativeId, ctx)),
     lateNativeRunning: () => state.runningBatches.some(batch => batch.lateReceipt && batch.sawStart && !batch.end),
+    canRetire: () => !state.inflightRound && !state.runningBatches.length,
     agentStart: (ctx, info) => lifecycleBoundary(
       "agent_start", ctx, () => agentStart(ctx, info)),
     agentSettled: (event, ctx) => lifecycleBoundary(

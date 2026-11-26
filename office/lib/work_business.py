@@ -89,6 +89,23 @@ def _review_mode(conn, reviewer, is_registered):
     return "reviewer", _resolve_person(conn, reviewer, "review", is_registered)
 
 
+def _responsible_person(conn, address):
+    position = conn.execute("SELECT holder FROM position_holders WHERE position=?", (address,)).fetchone()
+    return position[0] if position else address
+
+
+def _require_independent_review(conn, assignee, reviewer, pending=None):
+    if not reviewer:
+        return
+    holder = _responsible_person(conn, reviewer)
+    if (assignee == reviewer or (holder and _responsible_person(conn, assignee) == holder)
+            or (pending is not None and holder and same_submitter(
+                conn, pending['work_ref'], pending['sub_ref'], pending['submitted_by'], holder) is not False)):
+        raise ResultRefused("conflict", "请指定独立的审核人，承办人和提交人不能自审",
+                            en="Choose an independent reviewer. The assignee or submitter cannot review their own work.",
+                            reason_code="self_review")
+
+
 def _scope_list(conn, prow, scope):
     """交付范围：没给就用这个项目**已登记的工作区**（`project_refs` 里 kind=workspace）。
 
@@ -143,6 +160,7 @@ def create(storage, conn, actor, *, project_ref, objective, assignee, review=Non
                             needs="project.manage")
     who = _resolve_person(conn, assignee, "assignee", is_registered)
     mode, reviewer = _review_mode(conn, review, is_registered)
+    _require_independent_review(conn, who, reviewer)
     scopes = _scope_list(conn, prow, scope)
     refs, rels = _check_additions(conn, actor, project_ref, references, relations, manage)
 
@@ -463,14 +481,15 @@ def _available_actions(conn, row, roles, current, actor, person):
     acts = []
     open_ = row["state"] in (WORK_ACTIVE, WORK_SUBMITTED)
     if "assignee" in roles and open_:
-        if current is not None and current["submitted_by"] == actor:
-            acts.append("withdraw")
-        acts.append("publish")
+        if current is None:
+            acts.append("publish")
+        elif same_submitter(conn, row['work_ref'], current['sub_ref'], current['submitted_by'], person) is True:
+            acts += ["withdraw", "publish"]
         acts += ["update:wait", "update:references"]
         if row["waiting_json"]:
             acts.append("update:continue")
     if ("reviewer" in roles and current is not None and row["state"] == WORK_SUBMITTED
-            and same_submitter(conn, row["work_ref"], current["sub_ref"], current["submitted_by"], actor, person) is False):
+            and same_submitter(conn, row["work_ref"], current["sub_ref"], current["submitted_by"], person) is False):
         acts.append("review")
     if "manager" in roles and open_:
         acts += [a for a in ("update:assign", "update:reviewer", "update:edit", "update:cancel",
@@ -530,6 +549,7 @@ def update(storage, conn, actor, *, work_ref, action, expected_version=None, ass
     if action == "assign":
         _require_manage(manage, row["project_ref"], "改派", "reassign", work_ref)
         who = _resolve_person(conn, assignee, "assignee", is_registered)
+        _require_independent_review(conn, who, row['reviewer_ref'])
         previous_scopes = _scopes(row)
         scopes = _scope_list(conn, prow, scope) if scope is not None else previous_scopes
         changed = who != row["assignee_ref"] or scopes != previous_scopes
@@ -543,6 +563,7 @@ def update(storage, conn, actor, *, work_ref, action, expected_version=None, ass
             raise ResultRefused("conflict", "已有待审提交，请换审，或由提交人先撤回再设为免审",
                                 en="A submission awaits review. Assign a reviewer or have the submitter withdraw it first.",
                                 reason_code="pending_review_required", work_ref=work_ref)
+        _require_independent_review(conn, row['assignee_ref'], reviewer, _current_sub(conn, row))
         sets = {"review_mode": mode, "reviewer_ref": reviewer}
         payload.update(mode=mode, to=reviewer)
     elif action == "edit":
@@ -623,6 +644,10 @@ def update(storage, conn, actor, *, work_ref, action, expected_version=None, ass
     elif action in ("wait", "continue"):
         # 与"能不能补记资料"同一个集合（本人 + 当前持岗），这句话也只说一次。
         _require_holder(conn, actor, row, "等待说明" if action == "wait" else "解除等待", work_ref)
+        for field, value in (("reason", reason), ("on", on)):
+            if value is not None and not isinstance(value, str):
+                raise ResultRefused("invalid_request", "%s 必须为字符串" % field,
+                                    en="%s must be a string" % field, field=field)
         if action == "continue" and not row["waiting_json"]:
             raise ResultRefused("conflict", "当前没有等待说明",
                                 en="there is no wait note right now", reason_code="not_waiting")
@@ -818,7 +843,7 @@ def list_work(conn, actor, *, project_ref=None, role=None, state=None, limit=20,
 # --------------------------------------------------------------------------- withdraw
 
 def withdraw(storage, conn, actor, *, work_ref, sub_ref, expected_version=None, act_key,
-             now_ts=None):
+             now_ts=None, person=None):
     """撤回本人仍在待审的提交。判据是"是不是我的"，与审核的"不能审自己的"同一个比较。"""
     params = {"work_ref": work_ref, "sub_ref": sub_ref, "expected_version": expected_version}
     replay, digest = storage.action_replay(conn, actor, "work.withdraw", act_key, params)
@@ -826,7 +851,7 @@ def withdraw(storage, conn, actor, *, work_ref, sub_ref, expected_version=None, 
         return replay, False
     row = _work_row(conn, work_ref)
     current = _require_current_sub(conn, row, sub_ref)
-    if current["submitted_by"] != actor:
+    if same_submitter(conn, work_ref, sub_ref, current["submitted_by"], person) is not True:
         raise ResultRefused("unauthorized_attempt", "只能撤回本人的提交",
                             en="you can only withdraw your own submission",
                             sub_ref=sub_ref, reason_code="not_submitter", needs="submitter")

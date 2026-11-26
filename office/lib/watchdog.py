@@ -22,6 +22,9 @@ class ToolObservation:
     state: Literal["running", "finished", "waiting", "background"]
     # The adapter advances this only for actual progress.
     progress_revision: int | None = None
+    # Verified samples of the associated process tree, not inferred from missing output.
+    process_tree_idle: bool | None = None
+    process_tree_root: tuple[int, str] | None = None
 
 
 ToolDecision = Literal["clear", "advance", "unknown", "notify", "already_notified"]
@@ -52,6 +55,8 @@ def tool_due_decision(
         return "unknown"
     if observed_progress > progress_revision:
         return "advance"
+    if observation.process_tree_idle is not True:
+        return "unknown"
     return "already_notified" if fire_count else "notify"
 
 
