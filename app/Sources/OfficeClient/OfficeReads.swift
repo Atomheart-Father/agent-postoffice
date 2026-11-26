@@ -204,7 +204,8 @@ public struct OfficeReads: Sendable {
         call(.whoami) { r in
             guard let actor = r["actor"] as? String else { return nil }
             let approval = (r["admin_approval"] as? [String: Any]).map {
-                AdminApproval(switchOn: $0["enabled"] as? Bool, hasApprover: $0["available"] as? Bool)
+                AdminApproval(switchOn: $0["enabled"] as? Bool, hasApprover: $0["available"] as? Bool,
+                              position: $0["position"] as? String)
             }
             return OfficeContext(actor: actor, adminApproval: approval)
         }

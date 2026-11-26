@@ -451,11 +451,10 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         _rr = registered_refs or {}
         self.registered_refs = {k: set(_rr.get(k) or _rr.get(k + "_refs") or ())
                                for k in ("workspace", "group", "skill")}
-        # ★ A1：治理名单缺省取同一 home 的权威配置（`config.json` 的 `governance_actors`）——不读它，
-        #   治理身份就进不了判据（真机 `work.create` 全拒）。显式传入优先；读不出 ⇒ 空名单（不猜）。
+        # Fresh homes reserve office.admin. Authority still requires an appointed holder.
         if governance_actors is None:
             _cfg = self._config()
-            _raw = _cfg.get("governance_actors") if isinstance(_cfg, dict) else None
+            _raw = _cfg.get("governance_actors", ["office.admin"])
             governance_actors = ([g for g in _raw if isinstance(g, str) and g.strip()]
                                  if isinstance(_raw, list) else ())
         self._gov_static = set(governance_actors or ())
@@ -575,7 +574,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
         """Registration comes from the current bindings, positions and configured governance names."""
         if self._is_position_address(conn, ref):
             return True
-        if position_only or not isinstance(ref, str) or not ref:
+        if position_only or not isinstance(ref, str) or not ref or ref == "office.admin":
             return False
         return ref in self._gov_static or conn.execute(
             "SELECT 1 FROM bindings WHERE actor=? AND state='active' AND revoked_at IS NULL LIMIT 1",
@@ -964,6 +963,23 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                               "kind": kind, "target": target, "version": dup["version"], "duplicate": True}
                     self.storage.record_action(conn, actor, "request.create", act_key, digest, result, now_ts)
                     return result
+                if kind == "project":
+                    self._check_project_owner(conn, target)
+                    self._project_fields(**{k: v for k, v in rparams.items() if k not in ("quotes", "description")})
+                elif kind == "holder":
+                    if not create:
+                        self._require_appointment_position(conn, pos)
+                    elif project:
+                        self._validate_payload(self._project_insert, project, skip_first=2)
+                        owner = project["owner_ref"]
+                        if isinstance(owner, str) and owner.strip().removeprefix("@") == pos:
+                            if project_ref is not None or pos in self._governance_positions():
+                                raise CoreError("invalid_request", "新项目的经理岗不能已属于其他项目或担任组织管理员",
+                                                en="The new project manager cannot belong to another project or be an organization administrator",
+                                                reason_code="position_project_mismatch")
+                        else:
+                            self._check_project_owner(conn, owner)
+                        self._project_fields(**{k: v for k, v in project.items() if k not in ("description", "owner_ref", "now_ts")})
                 ref = dup["request_ref"] if completing else self._next_ref(conn, "handover_requests", "HR", "request_ref")
                 version = dup["version"] + 1 if completing else 1
                 items, power = ([], {}) if personal_join else self._request_power(conn, actor, kind, pos or target, rparams, now_ts)
@@ -974,7 +990,7 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                 state = "done" if execution is not None else "pending"
                 routes_to_project = any(item[1] is not None for item in items)
                 decider = (None if execution is not None or routes_to_project
-                           or (self._governance_actors(conn) and not any(i[2] for i in items))
+                           or (self._approval_admins(conn)[0] and not any(i[2] for i in items))
                            else self._request_user())
                 outcome = self.canonical_json({"applicant_person": applicant_person, **({"execution": execution, "by_user": actor == self._request_user()} if execution else {})})
                 if completing:
@@ -1108,10 +1124,17 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                                     "group_refs": list(group_refs or ()), "skill_refs": list(skill_refs or ()),
                                     "visibility": visibility or "shared"}, act_key, now_ts)
 
-    def _project_insert(self, conn, actor, *, name, owner_ref, workspace_refs, description="",
-                        group_refs=(), skill_refs=(), visibility=None, now_ts=None):
-        """在调用方事务里建 Project，**不判权**（内部执行：公开的 `project.create` 判完权调它，申请批准也调它）。
-        引用只认 `registered_refs`（受信启动供给），库内 `project_refs` 不是登记依据（新项目不能拿自己当来源）。"""
+    def _check_project_owner(self, conn, owner_ref):
+        owner_ref = owner_ref.strip().removeprefix("@") if isinstance(owner_ref, str) else None
+        if not self._is_position_address(conn, owner_ref):
+            raise CoreError("not_found", f"项目经理岗位 {owner_ref!r} 尚未建立。新岗位和新项目请用一份任职申请，填写 create.position 和 create.project。",
+                            en=f"Project manager position {owner_ref!r} does not exist. Submit a holder request with create.position and create.project to create both together.",
+                            reason_code="project_owner_not_registered")
+        self._check_manager_position(conn, owner_ref, None)
+        return owner_ref
+
+    def _project_fields(self, *, name, workspace_refs, group_refs=(), skill_refs=(), visibility=None):
+        """Check the same project fields before filing a request and when it executes."""
         visibility = visibility or "shared"
         if visibility not in ("shared", "private"):
             raise CoreError("invalid_request", "visibility 只能是 shared 或 private",
@@ -1123,14 +1146,16 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
             raise CoreError("invalid_request", "workspace_refs 至少一个真实工作空间引用",
                             en="workspace_refs needs at least one real workspace reference",
                             field="workspace_refs")
-        owner_ref = owner_ref.strip().removeprefix("@") if isinstance(owner_ref, str) else None
-        self._check_manager_position(conn, owner_ref, None)
         # 引用校验一遍、落库一遍（同一批）：`registered_refs` 是唯一登记依据，
         # 库内 project_refs 不参与 —— 新项目不能拿自己塞进去的行当来源。
         ref_rows, seen = [], set()
         for kind, refs in (("workspace", workspace_refs), ("group", group_refs),
                           ("skill", skill_refs)):
             for ref in refs:
+                if kind == "workspace" and isinstance(ref, str) and ref.startswith("/"):
+                    raise CoreError("invalid_request", "请先在 workspace-map.json 登记该目录，再填写映射名称",
+                                    en="Register this directory in workspace-map.json and use the mapped workspace name",
+                                    kind=kind, ref=ref, reason_code="unverifiable_ref")
                 self.check_ref(ref, "%s_ref" % kind)
                 if self._ref_registered(kind, ref) is None:
                     raise CoreError("invalid_request",
@@ -1146,6 +1171,13 @@ class Core(_BindingOperationsBase, _GrantOperationsBase, _PositionOperationsBase
                                        % (kind, ref), ref=ref)
                 seen.add(key)
                 ref_rows.append((kind, ref))
+        return visibility, ref_rows
+
+    def _project_insert(self, conn, actor, *, name, owner_ref, workspace_refs, description="",
+                        group_refs=(), skill_refs=(), visibility=None, now_ts=None):
+        owner_ref = self._check_project_owner(conn, owner_ref)
+        visibility, ref_rows = self._project_fields(name=name, workspace_refs=workspace_refs,
+                                                   group_refs=group_refs, skill_refs=skill_refs, visibility=visibility)
         row = conn.execute("SELECT COUNT(*) AS n FROM projects").fetchone()
         project_ref = "prj-%d" % (int(row["n"]) + 1)
         now = self._now(now_ts)

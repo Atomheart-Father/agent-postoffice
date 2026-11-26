@@ -35,12 +35,15 @@ struct SettingsPage: View {
                                           guard key != desk.adminApproval.value?.switchKey else { return }
                                           desk.beginAction("admin-approval", .adminApproval(enabled: key == "on"))
                                       }),
-                                      disabled: desk.isFixture || desk.adminApproval.value?.switchOn == nil || desk.actions["admin-approval"] != nil ? ["on", "off"] : [])
+                                      disabled: approvalButtonsDisabled)
                         }
                     }
                     ActionBox(desk: desk, key: "admin-approval")
                     if desk.adminApproval.value?.hasApprover == false {
-                        row(tr("可审批的管理员", "Approver available"), sub: nil) { Text(tr("没有", "None")).font(Theme.Font.body).foregroundStyle(Theme.ink2) }
+                        row(tr("管理员会话", "Admin session"), sub: nil) {
+                            Text(tr("请先绑定管理员会话", "Assign an admin session first"))
+                                .font(Theme.Font.body).foregroundStyle(Theme.ink2)
+                        }
                     }
                 }
                 section(tr("界面", "Interface")) {
@@ -54,6 +57,13 @@ struct SettingsPage: View {
                 }
                 .onChange(of: appearance) { _ in Prefs.applyAppearance() }
         }
+    }
+
+    private var approvalButtonsDisabled: Set<String> {
+        if desk.isFixture || desk.adminApproval.value?.switchOn == nil || desk.actions["admin-approval"] != nil {
+            return ["on", "off"]
+        }
+        return desk.adminApproval.value?.hasApprover == true ? [] : ["on"]
     }
 
     /// 现任管理员：lookup 读到的 holder 过 PersonLabel；岗位在但没人持有写"空缺"，读失败写"未知 / 没连上"。

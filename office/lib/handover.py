@@ -130,16 +130,21 @@ class HandoverOperations:
 
     def _approval_admins(self, conn):
         row = conn.execute("SELECT v FROM meta WHERE k='admin_approval_enabled'").fetchone()
-        enabled = row is None or row[0] == "true"
-        admins = self._governance_actors(conn) - {self._request_user()}
-        active = {a for a in admins if conn.execute(
-            "SELECT 1 FROM bindings WHERE actor=? AND state='active' AND revoked_at IS NULL", (a,)
-        ).fetchone()} if enabled else set()
-        return enabled, active
+        operator = self._request_user()
+        admins = {}
+        for position in sorted(self._governance_positions()):
+            if self._is_position_address(conn, position):
+                holder = self._request_person(conn, position)
+                if holder and holder != operator:
+                    admins[position] = holder
+        return bool(admins) and (row is None or row[0] == "true"), admins
 
     def _admin_approval(self, conn):
-        enabled, active = self._approval_admins(conn)
-        return {"enabled": enabled, "available": bool(active)}
+        enabled, admins = self._approval_admins(conn)
+        status = {"enabled": enabled, "available": bool(admins)}
+        if admins:
+            status["position"] = "office.admin" if "office.admin" in admins else next(iter(admins))
+        return status
 
     def request_admin_set(self, actor, *, enabled, act_key, now_ts=None):
         self._check_actor(actor)
@@ -151,6 +156,10 @@ class HandoverOperations:
             replay, digest = self.storage.action_replay(conn, actor, "request.admin_set", act_key, {"enabled": enabled})
             if replay is not None:
                 return replay
+            if enabled and not self._approval_admins(conn)[1]:
+                raise self.CoreError("conflict", "请先为管理员岗位指定已登记的会话",
+                                     en="Assign a registered session to the admin position first",
+                                     reason_code="no_admin_session")
             conn.execute("INSERT INTO meta(k,v) VALUES('admin_approval_enabled',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                          ("true" if enabled else "false",))
             out = {"ok": True, **self._admin_approval(conn)}
@@ -173,8 +182,8 @@ class HandoverOperations:
         create = rparams.get("create") or {}
         project = self._position_management_project(
             conn, position, project_ref=(create.get("position") or {}).get("project_ref"), now_ts=now_ts)
-        strict = (kind == "holder" and project is None
-                  and conn.execute("SELECT 1 FROM position_holders WHERE position=?", (position,)).fetchone() is not None)
+        strict = kind == "holder" and (position in self._governance_positions() or (project is None
+                  and self._is_position_address(conn, position)))
         items = [("position", project, strict)]              # 岗位这一项归它所在项目的经理；组织岗位归管理员
         if create.get("project"):                            # 新项目（负责人批准时拿 project.manage）另是一项：第 3 档，管理员
             items.append(("project", None, False))
@@ -191,7 +200,8 @@ class HandoverOperations:
             return "grant"
         if project and kind == "read_mail":
             return None
-        return "admin" if actor in self._approval_admins(conn)[1] else None
+        enabled, admins = self._approval_admins(conn)
+        return "admin" if enabled and (actor in admins or actor in admins.values()) else None
 
     def _request_power(self, conn, actor, kind, position, rparams, now_ts):
         """actor 办这条申请的全部项各有什么权（`{项名: 权}`）；所有项都有权才能自己直接办。"""
@@ -422,7 +432,8 @@ class HandoverOperations:
     def _request_notify(self, conn, ref, applicant, kind, target, reason, items, now_ts):
         """项目项送本项目经理，组织项送管理员，严格项送用户。每人只收到自己能批的项。"""
         user = {self._request_user()} - {None}
-        gov = {a for a in self._approval_admins(conn)[1] if self._is_position_address(conn, a)}
+        enabled, admins = self._approval_admins(conn)
+        gov = admins if enabled else ()
         person, who = self._request_person(conn, applicant), {}
         for item in items:
             managers = {g["subject_ref"] for g in self._project_grants(conn, item[1], now_ts)} if item[1] else set()

@@ -232,14 +232,18 @@ class PositionOperations:
         return conn.execute(
             "SELECT * FROM bindings WHERE binding_id=? AND state='active' AND revoked_at IS NULL",
             (position,)).fetchone()
+    def _require_appointment_position(self, conn, position):
+        if not self._position_exists(conn, position):
+            raise self.CoreError("not_found",
+                                 f"岗位 {position!r} 尚未建立或已撤销。新岗位请在任职申请填写 create.position。",
+                                 en=f"Position {position!r} is missing or retired. For a new position include create.position in the holder request.",
+                                 position=position)
+
     def _position_bind_apply(self, conn, actor, position, session_ref, instance, *,
                              now_ms, now, now_ts=None, act_key=None):
         """在**调用方事务**里执行一次岗位绑定（申请批准与交还共用；授权由调用方核过，没有公开入口）：
         gen 按最近一行（含 revoked）续增、旧会话通道随之失效；现任随绑定写进 `position_holders`。"""
-        if not self._position_exists(conn, position):
-            raise self.CoreError("not_found",
-                                 f"岗位 {position!r} 未注册（先 position.create，或经统一解析）",
-                                 en=f"Position {position!r} is not registered", position=position)
+        self._require_appointment_position(conn, position)
         holder = conn.execute("SELECT holder FROM position_holders WHERE position=?", (position,)).fetchone()[0]
         cur = self._position_active_binding(conn, position)
         prev_session = cur["host_session_ref"] if cur is not None else None

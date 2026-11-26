@@ -604,6 +604,8 @@ if (import.meta.main ?? (process.argv[1] && import.meta.url === pathToFileURL(re
         return true;
       });
       if (!args.windowOpen()) result = {status:'window_closed'};
+      else if (done.reason === 'session_or_descriptor' && descriptorPath
+          && !lstatSync(descriptorPath, {throwIfNoEntry:false})) process.exit(0);
       else if (done.status !== 'finished' && done.reason !== 'no_pending')
         throw Error('stop remains unknown: ' + done.reason);
     }

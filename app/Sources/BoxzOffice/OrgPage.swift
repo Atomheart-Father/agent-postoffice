@@ -57,8 +57,8 @@ struct OrgPage: View {
             Text("Studio").font(Theme.Font.viewTitle).tracking(Theme.Track.viewTitle).padding(.vertical, -6).lineLimit(1).fixedSize()
             if let address = desk.adminApproval.value?.studioAddress {
                 Button {
-                    if address == "@office.admin" { desk.openSeat(address) }
-                    else { desk.drawer = .inbox }
+                    if address == "@Boss" { desk.drawer = .inbox }
+                    else { desk.openSeat(address) }
                 } label: {
                     Text(address).font(Theme.Font.rowTitle).foregroundStyle(Theme.ink)
                 }

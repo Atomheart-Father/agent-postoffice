@@ -173,9 +173,26 @@ public struct ThreadUsagePage: Sendable, Equatable {
 public struct AdminApproval: Sendable, Equatable {
     public let switchOn: Bool?
     public let hasApprover: Bool?
-    /// 分段按钮的选中项：值未知（nil）时两个都不选，不把"未知"画成"在岗"。
-    public var switchKey: String { switchOn.map { $0 ? "on" : "off" } ?? "" }
-    public var studioAddress: String? { switchOn.map { $0 ? "@office.admin" : "@Boss" } }
+    public let position: String?
+
+    init(switchOn: Bool?, hasApprover: Bool?, position: String? = nil) {
+        self.switchOn = switchOn
+        self.hasApprover = hasApprover
+        self.position = position
+    }
+
+    public var switchKey: String {
+        guard let switchOn else { return "" }
+        return switchOn && hasApprover == true ? "on" : "off"
+    }
+
+    public var studioAddress: String? {
+        switch switchKey {
+        case "on": position.map { "@" + $0 } ?? "@office.admin"
+        case "off": "@Boss"
+        default: nil
+        }
+    }
 }
 
 public struct OfficeContext: Sendable {
